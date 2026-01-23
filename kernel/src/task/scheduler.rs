@@ -80,11 +80,28 @@ pub fn schedule_next() -> Option<TaskId> {
 
 /// Start scheduler (enter idle loop)
 pub fn start() -> ! {
+    crate::serial_println!("[SCHED] Scheduler started, entering task execution loop");
+
+    // Disable interrupts during initial context switch
+    x86_64::instructions::interrupts::disable();
+
     loop {
         if let Some(task_id) = schedule_next() {
-            // TODO: Context switch to task_id
-            crate::serial_println!("[SCHED] Would switch to task {}", task_id);
+            crate::serial_println!("[SCHED] Switching to task {}", task_id);
+
+            // Perform context switch
+            unsafe {
+                super::switch::switch_to(task_id);
+            }
+
+            // After returning from task (via yield or blocking)
+            crate::serial_println!("[SCHED] Task {} yielded", task_id);
+        } else {
+            // No tasks runnable, halt until interrupt
+            crate::serial_println!("[SCHED] No runnable tasks, halting");
+            x86_64::instructions::interrupts::enable();
+            x86_64::instructions::hlt();
+            x86_64::instructions::interrupts::disable();
         }
-        x86_64::instructions::hlt();
     }
 }

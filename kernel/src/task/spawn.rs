@@ -116,3 +116,57 @@ struct ElfSegment {
     _data: Vec<u8>,
     _flags: u32,
 }
+
+/// Spawn a new task from raw code (bypass ELF parsing)
+///
+/// This is a simplified version for testing and bootstrapping.
+/// Use when you have raw executable code without ELF wrapping.
+///
+/// # Arguments
+/// * `code` - Raw executable bytes
+/// * `entry_offset` - Offset into code where execution begins
+///
+/// # Returns
+/// TaskId of the newly created task
+///
+/// # Example
+/// ```no_run
+/// let task_id = spawn_raw(&user_code, 0)?;
+/// ```
+pub fn spawn_raw(code: &[u8], entry_offset: u64) -> Result<TaskId, SpawnError> {
+    use crate::arch::x86_64::usermode::{map_and_load_user_code, allocate_user_stack};
+    use crate::memory::PageTable;
+    use x86_64::VirtAddr;
+
+    // 1. Allocate new task ID
+    let task_id = allocate_task_id();
+
+    // 2. Map and load code into user space
+    let entry_point = map_and_load_user_code(code);
+    let entry_addr = entry_point.as_u64() + entry_offset;
+
+    // 3. Allocate user stack
+    let user_stack = allocate_user_stack();
+
+    // 4. Create dummy page table (we're still using kernel page table for now)
+    // TODO: Create proper per-task page table
+    let page_table = PageTable::new();
+
+    // 5. Create task structure
+    let mut task = Task::new(task_id, page_table, entry_addr);
+
+    // 6. Update task's stack pointer in context
+    task.context.rsp = user_stack.as_u64();
+    task.context.rbp = user_stack.as_u64();
+
+    // 7. Insert into global task table
+    insert_task(task);
+
+    // 8. Add to scheduler runqueue
+    crate::task::scheduler::enqueue(task_id);
+
+    crate::serial_println!("[SPAWN] Created user task {} at entry={:#x} stack={:#x}",
+        task_id, entry_addr, user_stack.as_u64());
+
+    Ok(task_id)
+}

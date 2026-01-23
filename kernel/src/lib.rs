@@ -196,20 +196,28 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
 
         serial_println!("[BOOT] ✅ Phase 3 COMPLETE - IPC & Task system operational\n");
 
-        // Load and execute test user program
-        serial_println!("[BOOT] Starting user-mode test program...\n");
+        // Spawn user-mode test task
+        serial_println!("[BOOT] Spawning user-mode test task...\n");
 
         // Get user program code
         let user_code = &userspace_test::USER_PROGRAM.code[..userspace_test::UserProgram::code_size()];
 
-        // Map and load user code at user-accessible address
-        let entry_point = arch::x86_64::usermode::map_and_load_user_code(user_code);
+        // Spawn user task using raw binary
+        match task::spawn_raw(user_code, 0) {
+            Ok(task_id) => {
+                serial_println!("[BOOT] User task spawned successfully (id={})\n", task_id);
+            }
+            Err(e) => {
+                serial_println!("[BOOT] Failed to spawn user task: {:?}\n", e);
+                loop { x86_64::instructions::hlt(); }
+            }
+        }
 
-        // Allocate user stack
-        let user_stack = arch::x86_64::usermode::allocate_user_stack();
+        serial_println!("[BOOT] Starting scheduler...\n");
+        serial_println!("==============================================\n");
 
-        // Jump to user mode (does not return!)
-        arch::x86_64::usermode::jump_to_usermode(entry_point, user_stack);
+        // Start scheduler (does not return)
+        task::scheduler_start();
     }
 }
 
