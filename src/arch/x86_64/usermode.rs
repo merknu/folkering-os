@@ -23,12 +23,7 @@ pub unsafe fn jump_to_usermode(entry_point: VirtAddr, user_stack: VirtAddr) -> !
     let user_cs = super::gdt::user_code_selector();
     let user_ss = super::gdt::user_data_selector();
 
-    crate::serial_println!("[USERMODE] Jumping to Ring 3...");
-    crate::serial_println!("[USERMODE]   Entry point: {:#x}", entry_point.as_u64());
-    crate::serial_println!("[USERMODE]   Stack: {:#x}", user_stack.as_u64());
-    crate::serial_println!("[USERMODE]   CS: {:#x}", user_cs.0);
-    crate::serial_println!("[USERMODE]   SS: {:#x}", user_ss.0);
-    crate::serial_println!("[USERMODE] About to execute IRETQ...");
+    crate::serial_println!("[USERMODE] Transitioning to Ring 3 at {:#x}", entry_point.as_u64());
 
     // IRET stack frame (pushed in reverse order):
     // [SS, RSP, RFLAGS, CS, RIP]
@@ -105,8 +100,7 @@ pub fn allocate_user_stack() -> VirtAddr {
         core::ptr::write_bytes(hhdm_addr as *mut u8, 0, 4096);
     }
 
-    crate::serial_println!("[USERMODE] Allocated user stack at {:#x} (physical {:#x})",
-        USER_STACK_BASE, stack_page_addr);
+    crate::serial_println!("[USERMODE] User stack allocated at {:#x}", USER_STACK_BASE);
 
     // Return top of stack (page base + 4096)
     VirtAddr::new(USER_STACK_BASE + 4096)
@@ -154,24 +148,14 @@ pub fn map_and_load_user_code(code: &[u8]) -> VirtAddr {
         );
     }
 
-    crate::serial_println!("[USERMODE] User code physical {:#x}, virtual {:#x}, size {} bytes",
-        code_page_addr, USER_CODE_ADDR, code.len());
-
-    // Dump first 16 bytes to verify it was copied correctly
-    crate::serial_print!("[USERMODE] First 16 bytes: ");
-    for i in 0..16 {
-        let byte = unsafe { *((hhdm_addr + i) as *const u8) };
-        crate::serial_print!("{:02x} ", byte);
-    }
-    crate::serial_println!("");
-
     // Flush TLB for user code page to ensure mapping is active
     use x86_64::instructions::tlb;
     unsafe {
         tlb::flush(VirtAddr::new(USER_CODE_ADDR));
     }
 
-    crate::serial_println!("[USERMODE] TLB flushed for user code page");
+    crate::serial_println!("[USERMODE] User code mapped at {:#x} ({} bytes)",
+        USER_CODE_ADDR, code.len());
 
     VirtAddr::new(USER_CODE_ADDR)
 }

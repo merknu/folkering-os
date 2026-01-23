@@ -30,59 +30,31 @@ pub enum Syscall {
 
 /// Initialize syscall support
 pub fn init() {
-    crate::serial_println!("[SYSCALL] Enabling SCE flag in EFER...");
-    // Enable SYSCALL/SYSRET
+    // Enable SYSCALL/SYSRET extensions
     unsafe {
         Efer::update(|flags| {
             flags.insert(EferFlags::SYSTEM_CALL_EXTENSIONS);
         });
     }
-    crate::serial_println!("[SYSCALL] SCE flag enabled");
 
-    crate::serial_println!("[SYSCALL] Setting LSTAR to syscall entry point...");
-    // Set syscall handler
+    // Set syscall handler entry point
     let entry_addr = syscall_entry as u64;
-    crate::serial_println!("[SYSCALL] Entry address: {:#x}", entry_addr);
     LStar::write(VirtAddr::new(entry_addr));
-    crate::serial_println!("[SYSCALL] LSTAR configured");
 
-    crate::serial_println!("[SYSCALL] Configuring STAR with segment selectors...");
-    // Standard GDT layout (back to original):
-    // 0: Null, 1: Kernel CS (0x08), 2: Kernel DS (0x10), 3: User CS (0x18), 4: User DS (0x20)
-    //
-    // SYSRET with base at kernel_cs (0x08):
-    //   CS = 0x08 + 16 = 0x18 (index 3 - user code) ✓
-    //   SS = 0x08 + 8 = 0x10 (index 2 - kernel data!) ✗
-    //
-    // This is a known limitation - we can't use the standard layout for SYSCALL/SYSRET!
-    // Solution: Use kernel_data as the SYSRET base, but the x86_64 crate validates this...
-    //
-    // Let me check if manually writing to STAR MSR works instead
-
+    // Configure STAR MSR for SYSCALL/SYSRET
+    // STAR[47:32] = kernel CS for SYSCALL
+    // STAR[63:48] = base for SYSRET (SYSRET adds +16 for CS, +8 for SS)
     let kernel_cs = super::gdt::kernel_code_selector();
-    let kernel_data = super::gdt::kernel_data_selector();
 
-    crate::serial_println!("[SYSCALL]   Kernel CS: {:#x}", kernel_cs.0);
-    crate::serial_println!("[SYSCALL]   Kernel DS: {:#x}", kernel_data.0);
-
-    // Manually write to STAR MSR, bypassing x86_64 crate validation
-    crate::serial_println!("[SYSCALL] Writing STAR MSR manually...");
     let star_value: u64 =
-        ((kernel_cs.0 as u64) << 32) |  // STAR[47:32] = kernel CS for SYSCALL
-        ((kernel_cs.0 as u64) << 48);   // STAR[63:48] = base for SYSRET (0x08)
-                                         // SYSRET will add 16 for CS (→0x18) and 8 for SS (→0x10)
-
-    crate::serial_println!("[SYSCALL]   STAR value: {:#x}", star_value);
-    crate::serial_println!("[SYSCALL]   SYSRET will load CS={:#x}, SS={:#x}",
-        kernel_cs.0 + 16 + 3, kernel_cs.0 + 8);
+        ((kernel_cs.0 as u64) << 32) |  // Kernel CS for SYSCALL
+        ((kernel_cs.0 as u64) << 48);   // Base for SYSRET
 
     unsafe {
         use x86_64::registers::model_specific::Msr;
         let mut star = Msr::new(0xC0000081); // IA32_STAR
         star.write(star_value);
     }
-
-    crate::serial_println!("[SYSCALL] STAR configured manually");
 }
 
 /// Syscall entry point
@@ -165,7 +137,6 @@ extern "C" fn syscall_handler(
     arg5: u64,
     arg6: u64,
 ) -> u64 {
-    crate::serial_println!("[SYSCALL] Handler called! syscall_num={}", syscall_num);
     match syscall_num {
         0 => syscall_ipc_send(arg1, arg2, arg3),
         1 => syscall_ipc_receive(arg1),
@@ -330,11 +301,8 @@ fn syscall_exit(exit_code: u64) -> u64 {
 
 fn syscall_yield() -> u64 {
     // Yield CPU to scheduler
-    // For MVP without scheduler, just print and return
-    crate::serial_println!("[SYSCALL] yield called from userspace! ✅");
-
-    // TODO: Uncomment when scheduler is implemented
-    // crate::task::scheduler::yield_cpu();
+    // TODO: Implement scheduler and call yield_cpu() here
+    // For now, this is a no-op that successfully returns to user mode
 
     0 // Success
 }

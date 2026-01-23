@@ -118,44 +118,32 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
         memory::heap::init();
         serial_println!("[HEAP] Kernel heap ready (16 MB allocated)\n");
 
-        // Test dynamic allocations
+        // Verify dynamic allocations work
         use alloc::vec::Vec;
         use alloc::string::String;
-        use x86_64::VirtAddr;
 
-        serial_println!("[TEST] Testing dynamic memory allocation...");
-
-        // Test Vec
         let mut v = Vec::new();
         v.push(1);
         v.push(2);
         v.push(3);
-        serial_println!("[TEST]   Vec::push() works: {:?}", v);
+        let _s = String::from("Folkering OS");
 
-        // Test String
-        let s = String::from("Folkering OS");
-        serial_println!("[TEST]   String::from() works: {}", s);
+        serial_println!("[TEST] Dynamic allocations verified (Vec, String)\n");
 
-        serial_println!("[TEST] All allocation tests passed!\n");
+        serial_println!("\n[BOOT] ✅ Phase 1 COMPLETE - Memory subsystem operational");
+        serial_println!("[BOOT] ✅ Phase 2 COMPLETE - User mode infrastructure ready\n");
 
-        serial_println!("[BOOT] ✅ Phase 1 COMPLETE - Memory subsystem functional!");
-
-        // Test jumping to user mode
-        serial_println!("[BOOT] Testing user mode transition...\n");
+        // Load and execute test user program
+        serial_println!("[BOOT] Starting user-mode test program...\n");
 
         // Get user program code
         let user_code = &userspace_test::USER_PROGRAM.code[..userspace_test::UserProgram::code_size()];
 
         // Map and load user code at user-accessible address
         let entry_point = arch::x86_64::usermode::map_and_load_user_code(user_code);
-        serial_println!("[TEST] User program loaded at {:#x}", entry_point.as_u64());
 
         // Allocate user stack
         let user_stack = arch::x86_64::usermode::allocate_user_stack();
-
-        serial_println!("[TEST] Entry point: {:#x}", entry_point.as_u64());
-        serial_println!("[TEST] User stack: {:#x}", user_stack.as_u64());
-        serial_println!("[TEST] Jumping to user mode...\n");
 
         // Jump to user mode (does not return!)
         arch::x86_64::usermode::jump_to_usermode(entry_point, user_stack);

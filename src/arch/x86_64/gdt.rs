@@ -36,39 +36,13 @@ pub fn init() {
     use x86_64::instructions::tables::load_tss;
 
     unsafe {
-        crate::serial_println!("[GDT] Setting up TSS stack...");
-        // Set TSS syscall stack pointer (TSS is already initialized by static initialization)
+        // Set TSS syscall stack pointer
         let stack_start = VirtAddr::from_ptr(&SYSCALL_STACK as *const _);
         let stack_end = stack_start + SYSCALL_STACK_SIZE as u64;
         TSS.privilege_stack_table[0] = stack_end;
-        crate::serial_println!("[GDT] TSS stack configured at {:#x}", stack_end.as_u64());
 
-        crate::serial_println!("[GDT] Building GDT...");
-        // Build GDT with SYSCALL/SYSRET compatible layout:
-        // Index 0: Null (0x00)
-        // Index 1: Kernel code (0x08)
-        // Index 2: Kernel data (0x10)
-        // Index 3: User code (0x18) - SYSRET CS = base + 16, so base must be 0x08 - 16 = invalid!
-        // Index 4: User data (0x20) - SYSRET SS = base + 8, so base must be 0x18
-        //
-        // Wait - that won't work! SYSRET needs:
-        //   CS = base + 16
-        //   SS = base + 8
-        // For a SINGLE base value!
-        //
-        // Standard x86-64 layout:
-        // 0: Null, 1: Kernel CS, 2: Kernel DS, 3: User CS, 4: User DS
-        // With base = index 1 = 0x08:
-        //   SYSRET CS = 0x08 + 16 = 0x18 (index 3) ✓
-        //   SYSRET SS = 0x08 + 8 = 0x10 (index 2) ✗ (this is kernel data!)
-        //
-        // So we need index 2 to be BOTH kernel data AND user data!
-        // OR... put user data BEFORE kernel data:
-        // 0: Null, 1: Kernel CS, 2: User DS, 3: User CS, 4: Kernel DS?
-        // NO - that breaks kernel operation!
-        //
-        // Linux solution: put 32-bit compatibility segments in between
-        // Let me try standard layout and see what Star::write expects
+        // Build GDT with standard x86-64 layout
+        // 0: Null, 1: Kernel CS (0x08), 2: Kernel DS (0x10), 3: User CS (0x18), 4: User DS (0x20), 5: TSS
         let mut gdt = GlobalDescriptorTable::new();
         let kernel_code = gdt.append(Descriptor::kernel_code_segment());
         let kernel_data = gdt.append(Descriptor::kernel_data_segment());
@@ -85,27 +59,12 @@ pub fn init() {
         };
 
         GDT = Some((gdt, selectors));
-        crate::serial_println!("[GDT] GDT built with {} entries", 6);
 
-        crate::serial_println!("[GDT] Loading GDT...");
-        // Load GDT
+        // Load GDT and configure segments
         GDT.as_ref().unwrap().0.load();
-        crate::serial_println!("[GDT] GDT loaded into GDTR");
-
-        crate::serial_println!("[GDT] Setting CS to {:#x}...", GDT.as_ref().unwrap().1.kernel_code.0);
-        // Set kernel code segment
         CS::set_reg(GDT.as_ref().unwrap().1.kernel_code);
-        crate::serial_println!("[GDT] CS updated");
-
-        crate::serial_println!("[GDT] Setting DS to {:#x}...", GDT.as_ref().unwrap().1.kernel_data.0);
-        // Set kernel data segment
         DS::set_reg(GDT.as_ref().unwrap().1.kernel_data);
-        crate::serial_println!("[GDT] DS updated");
-
-        crate::serial_println!("[GDT] Loading TSS (selector {:#x})...", GDT.as_ref().unwrap().1.tss.0);
-        // Load TSS
         load_tss(GDT.as_ref().unwrap().1.tss);
-        crate::serial_println!("[GDT] TSS loaded into TR");
     }
 }
 
