@@ -96,22 +96,8 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
         let bss_size = bss_end as usize - bss_start as usize;
         core::ptr::write_bytes(bss_start, 0, bss_size);
 
-        // Initialize serial
-        use x86_64::instructions::port::Port;
-        const PORT: u16 = 0x3F8;
-        let mut ier_port: Port<u8> = Port::new(PORT + 1);
-        ier_port.write(0x00);
-        let mut lcr_port: Port<u8> = Port::new(PORT + 3);
-        lcr_port.write(0x80);
-        let mut dll_port: Port<u8> = Port::new(PORT + 0);
-        let mut dlh_port: Port<u8> = Port::new(PORT + 1);
-        dll_port.write(0x03);
-        dlh_port.write(0x00);
-        lcr_port.write(0x03);
-        let mut fcr_port: Port<u8> = Port::new(PORT + 2);
-        fcr_port.write(0xC7);
-        let mut mcr_port: Port<u8> = Port::new(PORT + 4);
-        mcr_port.write(0x0B);
+        // Initialize serial console driver
+        drivers::serial::init();
 
         serial_println!("\n==============================================");
         serial_println!("   Folkering OS v0.1.0 - Microkernel        ");
