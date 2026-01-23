@@ -68,20 +68,18 @@ pub unsafe fn jump_to_usermode(entry_point: VirtAddr, user_stack: VirtAddr) -> !
     );
 }
 
-/// Allocate user stack
+/// Allocate user stack at specific address
 ///
-/// Allocates a page for user stack and returns the top address (stack grows down).
+/// Allocates a page for user stack at specified base and returns the top address.
+///
+/// # Arguments
+/// * `stack_base` - Base address for stack page
 ///
 /// # Returns
-/// Top of user stack (highest address)
-pub fn allocate_user_stack() -> VirtAddr {
+/// Top of user stack (highest address, stack_base + 4096)
+pub fn allocate_user_stack_at(stack_base: u64) -> VirtAddr {
     use crate::memory;
     use crate::memory::paging::flags;
-
-    // User stack address (high user memory, typical for stacks)
-    // Must be below 0x7FFFFFFFF000 to avoid non-canonical addresses
-    // when we add 4096 for stack top
-    const USER_STACK_BASE: u64 = 0x7FFF_FFFE_F000;
 
     // Allocate one page for user stack
     let stack_page_addr = memory::physical::alloc_page()
@@ -89,7 +87,7 @@ pub fn allocate_user_stack() -> VirtAddr {
 
     // Map at user-accessible address with USER_STACK flags
     memory::paging::map_page(
-        USER_STACK_BASE as usize,
+        stack_base as usize,
         stack_page_addr,
         flags::USER_STACK,
     ).expect("Failed to map user stack page");
@@ -100,32 +98,40 @@ pub fn allocate_user_stack() -> VirtAddr {
         core::ptr::write_bytes(hhdm_addr as *mut u8, 0, 4096);
     }
 
-    crate::serial_println!("[USERMODE] User stack allocated at {:#x}", USER_STACK_BASE);
-
     // Return top of stack (page base + 4096)
-    VirtAddr::new(USER_STACK_BASE + 4096)
+    VirtAddr::new(stack_base + 4096)
 }
 
-/// Map and load user code into address space
+/// Allocate user stack (legacy wrapper)
 ///
-/// Maps the user program code at a fixed userspace address and loads the code bytes.
+/// Allocates a page for user stack and returns the top address (stack grows down).
+///
+/// # Returns
+/// Top of user stack (highest address)
+pub fn allocate_user_stack() -> VirtAddr {
+    // User stack address (high user memory, typical for stacks)
+    // Must be below 0x7FFFFFFFF000 to avoid non-canonical addresses
+    // when we add 4096 for stack top
+    const USER_STACK_BASE: u64 = 0x7FFF_FFFE_F000;
+    allocate_user_stack_at(USER_STACK_BASE)
+}
+
+/// Map and load user code into address space at specific address
+///
+/// Maps the user program code at a specified userspace address and loads the code bytes.
 ///
 /// # Arguments
 /// * `code` - Slice of code bytes to load
+/// * `base_addr` - Virtual address where code should be mapped
 ///
 /// # Returns
 /// Virtual address where code was mapped (entry point)
-pub fn map_and_load_user_code(code: &[u8]) -> VirtAddr {
+pub fn map_and_load_user_code_at(code: &[u8], base_addr: u64) -> VirtAddr {
     use crate::memory;
     use crate::memory::paging::flags;
 
-    // Fixed user code address (standard ELF user code location)
-    const USER_CODE_ADDR: u64 = 0x400000; // 4 MB
-
     // Calculate number of pages needed
     let pages_needed = (code.len() + 4095) / 4096;
-
-    crate::serial_println!("[USERMODE] Mapping {} pages for user code", pages_needed);
 
     // Allocate physical page for user code
     let code_page_addr = memory::physical::alloc_page()
@@ -133,7 +139,7 @@ pub fn map_and_load_user_code(code: &[u8]) -> VirtAddr {
 
     // Map at user-accessible address with USER_CODE flags
     memory::paging::map_page(
-        USER_CODE_ADDR as usize,
+        base_addr as usize,
         code_page_addr,
         flags::USER_CODE,
     ).expect("Failed to map user code page");
@@ -151,11 +157,23 @@ pub fn map_and_load_user_code(code: &[u8]) -> VirtAddr {
     // Flush TLB for user code page to ensure mapping is active
     use x86_64::instructions::tlb;
     unsafe {
-        tlb::flush(VirtAddr::new(USER_CODE_ADDR));
+        tlb::flush(VirtAddr::new(base_addr));
     }
 
-    crate::serial_println!("[USERMODE] User code mapped at {:#x} ({} bytes)",
-        USER_CODE_ADDR, code.len());
+    VirtAddr::new(base_addr)
+}
 
-    VirtAddr::new(USER_CODE_ADDR)
+/// Map and load user code into address space (legacy wrapper)
+///
+/// Maps the user program code at a fixed userspace address and loads the code bytes.
+///
+/// # Arguments
+/// * `code` - Slice of code bytes to load
+///
+/// # Returns
+/// Virtual address where code was mapped (entry point)
+pub fn map_and_load_user_code(code: &[u8]) -> VirtAddr {
+    // Fixed user code address (standard ELF user code location)
+    const USER_CODE_ADDR: u64 = 0x400000; // 4 MB
+    map_and_load_user_code_at(code, USER_CODE_ADDR)
 }
