@@ -34,6 +34,48 @@ core::arch::global_asm!(
     "ret"
 );
 
+/// Create the initial kernel task (task 0)
+///
+/// The kernel task represents the kernel execution context.
+/// It never actually runs (kernel runs in interrupt/syscall context),
+/// but provides a valid task structure for the task system.
+fn create_kernel_task() -> task::TaskId {
+    use task::task::{Task, TaskState, Credentials, SandboxLevel, insert_task, set_current_task, allocate_task_id};
+    use memory::PageTable;
+    use x86_64::registers::control::Cr3;
+
+    let task_id = allocate_task_id(); // Will be 1 (first task)
+
+    // Create a zeroed page table for kernel task
+    // The kernel task doesn't actually use this - it uses CR3 directly
+    // This is just to satisfy the Task structure requirements
+    let kernel_page_table = PageTable::new();
+
+    let mut kernel_task = Task {
+        id: task_id,
+        state: TaskState::Running, // Kernel is always "running"
+        page_table: kernel_page_table,
+        context: task::switch::init_context(0, 0), // Dummy context
+        recv_queue: ipc::MessageQueue::new(),
+        ipc_reply: None,
+        blocked_on: None,
+        capabilities: alloc::vec::Vec::new(),
+        credentials: Credentials {
+            uid: 0,           // Root
+            gid: 0,           // Root
+            sandbox_level: SandboxLevel::System, // Kernel has full privileges
+        },
+    };
+
+    // Mark as running (current task)
+    kernel_task.state = TaskState::Running;
+
+    insert_task(kernel_task);
+    set_current_task(task_id);
+
+    task_id
+}
+
 /// Main kernel initialization function with extracted boot info
 ///
 /// Called from the binary entry point in main.rs
@@ -132,6 +174,27 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
 
         serial_println!("\n[BOOT] ✅ Phase 1 COMPLETE - Memory subsystem operational");
         serial_println!("[BOOT] ✅ Phase 2 COMPLETE - User mode infrastructure ready\n");
+
+        // ===== Phase 3: IPC & Task Management =====
+
+        serial_println!("[BOOT] Starting Phase 3: IPC & Task Management...\n");
+
+        // Initialize IPC subsystem
+        serial_println!("[INIT] Initializing IPC subsystem...");
+        ipc::init();
+        serial_println!("[IPC] IPC subsystem ready\n");
+
+        // Initialize scheduler
+        serial_println!("[INIT] Initializing scheduler...");
+        task::scheduler_init();
+        serial_println!("[SCHED] Scheduler ready\n");
+
+        // Create initial kernel task (task 0)
+        serial_println!("[INIT] Creating kernel task (task 0)...");
+        let kernel_task = create_kernel_task();
+        serial_println!("[TASK] Kernel task created (id={})\n", kernel_task);
+
+        serial_println!("[BOOT] ✅ Phase 3 COMPLETE - IPC & Task system operational\n");
 
         // Load and execute test user program
         serial_println!("[BOOT] Starting user-mode test program...\n");
