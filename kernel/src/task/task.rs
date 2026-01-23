@@ -145,6 +145,11 @@ pub fn remove_task(id: TaskId) -> Option<Arc<Mutex<Task>>> {
     TASK_TABLE.lock().remove(&id)
 }
 
+/// Get the current running task ID
+pub fn get_current_task() -> TaskId {
+    CURRENT_TASK_ID.load(Ordering::Acquire)
+}
+
 /// Get the current running task
 pub fn current_task() -> Arc<Mutex<Task>> {
     let current_id = CURRENT_TASK_ID.load(Ordering::Acquire);
@@ -154,6 +159,11 @@ pub fn current_task() -> Arc<Mutex<Task>> {
 /// Set the current running task
 pub fn set_current_task(id: TaskId) {
     CURRENT_TASK_ID.store(id, Ordering::Release);
+}
+
+/// Get the task table (for internal use)
+pub fn get_task_table() -> &'static Mutex<BTreeMap<TaskId, Arc<Mutex<Task>>>> {
+    &TASK_TABLE
 }
 
 /// Allocate a new unique TaskId

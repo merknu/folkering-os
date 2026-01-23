@@ -155,7 +155,41 @@ extern "C" fn syscall_handler(
 
 // ===== Syscall Implementations =====
 
-fn syscall_ipc_send(target: u64, msg_ptr: u64, _flags: u64) -> u64 {
+// Option B: Simplified register-based IPC for testing
+// These syscalls work directly with register values, no memory pointers needed
+// This allows the simple test programs to work without stack allocation
+
+fn syscall_ipc_send(target: u64, payload0: u64, payload1: u64) -> u64 {
+    use crate::ipc::{IpcMessage, IpcType, ipc_send};
+    use crate::task::task::get_current_task;
+
+    crate::serial_println!("[SYSCALL] ipc_send_simple(target={}, payload0={:#x}, payload1={:#x})",
+                          target, payload0, payload1);
+
+    // Create simple IPC message from register values
+    let mut msg = IpcMessage::new_request([payload0, payload1, 0, 0]);
+
+    // Set sender (will be overridden by IPC subsystem, but set for clarity)
+    msg.sender = get_current_task();
+
+    // Send message
+    let target_id = target as u32;
+    match ipc_send(target_id, &msg) {
+        Ok(reply) => {
+            crate::serial_println!("[SYSCALL] ipc_send SUCCESS - reply payload: {:#x}",
+                                  reply.payload[0]);
+            reply.payload[0] // Return first payload slot as result
+        }
+        Err(err) => {
+            crate::serial_println!("[SYSCALL] ipc_send FAILED - error: {:?}", err);
+            u64::MAX // Error
+        }
+    }
+}
+
+// Full version with memory pointers (Option A - for future use)
+#[allow(dead_code)]
+fn syscall_ipc_send_full(target: u64, msg_ptr: u64, _flags: u64) -> u64 {
     use crate::ipc::{IpcMessage, ipc_send};
 
     // 1. Validate pointer
@@ -187,7 +221,32 @@ fn syscall_ipc_send(target: u64, msg_ptr: u64, _flags: u64) -> u64 {
     }
 }
 
-fn syscall_ipc_receive(msg_ptr: u64) -> u64 {
+fn syscall_ipc_receive(_from_filter: u64) -> u64 {
+    use crate::ipc::ipc_receive;
+
+    crate::serial_println!("[SYSCALL] ipc_receive_simple(from={})", _from_filter);
+
+    // Receive message (blocking)
+    // Note: from_filter currently ignored, accepts from any sender
+    match ipc_receive() {
+        Ok(msg) => {
+            crate::serial_println!("[SYSCALL] ipc_receive SUCCESS - from task {}, payload: {:#x}",
+                                  msg.sender, msg.payload[0]);
+            // Return sender ID in lower 32 bits, first payload in upper 32 bits
+            // This allows userspace to know who sent the message
+            let result = ((msg.payload[0] & 0xFFFFFFFF) << 32) | (msg.sender as u64);
+            result
+        }
+        Err(err) => {
+            crate::serial_println!("[SYSCALL] ipc_receive FAILED - error: {:?}", err);
+            u64::MAX
+        }
+    }
+}
+
+// Full version with memory pointer (Option A - for future use)
+#[allow(dead_code)]
+fn syscall_ipc_receive_full(msg_ptr: u64) -> u64 {
     use crate::ipc::{IpcMessage, ipc_receive};
 
     // 1. Validate pointer
@@ -208,7 +267,57 @@ fn syscall_ipc_receive(msg_ptr: u64) -> u64 {
     }
 }
 
-fn syscall_ipc_reply(request_ptr: u64, reply_payload_ptr: u64) -> u64 {
+fn syscall_ipc_reply(payload0: u64, payload1: u64) -> u64 {
+    use crate::ipc::{ipc_reply, IpcMessage};
+    use crate::task::task;
+
+    crate::serial_println!("[SYSCALL] ipc_reply_simple(payload0={:#x}, payload1={:#x})",
+                          payload0, payload1);
+
+    // Get current task to find the pending IPC reply context
+    let current_task_id = task::get_current_task();
+
+    // Get the task structure to access the pending reply
+    let task_arc = match task::get_task(current_task_id) {
+        Some(t) => t,
+        None => {
+            crate::serial_println!("[SYSCALL] ipc_reply FAILED - task not found");
+            return u64::MAX;
+        }
+    };
+
+    let request_msg: IpcMessage = {
+        let task_guard = task_arc.lock();
+        // Get the IPC reply context (the original request we received)
+        match &task_guard.ipc_reply {
+            Some(req) => *req, // Copy the message
+            None => {
+                drop(task_guard);
+                crate::serial_println!("[SYSCALL] ipc_reply FAILED - no pending request");
+                return u64::MAX; // No pending reply
+            }
+        }
+    };
+
+    // Create reply payload from register values
+    let reply_payload = [payload0, payload1, 0, 0];
+
+    // Send reply
+    match ipc_reply(&request_msg, reply_payload) {
+        Ok(()) => {
+            crate::serial_println!("[SYSCALL] ipc_reply SUCCESS");
+            0 // Success
+        }
+        Err(err) => {
+            crate::serial_println!("[SYSCALL] ipc_reply FAILED - error: {:?}", err);
+            u64::MAX
+        }
+    }
+}
+
+// Full version with memory pointers (Option A - for future use)
+#[allow(dead_code)]
+fn syscall_ipc_reply_full(request_ptr: u64, reply_payload_ptr: u64) -> u64 {
     use crate::ipc::{IpcMessage, ipc_reply};
 
     // 1. Validate pointers
