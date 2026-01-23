@@ -62,12 +62,6 @@ SECTIONS {
         PROVIDE(__bss_end = .);
     } :data
 
-    /* Kernel stack - 32KB dedicated stack */
-    . = ALIGN(16);
-    PROVIDE(__stack_bottom = .);
-    . += 32K;
-    PROVIDE(__stack_top = .);
-
     __kernel_end = .;
 
     /* Discard unwanted sections */

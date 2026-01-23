@@ -95,6 +95,10 @@ struct IdtDescriptor {
 #[link_section = ".bss"]
 static mut IDT: [IdtEntry; 256] = [IdtEntry::new(); 256];
 
+/// 32KB kernel stack (allocated in BSS, automatically zeroed and mapped)
+#[link_section = ".bss"]
+static mut KERNEL_STACK: [u8; 32768] = [0; 32768];
+
 /// Generic exception handler - halt on any exception
 unsafe extern "C" fn exception_handler() {
     serial_write("\n[EXCEPTION] CPU exception occurred! Halting.\n");
@@ -111,6 +115,36 @@ unsafe fn serial_write(s: &str) {
             "out dx, al",
             in("dx") 0x3F8u16,
             in("al") byte,
+            options(nostack)
+        );
+    }
+}
+
+/// Write a hex number to serial (minimal implementation)
+unsafe fn write_hex(mut num: u64) {
+    serial_write("0x");
+    let hex_chars = b"0123456789ABCDEF";
+    let mut buffer = [0u8; 16];
+    let mut i = 0;
+
+    if num == 0 {
+        serial_write("0");
+        return;
+    }
+
+    while num > 0 {
+        buffer[i] = hex_chars[(num & 0xF) as usize];
+        num >>= 4;
+        i += 1;
+    }
+
+    // Print in reverse order
+    while i > 0 {
+        i -= 1;
+        core::arch::asm!(
+            "out dx, al",
+            in("dx") 0x3F8u16,
+            in("al") buffer[i],
             options(nostack)
         );
     }
@@ -141,8 +175,30 @@ unsafe fn init_idt() {
 /// Kernel entry point
 #[no_mangle]
 unsafe extern "C" fn kmain() -> ! {
-    // Note: Using Limine's default stack (sufficient for kernel needs)
-    // Custom 32KB stack defined in linker.ld reserved for future use
+    // CRITICAL: Clear BSS BEFORE switching to our custom stack
+    // (because our stack is IN the BSS section!)
+    extern "C" {
+        static mut __bss_start: u8;
+        static mut __bss_end: u8;
+    }
+
+    let bss_start = &raw mut __bss_start;
+    let bss_end = &raw mut __bss_end;
+    let bss_size = bss_end as usize - bss_start as usize;
+    core::ptr::write_bytes(bss_start, 0, bss_size);
+
+    // NOW switch to our 32KB kernel stack (which was just zeroed)
+    // Limine's default stack is tiny (~500 bytes) - not enough for task spawning
+    // Our 32KB stack is allocated in BSS section (KERNEL_STACK static array)
+
+    // Get stack top address (stack grows DOWN, so top = base + size)
+    let stack_top_addr = KERNEL_STACK.as_ptr().add(KERNEL_STACK.len()) as u64;
+
+    core::arch::asm!(
+        "mov rsp, {0}",
+        "mov rbp, {0}",
+        in(reg) stack_top_addr,
+    );
 
     // Disable interrupts
     core::arch::asm!("cli");

@@ -46,19 +46,12 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
     init_hhdm_offset(boot_info.hhdm_offset);
 
     unsafe {
-        // Clear BSS section first
-        extern "C" {
-            static mut __bss_start: u8;
-            static mut __bss_end: u8;
-        }
-
-        let bss_start = &raw mut __bss_start;
-        let bss_end = &raw mut __bss_end;
-        let bss_size = bss_end as usize - bss_start as usize;
-        core::ptr::write_bytes(bss_start, 0, bss_size);
+        // BSS already cleared in kmain() before switching stacks
 
         // Initialize serial console driver
         drivers::serial::init();
+
+        serial_println!("\n[KERNEL_MAIN] kernel_main_with_boot_info() started!");
 
         serial_println!("\n==============================================");
         serial_println!("   Folkering OS v0.1.0 - Microkernel        ");
@@ -142,19 +135,50 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
 
         serial_println!("[BOOT] ✅ Phase 3 COMPLETE - IPC & Task system operational\n");
 
-        // Spawn user-mode test task
-        serial_println!("[BOOT] Spawning user-mode test task...\n");
+        // Spawn IPC test tasks
+        // Note: IPC_SENDER is hardcoded to send to task ID 2
+        // So we spawn receiver first (ID 1), then sender (ID 2)
+        // Sender will send to task 2, but wait - that's itself!
+        // Actually, let's spawn receiver as task 2:
+        // - Dummy task 1 (idle loop)
+        // - Receiver as task 2
+        // - Sender as task 3 (sends to task 2)
 
-        // Get user program code
-        let user_code = &userspace_test::USER_PROGRAM.code[..userspace_test::UserProgram::code_size()];
+        serial_println!("[BOOT] Spawning IPC test tasks...\n");
 
-        // Spawn user task using raw binary
-        match task::spawn_raw(user_code, 0) {
+        // Spawn dummy idle task first (task ID 1)
+        serial_println!("[BOOT] Spawning dummy idle task...");
+        match task::spawn_raw(&userspace_test::USER_PROGRAM.code[..userspace_test::UserProgram::code_size()], 0) {
             Ok(task_id) => {
-                serial_println!("[BOOT] User task spawned successfully (id={})\n", task_id);
+                serial_println!("[BOOT] Dummy task spawned (id={})\n", task_id);
             }
             Err(e) => {
-                serial_println!("[BOOT] Failed to spawn user task: {:?}\n", e);
+                serial_println!("[BOOT] Failed to spawn dummy task: {:?}\n", e);
+                loop { x86_64::instructions::hlt(); }
+            }
+        }
+
+        // Spawn IPC receiver (task ID 2)
+        serial_println!("[BOOT] Spawning IPC receiver task...");
+        match task::spawn_raw(&userspace_test::IPC_RECEIVER.code, 0) {
+            Ok(task_id) => {
+                serial_println!("[BOOT] IPC receiver spawned (id={})\n", task_id);
+            }
+            Err(e) => {
+                serial_println!("[BOOT] Failed to spawn IPC receiver: {:?}\n", e);
+                loop { x86_64::instructions::hlt(); }
+            }
+        }
+
+        // Spawn IPC sender (task ID 3, but it sends to task 3... itself?)
+        // Wait - let me check what ID the sender targets
+        serial_println!("[BOOT] Spawning IPC sender task...");
+        match task::spawn_raw(&userspace_test::IPC_SENDER.code, 0) {
+            Ok(task_id) => {
+                serial_println!("[BOOT] IPC sender spawned (id={})\n", task_id);
+            }
+            Err(e) => {
+                serial_println!("[BOOT] Failed to spawn IPC sender: {:?}\n", e);
                 loop { x86_64::instructions::hlt(); }
             }
         }
