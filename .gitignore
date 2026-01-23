@@ -1,0 +1,40 @@
+# Rust
+target/
+Cargo.lock
+*.rlib
+*.rmeta
+
+# Build artifacts
+*.img
+*.iso
+*.bin
+*.elf
+*.o
+*.a
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# OS
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.log
+*.bak
+output/
+
+# Keep boot images if needed (comment out if you want to track them)
+# boot/*.img
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# WSL/Docker
+.wslconfig

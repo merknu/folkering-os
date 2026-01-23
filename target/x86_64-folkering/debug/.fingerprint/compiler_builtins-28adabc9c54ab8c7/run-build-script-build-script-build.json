@@ -1,1 +1,0 @@
-{"rustc":8923556206680323788,"features":"","declared_features":"","target":0,"profile":0,"path":0,"deps":[[7648903741785607723,"build_script_build",false,563775884866553169]],"local":[{"RerunIfChanged":{"output":"x86_64-folkering\\debug\\build\\compiler_builtins-28adabc9c54ab8c7\\output","paths":["build.rs","configure.rs"]}}],"rustflags":[],"config":0,"compile_kind":0}
