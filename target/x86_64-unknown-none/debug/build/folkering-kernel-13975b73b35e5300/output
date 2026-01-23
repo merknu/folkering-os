@@ -1,0 +1,2 @@
+cargo:rustc-link-arg=-Tlinker.ld
+cargo:rerun-if-changed=linker.ld

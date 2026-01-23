@@ -1,0 +1,49 @@
+[package]
+name = "folkering-kernel"
+version = "0.1.0"
+edition = "2021"
+authors = ["Folkering OS Contributors"]
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# Core utilities
+spin = { version = "0.9", default-features = false, features = ["spin_mutex", "rwlock"] }
+lazy_static = { version = "1.4", features = ["spin_no_std"] }
+bitflags = "2.4"
+cfg-if = "1.0"
+
+# x86_64 architecture support
+x86_64 = { version = "0.15", features = ["abi_x86_interrupt", "instructions"] }
+
+# Memory allocation
+linked_list_allocator = { version = "0.10", default-features = false, features = ["const_mut_refs", "use_spin"] }
+
+# Serial console
+uart_16550 = "0.3"
+
+# Data structures (no_std compatible)
+hashbrown = { version = "0.14", default-features = false, features = ["inline-more", "ahash"] }
+
+# Limine boot protocol
+[dependencies.limine]
+version = "0.5"
+default-features = false
+
+[profile.dev]
+panic = "abort"
+opt-level = 0
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = 3
+codegen-units = 1
+strip = false
+
+[[bin]]
+name = "kernel"
+path = "src/main.rs"
+
+[lib]
+name = "folkering_kernel"
+path = "src/lib.rs"
