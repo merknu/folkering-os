@@ -57,9 +57,41 @@ impl MessageQueue {
     /// - Low-priority tasks may use smaller queues (e.g., 16 messages)
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            queue: VecDeque::with_capacity(capacity),
+            queue: VecDeque::new(), // Start empty, grow as needed (workaround for boot hang)
             max_size: capacity,
         }
+    }
+
+    /// Initialize MessageQueue in-place at a raw pointer (zero-stack initialization)
+    ///
+    /// # Safety
+    /// - `ptr` must be valid, aligned, and point to uninitialized memory
+    /// - Caller must ensure exclusive access to `*ptr`
+    /// - **CRITICAL**: Memory must already be zeroed (use ptr::write_bytes first)
+    ///
+    /// # Design
+    /// This method assumes the memory is already zero-initialized.
+    /// An all-zero VecDeque is a valid empty state (no allocation, head=0, tail=0).
+    /// We only need to set the `max_size` field.
+    ///
+    /// # Use Case
+    /// Used during Task creation to avoid stack overflow.
+    /// The kernel stack is extremely small (<500 bytes), so we cannot create
+    /// structs on the stack. This allows initializing MessageQueue directly
+    /// in the global Task creation buffer.
+    ///
+    /// # Example
+    /// ```no_run
+    /// // In Task::new(), after zeroing the entire structure:
+    /// ptr::write_bytes(task_ptr, 0, 1);  // Zero entire Task
+    /// MessageQueue::init_at_ptr(ptr::addr_of_mut!((*task_ptr).recv_queue));
+    /// ```
+    #[inline]
+    pub unsafe fn init_at_ptr(ptr: *mut Self) {
+        use core::ptr;
+        // VecDeque is already zero-initialized (empty, no allocation)
+        // Just set the max_size field to DEFAULT_SIZE (64 messages)
+        ptr::addr_of_mut!((*ptr).max_size).write(Self::DEFAULT_SIZE);
     }
 
     /// Push message to end of queue

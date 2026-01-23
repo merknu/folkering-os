@@ -3,14 +3,24 @@
 use super::TaskId;
 use crate::ipc::{IpcMessage, MessageQueue};
 use crate::memory::PageTable;
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 use spin::Mutex;
 
+/// Send wrapper for PageTable pointer (we manage synchronization via Task's Mutex)
+pub struct PageTablePtr(*mut PageTable);
+unsafe impl Send for PageTablePtr {}
+impl PageTablePtr {
+    pub fn new(ptr: *mut PageTable) -> Self { Self(ptr) }
+    pub fn as_ptr(&self) -> *mut PageTable { self.0 }
+    pub fn as_ref(&self) -> &PageTable { unsafe { &*self.0 } }
+}
+
 /// Global task table - maps TaskId to Task structure
-static TASK_TABLE: Mutex<BTreeMap<TaskId, Arc<Mutex<Task>>>> = Mutex::new(BTreeMap::new());
+pub static TASK_TABLE: Mutex<BTreeMap<TaskId, Arc<Mutex<Task>>>> = Mutex::new(BTreeMap::new());
 
 /// Current task ID per CPU (single-core for now)
 static CURRENT_TASK_ID: AtomicU32 = AtomicU32::new(0);
@@ -18,11 +28,14 @@ static CURRENT_TASK_ID: AtomicU32 = AtomicU32::new(0);
 /// Next available task ID
 static NEXT_TASK_ID: AtomicU32 = AtomicU32::new(1);
 
+/// Global task creation buffer (avoid stack allocation - stack is tiny!)
+static TASK_CREATION_BUFFER: Mutex<core::mem::MaybeUninit<Task>> = Mutex::new(core::mem::MaybeUninit::uninit());
+
 /// Task (process) structure
 pub struct Task {
     pub id: TaskId,
     pub state: TaskState,
-    pub page_table: PageTable,
+    pub page_table: PageTablePtr,  // Wrapped pointer (Send-safe, we manage lifetime manually)
     pub context: Context,
 
     // IPC fields
@@ -102,26 +115,57 @@ pub enum TaskState {
 }
 
 impl Task {
-    /// Create a new task
-    pub fn new(id: TaskId, page_table: PageTable, entry_point: u64) -> Self {
-        // Initialize context with user-mode segments
-        let stack_top = 0x0000_7FFF_FFFF_F000; // User stack top
-        let context = super::switch::init_user_context(entry_point, stack_top);
+    /// Create a new task using global buffer (kernel stack is tiny!)
+    /// Returns Task (not Box) - caller must handle ownership
+    #[inline(never)]
+    pub fn new(id: TaskId, page_table_ptr: PageTablePtr, entry_point: u64) -> Self {
+        use core::ptr;
 
-        Self {
-            id,
-            state: TaskState::Runnable,
-            page_table,
-            context,
-            recv_queue: MessageQueue::with_capacity(64),
-            ipc_reply: None,
-            blocked_on: None,
-            capabilities: Vec::new(),
-            credentials: Credentials {
+        crate::serial_println!("[Task::new] START");
+        let mut buffer = TASK_CREATION_BUFFER.lock();
+        crate::serial_println!("[Task::new] Locked");
+        unsafe {
+            let task_ptr = buffer.as_mut_ptr();
+            crate::serial_println!("[Task::new] Got ptr, zeroing...");
+            ptr::write_bytes(task_ptr, 0, 1);
+            crate::serial_println!("[Task::new] Zeroed OK");
+
+            // Write non-zero fields directly to global buffer
+            ptr::addr_of_mut!((*task_ptr).id).write(id);
+            ptr::addr_of_mut!((*task_ptr).state).write(TaskState::Runnable);
+            ptr::addr_of_mut!((*task_ptr).page_table).write(page_table_ptr);
+            crate::serial_println!("[Task::new] Fields OK");
+            // Context - stack and entry point
+            ptr::addr_of_mut!((*task_ptr).context.rsp).write(0x0000_7FFF_FFFF_F000);
+            ptr::addr_of_mut!((*task_ptr).context.rbp).write(0x0000_7FFF_FFFF_F000);
+            ptr::addr_of_mut!((*task_ptr).context.rip).write(entry_point);
+            ptr::addr_of_mut!((*task_ptr).context.rflags).write(0x202);
+            ptr::addr_of_mut!((*task_ptr).context.cs).write(0x1B);
+            ptr::addr_of_mut!((*task_ptr).context.ss).write(0x23);
+            crate::serial_println!("[Task::new] Context OK");
+
+            // IPC - Initialize in-place (zero-stack method)
+            // recv_queue was already zeroed by write_bytes above
+            // MessageQueue::init_at_ptr just sets the max_size field
+            MessageQueue::init_at_ptr(ptr::addr_of_mut!((*task_ptr).recv_queue));
+            crate::serial_println!("[Task::new] recv_queue initialized");
+
+            ptr::addr_of_mut!((*task_ptr).ipc_reply).write(None);
+            ptr::addr_of_mut!((*task_ptr).blocked_on).write(None);
+            crate::serial_println!("[Task::new] IPC OK");
+
+            // Security
+            ptr::addr_of_mut!((*task_ptr).capabilities).write(Vec::new());
+            ptr::addr_of_mut!((*task_ptr).credentials).write(Credentials {
                 uid: 0,
                 gid: 0,
                 sandbox_level: SandboxLevel::Untrusted,
-            },
+            });
+            crate::serial_println!("[Task::new] Security OK");
+
+            // Move out of buffer (assume_init returns by value, perfect!)
+            crate::serial_println!("[Task::new] Reading out");
+            buffer.assume_init_read()
         }
     }
 }
@@ -132,6 +176,14 @@ impl Task {
 pub fn insert_task(task: Task) -> TaskId {
     let id = task.id;
     TASK_TABLE.lock().insert(id, Arc::new(Mutex::new(task)));
+    id
+}
+
+/// Insert a boxed task into the global task table (avoids stack overflow)
+pub fn insert_task_boxed(task: Box<Task>) -> TaskId {
+    let id = task.id;
+    // Convert Box<Task> directly to Arc<Mutex<Task>> without intermediate stack allocation
+    TASK_TABLE.lock().insert(id, Arc::from(Mutex::new(*task)));
     id
 }
 

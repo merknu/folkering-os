@@ -3,10 +3,11 @@
 //! Creates new tasks from ELF binaries.
 //! Unlike Unix fork/exec, we only have spawn() - create a new task from a binary.
 
-use super::task::{Task, allocate_task_id, insert_task};
+use super::task::{Task, allocate_task_id, insert_task, PageTablePtr};
 use super::elf::{ElfBinary, ElfError};
 use super::TaskId;
 use crate::memory::{PageTable, paging};
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 /// Task spawn error codes
@@ -59,8 +60,8 @@ pub fn spawn(binary: &[u8], _args: &[&str]) -> Result<TaskId, SpawnError> {
     // TODO: Create proper per-task page table
     let page_table = create_task_page_table()?;
 
-    // 4. Create task structure
-    let task = Task::new(task_id, page_table, entry_point);
+    // 4. Create task structure (PageTable as wrapped pointer - leak it for now)
+    let task = Task::new(task_id, PageTablePtr::new(Box::into_raw(Box::new(page_table))), entry_point);
 
     // 5. Insert into global task table
     insert_task(task);
@@ -148,12 +149,22 @@ pub fn spawn_raw(code: &[u8], entry_offset: u64) -> Result<TaskId, SpawnError> {
     // 3. Allocate user stack
     let user_stack = allocate_user_stack();
 
-    // 4. Create dummy page table (we're still using kernel page table for now)
-    // TODO: Create proper per-task page table
-    let page_table = PageTable::new();
+    // 4. Create page table DIRECTLY on heap (PageTable::new() uses stack!)
+    crate::serial_println!("[SPAWN] Creating PageTable...");
+    use alloc::boxed::Box;
+    use core::mem::MaybeUninit;
+    let page_table_box: Box<PageTable> = unsafe {
+        let mut uninit: Box<MaybeUninit<PageTable>> = Box::new_uninit();
+        core::ptr::write_bytes(uninit.as_mut_ptr(), 0, 1);
+        uninit.assume_init()
+    };
+    let page_table_ptr = PageTablePtr::new(Box::into_raw(page_table_box));
+    crate::serial_println!("[SPAWN] PageTable created OK");
 
-    // 5. Create task structure
-    let mut task = Task::new(task_id, page_table, entry_addr);
+    // 5. Create task structure using global buffer
+    crate::serial_println!("[SPAWN] Creating Task...");
+    let mut task = Task::new(task_id, page_table_ptr, entry_addr);
+    crate::serial_println!("[SPAWN] Task created OK");
 
     // 6. Update task's stack pointer in context
     task.context.rsp = user_stack.as_u64();
@@ -165,8 +176,8 @@ pub fn spawn_raw(code: &[u8], entry_offset: u64) -> Result<TaskId, SpawnError> {
     // 8. Add to scheduler runqueue
     crate::task::scheduler::enqueue(task_id);
 
-    crate::serial_println!("[SPAWN] Created user task {} at entry={:#x} stack={:#x}",
-        task_id, entry_addr, user_stack.as_u64());
+    // Success message (single line - minimal stack usage)
+    crate::serial_println!("[SPAWN] User task {} created", task_id);
 
     Ok(task_id)
 }

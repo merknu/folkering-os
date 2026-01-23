@@ -141,6 +141,9 @@ unsafe fn init_idt() {
 /// Kernel entry point
 #[no_mangle]
 unsafe extern "C" fn kmain() -> ! {
+    // Note: Using Limine's default stack (sufficient for kernel needs)
+    // Custom 32KB stack defined in linker.ld reserved for future use
+
     // Disable interrupts
     core::arch::asm!("cli");
 

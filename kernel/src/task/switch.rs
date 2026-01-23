@@ -21,14 +21,23 @@ use x86_64::PhysAddr;
 /// # Performance Target
 /// <500 CPU cycles
 pub unsafe fn switch_to(target_id: TaskId) {
-    let current = current_task();
-    let current_id = current.lock().id;
+    use super::task::get_current_task;
 
-    // Don't switch to ourselves
-    if current_id == target_id {
+    let current_id = get_current_task();
+
+    // Check if this is the first switch (from kernel context, no task)
+    let current = if current_id == 0 {
+        // First switch from kernel - no current task to save
+        None
+    } else if current_id == target_id {
+        // Don't switch to ourselves
         return;
-    }
+    } else {
+        // Normal switch - get current task
+        get_task(current_id)
+    };
 
+    crate::serial_println!("[SWITCH] Getting target task");
     let target = match get_task(target_id) {
         Some(task) => task,
         None => {
@@ -37,10 +46,13 @@ pub unsafe fn switch_to(target_id: TaskId) {
         }
     };
 
-    // Save current task's context pointer
-    let current_ctx_ptr = {
-        let current_locked = current.lock();
+    crate::serial_println!("[SWITCH] Getting context ptrs");
+    // Save current task's context pointer (if we have a current task)
+    let current_ctx_ptr = if let Some(ref current_task) = current {
+        let current_locked = current_task.lock();
         &current_locked.context as *const Context as usize
+    } else {
+        0 // No current task (first switch from kernel)
     };
 
     // Get target task's context pointer
@@ -49,10 +61,11 @@ pub unsafe fn switch_to(target_id: TaskId) {
         &target_locked.context as *const Context as usize
     };
 
+    crate::serial_println!("[SWITCH] Switching page table");
     // Switch page table to target's address space
     {
         let target_locked = target.lock();
-        let target_cr3 = get_page_table_phys_addr(&target_locked.page_table);
+        let target_cr3 = get_page_table_phys_addr(target_locked.page_table.as_ref());
 
         // Only switch if different
         let current_cr3 = Cr3::read().0.start_address().as_u64();
@@ -64,11 +77,20 @@ pub unsafe fn switch_to(target_id: TaskId) {
         }
     }
 
+    crate::serial_println!("[SWITCH] Updating current task");
     // Update current task pointer
     set_current_task(target_id);
 
+    crate::serial_println!("[SWITCH] Calling switch_context");
     // Perform actual register switch (assembly)
-    switch_context(current_ctx_ptr, target_ctx_ptr);
+    if current_ctx_ptr == 0 {
+        // First switch from kernel - just restore new task, don't save
+        crate::serial_println!("[SWITCH] First switch - restoring task context");
+        restore_context_only(target_ctx_ptr);
+    } else {
+        // Normal switch - save current, restore new
+        switch_context(current_ctx_ptr, target_ctx_ptr);
+    }
 }
 
 /// Get physical address of page table
@@ -165,6 +187,55 @@ extern "C" fn switch_context(_old_ctx: usize, _new_ctx: usize) {
 
         // Return will jump to restored RIP
         "ret"
+    );
+}
+
+/// Restore task context without saving (for first switch from kernel to user)
+///
+/// Uses IRETQ to properly transition from CPL 0 (kernel) to CPL 3 (user).
+///
+/// # Arguments
+/// - `new_ctx`: Pointer to Context structure to restore from
+#[unsafe(naked)]
+extern "C" fn restore_context_only(_new_ctx: usize) {
+    core::arch::naked_asm!(
+        // Argument: RDI = new_ctx pointer
+        "mov r11, rdi",           // R11 = new_ctx pointer
+
+        // Build IRETQ frame on stack (required for CPL 0->3 transition)
+        // IRETQ pops: SS, RSP, RFLAGS, CS, RIP
+        "mov rax, [r11 + 152]",   // SS
+        "push rax",
+        "mov rax, [r11 + 0]",     // RSP
+        "push rax",
+        "mov rax, [r11 + 136]",   // RFLAGS
+        "push rax",
+        "mov rax, [r11 + 144]",   // CS
+        "push rax",
+        "mov rax, [r11 + 128]",   // RIP
+        "push rax",
+
+        // Restore general-purpose registers
+        "mov rax, [r11 + 16]",    // Restore RAX
+        "mov rbx, [r11 + 24]",    // Restore RBX
+        "mov rcx, [r11 + 32]",    // Restore RCX
+        "mov rdx, [r11 + 40]",    // Restore RDX
+        "mov rsi, [r11 + 48]",    // Restore RSI
+        "mov rdi, [r11 + 56]",    // Restore RDI
+        "mov rbp, [r11 + 8]",     // Restore RBP
+        "mov r8,  [r11 + 64]",    // Restore R8
+        "mov r9,  [r11 + 72]",    // Restore R9
+        "mov r10, [r11 + 80]",    // Restore R10
+        "mov r12, [r11 + 96]",    // Restore R12
+        "mov r13, [r11 + 104]",   // Restore R13
+        "mov r14, [r11 + 112]",   // Restore R14
+        "mov r15, [r11 + 120]",   // Restore R15
+
+        // Finally restore R11
+        "mov r11, [r11 + 88]",    // Restore R11
+
+        // IRETQ will pop SS, RSP, RFLAGS, CS, RIP and switch to user mode
+        "iretq"
     );
 }
 

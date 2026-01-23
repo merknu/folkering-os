@@ -34,47 +34,8 @@ core::arch::global_asm!(
     "ret"
 );
 
-/// Create the initial kernel task (task 0)
-///
-/// The kernel task represents the kernel execution context.
-/// It never actually runs (kernel runs in interrupt/syscall context),
-/// but provides a valid task structure for the task system.
-fn create_kernel_task() -> task::TaskId {
-    use task::task::{Task, TaskState, Credentials, SandboxLevel, insert_task, set_current_task, allocate_task_id};
-    use memory::PageTable;
-    use x86_64::registers::control::Cr3;
-
-    let task_id = allocate_task_id(); // Will be 1 (first task)
-
-    // Create a zeroed page table for kernel task
-    // The kernel task doesn't actually use this - it uses CR3 directly
-    // This is just to satisfy the Task structure requirements
-    let kernel_page_table = PageTable::new();
-
-    let mut kernel_task = Task {
-        id: task_id,
-        state: TaskState::Running, // Kernel is always "running"
-        page_table: kernel_page_table,
-        context: task::switch::init_context(0, 0), // Dummy context
-        recv_queue: ipc::MessageQueue::new(),
-        ipc_reply: None,
-        blocked_on: None,
-        capabilities: alloc::vec::Vec::new(),
-        credentials: Credentials {
-            uid: 0,           // Root
-            gid: 0,           // Root
-            sandbox_level: SandboxLevel::System, // Kernel has full privileges
-        },
-    };
-
-    // Mark as running (current task)
-    kernel_task.state = TaskState::Running;
-
-    insert_task(kernel_task);
-    set_current_task(task_id);
-
-    task_id
-}
+// Kernel task creation removed - kernel runs in interrupt/syscall context
+// and doesn't need a schedulable Task structure
 
 /// Main kernel initialization function with extracted boot info
 ///
@@ -175,10 +136,9 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
         task::scheduler_init();
         serial_println!("[SCHED] Scheduler ready\n");
 
-        // Create initial kernel task (task 0)
-        serial_println!("[INIT] Creating kernel task (task 0)...");
-        let kernel_task = create_kernel_task();
-        serial_println!("[TASK] Kernel task created (id={})\n", kernel_task);
+        // Note: Kernel doesn't need its own Task structure
+        // It runs in interrupt/syscall context, not as a schedulable task
+        serial_println!("[INIT] Kernel running in interrupt context (no task structure needed)\n");
 
         serial_println!("[BOOT] ✅ Phase 3 COMPLETE - IPC & Task system operational\n");
 
