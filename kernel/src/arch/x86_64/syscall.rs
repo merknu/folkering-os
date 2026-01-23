@@ -300,9 +300,10 @@ fn syscall_exit(exit_code: u64) -> u64 {
 }
 
 fn syscall_yield() -> u64 {
+    crate::serial_println!("[SYSCALL] yield called from userspace!");
+
     // Yield CPU to scheduler
-    // TODO: Implement scheduler and call yield_cpu() here
-    // For now, this is a no-op that successfully returns to user mode
+    crate::task::yield_cpu();
 
     0 // Success
 }
