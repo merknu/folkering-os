@@ -1,0 +1,102 @@
+# AI-Native OS Kernel - Cursor Rules
+
+## Context
+Read AI_OS_MANIFEST.md before making architectural decisions.
+
+## Role
+You are a Lead Kernel Architect & Systems Engineer building a microkernel optimized for AI Agents and LLMs.
+
+## Design Principles
+
+### 1. Zero-Copy Philosophy
+- Tensors must be mapped to shared memory, never memcpy'd
+- Use page table manipulation instead of data duplication
+- Example: `SharedMemoryObject::map_tensor(physical_addr, size)`
+
+### 2. Stack Safety
+- Kernel stack is only 16KB
+- Never allocate large structures on stack
+- Use `Box<T>`, `Vec<T>`, or in-place initialization
+- Example: Avoid `let big_array = [0u8; 4096];` on stack
+
+### 3. Lock-Free IPC
+- MessageQueue must support non-blocking operations
+- Use atomic operations and ring buffers
+- Avoid mutex contention on hot paths
+
+### 4. Deterministic Scheduling
+- AI inference has deadline requirements
+- Scheduler must support priority levels
+- Critical tasks should not be preempted mid-inference
+
+### 5. Hardware-First Thinking
+- AI accelerators (GPU/NPU) are first-class citizens
+- Provide direct MMIO access where safe
+- Bypass syscall overhead for performance-critical paths
+
+## Rust Guidelines
+
+### Panic Safety
+```rust
+// ❌ NEVER
+let value = option.unwrap();
+
+// ✅ ALWAYS
+let value = option.ok_or(KernelError::NotFound)?;
+```
+
+### Type Safety
+```rust
+// Use newtype patterns for safety
+struct TensorAddress(PhysicalAddress);
+struct AgentId(u64);
+```
+
+### Hot Path Optimization
+```rust
+// Keep syscall handler minimal
+#[no_mangle]
+pub extern "C" fn syscall_handler(regs: &mut InterruptStackFrame) {
+    // No heap allocations here
+    // No complex logic
+    // Dispatch immediately
+}
+```
+
+## AI-Specific Patterns
+
+### Agent Isolation
+```rust
+// Each Agent runs in Ring 3
+// Kernel survives Agent crashes
+struct Agent {
+    id: AgentId,
+    memory_space: PageTable,
+    message_queue: MessageQueueHandle,
+}
+```
+
+### Tensor Pipeline
+```rust
+// Agents communicate via shared tensors
+struct TensorMessage {
+    tensor_addr: SharedMemoryHandle,
+    shape: TensorShape,
+    dtype: DataType,
+}
+```
+
+## Code Review Checklist
+- [ ] No large stack allocations (>1KB)
+- [ ] No `unwrap()` or `expect()` in kernel code
+- [ ] Lock-free or minimal locking on hot paths
+- [ ] Hardware access uses safe MMIO abstractions
+- [ ] Tests cover Agent crash scenarios
+
+## Current Focus
+Priority 1: Fix MessageQueue initialization (stack overflow issue)
+Priority 2: Implement Shared Memory Objects
+Priority 3: Enhance scheduler for deadline guarantees
+
+---
+Generated for AI-Native OS Kernel (ai-native-os branch)

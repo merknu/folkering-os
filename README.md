@@ -1,10 +1,28 @@
-# Folkering OS
+# AI-Native OS Kernel (Folkering OS AI Branch)
 
-A capability-based microkernel operating system written in Rust for x86-64 architecture.
+**A specialized microkernel optimized for AI Agents and Large Language Models**, written in Rust for x86-64 architecture.
+
+> **Branch Notice**: This is the `ai-native-os` branch, focused on AI-specific optimizations. For the original general-purpose OS design, see the `master` branch.
 
 ## Project Vision
 
-Folkering OS is a long-term research and development project aimed at creating a secure, modular operating system with a microkernel architecture and capability-based security model.
+Unlike general-purpose operating systems designed for human-GUI interaction, this OS is optimized for:
+
+- **High-Throughput Data Flow**: Moving large tensors (GBs) between CPU, RAM, and GPU/NPU with zero-copy overhead
+- **Low-Latency IPC**: AI Agents communicate via high-performance message buses instantly
+- **Deterministic Scheduling**: Critical inference tasks are not preempted unnecessarily
+
+**Read the full architectural context**: [AI_OS_MANIFEST.md](./AI_OS_MANIFEST.md)
+
+## Key Differences from General-Purpose OS
+
+| Feature | Traditional OS | AI-Native OS |
+|---------|---------------|--------------|
+| **Process Model** | Multi-user, file-based | Agent-based, data-flow oriented |
+| **IPC** | Pipes, sockets | High-bandwidth message queues, shared tensors |
+| **Scheduling** | Fair-share | Deadline-driven, inference-optimized |
+| **Memory** | CoW fork(), swap | Zero-copy regions, no swap |
+| **Hardware Access** | Abstracted drivers | Direct MMIO for AI accelerators |
 
 ## Current Status
 
@@ -20,11 +38,12 @@ Folkering OS is a long-term research and development project aimed at creating a
 - User-mode task execution (Ring 3)
 - User↔Kernel transitions working
 
-**Next Steps:**
-- IPC message passing
-- Process/task management
-- Capability system
-- Scheduler
+**Next Steps (AI-Optimized):**
+- Fix MessageQueue stack overflow (in-place initialization)
+- Shared Memory Objects for zero-copy tensor passing
+- Priority + deadline scheduler for inference workloads
+- PCI/PCIe enumeration for GPU/NPU drivers
+- MMIO framework for safe hardware register access
 
 ## Repository Structure
 
