@@ -1,0 +1,30 @@
+[package]
+name = "neural-scheduler"
+version = "0.1.0"
+edition = "2021"
+authors = ["Folkering OS Team"]
+description = "Neural predictive scheduler for Folkering OS - the Fast Brain"
+
+[dependencies]
+# Time series
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+
+# Statistics
+ndarray = "0.15"
+ndarray-stats = "0.5"
+
+# Future: Time-series ML models
+# chronos = { version = "0.1", optional = true }
+# onnxruntime = { version = "0.0.14", optional = true }
+
+[features]
+default = []
+# ml = ["chronos", "onnxruntime"]
+
+[[bin]]
+name = "neural-scheduler"
+path = "src/main.rs"
