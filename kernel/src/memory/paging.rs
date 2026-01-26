@@ -273,6 +273,141 @@ pub enum MapError {
     OutOfMemory,
 }
 
+/// Create a new page table for a task
+///
+/// Allocates a new PML4 and copies kernel mappings (upper half) from the current page table.
+/// This provides isolation while sharing kernel address space.
+///
+/// # Returns
+/// Physical address of the new PML4 on success, or error.
+///
+/// # Safety
+/// The returned page table must be properly freed when the task exits.
+pub fn create_task_page_table() -> Result<u64, MapError> {
+    use x86_64::registers::control::Cr3;
+
+    crate::drivers::serial::write_str("[PAGING] Creating new task page table...\n");
+
+    // Allocate a page for the new PML4
+    let new_pml4_phys = physical::alloc_page().ok_or(MapError::OutOfMemory)?;
+    let new_pml4_virt = crate::phys_to_virt(new_pml4_phys);
+
+    // Zero out the new PML4
+    unsafe {
+        core::ptr::write_bytes(new_pml4_virt as *mut u8, 0, PAGE_SIZE);
+    }
+
+    // Get the current (kernel) PML4
+    let (current_pml4_frame, _) = Cr3::read();
+    let current_pml4_phys = current_pml4_frame.start_address().as_u64() as usize;
+    let current_pml4_virt = crate::phys_to_virt(current_pml4_phys);
+
+    // Copy kernel mappings (upper half: entries 256-511)
+    // The upper half of the address space (0xFFFF_8000_0000_0000 and above) is kernel space
+    unsafe {
+        let src = current_pml4_virt as *const u64;
+        let dst = new_pml4_virt as *mut u64;
+
+        // Copy entries 256-511 (kernel half)
+        for i in 256..512 {
+            let entry = *src.add(i);
+            *dst.add(i) = entry;
+        }
+    }
+
+    crate::drivers::serial::write_str("[PAGING] New PML4 at phys ");
+    crate::drivers::serial::write_hex(new_pml4_phys as u64);
+    crate::drivers::serial::write_newline();
+
+    Ok(new_pml4_phys as u64)
+}
+
+/// Map a page in a specific task's page table
+///
+/// # Arguments
+/// * `pml4_phys` - Physical address of the task's PML4
+/// * `virt_addr` - Virtual address to map
+/// * `phys_addr` - Physical address to map to
+/// * `flags` - Page table flags
+///
+/// # Safety
+/// Caller must ensure the page table is valid and the physical address is allocated.
+pub fn map_page_in_table(
+    pml4_phys: u64,
+    virt_addr: usize,
+    phys_addr: usize,
+    flags: PageTableFlags,
+) -> Result<(), MapError> {
+    let pml4_virt = crate::phys_to_virt(pml4_phys as usize);
+
+    // Create a temporary mapper for this page table
+    let hhdm = crate::HHDM_OFFSET.load(core::sync::atomic::Ordering::Relaxed);
+    let phys_mem_offset = VirtAddr::new(hhdm as u64);
+
+    let pml4 = unsafe { &mut *(pml4_virt as *mut PageTable) };
+    let mut mapper = unsafe { OffsetPageTable::new(pml4, phys_mem_offset) };
+
+    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(virt_addr as u64));
+    let frame = PhysFrame::containing_address(PhysAddr::new(phys_addr as u64));
+
+    let mut frame_allocator = BootFrameAllocator;
+
+    unsafe {
+        mapper
+            .map_to(page, frame, flags, &mut frame_allocator)
+            .map_err(|_| MapError::MapFailed)?
+            .flush();
+    }
+
+    Ok(())
+}
+
+/// Switch to a task's page table
+///
+/// Loads the specified PML4 into CR3.
+///
+/// # Arguments
+/// * `pml4_phys` - Physical address of the task's PML4
+///
+/// # Safety
+/// The page table must be valid and properly initialized.
+#[inline]
+pub unsafe fn switch_page_table(pml4_phys: u64) {
+    use x86_64::registers::control::{Cr3, Cr3Flags};
+
+    let frame = PhysFrame::containing_address(PhysAddr::new(pml4_phys));
+    Cr3::write(frame, Cr3Flags::empty());
+}
+
+/// Get the current page table's physical address
+#[inline]
+pub fn current_page_table_phys() -> u64 {
+    use x86_64::registers::control::Cr3;
+    Cr3::read().0.start_address().as_u64()
+}
+
+/// Free a task's page table
+///
+/// Deallocates the PML4 and any intermediate page tables allocated for user space.
+/// Does NOT free kernel mappings (those are shared).
+///
+/// # Arguments
+/// * `pml4_phys` - Physical address of the task's PML4
+///
+/// # Safety
+/// Must not be called while the page table is active (loaded in CR3).
+pub fn free_task_page_table(pml4_phys: u64) -> Result<(), MapError> {
+    // For now, just free the PML4 page itself
+    // TODO: Walk and free intermediate page tables for user space
+    physical::free_page(pml4_phys as usize);
+
+    crate::drivers::serial::write_str("[PAGING] Freed task page table at ");
+    crate::drivers::serial::write_hex(pml4_phys);
+    crate::drivers::serial::write_newline();
+
+    Ok(())
+}
+
 /// Common page table flag combinations
 pub mod flags {
     use x86_64::structures::paging::PageTableFlags as PTF;

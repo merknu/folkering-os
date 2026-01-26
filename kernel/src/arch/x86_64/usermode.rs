@@ -252,3 +252,97 @@ pub fn map_and_load_user_code(code: &[u8]) -> VirtAddr {
     const USER_CODE_ADDR: u64 = 0x400000; // 4 MB
     map_and_load_user_code_at(code, USER_CODE_ADDR)
 }
+
+/// Map and load user code into a specific page table
+///
+/// Maps the user program code at a specified userspace address into the given page table.
+///
+/// # Arguments
+/// * `pml4_phys` - Physical address of the task's PML4
+/// * `code` - Slice of code bytes to load
+/// * `base_addr` - Virtual address where code should be mapped
+///
+/// # Returns
+/// Virtual address where code was mapped (entry point)
+pub fn map_and_load_user_code_in_table(pml4_phys: u64, code: &[u8], base_addr: u64) -> VirtAddr {
+    use crate::memory;
+    use crate::memory::paging::flags;
+
+    crate::serial_println!("[USER_CODE] Mapping user code at {:#x} in table {:#x}, len={}", base_addr, pml4_phys, code.len());
+
+    // Calculate number of pages needed
+    let code_len = code.len();
+
+    // Allocate physical page for user code
+    let code_page_addr = memory::physical::alloc_page()
+        .expect("Failed to allocate user code page");
+    crate::serial_println!("[USER_CODE] Physical page: {:#x}", code_page_addr);
+
+    // Map into the task's page table
+    crate::serial_println!("[USER_CODE] Mapping with flags USER_CODE (PRESENT | USER_ACCESSIBLE)");
+    memory::paging::map_page_in_table(
+        pml4_phys,
+        base_addr as usize,
+        code_page_addr,
+        flags::USER_CODE,
+    ).expect("Failed to map user code page in task table");
+    crate::serial_println!("[USER_CODE] Page mapped successfully");
+
+    // Copy code to the page via HHDM
+    let hhdm_addr = crate::phys_to_virt(code_page_addr);
+    crate::serial_println!("[USER_CODE] Copying {} bytes via HHDM at {:#x}", code_len, hhdm_addr);
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            code.as_ptr(),
+            hhdm_addr as *mut u8,
+            code_len,
+        );
+    }
+    crate::serial_println!("[USER_CODE] Code copied");
+
+    crate::serial_println!("[USER_CODE] User code setup complete in task table");
+    VirtAddr::new(base_addr)
+}
+
+/// Allocate user stack in a specific page table
+///
+/// Allocates a page for user stack at specified base in the given page table.
+///
+/// # Arguments
+/// * `pml4_phys` - Physical address of the task's PML4
+/// * `stack_base` - Base address for stack page
+///
+/// # Returns
+/// Top of user stack (highest address, stack_base + 4096 - 8)
+pub fn allocate_user_stack_in_table(pml4_phys: u64, stack_base: u64) -> VirtAddr {
+    use crate::memory;
+    use crate::memory::paging::flags;
+
+    crate::serial_println!("[USER_STACK] Allocating user stack at {:#x} in table {:#x}", stack_base, pml4_phys);
+
+    // Allocate one page for user stack
+    let stack_page_addr = memory::physical::alloc_page()
+        .expect("Failed to allocate user stack page");
+    crate::serial_println!("[USER_STACK] Physical page: {:#x}", stack_page_addr);
+
+    // Map into the task's page table
+    crate::serial_println!("[USER_STACK] Mapping with flags USER_STACK");
+    memory::paging::map_page_in_table(
+        pml4_phys,
+        stack_base as usize,
+        stack_page_addr,
+        flags::USER_STACK,
+    ).expect("Failed to map user stack page in task table");
+    crate::serial_println!("[USER_STACK] Page mapped");
+
+    // Zero the stack page via HHDM
+    let hhdm_addr = crate::phys_to_virt(stack_page_addr);
+    unsafe {
+        core::ptr::write_bytes(hhdm_addr as *mut u8, 0, 4096);
+    }
+
+    let stack_top = stack_base + 4096 - 8;
+    crate::serial_println!("[USER_STACK] Stack top: {:#x}", stack_top);
+    crate::serial_println!("[USER_STACK] User stack setup complete in task table");
+    VirtAddr::new(stack_top)
+}

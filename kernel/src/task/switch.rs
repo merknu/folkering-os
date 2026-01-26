@@ -76,11 +76,16 @@ pub unsafe fn switch_to(target_id: TaskId) {
         ctx_ptr
     };
 
-    // NOTE: All tasks currently share the kernel page table
-    // Each task has its own address region (1 GB), but they're all mapped
-    // in the same page table. This simplifies implementation and is safe
-    // as long as tasks don't try to access each other's regions.
-    // TODO: Implement per-task page tables for better isolation
+    // Switch to target task's page table if it has one
+    {
+        let target_locked = target.lock();
+        if target_locked.page_table_phys != 0 {
+            crate::serial_println!("[SWITCH] Switching to page table {:#x}", target_locked.page_table_phys);
+            unsafe {
+                crate::memory::paging::switch_page_table(target_locked.page_table_phys);
+            }
+        }
+    }
 
     // Update current task pointer
     set_current_task(target_id);

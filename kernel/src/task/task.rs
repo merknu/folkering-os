@@ -73,6 +73,7 @@ pub struct Task {
     pub id: TaskId,
     pub state: TaskState,
     pub page_table: PageTablePtr,  // Wrapped pointer (Send-safe, we manage lifetime manually)
+    pub page_table_phys: u64,      // Physical address of PML4 for CR3 switching
 
     // Stack-based context (NEW approach)
     // Instead of storing register values in a struct, we store a pointer to
@@ -265,6 +266,8 @@ impl Task {
             ptr::addr_of_mut!((*task_ptr).id).write(id);
             ptr::addr_of_mut!((*task_ptr).state).write(TaskState::Runnable);
             ptr::addr_of_mut!((*task_ptr).page_table).write(page_table_ptr);
+            // page_table_phys will be set by spawn_raw after calling create_task_page_table
+            ptr::addr_of_mut!((*task_ptr).page_table_phys).write(0);
 
             // NEW: Allocate kernel stack and set up InterruptFrame
             let (stack_base, stack_top) = allocate_kernel_stack();

@@ -308,19 +308,30 @@ pub fn yield_cpu() {
     // DEBUG: Set marker 104 before get_task
     crate::arch::x86_64::syscall::set_debug_marker(104);
 
-    // Get target task's context pointer
+    // Get target task's context pointer and page table
     let target = task::get_task(next_id).expect("Target task not found");
 
     // DEBUG: Set marker 105 after get_task
     crate::arch::x86_64::syscall::set_debug_marker(105);
 
-    let target_ctx_ptr = {
+    let (target_ctx_ptr, target_page_table_phys) = {
         let target_locked = target.lock();
-        &target_locked.context as *const task::Context as usize
+        (
+            &target_locked.context as *const task::Context as usize,
+            target_locked.page_table_phys,
+        )
     };
 
     // DEBUG: Set marker 106 after getting context pointer
     crate::arch::x86_64::syscall::set_debug_marker(106);
+
+    // Switch to target task's page table
+    if target_page_table_phys != 0 {
+        crate::serial_println!("[YIELD_CPU] Switching to page table {:#x}", target_page_table_phys);
+        unsafe {
+            crate::memory::paging::switch_page_table(target_page_table_phys);
+        }
+    }
 
     // Update current task
     task::set_current_task(next_id);

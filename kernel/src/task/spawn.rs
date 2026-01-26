@@ -135,25 +135,31 @@ struct ElfSegment {
 /// let task_id = spawn_raw(&user_code, 0)?;
 /// ```
 pub fn spawn_raw(code: &[u8], entry_offset: u64) -> Result<TaskId, SpawnError> {
-    use crate::arch::x86_64::usermode::{map_and_load_user_code_at, allocate_user_stack_at};
+    use crate::arch::x86_64::usermode::{map_and_load_user_code_in_table, allocate_user_stack_in_table};
     use crate::memory::PageTable;
     use x86_64::VirtAddr;
 
     // 1. Allocate new task ID
     let task_id = allocate_task_id();
 
-    // 2. Map and load code into user space at task-specific address
+    // 2. Create per-task page table (copies kernel mappings)
+    crate::serial_println!("[SPAWN_RAW] Step 2: Creating per-task page table...");
+    let page_table_phys = paging::create_task_page_table()
+        .map_err(|_| SpawnError::OutOfMemory)?;
+    crate::serial_println!("[SPAWN_RAW] Step 2: Page table created at phys {:#x}", page_table_phys);
+
+    // 3. Map and load code into task's page table at task-specific address
     // Each task gets 1 GB of address space: 0x400000 + (task_id - 1) * 0x40000000
     let code_base = 0x400000u64 + ((task_id - 1) as u64 * 0x40000000);
-    let entry_point = map_and_load_user_code_at(code, code_base);
+    let entry_point = map_and_load_user_code_in_table(page_table_phys, code, code_base);
     let entry_addr = entry_point.as_u64() + entry_offset;
 
-    // 3. Allocate user stack at task-specific address
+    // 4. Allocate user stack in task's page table at task-specific address
     // Stack at top of task's 1GB region: code_base + 1GB - 4KB
     let stack_base = code_base + 0x40000000 - 4096;
-    let user_stack = allocate_user_stack_at(stack_base);
+    let user_stack = allocate_user_stack_in_table(page_table_phys, stack_base);
 
-    // 4. Create page table DIRECTLY on heap (PageTable::new() uses stack!)
+    // 5. Create placeholder PageTablePtr (legacy, will be removed)
     use alloc::boxed::Box;
     use core::mem::MaybeUninit;
     let page_table_box: Box<PageTable> = unsafe {
@@ -163,27 +169,31 @@ pub fn spawn_raw(code: &[u8], entry_offset: u64) -> Result<TaskId, SpawnError> {
     };
     let page_table_ptr = PageTablePtr::new(Box::into_raw(page_table_box));
 
-    crate::serial_println!("[SPAWN_RAW] Step 5: about to call Task::new()...");
-    // 5. Create task structure using global buffer
+    crate::serial_println!("[SPAWN_RAW] Step 6: about to call Task::new()...");
+    // 6. Create task structure using global buffer
     let mut task = Task::new(task_id, page_table_ptr, entry_addr);
-    crate::serial_println!("[SPAWN_RAW] Step 5: Task::new() returned");
+    crate::serial_println!("[SPAWN_RAW] Step 6: Task::new() returned");
 
-    // 6. Update task's stack pointer in context
-    crate::serial_println!("[SPAWN_RAW] Step 6: updating context.rsp/rbp to {:#x}", user_stack.as_u64());
+    // 7. Set the per-task page table physical address
+    task.page_table_phys = page_table_phys;
+    crate::serial_println!("[SPAWN_RAW] Step 7: page_table_phys set to {:#x}", page_table_phys);
+
+    // 8. Update task's stack pointer in context
+    crate::serial_println!("[SPAWN_RAW] Step 8: updating context.rsp/rbp to {:#x}", user_stack.as_u64());
     task.context.rsp = user_stack.as_u64();
     task.context.rbp = user_stack.as_u64();
-    crate::serial_println!("[SPAWN_RAW] Step 6: context updated");
+    crate::serial_println!("[SPAWN_RAW] Step 8: context updated");
 
-    // 7. Insert into global task table
-    crate::serial_println!("[SPAWN_RAW] Step 7: about to insert_task()...");
+    // 9. Insert into global task table
+    crate::serial_println!("[SPAWN_RAW] Step 9: about to insert_task()...");
     insert_task(task);
-    crate::serial_println!("[SPAWN_RAW] Step 7: insert_task() done");
+    crate::serial_println!("[SPAWN_RAW] Step 9: insert_task() done");
 
-    // 8. Add to scheduler runqueue
-    crate::serial_println!("[SPAWN_RAW] Step 8: about to enqueue()...");
+    // 10. Add to scheduler runqueue
+    crate::serial_println!("[SPAWN_RAW] Step 10: about to enqueue()...");
     crate::task::scheduler::enqueue(task_id);
-    crate::serial_println!("[SPAWN_RAW] Step 8: enqueue() done");
+    crate::serial_println!("[SPAWN_RAW] Step 10: enqueue() done");
 
-    crate::serial_println!("[SPAWN_RAW] Task {} spawn complete!", task_id);
+    crate::serial_println!("[SPAWN_RAW] Task {} spawn complete with page table {:#x}!", task_id, page_table_phys);
     Ok(task_id)
 }
