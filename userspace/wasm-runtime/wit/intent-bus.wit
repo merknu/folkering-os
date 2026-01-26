@@ -1,0 +1,121 @@
+// Intent Bus Interface Definition (WIT)
+// Defines how WASM applications communicate via intents
+
+package folkering:intent-bus@0.1.0;
+
+/// The Intent Bus world - main interface for applications
+world intent-bus {
+    /// Import: Functions applications can call
+    import intent-dispatcher;
+    import capability-registry;
+
+    /// Export: Functions applications must implement
+    export intent-handler;
+}
+
+/// Intent dispatcher - send intents to other apps
+interface intent-dispatcher {
+    /// Intent payload types
+    variant payload {
+        text(string),
+        binary(list<u8>),
+        file-ref(string),
+        structured(string), // JSON
+    }
+
+    /// Intent metadata
+    record intent-metadata {
+        source-app: string,
+        target-app: option<string>,
+        timestamp: u64,
+        priority: u8,
+    }
+
+    /// Intent structure
+    record intent {
+        action: string,
+        payload: payload,
+        metadata: intent-metadata,
+    }
+
+    /// Routing result
+    record routing-result {
+        matched-apps: list<string>,
+        confidence: float32,
+        latency-ms: float32,
+    }
+
+    /// Dispatch an intent to the bus
+    /// Returns the apps that can handle it
+    dispatch: func(intent: intent) -> result<routing-result, string>;
+
+    /// Send intent directly to a specific app
+    send-to: func(app-id: string, intent: intent) -> result<bool, string>;
+
+    /// Broadcast intent to all capable apps
+    broadcast: func(intent: intent) -> result<u32, string>;
+}
+
+/// Capability registry - register app capabilities
+interface capability-registry {
+    /// Capability definition
+    record capability {
+        action: string,
+        description: string,
+        patterns: list<string>,
+        examples: list<string>,
+    }
+
+    /// Register this app's capabilities
+    register: func(app-id: string, capabilities: list<capability>) -> result<bool, string>;
+
+    /// Unregister app
+    unregister: func(app-id: string) -> result<bool, string>;
+
+    /// Query available capabilities
+    query-capabilities: func(action: string) -> result<list<string>, string>;
+}
+
+/// Intent handler - apps implement this to receive intents
+interface intent-handler {
+    /// Handle an incoming intent
+    /// Returns true if handled successfully
+    handle-intent: func(intent: intent-dispatcher.intent) -> result<bool, string>;
+
+    /// Get this app's capabilities
+    get-capabilities: func() -> list<capability-registry.capability>;
+}
+
+/// File system interface for apps
+interface app-filesystem {
+    /// Read file contents
+    read-file: func(path: string) -> result<list<u8>, string>;
+
+    /// Write file contents
+    write-file: func(path: string, data: list<u8>) -> result<bool, string>;
+
+    /// List directory
+    list-dir: func(path: string) -> result<list<string>, string>;
+
+    /// Check if file exists
+    exists: func(path: string) -> bool;
+}
+
+/// Synapse query interface for apps
+interface synapse-query {
+    /// Semantic search result
+    record search-result {
+        file-id: string,
+        score: float32,
+        snippet: string,
+    }
+
+    /// Find files semantically similar to query
+    find-files: func(query: string, limit: u32) -> result<list<search-result>, string>;
+
+    /// Find files mentioning an entity
+    find-entity: func(entity: string, entity-type: string) -> result<list<string>, string>;
+
+    /// Get related entities
+    find-related: func(entity: string, limit: u32) -> result<list<string>, string>;
+}
