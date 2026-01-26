@@ -188,31 +188,45 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
 
         // Spawn Task 2 - IPC Receiver (must be ID 2 because sender targets task 2)
         serial_strln!("[BOOT] Spawning Task 2 (IPC receiver)...");
-        match task::spawn_raw(&userspace_test::IPC_RECEIVER.code[..userspace_test::IpcReceiverProgram::code_size()], 0) {
+        let receiver_id = match task::spawn_raw(&userspace_test::IPC_RECEIVER.code[..userspace_test::IpcReceiverProgram::code_size()], 0) {
             Ok(task_id) => {
                 serial_str!("[BOOT] Task 2 (receiver) spawned, id=");
                 drivers::serial::write_dec(task_id);
                 serial_strln!("");
+                task_id
             }
             Err(_e) => {
                 serial_strln!("[BOOT] Task 2 spawn FAILED\n");
                 loop { x86_64::instructions::hlt(); }
             }
-        }
+        };
 
         // Spawn Task 3 - IPC Sender (sends to task 2)
         serial_strln!("[BOOT] Spawning Task 3 (IPC sender)...");
-        match task::spawn_raw(&userspace_test::IPC_SENDER.code[..userspace_test::IpcSenderProgram::code_size()], 0) {
+        let sender_id = match task::spawn_raw(&userspace_test::IPC_SENDER.code[..userspace_test::IpcSenderProgram::code_size()], 0) {
             Ok(task_id) => {
                 serial_str!("[BOOT] Task 3 (sender) spawned, id=");
                 drivers::serial::write_dec(task_id);
                 serial_strln!("");
+                task_id
             }
             Err(_e) => {
                 serial_strln!("[BOOT] Task 3 spawn FAILED\n");
                 loop { x86_64::instructions::hlt(); }
             }
+        };
+
+        // Grant IPC capabilities
+        serial_strln!("[BOOT] Granting IPC capabilities...");
+        // Sender needs capability to send to receiver
+        if let Err(_e) = capability::grant_ipc_send(sender_id, receiver_id) {
+            serial_strln!("[BOOT] WARNING: Failed to grant IPC capability to sender");
         }
+        // Receiver needs capability to reply (send back to sender)
+        if let Err(_e) = capability::grant_ipc_send(receiver_id, sender_id) {
+            serial_strln!("[BOOT] WARNING: Failed to grant IPC capability to receiver");
+        }
+        serial_strln!("[BOOT] IPC capabilities granted");
 
         serial_strln!("[BOOT] All IPC test tasks spawned, starting scheduler...\n");
         serial_strln!("==============================================\n");

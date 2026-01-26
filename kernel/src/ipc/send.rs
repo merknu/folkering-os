@@ -5,27 +5,26 @@
 
 use crate::ipc::message::{IpcMessage, IpcType, TaskId};
 use crate::task::task::{get_task, current_task, Task, TaskState};
+use crate::capability::{self, CapabilityType};
 use alloc::sync::Arc;
 use spin::Mutex;
 
-// Temporary stub until capability system is implemented
-#[derive(Debug, Clone, Copy)]
-pub enum CapabilityType {
-    IpcSend(TaskId),
-}
-
-fn capability_check(_task: &Arc<Mutex<Task>>, _cap_type: CapabilityType) -> bool {
-    // TODO: Implement capability checking
-    // For now, allow all IPC sends
-    true
+/// Check if task has capability to send IPC to target
+fn capability_check(task: &Arc<Mutex<Task>>, target: TaskId) -> bool {
+    let task_id = task.lock().id;
+    capability::has_ipc_send(task_id, target)
 }
 
 fn transfer_capability(
-    _sender: &Arc<Mutex<Task>>,
-    _target: &Arc<Mutex<Task>>,
-    _cap_id: u32,
+    sender: &Arc<Mutex<Task>>,
+    target: &Arc<Mutex<Task>>,
+    cap_id: u32,
 ) -> Result<(), Errno> {
-    // TODO: Implement capability transfer
+    let sender_id = sender.lock().id;
+    let target_id = target.lock().id;
+
+    capability::transfer(sender_id, target_id, cap_id)
+        .map_err(|_| Errno::ECAPFAIL)?;
     Ok(())
 }
 
@@ -108,7 +107,7 @@ pub fn ipc_send(target: TaskId, msg: &IpcMessage) -> Result<IpcMessage, Errno> {
     crate::drivers::serial::write_str("[IPC_SEND] current_task() returned\n");
 
     crate::drivers::serial::write_str("[IPC_SEND] Checking capability\n");
-    if !capability_check(&current, CapabilityType::IpcSend(target)) {
+    if !capability_check(&current, target) {
         crate::drivers::serial::write_str("[IPC_SEND] ERROR: no capability\n");
         return Err(Errno::EPERM);
     }
@@ -220,7 +219,7 @@ pub fn ipc_send_async(target: TaskId, msg: &IpcMessage) -> Result<(), Errno> {
     // 2. Check IpcSend capability
     let current = current_task();
 
-    if !capability_check(&current, CapabilityType::IpcSend(target)) {
+    if !capability_check(&current, target) {
         return Err(Errno::EPERM);
     }
 
