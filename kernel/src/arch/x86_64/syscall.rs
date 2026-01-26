@@ -1044,6 +1044,8 @@ extern "C" fn syscall_handler(
         8 => syscall_read_key(),
         9 => syscall_write_char(arg1),
         10 => syscall_get_pid(),
+        11 => syscall_task_list(),
+        12 => syscall_uptime(),
         _ => {
             crate::drivers::serial::write_str("[HANDLER] Invalid syscall!\n");
             u64::MAX // Return error
@@ -1546,6 +1548,55 @@ fn syscall_write_char(char_code: u64) -> u64 {
 /// Returns: current task ID
 fn syscall_get_pid() -> u64 {
     crate::task::task::get_current_task() as u64
+}
+
+/// List all tasks (prints to serial)
+/// Returns: number of tasks
+fn syscall_task_list() -> u64 {
+    use crate::task::task::{TASK_TABLE, TaskState};
+    use crate::drivers::serial;
+
+    serial::write_str("\n=== TASK LIST ===\n");
+    serial::write_str("ID   STATE         \n");
+    serial::write_str("-----------------\n");
+
+    let table = TASK_TABLE.lock();
+    let count = table.len();
+
+    for (&id, task_arc) in table.iter() {
+        let task = task_arc.lock();
+
+        // Print ID
+        serial::write_dec(id);
+        serial::write_str("    ");
+
+        // Print state
+        match task.state {
+            TaskState::Runnable => serial::write_str("Runnable"),
+            TaskState::Running => serial::write_str("Running"),
+            TaskState::BlockedOnReceive => serial::write_str("Blocked(Recv)"),
+            TaskState::BlockedOnSend(t) => {
+                serial::write_str("Blocked(Send:");
+                serial::write_dec(t);
+                serial::write_str(")");
+            }
+            TaskState::Exited => serial::write_str("Exited"),
+        }
+        serial::write_str("\n");
+    }
+
+    serial::write_str("-----------------\n");
+    serial::write_str("Total: ");
+    serial::write_dec(count as u32);
+    serial::write_str(" tasks\n\n");
+
+    count as u64
+}
+
+/// Get system uptime in milliseconds
+/// Returns: number of milliseconds since boot
+fn syscall_uptime() -> u64 {
+    crate::timer::uptime_ms()
 }
 
 /// Debug: Print RAX value at syscall entry
