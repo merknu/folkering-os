@@ -256,7 +256,8 @@ pub fn yield_cpu() {
     use super::task;
 
     // CRITICAL DEBUG: Print immediately at function entry
-    crate::serial_println!("[YIELD_CPU] Function entered!");
+    let marker_value = crate::arch::x86_64::syscall::get_debug_marker();
+    crate::serial_println!("[YIELD_CPU] Function entered! DEBUG_MARKER = {:#x}", marker_value);
 
     // Record voluntary yield
     let current_id = task::get_current_task();
@@ -329,6 +330,16 @@ pub fn yield_cpu() {
 
     // Update current context pointer for syscalls
     crate::arch::x86_64::syscall::set_current_context_ptr(target_ctx_ptr as *mut task::Context);
+
+    // CANARY CHECKPOINT #2: SWITCH_POINT - Verify target task Context before switch
+    crate::serial_println!("[YIELD_CPU] About to switch to task {}", next_id);
+    crate::arch::x86_64::syscall::verify_task_context(next_id, "SWITCH_POINT");
+
+    // If we're switching AWAY from a task, also verify we saved its context correctly
+    if current_id != 0 && current_id != next_id {
+        crate::serial_println!("[YIELD_CPU] Also verifying outgoing task {}", current_id);
+        crate::arch::x86_64::syscall::verify_task_context(current_id, "SWITCH_POINT_OUTGOING");
+    }
 
     // DEBUG: Set marker 107 before restore_context_only
     crate::arch::x86_64::syscall::set_debug_marker(107);

@@ -20,10 +20,31 @@ use x86_64::structures::gdt::SegmentSelector;
 /// - Stack must have sufficient space
 #[no_mangle]
 pub unsafe fn jump_to_usermode(entry_point: VirtAddr, user_stack: VirtAddr) -> ! {
+    use crate::task::task;
+
     let user_cs = super::gdt::user_code_selector();
     let user_ss = super::gdt::user_data_selector();
 
     crate::serial_println!("[USERMODE] Transitioning to Ring 3 at {:#x}", entry_point.as_u64());
+
+    // Set up Context pointer for syscalls
+    // Get current task ID (should be 1 for first user task)
+    let current_id = task::get_current_task();
+    crate::serial_println!("[USERMODE] Current task ID: {}", current_id);
+
+    if current_id != 0 {
+        // Get task and set Context pointer
+        if let Some(task_arc) = task::get_task(current_id) {
+            let task_locked = task_arc.lock();
+            let ctx_ptr = &task_locked.context as *const _ as *mut _;
+            crate::serial_println!("[USERMODE] Setting Context ptr to {:#x}", ctx_ptr as usize);
+            super::syscall::set_current_context_ptr(ctx_ptr);
+        } else {
+            crate::serial_println!("[USERMODE] WARNING: Could not get task {}!", current_id);
+        }
+    } else {
+        crate::serial_println!("[USERMODE] WARNING: Current task ID is 0!");
+    }
 
     // IRET stack frame (pushed in reverse order):
     // [SS, RSP, RFLAGS, CS, RIP]
@@ -81,25 +102,54 @@ pub fn allocate_user_stack_at(stack_base: u64) -> VirtAddr {
     use crate::memory;
     use crate::memory::paging::flags;
 
+    crate::serial_println!("[USER_STACK] Allocating user stack at {:#x}", stack_base);
+
     // Allocate one page for user stack
     let stack_page_addr = memory::physical::alloc_page()
         .expect("Failed to allocate user stack page");
+    crate::serial_println!("[USER_STACK] Physical page: {:#x}", stack_page_addr);
 
     // Map at user-accessible address with USER_STACK flags
+    crate::serial_println!("[USER_STACK] Mapping with flags USER_STACK");
     memory::paging::map_page(
         stack_base as usize,
         stack_page_addr,
         flags::USER_STACK,
     ).expect("Failed to map user stack page");
+    crate::serial_println!("[USER_STACK] Page mapped");
 
-    // Zero the stack page via HHDM (we can't write through user address from kernel)
+    // Zero the stack page via HHDM
     let hhdm_addr = crate::phys_to_virt(stack_page_addr);
     unsafe {
         core::ptr::write_bytes(hhdm_addr as *mut u8, 0, 4096);
     }
 
-    // Return top of stack (page base + 4096)
-    VirtAddr::new(stack_base + 4096)
+    // Flush TLB
+    use x86_64::instructions::tlb;
+    unsafe {
+        tlb::flush(VirtAddr::new(stack_base));
+    }
+
+    let stack_top = stack_base + 4096 - 8;
+    crate::serial_println!("[USER_STACK] Stack top: {:#x}", stack_top);
+
+    // Verify we can read the stack
+    crate::serial_println!("[USER_STACK] Checking translation...");
+    let translate_result = memory::paging::translate(stack_base as usize);
+    match translate_result {
+        Some(phys) => crate::serial_println!("[USER_STACK] Translation OK: phys={:#x}", phys),
+        None => crate::serial_println!("[USER_STACK] Translation FAILED!"),
+    }
+
+    // Try reading from the stack
+    crate::serial_println!("[USER_STACK] Reading from stack...");
+    unsafe {
+        let test_byte = core::ptr::read_volatile(stack_base as *const u8);
+        crate::serial_println!("[USER_STACK] Read OK: val={:#x}", test_byte);
+    }
+
+    crate::serial_println!("[USER_STACK] User stack setup complete");
+    VirtAddr::new(stack_top)
 }
 
 /// Allocate user stack (legacy wrapper)
@@ -126,40 +176,65 @@ pub fn allocate_user_stack() -> VirtAddr {
 ///
 /// # Returns
 /// Virtual address where code was mapped (entry point)
+#[inline(never)]
 pub fn map_and_load_user_code_at(code: &[u8], base_addr: u64) -> VirtAddr {
     use crate::memory;
     use crate::memory::paging::flags;
 
+    crate::serial_println!("[USER_CODE] Mapping user code at {:#x}, len={}", base_addr, code.len());
+
     // Calculate number of pages needed
-    let pages_needed = (code.len() + 4095) / 4096;
+    let code_len = code.len();
+    let _pages_needed = (code_len + 4095) / 4096;
 
     // Allocate physical page for user code
     let code_page_addr = memory::physical::alloc_page()
         .expect("Failed to allocate user code page");
+    crate::serial_println!("[USER_CODE] Physical page: {:#x}", code_page_addr);
 
     // Map at user-accessible address with USER_CODE flags
+    crate::serial_println!("[USER_CODE] Mapping with flags USER_CODE (PRESENT | USER_ACCESSIBLE)");
     memory::paging::map_page(
         base_addr as usize,
         code_page_addr,
         flags::USER_CODE,
     ).expect("Failed to map user code page");
+    crate::serial_println!("[USER_CODE] Page mapped successfully");
 
-    // Copy code to the page via HHDM (kernel can't write to user addresses directly)
+    // Copy code to the page via HHDM
     let hhdm_addr = crate::phys_to_virt(code_page_addr);
+    crate::serial_println!("[USER_CODE] Copying {} bytes via HHDM at {:#x}", code_len, hhdm_addr);
     unsafe {
         core::ptr::copy_nonoverlapping(
             code.as_ptr(),
             hhdm_addr as *mut u8,
-            code.len(),
+            code_len,
         );
     }
+    crate::serial_println!("[USER_CODE] Code copied");
 
-    // Flush TLB for user code page to ensure mapping is active
+    // Flush TLB
     use x86_64::instructions::tlb;
     unsafe {
         tlb::flush(VirtAddr::new(base_addr));
     }
 
+    // Verify the mapping
+    crate::serial_println!("[USER_CODE] Checking translation...");
+    let translate_result = memory::paging::translate(base_addr as usize);
+    match translate_result {
+        Some(phys) => crate::serial_println!("[USER_CODE] Translation OK: phys={:#x}", phys),
+        None => crate::serial_println!("[USER_CODE] Translation FAILED!"),
+    }
+
+    // Try reading the first byte from the user address (via kernel)
+    crate::serial_println!("[USER_CODE] Reading first byte from user code...");
+    unsafe {
+        let first_byte = core::ptr::read_volatile(base_addr as *const u8);
+        crate::serial_println!("[USER_CODE] Read OK: first_byte={:#x}", first_byte);
+    }
+
+    crate::serial_println!("[USER_CODE] User code setup complete");
     VirtAddr::new(base_addr)
 }
 

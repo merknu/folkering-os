@@ -42,7 +42,7 @@ pub enum IpcType {
 /// - `msg_id` (u64): 8 bytes, offset 56-63
 ///
 /// **Total: 64 bytes**
-#[repr(C)]
+#[repr(C, align(16))]
 #[derive(Copy, Clone, Debug)]
 pub struct IpcMessage {
     /// Sender task ID (set by kernel)
@@ -132,9 +132,9 @@ const _: () = {
 
 // Additional compile-time checks
 const _: () = {
-    // Payload must be 8-byte aligned
-    if core::mem::align_of::<IpcMessage>() < 8 {
-        panic!("IpcMessage must be 8-byte aligned!");
+    // Must be 16-byte aligned for SSE operations on stack
+    if core::mem::align_of::<IpcMessage>() < 16 {
+        panic!("IpcMessage must be 16-byte aligned!");
     }
 };
 
@@ -145,7 +145,7 @@ mod tests {
     #[test]
     fn test_ipc_message_size() {
         assert_eq!(core::mem::size_of::<IpcMessage>(), 64);
-        assert_eq!(core::mem::align_of::<IpcMessage>(), 8);
+        assert_eq!(core::mem::align_of::<IpcMessage>(), 16);
     }
 
     #[test]

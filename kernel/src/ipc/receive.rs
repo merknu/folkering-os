@@ -45,27 +45,23 @@ use super::send::Errno;
 pub fn ipc_receive() -> Result<IpcMessage, Errno> {
     let current = current_task();
 
-    loop {
-        // Check if messages in queue (fast path)
-        {
-            let mut current_lock = current.lock();
-            if let Some(msg) = current_lock.recv_queue.pop() {
-                return Ok(msg);
-            }
+    // Check if messages in queue (fast path)
+    {
+        let mut current_lock = current.lock();
+        if let Some(msg) = current_lock.recv_queue.pop() {
+            return Ok(msg);
         }
-
-        // No messages - block until one arrives (slow path)
-        {
-            let mut current_lock = current.lock();
-            current_lock.state = TaskState::BlockedOnReceive;
-        }
-
-        // Yield CPU to scheduler - will resume when message arrives
-        crate::task::scheduler::yield_cpu();
-
-        // Will resume here when message arrives
-        // Loop back to check queue again
     }
+
+    // No messages - mark task as blocked and return EWOULDBLOCK
+    // The syscall handler will yield properly
+    {
+        let mut current_lock = current.lock();
+        current_lock.state = TaskState::BlockedOnReceive;
+    }
+
+    // Return error to indicate syscall should yield
+    Err(Errno::EWOULDBLOCK)
 }
 
 /// Non-blocking IPC receive

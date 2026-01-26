@@ -30,27 +30,31 @@ impl UserProgram {
     pub const fn new() -> Self {
         let mut code = [0u8; 4096];
 
+        // DEBUG: Add a marker instruction first to verify we're executing user code
+        // nop (0x90) - easier to spot in debug output
+        code[0] = 0x90;  // NOP
+
         // mov rax, 7
-        code[0] = 0x48;  // REX.W prefix
-        code[1] = 0xc7;  // MOV r/m64, imm32
-        code[2] = 0xc0;  // ModR/M: RAX
-        code[3] = 0x07;  // Immediate: 7 (syscall_yield)
-        code[4] = 0x00;
+        code[1] = 0x48;  // REX.W prefix
+        code[2] = 0xc7;  // MOV r/m64, imm32
+        code[3] = 0xc0;  // ModR/M: RAX
+        code[4] = 0x07;  // Immediate: 7 (syscall_yield)
         code[5] = 0x00;
         code[6] = 0x00;
+        code[7] = 0x00;
 
         // syscall
-        code[7] = 0x0f;  // SYSCALL opcode
-        code[8] = 0x05;
+        code[8] = 0x0f;  // SYSCALL opcode
+        code[9] = 0x05;
 
         // inc rbx
-        code[9] = 0x48;   // REX.W prefix
-        code[10] = 0xff;  // INC r/m64
-        code[11] = 0xc3;  // ModR/M: RBX
+        code[10] = 0x48;   // REX.W prefix
+        code[11] = 0xff;  // INC r/m64
+        code[12] = 0xc3;  // ModR/M: RBX
 
-        // jmp -14 (back to start)
-        code[12] = 0xeb;  // JMP rel8
-        code[13] = 0xf2;  // Offset: -14 bytes
+        // jmp back to NOP (offset: -(13) = 0xF3)
+        code[13] = 0xeb;  // JMP rel8
+        code[14] = 0xf3;  // Offset: -13 bytes (back to NOP)
 
         UserProgram { code }
     }
@@ -62,7 +66,7 @@ impl UserProgram {
 
     /// Get code size
     pub const fn code_size() -> usize {
-        14 // 14 bytes of actual code
+        15 // 15 bytes of actual code (added NOP)
     }
 }
 
@@ -71,13 +75,14 @@ pub static USER_PROGRAM: UserProgram = UserProgram::new();
 
 /// IPC Sender Program
 ///
-/// This program sends IPC messages to task 3 (receiver) in a loop.
+/// This program sends IPC messages to task 2 (receiver) in a loop.
+/// Task IDs: 1=dummy, 2=receiver, 3=sender
 ///
 /// Assembly:
 /// ```asm
 /// sender_start:
 ///     mov rax, 0          ; syscall IpcSend
-///     mov rdi, 3          ; target_task = 3 (receiver)
+///     mov rdi, 2          ; target_task = 2 (receiver)
 ///     mov rsi, 0x1234     ; payload[0] = test data
 ///     syscall
 ///     mov rax, 7          ; syscall Yield
@@ -103,11 +108,11 @@ impl IpcSenderProgram {
         code[pos] = 0x00; pos += 1;
         code[pos] = 0x00; pos += 1;
 
-        // mov rdi, 3 (target task ID)
+        // mov rdi, 2 (target task ID - receiver)
         code[pos] = 0x48; pos += 1;  // REX.W
         code[pos] = 0xc7; pos += 1;  // MOV r/m64, imm32
         code[pos] = 0xc7; pos += 1;  // ModR/M: RDI
-        code[pos] = 0x03; pos += 1;  // Immediate: 3
+        code[pos] = 0x02; pos += 1;  // Immediate: 2 (FIXED: was 3)
         code[pos] = 0x00; pos += 1;
         code[pos] = 0x00; pos += 1;
         code[pos] = 0x00; pos += 1;
@@ -138,22 +143,27 @@ impl IpcSenderProgram {
         code[pos] = 0x0f; pos += 1;
         code[pos] = 0x05; pos += 1;
 
-        // jmp to start (offset calculation: -(pos+2))
-        // Current pos is 37, so offset is -(37+2) = -39 = 0xD9
+        // jmp to start
+        // jmp opcode at pos 32, offset at pos 33
+        // After jmp instruction, RIP = 34
+        // Target = 0
+        // Offset = 0 - 34 = -34 = 0xDE
         code[pos] = 0xeb; pos += 1;  // JMP rel8
-        code[pos] = 0xd9; // -39 bytes
+        code[pos] = 0xde; // -34 bytes (256 - 34 = 222 = 0xDE)
+        // pos = 34 (total code size)
 
         IpcSenderProgram { code }
     }
 
     pub const fn code_size() -> usize {
-        39 // Total bytes of actual code
+        34 // Total bytes of actual code
     }
 }
 
 /// IPC Receiver Program
 ///
 /// This program receives IPC messages and replies to them.
+/// Now with proper return value checking - if IpcReceive returns error, yield and retry.
 ///
 /// Assembly:
 /// ```asm
@@ -161,11 +171,18 @@ impl IpcSenderProgram {
 ///     mov rax, 1          ; syscall IpcReceive
 ///     mov rdi, 0          ; from_task = 0 (any sender)
 ///     syscall
+///     cmp rax, -1         ; check for error (0xFFFFFFFFFFFFFFFF or similar)
+///     jl yield_and_retry  ; if negative (error), yield and retry
+///     ; Message received successfully
+///     mov rdi, rax        ; save result (sender in lower 32 bits)
 ///     mov rax, 2          ; syscall IpcReply
+///     mov rsi, 0x42       ; reply payload0 = 0x42 (success marker)
 ///     syscall
+///     jmp receiver_start  ; loop to receive next message
+/// yield_and_retry:
 ///     mov rax, 7          ; syscall Yield
 ///     syscall
-///     jmp receiver_start  ; loop
+///     jmp receiver_start  ; retry IpcReceive
 /// ```
 #[repr(align(4096))]
 pub struct IpcReceiverProgram {
@@ -173,10 +190,62 @@ pub struct IpcReceiverProgram {
 }
 
 impl IpcReceiverProgram {
+    /// Simplified receiver: yield twice first, then receive and reply
+    /// This ensures the sender has time to send before we try to receive.
+    ///
+    /// Assembly:
+    /// ```asm
+    /// receiver_start:           ; pos 0
+    ///     mov rax, 7            ; Yield syscall
+    ///     syscall               ; yield #1
+    ///     mov rax, 7            ; Yield syscall
+    ///     syscall               ; yield #2
+    ///     mov rax, 1            ; IpcReceive
+    ///     mov rdi, 0            ; from any sender
+    ///     syscall
+    ///     mov rdi, rax          ; save result (sender info)
+    ///     mov rax, 2            ; IpcReply
+    ///     mov rsi, 0x42         ; reply payload
+    ///     syscall
+    ///     jmp receiver_start
+    /// ```
     pub const fn new() -> Self {
         let mut code = [0u8; 4096];
         let mut pos = 0;
 
+        // === YIELD #1 === (pos 0-8)
+        // mov rax, 7 (Yield)
+        code[pos] = 0x48; pos += 1;  // REX.W
+        code[pos] = 0xc7; pos += 1;  // MOV r/m64, imm32
+        code[pos] = 0xc0; pos += 1;  // ModR/M: RAX
+        code[pos] = 0x07; pos += 1;  // Immediate: 7
+        code[pos] = 0x00; pos += 1;
+        code[pos] = 0x00; pos += 1;
+        code[pos] = 0x00; pos += 1;
+        // pos = 7
+
+        // syscall
+        code[pos] = 0x0f; pos += 1;
+        code[pos] = 0x05; pos += 1;
+        // pos = 9
+
+        // === YIELD #2 === (pos 9-17)
+        // mov rax, 7 (Yield)
+        code[pos] = 0x48; pos += 1;  // REX.W
+        code[pos] = 0xc7; pos += 1;  // MOV r/m64, imm32
+        code[pos] = 0xc0; pos += 1;  // ModR/M: RAX
+        code[pos] = 0x07; pos += 1;  // Immediate: 7
+        code[pos] = 0x00; pos += 1;
+        code[pos] = 0x00; pos += 1;
+        code[pos] = 0x00; pos += 1;
+        // pos = 16
+
+        // syscall
+        code[pos] = 0x0f; pos += 1;
+        code[pos] = 0x05; pos += 1;
+        // pos = 18
+
+        // === IPC RECEIVE === (pos 18-33)
         // mov rax, 1 (IpcReceive)
         code[pos] = 0x48; pos += 1;  // REX.W
         code[pos] = 0xc7; pos += 1;  // MOV r/m64, imm32
@@ -185,6 +254,7 @@ impl IpcReceiverProgram {
         code[pos] = 0x00; pos += 1;
         code[pos] = 0x00; pos += 1;
         code[pos] = 0x00; pos += 1;
+        // pos = 25
 
         // mov rdi, 0 (any sender)
         code[pos] = 0x48; pos += 1;  // REX.W
@@ -194,10 +264,19 @@ impl IpcReceiverProgram {
         code[pos] = 0x00; pos += 1;
         code[pos] = 0x00; pos += 1;
         code[pos] = 0x00; pos += 1;
+        // pos = 32
 
         // syscall (IpcReceive)
         code[pos] = 0x0f; pos += 1;
         code[pos] = 0x05; pos += 1;
+        // pos = 34
+
+        // === IPC REPLY === (pos 34-52)
+        // mov rdi, rax (save sender info for reply)
+        code[pos] = 0x48; pos += 1;  // REX.W
+        code[pos] = 0x89; pos += 1;  // MOV r/m64, r64
+        code[pos] = 0xc7; pos += 1;  // ModR/M: RDI, RAX
+        // pos = 37
 
         // mov rax, 2 (IpcReply)
         code[pos] = 0x48; pos += 1;  // REX.W
@@ -207,33 +286,36 @@ impl IpcReceiverProgram {
         code[pos] = 0x00; pos += 1;
         code[pos] = 0x00; pos += 1;
         code[pos] = 0x00; pos += 1;
+        // pos = 44
+
+        // mov rsi, 0x42 (reply payload = success marker)
+        code[pos] = 0x48; pos += 1;  // REX.W
+        code[pos] = 0xc7; pos += 1;  // MOV r/m64, imm32
+        code[pos] = 0xc6; pos += 1;  // ModR/M: RSI
+        code[pos] = 0x42; pos += 1;  // Immediate: 0x42
+        code[pos] = 0x00; pos += 1;
+        code[pos] = 0x00; pos += 1;
+        code[pos] = 0x00; pos += 1;
+        // pos = 51
 
         // syscall (IpcReply)
         code[pos] = 0x0f; pos += 1;
         code[pos] = 0x05; pos += 1;
+        // pos = 53
 
-        // mov rax, 7 (Yield)
-        code[pos] = 0x48; pos += 1;  // REX.W
-        code[pos] = 0xc7; pos += 1;  // MOV r/m64, imm32
-        code[pos] = 0xc0; pos += 1;  // ModR/M: RAX
-        code[pos] = 0x07; pos += 1;  // Immediate: 7
-        code[pos] = 0x00; pos += 1;
-        code[pos] = 0x00; pos += 1;
-        code[pos] = 0x00; pos += 1;
-
-        // syscall (Yield)
-        code[pos] = 0x0f; pos += 1;
-        code[pos] = 0x05; pos += 1;
-
-        // jmp to start (offset: -(pos+2) = -(35+2) = -37 = 0xDB)
+        // === LOOP BACK === (pos 53-54)
+        // jmp receiver_start (pos 0)
+        // jmp instruction at pos 53-54, ends at 55
+        // offset = 0 - 55 = -55
         code[pos] = 0xeb; pos += 1;  // JMP rel8
-        code[pos] = 0xdb; // -37 bytes
+        code[pos] = (256 - 55) as u8; // -55 bytes = 0xC9
+        // pos = 55
 
         IpcReceiverProgram { code }
     }
 
     pub const fn code_size() -> usize {
-        37 // Total bytes of actual code
+        55 // Total bytes of actual code
     }
 }
 

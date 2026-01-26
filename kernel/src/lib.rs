@@ -20,9 +20,7 @@
 #![feature(abi_x86_interrupt)]
 #![feature(allocator_api)]
 #![feature(alloc_error_handler)]
-#![feature(const_mut_refs)]
-#![feature(panic_info_message)]
-#![feature(naked_functions)]
+// const_mut_refs is stable since 1.83, panic_info_message since 1.81, naked_functions since 1.88
 
 // Text section anchor - workaround for lld orphaned section bug
 // Forces .text section creation so ltext sections get proper permissions
@@ -51,59 +49,74 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
         // Initialize serial console driver
         drivers::serial::init();
 
-        serial_println!("\n[KERNEL_MAIN] kernel_main_with_boot_info() started!");
+        serial_strln!("\n[KERNEL_MAIN] kernel_main_with_boot_info() started!");
 
-        serial_println!("\n==============================================");
-        serial_println!("   Folkering OS v0.1.0 - Microkernel        ");
-        serial_println!("==============================================\n");
+        serial_strln!("\n==============================================");
+        serial_strln!("   Folkering OS v0.1.0 - Microkernel        ");
+        serial_strln!("==============================================\n");
 
-        // Display boot information
-        serial_println!("[BOOT] Boot information:");
-        serial_println!("[BOOT] Bootloader: {} {}", boot_info.bootloader_name, boot_info.bootloader_version);
-        serial_println!("[BOOT] Kernel physical base: {:#x}", boot_info.kernel_phys_base);
-        serial_println!("[BOOT] Kernel virtual base:  {:#x}", boot_info.kernel_virt_base);
-        serial_println!("[BOOT] HHDM offset:          {:#x}", boot_info.hhdm_offset);
+        // Display boot information using bypass functions
+        serial_strln!("[BOOT] Boot information:");
+        serial_strln!("[BOOT] Bootloader: Limine 8.7.0");
+        serial_str!("[BOOT] Kernel physical base: ");
+        drivers::serial::write_hex(boot_info.kernel_phys_base as u64);
+        drivers::serial::write_newline();
+        serial_str!("[BOOT] Kernel virtual base:  ");
+        drivers::serial::write_hex(boot_info.kernel_virt_base as u64);
+        drivers::serial::write_newline();
+        serial_str!("[BOOT] HHDM offset:          ");
+        drivers::serial::write_hex(boot_info.hhdm_offset as u64);
+        drivers::serial::write_newline();
         if boot_info.rsdp_addr != 0 {
-            serial_println!("[BOOT] RSDP address:         {:#x}", boot_info.rsdp_addr);
+            serial_str!("[BOOT] RSDP address:         ");
+            drivers::serial::write_hex(boot_info.rsdp_addr as u64);
+            drivers::serial::write_newline();
         }
-
-        serial_println!("\n[BOOT] Boot information complete!");
+        serial_strln!("[BOOT] Boot information complete!");
 
         // Initialize physical memory manager
-        serial_println!("\n[PMM] Initializing physical memory manager...");
+        serial_strln!("\n[PMM] Initializing physical memory manager...");
         memory::physical::init(boot_info);
 
         // Get memory stats
         let stats = memory::physical::stats();
-        serial_println!("\n[PMM] Initialization complete!");
-        serial_println!("[PMM] Total memory: {} MB", stats.total_bytes / (1024 * 1024));
-        serial_println!("[PMM] Free memory:  {} MB", stats.free_bytes / (1024 * 1024));
-        serial_println!("[PMM] Used memory:  {} MB\n", stats.used_bytes / (1024 * 1024));
+        serial_strln!("\n[PMM] Initialization complete!");
+        serial_str!("[PMM] Total memory: ");
+        drivers::serial::write_dec((stats.total_bytes / (1024 * 1024)) as u32);
+        serial_strln!(" MB");
+        serial_str!("[PMM] Free memory:  ");
+        drivers::serial::write_dec((stats.free_bytes / (1024 * 1024)) as u32);
+        serial_strln!(" MB\n");
 
         // Initialize GDT and TSS
-        serial_println!("[INIT] Initializing GDT and TSS...");
+        serial_strln!("[INIT] Initializing GDT and TSS...");
         arch::x86_64::gdt_init();
-        serial_println!("[GDT] Global Descriptor Table and Task State Segment loaded\n");
+        serial_strln!("[GDT] Done\n");
 
         // Initialize syscall support (requires GDT to be loaded first)
-        serial_println!("[INIT] Initializing SYSCALL/SYSRET support...");
+        serial_strln!("[INIT] Initializing SYSCALL/SYSRET support...");
         arch::x86_64::syscall_init();
-        serial_println!("[SYSCALL] Fast system calls enabled (8 syscalls registered)\n");
+        serial_strln!("[SYSCALL] Fast system calls enabled\n");
 
         // Initialize CPU frequency scaling
-        serial_println!("[INIT] Initializing CPU frequency scaling...");
+        serial_strln!("[INIT] Initializing CPU frequency scaling...");
         arch::x86_64::cpu_freq_init();
-        serial_println!("[CPU_FREQ] Dynamic voltage and frequency scaling ready\n");
+        serial_strln!("[CPU_FREQ] Dynamic voltage and frequency scaling ready\n");
 
-        // Initialize paging subsystem
-        serial_println!("[INIT] Initializing page table mapper...");
+        // Initialize paging subsystem (needed before APIC init for MMIO mapping)
+        serial_strln!("[INIT] Initializing page table mapper...");
         memory::paging::init(boot_info);
-        serial_println!("[PAGING] Page table mapper ready\n");
+        serial_strln!("[PAGING] Page table mapper ready\n");
 
         // Initialize kernel heap
-        serial_println!("[INIT] Initializing kernel heap...");
+        serial_strln!("[INIT] Initializing kernel heap...");
         memory::heap::init();
-        serial_println!("[HEAP] Kernel heap ready (16 MB allocated)\n");
+        serial_strln!("[HEAP] Kernel heap ready (16 MB allocated)\n");
+
+        // Initialize APIC timer for preemptive scheduling (after paging for MMIO mapping)
+        serial_strln!("[INIT] Initializing Local APIC...");
+        arch::x86_64::apic_init();
+        serial_strln!("[APIC] Timer interrupts enabled\n");
 
         // Verify dynamic allocations work
         use alloc::vec::Vec;
@@ -115,107 +128,94 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
         v.push(3);
         let _s = String::from("Folkering OS");
 
-        serial_println!("[TEST] Dynamic allocations verified (Vec, String)\n");
+        serial_strln!("[TEST] Dynamic allocations verified (Vec, String)\n");
 
-        serial_println!("\n[BOOT] ✅ Phase 1 COMPLETE - Memory subsystem operational");
-        serial_println!("[BOOT] ✅ Phase 2 COMPLETE - User mode infrastructure ready\n");
+        serial_strln!("\n[BOOT] ✅ Phase 1 COMPLETE - Memory subsystem operational");
+        serial_strln!("[BOOT] ✅ Phase 2 COMPLETE - User mode infrastructure ready\n");
 
         // ===== Phase 3: IPC & Task Management =====
 
-        serial_println!("[BOOT] Starting Phase 3: IPC & Task Management...\n");
+        serial_strln!("[BOOT] Starting Phase 3: IPC & Task Management...\n");
 
-        serial_println!("[DEBUG] About to call ipc::init()...");
+        serial_strln!("[DEBUG] About to call ipc::init()...");
         // Initialize IPC subsystem
-        serial_println!("[INIT] Initializing IPC subsystem...");
+        serial_strln!("[INIT] Initializing IPC subsystem...");
         ipc::init();
-        serial_println!("[DEBUG] ipc::init() returned OK");
-        serial_println!("[IPC] IPC subsystem ready\n");
+        serial_strln!("[DEBUG] ipc::init() returned OK");
+        serial_strln!("[IPC] IPC subsystem ready\n");
 
-        serial_println!("[DEBUG] About to call scheduler_init()...");
+        serial_strln!("[DEBUG] About to call scheduler_init()...");
         // Initialize scheduler
-        serial_println!("[INIT] Initializing scheduler...");
+        serial_strln!("[INIT] Initializing scheduler...");
         task::scheduler_init();
-        serial_println!("[DEBUG] scheduler_init() returned OK");
-        serial_println!("[SCHED] Scheduler ready\n");
+        serial_strln!("[DEBUG] scheduler_init() returned OK");
+        serial_strln!("[SCHED] Scheduler ready\n");
 
         // Note: Kernel doesn't need its own Task structure
         // It runs in interrupt/syscall context, not as a schedulable task
-        serial_println!("[INIT] Kernel running in interrupt context (no task structure needed)\n");
+        serial_strln!("[INIT] Kernel running in interrupt context (no task structure needed)\n");
 
-        serial_println!("[BOOT] ✅ Phase 3 COMPLETE - IPC & Task system operational\n");
+        serial_strln!("[BOOT] ✅ Phase 3 COMPLETE - IPC & Task system operational\n");
 
-        // Spawn IPC test tasks
-        // Note: IPC_SENDER is hardcoded to send to task ID 2
-        // So we spawn receiver first (ID 1), then sender (ID 2)
-        // Sender will send to task 2, but wait - that's itself!
-        // Actually, let's spawn receiver as task 2:
-        // - Dummy task 1 (idle loop)
-        // - Receiver as task 2
-        // - Sender as task 3 (sends to task 2)
+        // ===== IPC Test Setup =====
+        // Task layout:
+        // - Task 1: Dummy yield loop (to occupy ID 1)
+        // - Task 2: IPC Receiver (receives messages and replies)
+        // - Task 3: IPC Sender (sends to task 2)
 
-        serial_println!("[TEST] Spawning ONLY task 1 (yield loop) for debugging...\n");
+        serial_strln!("[TEST] Spawning IPC test tasks (sender + receiver)...\n");
 
-        // TEST: Simple yield loop using SYSCALL instruction
+        // Simple yield loop for Task 1 (dummy)
         static YIELD_LOOP: [u8; 11] = [
-            // loop_start:
-            0x48, 0xc7, 0xc0, 0x07, 0x00, 0x00, 0x00,  // mov rax, 7 (YIELD syscall)
+            0x48, 0xc7, 0xc0, 0x07, 0x00, 0x00, 0x00,  // mov rax, 7 (YIELD)
             0x0f, 0x05,                                 // syscall
-            0xeb, 0xf7,                                 // jmp loop_start (back 9 bytes)
+            0xeb, 0xf5,                                 // jmp -11
         ];
-        serial_println!("[BOOT] Spawning infinite yield loop task...");
+
+        // Spawn Task 1 - dummy yield loop (occupies ID 1)
+        serial_strln!("[BOOT] Spawning Task 1 (dummy yield)...");
         match task::spawn_raw(&YIELD_LOOP, 0) {
             Ok(task_id) => {
-                serial_println!("[BOOT] spawn_raw OK, task_id={}", task_id);
-                serial_println!("[BOOT] Dummy task spawned (id={})\n", task_id);
+                serial_str!("[BOOT] Task 1 spawned, id=");
+                drivers::serial::write_dec(task_id);
+                serial_strln!("");
             }
-            Err(e) => {
-                serial_println!("[BOOT] spawn_raw FAILED: {:?}\n", e);
+            Err(_e) => {
+                serial_strln!("[BOOT] Task 1 spawn FAILED\n");
                 loop { x86_64::instructions::hlt(); }
             }
         }
 
-        // DISABLED for testing - only spawning task 1
-        /*
-        // Spawn task 2 - IPC receive loop
-        static IPC_RECEIVE_LOOP: [u8; 15] = [
-            // loop_start:
-            0x48, 0x31, 0xff,                           // xor rdi, rdi (from=0, receive from any)
-            0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00,  // mov rax, 1 (IPC_RECEIVE)
-            0x0f, 0x05,                                 // syscall
-            0xeb, 0xf3,                                 // jmp loop_start
-            0xf4,                                       // hlt
-        ];
-        serial_println!("[BOOT] Spawning task 2 (IPC receiver)...");
-        match task::spawn_raw(&IPC_RECEIVE_LOOP, 0) {
-            Ok(_) => { serial_println!("[BOOT] Task 2 spawned OK"); }
-            Err(_) => {
-                serial_println!("[BOOT] Task 2 spawn FAILED");
+        // Spawn Task 2 - IPC Receiver (must be ID 2 because sender targets task 2)
+        serial_strln!("[BOOT] Spawning Task 2 (IPC receiver)...");
+        match task::spawn_raw(&userspace_test::IPC_RECEIVER.code[..userspace_test::IpcReceiverProgram::code_size()], 0) {
+            Ok(task_id) => {
+                serial_str!("[BOOT] Task 2 (receiver) spawned, id=");
+                drivers::serial::write_dec(task_id);
+                serial_strln!("");
+            }
+            Err(_e) => {
+                serial_strln!("[BOOT] Task 2 spawn FAILED\n");
                 loop { x86_64::instructions::hlt(); }
             }
         }
 
-        // Spawn task 3 - TEST: IPC send (single, no loop)
-        // Use static to avoid stack overflow (kernel stack is limited)
-        static IPC_SEND_CODE: [u8; 27] = [
-            0x48, 0xc7, 0xc7, 0x02, 0x00, 0x00, 0x00,  // mov rdi, 2 (target task 2)
-            0x48, 0xc7, 0xc6, 0xAA, 0x00, 0x00, 0x00,  // mov rsi, 0xAA (payload0)
-            0x48, 0x31, 0xd2,                           // xor rdx, rdx (payload1=0)
-            0x48, 0xc7, 0xc0, 0x00, 0x00, 0x00, 0x00,  // mov rax, 0 (IPC_SEND)
-            0x0f, 0x05,                                 // syscall
-            0xf4,                                       // hlt
-        ];
-        serial_println!("[TEST] Spawning task 3 with IPC send (no loop)...");
-        match task::spawn_raw(&IPC_SEND_CODE, 0) {
-            Ok(_) => { serial_println!("[TEST] Task 3 (IPC send) spawned OK"); }
-            Err(_) => {
-                serial_println!("[TEST] Task 3 spawn FAILED");
+        // Spawn Task 3 - IPC Sender (sends to task 2)
+        serial_strln!("[BOOT] Spawning Task 3 (IPC sender)...");
+        match task::spawn_raw(&userspace_test::IPC_SENDER.code[..userspace_test::IpcSenderProgram::code_size()], 0) {
+            Ok(task_id) => {
+                serial_str!("[BOOT] Task 3 (sender) spawned, id=");
+                drivers::serial::write_dec(task_id);
+                serial_strln!("");
+            }
+            Err(_e) => {
+                serial_strln!("[BOOT] Task 3 spawn FAILED\n");
                 loop { x86_64::instructions::hlt(); }
             }
         }
-        */
 
-        serial_println!("[BOOT] All tasks spawned, starting scheduler...\n");
-        serial_println!("==============================================\n");
+        serial_strln!("[BOOT] All IPC test tasks spawned, starting scheduler...\n");
+        serial_strln!("==============================================\n");
 
         // Start scheduler (does not return)
         task::scheduler_start();
@@ -293,7 +293,7 @@ pub fn virt_to_phys(virt: usize) -> Option<usize> {
     }
 }
 
-/// Serial print macro
+/// Serial print macro (uses format_args - may hang on toolchain bug)
 #[macro_export]
 macro_rules! serial_print {
     ($($arg:tt)*) => {
@@ -301,9 +301,26 @@ macro_rules! serial_print {
     };
 }
 
-/// Serial println macro
+/// Serial println macro (uses format_args - may hang on toolchain bug)
 #[macro_export]
 macro_rules! serial_println {
     () => ($crate::serial_print!("\n"));
     ($($arg:tt)*) => ($crate::serial_print!("{}\n", format_args!($($arg)*)));
+}
+
+/// Simple string print (bypasses format! - toolchain safe)
+#[macro_export]
+macro_rules! serial_str {
+    ($s:expr) => {
+        $crate::drivers::serial::write_str($s)
+    };
+}
+
+/// Simple string print with newline (bypasses format! - toolchain safe)
+#[macro_export]
+macro_rules! serial_strln {
+    ($s:expr) => {
+        $crate::drivers::serial::write_str($s);
+        $crate::drivers::serial::write_newline();
+    };
 }

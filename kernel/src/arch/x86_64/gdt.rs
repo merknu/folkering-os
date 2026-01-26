@@ -5,7 +5,6 @@
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector};
 use x86_64::structures::tss::TaskStateSegment;
 use x86_64::VirtAddr;
-use spin::Mutex;
 
 /// Syscall stack size (16 KB)
 const SYSCALL_STACK_SIZE: usize = 16 * 1024;
@@ -41,13 +40,13 @@ pub fn init() {
         let stack_end = stack_start + SYSCALL_STACK_SIZE as u64;
         TSS.privilege_stack_table[0] = stack_end;
 
-        // Build GDT with standard x86-64 layout
-        // 0: Null, 1: Kernel CS (0x08), 2: Kernel DS (0x10), 3: User CS (0x18), 4: User DS (0x20), 5: TSS
+        // Build GDT layout compatible with SYSRET
+        // Order: kernel_code (0x08), kernel_data (0x10), user_data (0x18), user_code (0x20)
         let mut gdt = GlobalDescriptorTable::new();
-        let kernel_code = gdt.append(Descriptor::kernel_code_segment());
-        let kernel_data = gdt.append(Descriptor::kernel_data_segment());
-        let user_code = gdt.append(Descriptor::user_code_segment());
-        let user_data = gdt.append(Descriptor::user_data_segment());
+        let kernel_code = gdt.append(Descriptor::kernel_code_segment());  // 0x08
+        let kernel_data = gdt.append(Descriptor::kernel_data_segment());  // 0x10
+        let user_data = gdt.append(Descriptor::user_data_segment());      // 0x18
+        let user_code = gdt.append(Descriptor::user_code_segment());      // 0x20
         let tss_selector = gdt.append(Descriptor::tss_segment(&TSS));
 
         let selectors = Selectors {
@@ -66,6 +65,8 @@ pub fn init() {
         DS::set_reg(GDT.as_ref().unwrap().1.kernel_data);
         load_tss(GDT.as_ref().unwrap().1.tss);
     }
+
+    crate::drivers::serial::write_str("[GDT] Done\n");
 }
 
 /// Get kernel code selector (for returning from interrupts)
