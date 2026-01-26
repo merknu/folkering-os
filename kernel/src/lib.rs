@@ -229,6 +229,11 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
         serial_strln!("[BOOT] IPC capabilities granted");
 
         serial_strln!("[BOOT] All IPC test tasks spawned, starting scheduler...\n");
+
+        // Enable timer interrupts for preemption
+        serial_strln!("[BOOT] Enabling APIC timer for preemption...");
+        arch::x86_64::enable_timer();
+
         serial_strln!("==============================================\n");
 
         // Start scheduler (does not return)

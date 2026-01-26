@@ -163,7 +163,50 @@ make_exception_handler!(exc_vc, 29, "\n[#VC] VMM Communication Exception (Vector
 make_exception_handler!(exc_sx, 30, "\n[#SX] Security Exception (Vector 30)!");
 make_exception_handler!(exc_reserved31, 31, "\n[RESERVED] Vector 31!");
 // IRQ handlers
-make_exception_handler!(irq_timer, 32, "\n[IRQ0] Timer (Vector 32)!");
+
+/// Timer interrupt handler (Vector 32)
+///
+/// This handler is called ~100 times per second (10ms interval).
+/// Currently just increments tick counter and sends EOI.
+/// Preemption from timer will be implemented in a future enhancement.
+#[unsafe(naked)]
+extern "C" fn irq_timer() {
+    core::arch::naked_asm!(
+        // Save caller-saved registers
+        "push rax",
+        "push rcx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+
+        // Increment tick counter
+        "call {tick_fn}",
+
+        // Send EOI to APIC
+        "call {eoi_fn}",
+
+        // Restore registers
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop rcx",
+        "pop rax",
+
+        // Return from interrupt
+        "iretq",
+
+        tick_fn = sym folkering_kernel::arch::x86_64::apic::tick,
+        eoi_fn = sym folkering_kernel::arch::x86_64::apic::send_eoi,
+    );
+}
 make_exception_handler!(irq_33, 33, "\n[IRQ1] Keyboard (Vector 33)!");
 make_exception_handler!(irq_34, 34, "\n[IRQ2] Cascade (Vector 34)!");
 make_exception_handler!(irq_35, 35, "\n[IRQ3] COM2 (Vector 35)!");

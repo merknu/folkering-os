@@ -151,3 +151,50 @@ pub fn get_apic_id() -> u8 {
         ((id_reg >> 24) & 0xFF) as u8
     }
 }
+
+/// Tick counter for timer interrupts
+static TIMER_TICKS: AtomicUsize = AtomicUsize::new(0);
+
+/// Get current timer tick count
+pub fn get_ticks() -> usize {
+    TIMER_TICKS.load(Ordering::Relaxed)
+}
+
+/// Increment tick counter (called from timer interrupt handler)
+pub fn tick() {
+    TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Enable the APIC timer (unmask)
+///
+/// Call this after interrupt handlers are set up and ready.
+pub fn enable_timer() {
+    let apic_virt = APIC_VIRT_ADDR.load(Ordering::Relaxed);
+    if apic_virt == 0 {
+        crate::drivers::serial::write_str("[APIC] ERROR: Cannot enable timer - APIC not initialized!\n");
+        return;
+    }
+    unsafe {
+        // Read current LVT timer value
+        let current = read_apic_reg(apic_virt, APIC_LVT_TIMER);
+
+        // Clear the mask bit (bit 16) to enable timer
+        let enabled = current & !0x10000;
+        write_apic_reg(apic_virt, APIC_LVT_TIMER, enabled);
+
+        crate::drivers::serial::write_str("[APIC] Timer ENABLED (unmasked)\n");
+    }
+}
+
+/// Disable the APIC timer (mask)
+pub fn disable_timer() {
+    let apic_virt = APIC_VIRT_ADDR.load(Ordering::Relaxed);
+    if apic_virt == 0 {
+        return;
+    }
+    unsafe {
+        let current = read_apic_reg(apic_virt, APIC_LVT_TIMER);
+        let disabled = current | 0x10000; // Set mask bit
+        write_apic_reg(apic_virt, APIC_LVT_TIMER, disabled);
+    }
+}

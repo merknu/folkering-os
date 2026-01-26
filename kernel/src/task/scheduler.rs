@@ -473,3 +473,118 @@ pub fn start() -> ! {
         }
     }
 }
+
+/// Time slice in ticks (10ms each, so 5 ticks = 50ms time slice)
+const TIME_SLICE_TICKS: usize = 5;
+
+/// Current remaining time slice for the running task
+static TICKS_REMAINING: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(TIME_SLICE_TICKS);
+
+/// Called from timer interrupt to handle potential preemption
+///
+/// Returns true if preemption should occur.
+#[no_mangle]
+pub extern "C" fn timer_tick_preempt() -> bool {
+    use core::sync::atomic::Ordering;
+
+    // Decrement tick counter
+    let remaining = TICKS_REMAINING.fetch_sub(1, Ordering::Relaxed);
+
+    if remaining <= 1 {
+        // Time slice expired - reset counter and signal preemption
+        TICKS_REMAINING.store(TIME_SLICE_TICKS, Ordering::Relaxed);
+
+        // Record involuntary preemption
+        let current_id = super::task::get_current_task();
+        super::statistics::record_preemption(current_id);
+
+        return true;
+    }
+
+    false
+}
+
+/// Reset time slice counter (called when a task voluntarily yields)
+pub fn reset_time_slice() {
+    use core::sync::atomic::Ordering;
+    TICKS_REMAINING.store(TIME_SLICE_TICKS, Ordering::Relaxed);
+}
+
+/// Handle timer preemption - save current context and get next task
+///
+/// # Arguments
+/// * `saved_rsp` - RSP pointing to saved registers on stack
+///
+/// # Returns
+/// Pointer to the Context to restore (may be same or different task)
+#[no_mangle]
+pub extern "C" fn do_preemption(saved_rsp: usize) -> usize {
+    use super::task;
+
+    let current_id = task::get_current_task();
+
+    // Save interrupted context from stack to task's Context
+    if let Some(current_arc) = task::get_task(current_id) {
+        let mut current = current_arc.lock();
+
+        // Stack layout (pushed in reverse order in handler):
+        // [ss, rsp, rflags, cs, rip, rax, rcx, rdx, rsi, rdi, r8, r9, r10, r11]
+        // At saved_rsp: r11 is first (top of stack)
+        unsafe {
+            let frame_ptr = saved_rsp as *const u64;
+
+            current.context.r11 = *frame_ptr.add(0);
+            current.context.r10 = *frame_ptr.add(1);
+            current.context.r9 = *frame_ptr.add(2);
+            current.context.r8 = *frame_ptr.add(3);
+            current.context.rdi = *frame_ptr.add(4);
+            current.context.rsi = *frame_ptr.add(5);
+            current.context.rdx = *frame_ptr.add(6);
+            current.context.rcx = *frame_ptr.add(7);
+            current.context.rax = *frame_ptr.add(8);
+            current.context.rip = *frame_ptr.add(9);
+            current.context.cs = *frame_ptr.add(10);
+            current.context.rflags = *frame_ptr.add(11);
+            current.context.rsp = *frame_ptr.add(12);
+            current.context.ss = *frame_ptr.add(13);
+        }
+    }
+
+    // Re-enqueue current task
+    enqueue(current_id);
+
+    // Get next task
+    let next_id = match schedule_next() {
+        Some(id) => id,
+        None => current_id, // No other task, continue current
+    };
+
+    if next_id != current_id {
+        crate::serial_println!("[PREEMPT] {} -> {}", current_id, next_id);
+    }
+
+    // Update current task
+    task::set_current_task(next_id);
+
+    // Record context switch
+    super::statistics::record_context_switch(next_id);
+
+    // Get next task's context
+    let next_arc = task::get_task(next_id).expect("Next task not found");
+    let next = next_arc.lock();
+
+    // Switch page table if different
+    if next.page_table_phys != 0 {
+        unsafe {
+            crate::memory::paging::switch_page_table(next.page_table_phys);
+        }
+    }
+
+    // Update context pointer for syscalls
+    let ctx_ptr = &next.context as *const task::Context;
+    crate::arch::x86_64::syscall::set_current_context_ptr(ctx_ptr as *mut task::Context);
+
+    // Return pointer to context for restore
+    ctx_ptr as usize
+}

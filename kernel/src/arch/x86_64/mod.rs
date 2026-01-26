@@ -6,14 +6,16 @@ pub mod interrupts;
 pub mod apic;
 pub mod acpi;
 pub mod syscall;
+pub mod syscall_stack;  // NEW: Stack-based syscall handler
 pub mod usermode;
 pub mod cpu_freq;
+pub mod interrupt_frame;
 
 // Re-export with module-specific names
 pub use gdt::init as gdt_init;
 pub use idt::init as idt_init;
 pub use interrupts::enable as interrupts_enable;
-pub use apic::init as apic_init;
+pub use apic::{init as apic_init, enable_timer, disable_timer, tick, send_eoi, get_ticks};
 pub use acpi::init as acpi_init;
 pub use syscall::init as syscall_init;
 pub use cpu_freq::{init as cpu_freq_init, set_cpu_freq, set_power_save, set_base, set_turbo, current_frequency};
