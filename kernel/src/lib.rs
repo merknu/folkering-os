@@ -90,6 +90,11 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
         arch::x86_64::syscall_init();
         serial_println!("[SYSCALL] Fast system calls enabled (8 syscalls registered)\n");
 
+        // Initialize CPU frequency scaling
+        serial_println!("[INIT] Initializing CPU frequency scaling...");
+        arch::x86_64::cpu_freq_init();
+        serial_println!("[CPU_FREQ] Dynamic voltage and frequency scaling ready\n");
+
         // Initialize paging subsystem
         serial_println!("[INIT] Initializing page table mapper...");
         memory::paging::init(boot_info);

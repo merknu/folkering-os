@@ -362,8 +362,8 @@ fn apply_brain_hint(hint: &BrainBridgeSnapshot, cpu_boost: &mut bool) {
             // High-confidence compilation detected
             if !*cpu_boost {
                 crate::serial_println!("[SCHED_HINT] Boosting CPU for compilation");
-                // In a real implementation, would call:
-                // crate::arch::set_cpu_freq(3500); // 3.5GHz
+                // Boost CPU to maximum performance
+                crate::arch::x86_64::set_cpu_freq(3500); // 3.5GHz
                 *cpu_boost = true;
             }
 
@@ -394,8 +394,9 @@ fn apply_brain_hint(hint: &BrainBridgeSnapshot, cpu_boost: &mut bool) {
         IntentType::Idle => {
             // No specific workload, reduce to power-saving mode
             if *cpu_boost {
-                crate::serial_println!("[SCHED_HINT] Returning to normal CPU frequency");
-                // crate::arch::set_cpu_freq(2000); // 2.0GHz base
+                crate::serial_println!("[SCHED_HINT] Returning to power-saving CPU frequency");
+                // Return to base frequency or power save
+                crate::arch::x86_64::set_base(); // Base frequency (typically 2.0-2.4 GHz)
                 *cpu_boost = false;
             }
         },
