@@ -48,6 +48,9 @@ impl EnhancedScheduler {
 
         let current_time = crate::timer::uptime_ms();
 
+        // Record scheduler invocation
+        super::statistics::record_scheduler_invocation();
+
         // Check for brain hints periodically
         if current_time - self.last_hint_check >= self.hint_check_interval {
             self.last_hint_check = current_time;
@@ -255,6 +258,10 @@ pub fn yield_cpu() {
     // CRITICAL DEBUG: Print immediately at function entry
     crate::serial_println!("[YIELD_CPU] Function entered!");
 
+    // Record voluntary yield
+    let current_id = task::get_current_task();
+    super::statistics::record_voluntary_yield(current_id);
+
     // DEBUG: Set marker 100 at yield entry
     crate::arch::x86_64::syscall::set_debug_marker(100);
 
@@ -316,6 +323,9 @@ pub fn yield_cpu() {
 
     // Update current task
     task::set_current_task(next_id);
+
+    // Record context switch
+    super::statistics::record_context_switch(next_id);
 
     // Update current context pointer for syscalls
     crate::arch::x86_64::syscall::set_current_context_ptr(target_ctx_ptr as *mut task::Context);

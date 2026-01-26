@@ -5,6 +5,7 @@
 use x86_64::registers::model_specific::{Efer, EferFlags, LStar, Star};
 use x86_64::structures::gdt::SegmentSelector;
 use x86_64::{VirtAddr, PrivilegeLevel};
+use crate::task::task;
 
 /// Syscall numbers
 #[repr(u64)]
@@ -28,8 +29,168 @@ pub enum Syscall {
     Yield = 7,
 }
 
+/// Debug function called from int_syscall_entry
+#[no_mangle]
+extern "C" fn debug_int_entry() {
+    static mut ENTRY_COUNT: u64 = 0;
+    unsafe {
+        ENTRY_COUNT += 1;
+        if ENTRY_COUNT <= 5 {
+            crate::serial_println!("[INT_ENTRY] int_syscall_entry() started (call #{})", ENTRY_COUNT);
+        } else if ENTRY_COUNT == 6 {
+            let syscall_count = SYSCALL_COUNT.load(core::sync::atomic::Ordering::Relaxed);
+            let marker = DEBUG_MARKER.load(core::sync::atomic::Ordering::Relaxed);
+            crate::serial_println!("[INT_ENTRY] (suppressing further messages, syscall loop running...)");
+            crate::serial_println!("[INT_ENTRY] Current syscall counter: {}", syscall_count);
+            crate::serial_println!("[INT_ENTRY] Current debug marker: {:#x}", marker);
+        } else if ENTRY_COUNT % 100 == 0 {
+            let syscall_count = SYSCALL_COUNT.load(core::sync::atomic::Ordering::Relaxed);
+            crate::serial_println!("[INT_ENTRY] Syscall count at entry #{}: {}", ENTRY_COUNT, syscall_count);
+        }
+    }
+}
+
+/// Debug function called after yield returns
+#[no_mangle]
+extern "C" fn debug_after_yield() {
+    static mut AFTER_YIELD_COUNT: u64 = 0;
+    unsafe {
+        AFTER_YIELD_COUNT += 1;
+        if AFTER_YIELD_COUNT <= 5 {
+            crate::serial_println!("[INT_ENTRY] After yield returned (count={})", AFTER_YIELD_COUNT);
+        }
+    }
+}
+
+/// INT 0x80 syscall entry
+/// Solution from Phil Opp + Redox research:
+/// Switch to dedicated kernel stack, build fresh IRETQ frame there
+#[unsafe(naked)]
+pub unsafe extern "C" fn int_syscall_entry() {
+    core::arch::naked_asm!(
+        // INT has pushed: SS, RSP, RFLAGS, CS, RIP (on INT's stack)
+
+        // Call debug function FIRST to verify naked asm is executing
+        "call {debug_entry_fn}",
+
+        // Checkpoint 0xA0: INT entry
+        "push rax",
+        "mov rax, 0xA0",
+        "mov qword ptr [rip + {debug_marker}], rax",
+        "pop rax",
+
+        // Increment syscall counter (using INT's stack briefly)
+        "push rax",
+        "mov rax, qword ptr [rip + {syscall_counter}]",
+        "inc rax",
+        "mov qword ptr [rip + {syscall_counter}], rax",
+        "pop rax",
+
+        // Checkpoint 0xA1: After counter increment
+        "push rax",
+        "mov rax, 0xA1",
+        "mov qword ptr [rip + {debug_marker}], rax",
+        "pop rax",
+
+        // NOTE: INT frame was already popped by int_0x80_handler
+        // We're now on the TSS stack but without the frame
+
+        // Switch to dedicated kernel stack
+        "lea rsp, [rip + {kernel_stack}]",
+        "add rsp, 16384",  // Top of stack
+
+        // Checkpoint 0xA2: After stack switch
+        "mov qword ptr [rip + {debug_marker}], 0xA2",
+
+        // Call yield unconditionally (simplifies logic for now)
+        // Context was already saved by previous syscall or spawn
+        "call {yield_fn}",
+
+        // Checkpoint 0xA3: After yield returned
+        "mov qword ptr [rip + {debug_marker}], 0xA3",
+
+        // Debug: Call after-yield function
+        "call {debug_after_yield_fn}",
+
+        // After yield, get NEW context (task switched!)
+        "call {get_ctx_fn}",
+        "mov r11, rax",    // R11 = context pointer
+
+        // Checkpoint 0xA4: After get_ctx_fn, save context pointer
+        "mov qword ptr [rip + {debug_ctx_ptr}], r11",
+        "mov qword ptr [rip + {debug_marker}], 0xA4",
+
+        // Save IRETQ frame values for debugging BEFORE building frame
+        "mov rax, [r11 + 128]",   // RIP
+        "mov qword ptr [rip + {debug_rip}], rax",
+        "mov rax, [r11 + 0]",     // RSP
+        "mov qword ptr [rip + {debug_rsp}], rax",
+        "mov rax, [r11 + 136]",   // RFLAGS
+        "mov qword ptr [rip + {debug_rflags}], rax",
+
+        // Checkpoint 0xA5: After saving debug values
+        "mov qword ptr [rip + {debug_marker}], 0xA5",
+
+        // Build IRETQ frame on kernel stack (like restore_context_only)
+        "mov rax, [r11 + 152]",   // SS
+        "push rax",
+        "mov rax, [r11 + 0]",     // RSP
+        "push rax",
+        "mov rax, [r11 + 136]",   // RFLAGS
+        "push rax",
+        "mov rax, [r11 + 144]",   // CS
+        "push rax",
+        "mov rax, [r11 + 128]",   // RIP
+        "push rax",
+
+        // Checkpoint 0xA6: After building IRETQ frame
+        "mov qword ptr [rip + {debug_marker}], 0xA6",
+
+        // Restore all registers from context
+        "mov rax, [r11 + 16]",
+        "mov rbx, [r11 + 24]",
+        "mov rcx, [r11 + 32]",
+        "mov rdx, [r11 + 40]",
+        "mov rsi, [r11 + 48]",
+        "mov rdi, [r11 + 56]",
+        "mov rbp, [r11 + 8]",
+        "mov r8, [r11 + 64]",
+        "mov r9, [r11 + 72]",
+        "mov r10, [r11 + 80]",
+        "mov r12, [r11 + 96]",
+        "mov r13, [r11 + 104]",
+        "mov r14, [r11 + 112]",
+        "mov r15, [r11 + 120]",
+
+        // Restore R11 last
+        "mov r11, [r11 + 88]",
+
+        // Checkpoint 0xA7: Before IRETQ (can't set - no free registers!)
+        // The debug_marker will be 0xA6 when we crash
+
+        // IRETQ from kernel stack!
+        "iretq",
+
+        get_ctx_fn = sym get_current_task_context_ptr,
+        yield_fn = sym syscall_do_yield,
+        syscall_counter = sym SYSCALL_COUNT,
+        kernel_stack = sym SYSCALL_STACK,
+        debug_marker = sym DEBUG_MARKER,
+        debug_ctx_ptr = sym DEBUG_CONTEXT_PTR,
+        debug_rip = sym DEBUG_RIP,
+        debug_rsp = sym DEBUG_RSP,
+        debug_rflags = sym DEBUG_RFLAGS,
+        debug_entry_fn = sym debug_int_entry,
+        debug_after_yield_fn = sym debug_after_yield,
+    );
+}
+
 /// Initialize syscall support
 pub fn init() {
+    // Set initialization marker to verify new code is loaded
+    DEBUG_MARKER.store(0xBEEF, core::sync::atomic::Ordering::Relaxed);
+    crate::serial_println!("[SYSCALL_INIT] DEBUG_MARKER initialized to 0xBEEF");
+
     // Enable SYSCALL/SYSRET extensions
     unsafe {
         Efer::update(|flags| {
@@ -37,18 +198,36 @@ pub fn init() {
         });
     }
 
+    // Verify SYSCALL is enabled
+    let efer = Efer::read();
+    crate::serial_println!("[SYSCALL_INIT] EFER.SCE = {}", efer.contains(EferFlags::SYSTEM_CALL_EXTENSIONS));
+
     // Set syscall handler entry point
     let entry_addr = syscall_entry as u64;
+    crate::serial_println!("[SYSCALL_INIT] syscall_entry function address: {:#x}", entry_addr);
     LStar::write(VirtAddr::new(entry_addr));
+
+    let lstar_check = LStar::read();
+    crate::serial_println!("[SYSCALL_INIT] LSTAR set to {:#x}", lstar_check.as_u64());
+
+    if lstar_check.as_u64() != entry_addr {
+        crate::serial_println!("[SYSCALL_INIT] WARNING: LSTAR mismatch!");
+    }
 
     // Configure STAR MSR for SYSCALL/SYSRET
     // STAR[47:32] = kernel CS for SYSCALL
     // STAR[63:48] = base for SYSRET (SYSRET adds +16 for CS, +8 for SS)
+    // With our GDT: user_data=0x18, user_code=0x20, so base must be 0x10
+    // SYSRET will set: CS = (0x10 + 16) | 3 = 0x23, SS = (0x10 + 8) | 3 = 0x1B
     let kernel_cs = super::gdt::kernel_code_selector();
+    let kernel_data = super::gdt::kernel_data_selector();  // 0x10
 
     let star_value: u64 =
-        ((kernel_cs.0 as u64) << 32) |  // Kernel CS for SYSCALL
-        ((kernel_cs.0 as u64) << 48);   // Base for SYSRET
+        ((kernel_cs.0 as u64) << 32) |   // Kernel CS for SYSCALL
+        ((kernel_data.0 as u64) << 48);  // Base for SYSRET
+
+    crate::serial_println!("[SYSCALL_INIT] Setting STAR to {:#x} (kernel_cs={:#x}, sysret_base={:#x})",
+        star_value, kernel_cs.0, kernel_data.0);
 
     unsafe {
         use x86_64::registers::model_specific::Msr;
@@ -57,10 +236,281 @@ pub fn init() {
     }
 }
 
+/// Per-CPU context pointer (single-core for now)
+/// This is set during context switch to avoid mutex locking in syscall path
+static CURRENT_CONTEXT_PTR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Kernel syscall stack (16KB)
+/// Used for handling syscalls - SYSCALL doesn't switch stacks automatically
+#[no_mangle]
+#[link_section = ".bss"]
+static mut SYSCALL_STACK: [u8; 16384] = [0; 16384];
+
+/// Syscall counter for debugging
+#[no_mangle]
+static SYSCALL_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Debug marker for tracking exact crash location
+#[no_mangle]
+pub static DEBUG_MARKER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Debug: Last context pointer value (for crash analysis)
+/// Also used to store RIP before IRETQ
+#[no_mangle]
+static DEBUG_CONTEXT_PTR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Debug: RIP value before IRETQ
+#[no_mangle]
+static DEBUG_RIP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Debug: RAX value at yield check
+#[no_mangle]
+static DEBUG_RAX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Debug: RSP value before IRETQ
+#[no_mangle]
+static DEBUG_RSP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Debug: RFLAGS value before IRETQ
+#[no_mangle]
+static DEBUG_RFLAGS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Debug: RCX value at syscall entry (saved RIP from SYSCALL instruction)
+#[no_mangle]
+static DEBUG_RCX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Temporary storage for user R15 during syscall (R15 is used as Context pointer)
+#[no_mangle]
+static USER_R15_SAVE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Get the current syscall count
+pub fn get_syscall_count() -> u64 {
+    SYSCALL_COUNT.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Get the debug marker value
+pub fn get_debug_marker() -> u64 {
+    DEBUG_MARKER.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Get DEBUG_RAX value
+pub fn get_debug_rax() -> u64 {
+    DEBUG_RAX.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set the debug marker value (for debugging from Rust code)
+pub fn set_debug_marker(value: u64) {
+    DEBUG_MARKER.store(value, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Get the debug context pointer value
+pub fn get_debug_context_ptr() -> u64 {
+    DEBUG_CONTEXT_PTR.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Debug function to save R15 value
+#[no_mangle]
+extern "C" fn debug_save_r15_value(value: u64) {
+    DEBUG_CONTEXT_PTR.store(value, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Get the debug RIP value
+pub fn get_debug_rip() -> u64 {
+    DEBUG_RIP.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Get the debug RSP value
+pub fn get_debug_rsp() -> u64 {
+    DEBUG_RSP.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Get the debug RFLAGS value
+pub fn get_debug_rflags() -> u64 {
+    DEBUG_RFLAGS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Get the debug RCX value (saved RIP from SYSCALL)
+pub fn get_debug_rcx() -> u64 {
+    DEBUG_RCX.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Debug: Check if page is mapped before IRETQ
+#[no_mangle]
+extern "C" fn debug_check_page_mapping(rip: u64) {
+    use crate::memory::paging;
+
+    crate::serial_println!("[DEBUG_IRETQ] About to IRETQ to RIP={:#x}", rip);
+
+    match paging::translate(rip as usize) {
+        Some(phys) => {
+            crate::serial_println!("[DEBUG_IRETQ] RIP page IS mapped: virt={:#x} -> phys={:#x}", rip, phys);
+        }
+        None => {
+            crate::serial_println!("[DEBUG_IRETQ] ERROR: RIP page NOT MAPPED! virt={:#x}", rip);
+        }
+    }
+}
+
+/// Debug: Check RSP value before building IRETQ frame
+#[no_mangle]
+extern "C" fn debug_check_rsp(rsp: u64) {
+    crate::serial_println!("[DEBUG_IRETQ] Kernel RSP before building frame: {:#x}", rsp);
+
+    // Check if RSP is in valid kernel range
+    if rsp < 0xFFFF_8000_0000_0000 {
+        crate::serial_println!("[DEBUG_IRETQ] ERROR: RSP is NOT in kernel space!");
+    } else if rsp == 0 {
+        crate::serial_println!("[DEBUG_IRETQ] ERROR: RSP is 0!");
+    } else {
+        crate::serial_println!("[DEBUG_IRETQ] RSP looks valid (kernel space)");
+    }
+}
+
+/// Debug: Show all IRETQ frame values before pushing
+#[no_mangle]
+extern "C" fn debug_show_iretq_frame(ctx_ptr: u64) {
+    use crate::task::task::Context;
+    use crate::memory::paging;
+
+    let ctx = unsafe { &*(ctx_ptr as *const Context) };
+
+    crate::serial_println!("[DEBUG_IRETQ] IRETQ frame values:");
+    crate::serial_println!("  RIP:    {:#x}", ctx.rip);
+    crate::serial_println!("  CS:     {:#x}", ctx.cs);
+    crate::serial_println!("  RFLAGS: {:#x}", ctx.rflags);
+    crate::serial_println!("  RSP:    {:#x}", ctx.rsp);
+    crate::serial_println!("  SS:     {:#x}", ctx.ss);
+
+    // Check if user stack page is mapped
+    match paging::translate(ctx.rsp as usize) {
+        Some(phys) => {
+            crate::serial_println!("[DEBUG_IRETQ] User stack IS mapped: virt={:#x} -> phys={:#x}", ctx.rsp, phys);
+        }
+        None => {
+            crate::serial_println!("[DEBUG_IRETQ] ERROR: User stack NOT MAPPED! virt={:#x}", ctx.rsp);
+        }
+    }
+}
+
+/// Set the current context pointer (called during task switch)
+pub fn set_current_context_ptr(ptr: *mut crate::task::task::Context) {
+    let ptr_val = ptr as usize;
+    crate::serial_println!("[SET_CTX_PTR] Setting CURRENT_CONTEXT_PTR to {:#x}", ptr_val);
+    CURRENT_CONTEXT_PTR.store(ptr_val, core::sync::atomic::Ordering::Release);
+    // Verify it was stored
+    let stored = CURRENT_CONTEXT_PTR.load(core::sync::atomic::Ordering::Acquire);
+    crate::serial_println!("[SET_CTX_PTR] Verified stored value: {:#x}", stored);
+}
+
+/// Get current task's context pointer (lock-free, fast path for syscalls)
+#[no_mangle]
+extern "C" fn get_current_task_context_ptr() -> *mut crate::task::task::Context {
+    let ptr = CURRENT_CONTEXT_PTR.load(core::sync::atomic::Ordering::Acquire) as *mut _;
+    static mut CALL_COUNT: u64 = 0;
+    unsafe {
+        CALL_COUNT += 1;
+        // Always print to see when it returns bad values
+        let ptr_addr = ptr as usize;
+        crate::serial_println!("[GET_CTX #{}] -> {:#x}", CALL_COUNT, ptr_addr);
+        if ptr_addr == 0 {
+            crate::serial_println!("[GET_CTX] WARNING: Returning NULL pointer!");
+        } else if ptr_addr < 0xFFFF_FF00_0000_0000 {
+            crate::serial_println!("[GET_CTX] WARNING: Pointer looks like kernel address, not heap!");
+        }
+    }
+    ptr
+}
+
+/// Yield CPU from syscall (may not return if task switch)
+#[no_mangle]
+extern "C" fn syscall_do_yield() {
+    static mut YIELD_COUNT: u64 = 0;
+    unsafe {
+        YIELD_COUNT += 1;
+        if YIELD_COUNT <= 5 {
+            crate::serial_println!("[YIELD] syscall_do_yield called (count={})", YIELD_COUNT);
+        }
+    }
+    crate::task::scheduler::yield_cpu();
+}
+
+/// Debug function to print syscall entry state
+#[inline(never)]
+#[no_mangle]
+extern "C" fn debug_syscall_entry(rcx: u64, rax: u64) {
+    static mut CALL_COUNT: u64 = 0;
+    unsafe {
+        CALL_COUNT += 1;
+        crate::serial_println!("[SYSCALL_ENTRY] Call #{}: RAX={:#x} (syscall num), RCX={:#x} (saved RIP)",
+                              CALL_COUNT, rax, rcx);
+    }
+}
+
+/// Debug function to print saved context
+#[inline(never)]
+#[no_mangle]
+extern "C" fn debug_context_saved(ctx_ptr: usize) {
+    static mut CALL_COUNT: u64 = 0;
+    unsafe {
+        CALL_COUNT += 1;
+        let ctx = &*(ctx_ptr as *const crate::task::task::Context);
+        crate::serial_println!("[CONTEXT_SAVED] Call #{}: Context at {:#x}, RIP={:#x}, RSP={:#x}",
+                              CALL_COUNT, ctx_ptr, ctx.rip, ctx.rsp);
+    }
+}
+
+/// Debug: Increment entry counter
+#[no_mangle]
+extern "C" fn debug_syscall_entry_hit(rax: u64) {
+    static mut COUNT: u64 = 0;
+    unsafe {
+        COUNT += 1;
+        // Print for first few syscalls
+        if COUNT <= 7 {
+            let rcx_val = DEBUG_RCX.load(core::sync::atomic::Ordering::Relaxed);
+            crate::serial_println!("[SYSCALL #{}] RAX={}, RCX_at_entry={:#x}", COUNT, rax, rcx_val);
+        }
+    }
+}
+
+#[no_mangle]
+extern "C" fn debug_before_yield_check(rax: u64) {
+    static mut COUNT: u64 = 0;
+    unsafe {
+        COUNT += 1;
+        if COUNT <= 3 {
+            crate::serial_println!("[YIELD_CHECK] Before comparison #{}: RAX={}", COUNT, rax);
+        }
+    }
+}
+
+#[no_mangle]
+extern "C" fn debug_iretq_frame(rip: u64, cs: u64, rflags: u64, rsp: u64, ss: u64) {
+    static mut COUNT: u64 = 0;
+    unsafe {
+        COUNT += 1;
+        crate::serial_println!("[IRETQ_FRAME #{}] RIP={:#x}, CS={:#x}, RFLAGS={:#x}, RSP={:#x}, SS={:#x}",
+            COUNT, rip, cs, rflags, rsp, ss);
+    }
+}
+
+/// Debug: print context before loading for IRETQ
+#[no_mangle]
+extern "C" fn debug_context_values(ctx_ptr: usize) {
+    unsafe {
+        let ctx = &*(ctx_ptr as *const crate::task::task::Context);
+        crate::serial_println!("[CTX_DEBUG] Context at {:#x}:", ctx_ptr);
+        crate::serial_println!("  RIP={:#x}, CS={:#x}, RFLAGS={:#x}", ctx.rip, ctx.cs, ctx.rflags);
+        crate::serial_println!("  RSP={:#x}, SS={:#x}", ctx.rsp, ctx.ss);
+        crate::serial_println!("  RAX={:#x}, RCX={:#x}", ctx.rax, ctx.rcx);
+    }
+}
+
 /// Syscall entry point
 ///
-/// Simplified version without GS base switching for MVP.
-/// Uses current stack (kernel stack from task structure).
+/// Saves ALL registers to current task's Context on entry.
+/// For yield, switches tasks. For other syscalls, calls handler.
+/// Restores from (possibly different) task's Context on exit.
 ///
 /// # Register Convention (x86-64 SYSCALL)
 /// - RAX: syscall number
@@ -75,54 +525,372 @@ pub fn init() {
 #[unsafe(naked)]
 extern "C" fn syscall_entry() {
     core::arch::naked_asm!(
-        // Save callee-saved registers (caller-saved are preserved by C ABI)
-        "push rcx",         // Save return RIP
-        "push r11",         // Save return RFLAGS
-        "push rbx",
-        "push rbp",
-        "push r12",
-        "push r13",
-        "push r14",
-        "push r15",
+        // SYSCALL saved: RIP→RCX, RFLAGS→R11, switched to kernel CS/SS
 
-        // Rearrange arguments for C ABI (System V AMD64):
-        // C ABI expects: RDI, RSI, RDX, RCX, R8, R9
-        // We have: RAX=syscall#, RDI=arg1, RSI=arg2, RDX=arg3, R10=arg4, R8=arg5, R9=arg6
-        // Need to shift: syscall# → RDI, arg1 → RSI, arg2 → RDX, arg3 → RCX, arg4 → R8, arg5 → R9
+        // CRITICAL FIRST STEP: Save user RSP before touching stack!
+        // SYSCALL doesn't switch stacks, so RSP still points to user stack
+        "mov r14, rsp",  // R14 = user RSP (BEFORE any pushes!)
 
-        // Save RAX (syscall number) temporarily
+        // CRITICAL SECOND STEP: Save RCX and R11 to safe registers
+        // These are caller-saved and will be corrupted by function calls
+        // We can't push them yet because we're still on user stack
+        "mov r12, rcx",  // R12 = user RIP (from SYSCALL)
+        "mov r13, r11",  // R13 = user RFLAGS (from SYSCALL)
+
+        // DEBUG: Save RCX (user RIP) from R12
         "push rax",
+        "mov rax, r12",
+        "mov qword ptr [rip + {debug_rcx}], rax",
+        "mov qword ptr [rip + {debug_rip}], rax",
+        "pop rax",
 
-        // Shift arguments: arg6→arg7, arg5→arg6, arg4→arg5, arg3→arg4, arg2→arg3, arg1→arg2
-        "mov r9, r8",       // arg5 → arg6
-        "mov r8, r10",      // arg4 → arg5
-        "mov rcx, rdx",     // arg3 → arg4
-        "mov rdx, rsi",     // arg2 → arg3
-        "mov rsi, rdi",     // arg1 → arg2
+        // DEBUG: Call function to verify we entered and check syscall number
+        "push rax",       // Save RAX (function will overwrite it with return value!)
+        "push rdi",
+        "mov rdi, rax",   // Pass RAX (syscall number) as first arg
+        "call {debug_entry_hit}",
+        "pop rdi",
+        "pop rax",        // Restore RAX
 
-        // Pop syscall number into RDI (first argument)
+        // Increment syscall counter (for debugging)
+        "push rax",
+        "mov rax, qword ptr [rip + {syscall_counter}]",
+        "inc rax",
+        "mov qword ptr [rip + {syscall_counter}], rax",
+        "pop rax",
+
+        // Step 0: Switch to kernel stack immediately
+
+        // Load kernel stack pointer (top of SYSCALL_STACK)
+        "lea rsp, [rip + {syscall_stack}]",  // Load base address
+        "add rsp, 16384",                     // Add stack size to get top
+
+        // Step 1: Get current task's Context pointer
+        // R12 and R13 are callee-saved, so they'll survive the call
+        // We only need to save caller-saved registers that we care about
+
+        // DEBUG: Save RAX before first push (should be 7)
+        "push rbx",
+        "mov rbx, rax",
+        "mov qword ptr [rip + {debug_rax}], rbx",  // Save RAX before ANY pushes
+        "pop rbx",
+
+        // Save user R15 to static (we'll need R15 for Context pointer)
+        "push rax",
+        "mov rax, r15",
+        "mov qword ptr [rip + {user_r15_save}], rax",
+        "pop rax",
+
+        "push rax",      // Syscall number
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r14",      // User RSP
+
+        "call {get_ctx_fn}",
+        // RAX now has Context* (or NULL if error)
+
+        "mov r15, rax",  // R15 = Context pointer (overwrites user R15!)
+
+        // Restore all saved registers (R12/R13 still have user RIP/RFLAGS)
+        "pop r14",       // User RSP
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop rax",       // Syscall number
+
+        // R12 and R13 weren't pushed, so don't pop them!
+        // They still contain user RIP and RFLAGS
+
+        // DEBUG: Verify R12 (user RIP) is correct
+        "push rbx",
+        "mov rbx, r12",
+        "mov qword ptr [rip + {debug_rsp}], rbx",  // Abuse DEBUG_RSP for R12-after-call
+        "pop rbx",
+
+        // DEBUG: Save RAX immediately after pop to verify stack is correct
+        "push rbx",
+        "mov rbx, rax",
+        "mov qword ptr [rip + {debug_rax}], rbx",  // Should be 7 if pop worked
+        "pop rbx",
+
+        // Note: Assuming R15 is valid (if NULL, we're in big trouble anyway)
+
+        // Step 2: Save ALL registers to Context
+        // Context layout: rsp, rbp, rax, rbx, rcx, rdx, rsi, rdi,
+        //                 r8, r9, r10, r11, r12, r13, r14, r15,
+        //                 rip, rflags, cs, ss
+        // Note: R12 has user RIP, R13 has user RFLAGS, user R15 is in USER_R15_SAVE static
+
+        "mov [r15 + 0], r14",      // RSP (user RSP saved before stack switch)
+        "mov [r15 + 8], rbp",      // RBP
+        "mov [r15 + 16], rax",     // RAX (syscall number)
+        "mov [r15 + 24], rbx",     // RBX
+        "mov [r15 + 32], r12",     // RCX slot = user RIP (from R12)
+        "mov [r15 + 40], rdx",     // RDX
+        "mov [r15 + 48], rsi",     // RSI
+        "mov [r15 + 56], rdi",     // RDI
+        "mov [r15 + 64], r8",      // R8
+        "mov [r15 + 72], r9",      // R9
+        "mov [r15 + 80], r10",     // R10
+        "mov [r15 + 88], r13",     // R11 slot = user RFLAGS (from R13)
+        "mov [r15 + 96], r12",     // R12 (also save to its own slot)
+        "mov [r15 + 104], r13",    // R13 (also save to its own slot)
+        "mov [r15 + 112], r14",    // R14
+
+        // Save user R15 from static
+        "push rbx",
+        "mov rbx, qword ptr [rip + {user_r15_save}]",
+        "mov [r15 + 120], rbx",    // R15 (user R15 value from static)
+        "pop rbx",
+
+        // DEBUG: Check R12 value RIGHT BEFORE saving to Context.rip
+        "push rax",
+        "mov rax, r12",
+        "mov qword ptr [rip + {debug_rflags}], rax",  // Abuse DEBUG_RFLAGS for R12-before-save
+        "pop rax",
+
+        "mov [r15 + 128], r12",    // RIP (user RIP from R12)
+        "mov [r15 + 136], r13",    // RFLAGS (user RFLAGS from R13)
+
+        // DEBUG: Save RAX value BEFORE push (should be syscall number = 7)
+        "push rbx",
+        "mov rbx, rax",
+        "mov qword ptr [rip + {debug_rax}], rbx",  // Save RAX before push
+        "pop rbx",
+
+        // DEBUG: Save what we wrote to Context.rip
+        "push rax",
+        "mov rax, [r15 + 128]",  // Load back what we just saved
+        "mov qword ptr [rip + {debug_rip}], rax",  // Save to DEBUG_RIP
+        "pop rax",
+
+        // DEBUG: Immediately save RAX after pop to verify it's still correct
+        "push rbx",
+        "mov rbx, rax",
+        "mov qword ptr [rip + {debug_rax}], rbx",  // Save RAX value right after pop
+        "pop rbx",
+
+        // Save USER segment selectors (SYSCALL switches to kernel segments,
+        // but we need user segments for IRETQ back to user mode)
+        "mov qword ptr [r15 + 144], 0x23",    // CS = user code (0x20 | RPL=3)
+        "mov qword ptr [r15 + 152], 0x1B",    // SS = user data (0x18 | RPL=3)
+
+        "cmp rax, 7",
+        "je yield_path",   // Jump to yield path
+
+        // DEBUG: If we reach here, we didn't jump to yield_path
+        "push rax",
+        "mov rax, 0xBB",
+        "mov qword ptr [rip + {debug_marker}], rax",
+        "pop rax",
+
+        // Normal syscall path
+        // Rearrange arguments for C ABI
+        "normal_path:",
+        "push rax",
+        "mov r9, r8",
+        "mov r8, r10",
+        "mov rcx, rdx",
+        "mov rdx, rsi",
+        "mov rsi, rdi",
         "pop rdi",
 
-        // Call Rust syscall handler
-        // Signature: fn(syscall_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64, arg6: u64) -> u64
         "call {handler}",
 
-        // Return value in RAX (preserved automatically)
+        // Handler returned with result in RAX
+        // Check if result is 0xFFFF_FFFF_FFFF_FFFE (EWOULDBLOCK - should yield)
+        "mov r14, rax",           // R14 = return value
+        "mov r13, 0xFFFFFFFFFFFFFFFE", // R13 = EWOULDBLOCK marker
+        "cmp rax, r13",
+        "je yield_path",          // If EWOULDBLOCK, go to yield path
 
-        // Restore callee-saved registers
-        "pop r15",
-        "pop r14",
-        "pop r13",
-        "pop r12",
-        "pop rbp",
-        "pop rbx",
-        "pop r11",          // Restore RFLAGS
-        "pop rcx",          // Restore RIP
+        // Normal return path - restore and return to user
+        // Step 4: Restore from (possibly same) task's Context
+        "call {get_ctx_fn}",
+        "mov r15, rax",
 
-        // Return to userspace
-        "sysretq",
+        // Restore all registers from Context (EXCEPT RAX - use return value!)
+        "mov r11, [r15 + 136]",   // RFLAGS
+        "mov rcx, [r15 + 128]",   // RIP
+        // Skip RAX - use handler return value (in R14)
+        "mov rbx, [r15 + 24]",
+        "mov rdx, [r15 + 40]",
+        "mov rsi, [r15 + 48]",
+        "mov rdi, [r15 + 56]",
+        "mov rbp, [r15 + 8]",
+        "mov r8, [r15 + 64]",
+        "mov r9, [r15 + 72]",
+        "mov r10, [r15 + 80]",
+        "mov r12, [r15 + 96]",
+        "mov r13, [r15 + 104]",
+        // R14 has return value, restore later
+        "mov rax, r14",           // RAX = return value from handler
+        "mov r14, [r15 + 112]",   // Now restore R14
 
-        handler = sym syscall_handler
+        // Build IRETQ frame: SS, RSP, RFLAGS, CS, RIP
+        "push qword ptr [r15 + 152]",  // SS
+        "push qword ptr [r15 + 0]",    // RSP
+        "push r11",                     // RFLAGS (already in R11)
+        "push qword ptr [r15 + 144]",  // CS
+        "push rcx",                     // RIP (already in RCX)
+
+        // Restore all registers
+        "mov rbx, [r15 + 24]",
+        "mov rdx, [r15 + 40]",
+        "mov rsi, [r15 + 48]",
+        "mov rdi, [r15 + 56]",
+        "mov rbp, [r15 + 8]",
+        "mov r8, [r15 + 64]",
+        "mov r9, [r15 + 72]",
+        "mov r10, [r15 + 80]",
+        "mov r12, [r15 + 96]",
+        "mov r13, [r15 + 104]",
+        "mov r14, [r15 + 112]",
+        "mov r15, [r15 + 120]",
+        // RAX already has return value (0 for yield)
+
+        "iretq",
+
+        // Yield path - switch to next task
+        "yield_path:",
+
+        // DEBUG: Mark that we entered yield path (checkpoint 0xCC first)
+        "push rax",
+        "mov rax, 0xCC",
+        "mov qword ptr [rip + {debug_marker}], rax",
+        "pop rax",
+
+        // DEBUG: Second marker for yield path
+        "push rax",
+        "mov rax, 0xFF",
+        "mov qword ptr [rip + {debug_marker}], rax",
+        "pop rax",
+
+        // Update RAX in Context to return value (0 for yield)
+        "mov qword ptr [r15 + 16], 0",  // Set RAX=0 (yield return value)
+
+        // Debug: Increment counter before yield
+        "push rax",
+        "mov rax, qword ptr [rip + {syscall_counter}]",
+        "inc rax",
+        "mov qword ptr [rip + {syscall_counter}], rax",
+        "pop rax",
+
+        // Call yield function (does not return if task switch happens)
+        "call {yield_fn}",
+
+        // Debug: Increment counter after yield (if we returned)
+        "push rax",
+        "mov rax, qword ptr [rip + {syscall_counter}]",
+        "inc rax",
+        "mov qword ptr [rip + {syscall_counter}], rax",
+        "pop rax",
+
+        // Debug: Counter = 4 (after yield returned)
+        "push rax",
+        "mov rax, qword ptr [rip + {syscall_counter}]",
+        "inc rax",
+        "mov qword ptr [rip + {syscall_counter}], rax",
+        "pop rax",
+
+        // If we get here, no task switch - restore and return
+        "call {get_ctx_fn}",
+
+        // DEBUG: Call function to save Context* value
+        "push rdi",
+        "mov rdi, rax",  // Pass Context* as first arg
+        "call {debug_save_r15_fn}",
+        "pop rdi",
+
+        "mov r15, rax",
+
+        // Debug: Counter = 5 (after get_ctx_fn)
+        "push rax",
+        "mov rax, qword ptr [rip + {syscall_counter}]",
+        "inc rax",
+        "mov qword ptr [rip + {syscall_counter}], rax",
+        "pop rax",
+
+        // DEBUG: Verify R15 is valid before dereferencing
+        "push rax",
+        "mov rax, r15",
+        "mov qword ptr [rip + {debug_rcx}], rax",  // Save R15 value (abuse debug_rcx temporarily)
+        "pop rax",
+
+        "mov r11, [r15 + 136]",   // RFLAGS
+        "mov rcx, [r15 + 128]",   // RIP
+
+        // DEBUG: Verify Context address and CS/SS values
+        "push rax",
+        "mov rax, qword ptr [r15 + 144]",             // Load CS value
+        "mov qword ptr [rip + {debug_rsp}], rax",    // Save CS (abuse debug_rsp)
+        "mov rax, qword ptr [r15 + 152]",             // Load SS value
+        "mov qword ptr [rip + {debug_rflags}], rax", // Save SS (abuse debug_rflags)
+        "mov qword ptr [rip + {debug_rcx}], rcx",    // RCX = RIP value
+        "mov qword ptr [rip + {debug_rax}], r11",    // R11 = RFLAGS value
+        "mov rax, 0xABCD1234",
+        "mov qword ptr [rip + {debug_marker}], rax",
+        "pop rax",
+
+        // Build IRETQ frame on kernel stack (not user stack!)
+        // IRETQ pops: RIP, CS, RFLAGS, RSP, SS (so push in REVERSE order!)
+        "push qword ptr [r15 + 152]",  // SS (offset 152 = user data 0x1B)
+        "push qword ptr [r15 + 0]",    // RSP
+        "push r11",                     // RFLAGS (R11)
+        "push qword ptr [r15 + 144]",  // CS (offset 144 = user code 0x23)
+        "push rcx",                     // RIP (RCX)
+
+        // DEBUG: Verify IRETQ frame on stack
+        "push rax",
+        "mov rax, [rsp + 8]",           // RIP value (skip pushed RAX)
+        "mov qword ptr [rip + {debug_rip}], rax",
+        "mov rax, [rsp + 16]",          // CS value
+        "mov qword ptr [rip + {debug_rsp}], rax",
+        "mov rax, [rsp + 24]",          // RFLAGS value
+        "mov qword ptr [rip + {debug_rflags}], rax",
+        "pop rax",
+
+        // Restore all general-purpose registers (EXCEPT RCX/R11 which are in IRETQ frame!)
+        "xor rax, rax",           // RAX = 0 (yield return value)
+        "mov rbx, [r15 + 24]",
+        "mov rcx, [r15 + 32]",    // Restore user RCX
+        "mov rdx, [r15 + 40]",
+        "mov rsi, [r15 + 48]",
+        "mov rdi, [r15 + 56]",
+        "mov rbp, [r15 + 8]",
+        "mov r8, [r15 + 64]",
+        "mov r9, [r15 + 72]",
+        "mov r10, [r15 + 80]",
+        "mov r11, [r15 + 88]",    // Restore user R11
+        "mov r12, [r15 + 96]",
+        "mov r13, [r15 + 104]",
+        "mov r14, [r15 + 112]",
+        "mov r15, [r15 + 120]",   // R15 = user R15
+
+        // Return to user mode via IRETQ
+        "iretq",
+
+        get_ctx_fn = sym get_current_task_context_ptr,
+        handler = sym syscall_handler,
+        yield_fn = sym syscall_do_yield,
+        syscall_stack = sym SYSCALL_STACK,
+        syscall_counter = sym SYSCALL_COUNT,
+        user_r15_save = sym USER_R15_SAVE,
+        debug_rcx = sym DEBUG_RCX,
+        debug_rip = sym DEBUG_RIP,
+        debug_rax = sym DEBUG_RAX,
+        debug_rsp = sym DEBUG_RSP,
+        debug_rflags = sym DEBUG_RFLAGS,
+        debug_marker = sym DEBUG_MARKER,
+        debug_entry_hit = sym debug_syscall_entry_hit,
+        debug_save_r15_fn = sym debug_save_r15_value,
     );
 }
 
@@ -137,6 +905,10 @@ extern "C" fn syscall_handler(
     arg5: u64,
     arg6: u64,
 ) -> u64 {
+    // Record syscall invocation
+    let current_task = crate::task::task::get_current_task();
+    crate::task::statistics::record_syscall(current_task);
+
     match syscall_num {
         0 => syscall_ipc_send(arg1, arg2, arg3),
         1 => syscall_ipc_receive(arg1),
@@ -163,9 +935,6 @@ fn syscall_ipc_send(target: u64, payload0: u64, payload1: u64) -> u64 {
     use crate::ipc::{IpcMessage, IpcType, ipc_send};
     use crate::task::task::get_current_task;
 
-    crate::serial_println!("[SYSCALL] ipc_send_simple(target={}, payload0={:#x}, payload1={:#x})",
-                          target, payload0, payload1);
-
     // Create simple IPC message from register values
     let mut msg = IpcMessage::new_request([payload0, payload1, 0, 0]);
 
@@ -176,12 +945,11 @@ fn syscall_ipc_send(target: u64, payload0: u64, payload1: u64) -> u64 {
     let target_id = target as u32;
     match ipc_send(target_id, &msg) {
         Ok(reply) => {
-            crate::serial_println!("[SYSCALL] ipc_send SUCCESS - reply payload: {:#x}",
-                                  reply.payload[0]);
+            // Record IPC send
+            crate::task::statistics::record_ipc_sent(get_current_task());
             reply.payload[0] // Return first payload slot as result
         }
-        Err(err) => {
-            crate::serial_println!("[SYSCALL] ipc_send FAILED - error: {:?}", err);
+        Err(_err) => {
             u64::MAX // Error
         }
     }
@@ -222,24 +990,29 @@ fn syscall_ipc_send_full(target: u64, msg_ptr: u64, _flags: u64) -> u64 {
 }
 
 fn syscall_ipc_receive(_from_filter: u64) -> u64 {
-    use crate::ipc::ipc_receive;
+    use crate::ipc::{ipc_receive, send::Errno};
 
-    crate::serial_println!("[SYSCALL] ipc_receive_simple(from={})", _from_filter);
+    // Blocking loop - retry until message arrives
+    loop {
+        // Try to receive message
+        match ipc_receive() {
+            Ok(msg) => {
+                // Record IPC receive
+                let current_task = crate::task::task::get_current_task();
+                crate::task::statistics::record_ipc_received(current_task);
 
-    // Receive message (blocking)
-    // Note: from_filter currently ignored, accepts from any sender
-    match ipc_receive() {
-        Ok(msg) => {
-            crate::serial_println!("[SYSCALL] ipc_receive SUCCESS - from task {}, payload: {:#x}",
-                                  msg.sender, msg.payload[0]);
-            // Return sender ID in lower 32 bits, first payload in upper 32 bits
-            // This allows userspace to know who sent the message
-            let result = ((msg.payload[0] & 0xFFFFFFFF) << 32) | (msg.sender as u64);
-            result
-        }
-        Err(err) => {
-            crate::serial_println!("[SYSCALL] ipc_receive FAILED - error: {:?}", err);
-            u64::MAX
+                // Return sender ID in lower 32 bits, first payload in upper 32 bits
+                let result = ((msg.payload[0] & 0xFFFFFFFF) << 32) | (msg.sender as u64);
+                return result;
+            }
+            Err(Errno::EWOULDBLOCK) => {
+                // No messages available - task is marked as BlockedOnReceive
+                // Return special code to trigger yield from syscall_entry
+                return 0xFFFF_FFFF_FFFF_FFFE;
+            }
+            Err(_err) => {
+                return u64::MAX;
+            }
         }
     }
 }
@@ -306,6 +1079,8 @@ fn syscall_ipc_reply(payload0: u64, payload1: u64) -> u64 {
     match ipc_reply(&request_msg, reply_payload) {
         Ok(()) => {
             crate::serial_println!("[SYSCALL] ipc_reply SUCCESS");
+            // Record IPC reply
+            crate::task::statistics::record_ipc_replied(current_task_id);
             0 // Success
         }
         Err(err) => {
@@ -409,10 +1184,98 @@ fn syscall_exit(exit_code: u64) -> u64 {
 }
 
 fn syscall_yield() -> u64 {
-    crate::serial_println!("[SYSCALL] yield called from userspace!");
+    // This should never be called - yield is handled directly in syscall_entry
+    crate::serial_println!("[SYSCALL] ERROR: yield handler called (should be handled in assembly!)");
+    0
+}
 
-    // Yield CPU to scheduler
-    crate::task::yield_cpu();
+/// Debug: Print RAX value at syscall entry
+#[no_mangle]
+extern "C" fn debug_syscall_rax(rax_value: u64) {
+    crate::serial_println!("[SYSCALL_ENTRY] RAX={:#x} ({})", rax_value, rax_value);
+}
 
-    0 // Success
+/// Debug: Print RAX value before cmp
+#[no_mangle]
+extern "C" fn debug_syscall_rax_before_cmp(rax_value: u64) {
+    crate::serial_println!("[BEFORE_CMP] RAX={:#x} ({})", rax_value, rax_value);
+}
+
+// Debug: Print saved RIP (RCX from SYSCALL)
+#[no_mangle]
+extern "C" fn debug_saved_rip(rip_value: u64) {
+    crate::serial_println!("[SYSCALL_SAVE] Saved RIP={:#x}", rip_value);
+}
+
+/// Get current task's context pointer (simple version for assembly)
+#[no_mangle]
+extern "C" fn get_current_task_context_ptr_simple() -> *mut task::Context {
+    use crate::task::task;
+
+    let current_id = task::get_current_task();
+    if current_id == 0 {
+        return core::ptr::null_mut();
+    }
+
+    let task_arc = match task::get_task(current_id) {
+        Some(t) => t,
+        None => return core::ptr::null_mut(),
+    };
+
+    let mut task_locked = task_arc.lock();
+    &mut task_locked.context as *mut task::Context
+}
+
+/// Special yield path from syscall (called from assembly)
+///
+/// This function does NOT return if a task switch happens.
+/// Assumes current task's context has already been saved.
+/// Switches to next task and directly restores its context + IRETQ.
+#[no_mangle]
+extern "C" fn yield_cpu_from_syscall_asm() {
+    use crate::task::{scheduler, task};
+
+    // Disable interrupts
+    x86_64::instructions::interrupts::disable();
+
+    // Get next task
+    let next_id = match scheduler::schedule_next() {
+        Some(id) => id,
+        None => {
+            // No task to switch to, just return
+            x86_64::instructions::interrupts::enable();
+            return;
+        }
+    };
+
+    // Get current task ID
+    let current_id = task::get_current_task();
+
+    if current_id == next_id {
+        // Same task, just return
+        x86_64::instructions::interrupts::enable();
+        return;
+    }
+
+    crate::serial_println!("[YIELD] Switching from task {} to task {}", current_id, next_id);
+
+    // Current task's context was already saved by syscall_entry
+
+    // Get target task's context pointer
+    let target = task::get_task(next_id).expect("Target task not found");
+    let target_ctx_ptr = {
+        let target_locked = target.lock();
+        &target_locked.context as *const task::Context as usize
+    };
+
+    // Update current task
+    task::set_current_task(next_id);
+
+    // DEBUG: Print context before restoring
+    crate::task::switch::debug_context_before_restore(target_ctx_ptr);
+
+    // Jump to new task using IRETQ (does not return)
+    unsafe {
+        crate::task::switch::restore_context_only(target_ctx_ptr);
+    }
 }

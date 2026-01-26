@@ -52,7 +52,10 @@ pub struct Task {
     pub base_priority: Priority,     // Base priority (before dynamic adjustments)
     pub deadline_ms: Option<u64>,    // Absolute deadline in milliseconds (None = no deadline)
     pub cpu_time_used_ms: u64,       // Total CPU time used (for scheduling fairness)
-    pub last_scheduled_ms: u64,      // Last time this task was scheduled
+    pub last_scheduled_ms: u64,      // Last time this was scheduled
+
+    // Statistics fields
+    pub stats: TaskStatistics,
 }
 
 /// CPU context for task switching
@@ -131,6 +134,34 @@ pub struct Credentials {
     pub uid: u32,
     pub gid: u32,
     pub sandbox_level: SandboxLevel,
+}
+
+/// Task performance statistics
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TaskStatistics {
+    // Execution metrics
+    pub context_switches: u64,       // Total context switches
+    pub syscalls: u64,                // Total syscalls made
+    pub cpu_cycles: u64,             // Total CPU cycles used
+    pub created_at_ms: u64,          // Creation timestamp
+    pub total_runtime_ms: u64,       // Total time in runnable/running state
+
+    // IPC metrics
+    pub ipc_sent: u64,               // Messages sent
+    pub ipc_received: u64,           // Messages received
+    pub ipc_replied: u64,            // Replies sent
+    pub ipc_blocks: u64,             // Times blocked on IPC
+
+    // Memory metrics
+    pub page_faults: u64,            // Page faults handled
+    pub heap_allocations: u64,       // Heap allocations
+    pub heap_frees: u64,             // Heap frees
+
+    // Scheduling metrics
+    pub deadline_misses: u64,        // Deadlines missed
+    pub priority_boosts: u64,        // Times priority was boosted
+    pub voluntary_yields: u64,       // Times yielded voluntarily
+    pub preemptions: u64,            // Times preempted by scheduler
 }
 
 /// Sandbox isolation level
@@ -220,6 +251,13 @@ impl Task {
             ptr::addr_of_mut!((*task_ptr).deadline_ms).write(None);
             ptr::addr_of_mut!((*task_ptr).cpu_time_used_ms).write(0);
             ptr::addr_of_mut!((*task_ptr).last_scheduled_ms).write(0);
+
+            // Statistics
+            let current_time = crate::timer::uptime_ms();
+            ptr::addr_of_mut!((*task_ptr).stats).write(TaskStatistics {
+                created_at_ms: current_time,
+                ..Default::default()
+            });
 
             // Move out of buffer (assume_init returns by value, perfect!)
             buffer.assume_init_read()
