@@ -335,39 +335,6 @@ pub static IPC_RECEIVER: IpcReceiverProgram = IpcReceiverProgram::new();
 /// - 8: READ_KEY (returns key or 0 if none)
 /// - 9: WRITE_CHAR (writes character to console)
 /// - 7: YIELD (when no key available)
-///
-/// Assembly:
-/// ```asm
-/// shell_start:
-///     ; Print prompt "> "
-///     mov rax, 9          ; WRITE_CHAR
-///     mov rdi, '>'        ; character
-///     syscall
-///     mov rax, 9          ; WRITE_CHAR
-///     mov rdi, ' '        ; space
-///     syscall
-/// read_loop:
-///     mov rax, 8          ; READ_KEY
-///     syscall
-///     test rax, rax       ; check if key available
-///     jz yield_and_retry  ; no key, yield
-///     cmp rax, 13         ; is it Enter (CR)?
-///     je newline          ; yes, print newline
-///     ; Echo the character
-///     mov rdi, rax        ; character to write
-///     mov rax, 9          ; WRITE_CHAR
-///     syscall
-///     jmp read_loop
-/// newline:
-///     mov rax, 9          ; WRITE_CHAR
-///     mov rdi, 10         ; newline (LF)
-///     syscall
-///     jmp shell_start     ; new prompt
-/// yield_and_retry:
-///     mov rax, 7          ; YIELD
-///     syscall
-///     jmp read_loop
-/// ```
 #[repr(align(4096))]
 pub struct ShellProgram {
     pub code: [u8; 4096],
@@ -376,201 +343,132 @@ pub struct ShellProgram {
 impl ShellProgram {
     pub const fn new() -> Self {
         let mut code = [0u8; 4096];
-        let mut pos = 0;
 
-        // === PRINT PROMPT "> " ===
+        // === PRINT PROMPT "> " === (pos 0-31)
         // shell_start: (pos 0)
 
         // mov rax, 9 (WRITE_CHAR)
-        code[pos] = 0x48; pos += 1;  // REX.W
-        code[pos] = 0xc7; pos += 1;  // MOV r/m64, imm32
-        code[pos] = 0xc0; pos += 1;  // ModR/M: RAX
-        code[pos] = 0x09; pos += 1;  // Immediate: 9
-        code[pos] = 0x00; pos += 1;
-        code[pos] = 0x00; pos += 1;
-        code[pos] = 0x00; pos += 1;
-        // pos = 7
+        code[0] = 0x48;   // REX.W
+        code[1] = 0xc7;   // MOV r/m64, imm32
+        code[2] = 0xc0;   // ModR/M: RAX
+        code[3] = 0x09;   // Immediate: 9
+        code[4] = 0x00;
+        code[5] = 0x00;
+        code[6] = 0x00;
 
         // mov rdi, '>' (0x3e)
-        code[pos] = 0x48; pos += 1;  // REX.W
-        code[pos] = 0xc7; pos += 1;  // MOV r/m64, imm32
-        code[pos] = 0xc7; pos += 1;  // ModR/M: RDI
-        code[pos] = 0x3e; pos += 1;  // Immediate: '>'
-        code[pos] = 0x00; pos += 1;
-        code[pos] = 0x00; pos += 1;
-        code[pos] = 0x00; pos += 1;
-        // pos = 14
+        code[7] = 0x48;
+        code[8] = 0xc7;
+        code[9] = 0xc7;   // ModR/M: RDI
+        code[10] = 0x3e;  // '>'
+        code[11] = 0x00;
+        code[12] = 0x00;
+        code[13] = 0x00;
 
         // syscall
-        code[pos] = 0x0f; pos += 1;
-        code[pos] = 0x05; pos += 1;
-        // pos = 16
+        code[14] = 0x0f;
+        code[15] = 0x05;
 
         // mov rax, 9 (WRITE_CHAR)
-        code[pos] = 0x48; pos += 1;
-        code[pos] = 0xc7; pos += 1;
-        code[pos] = 0xc0; pos += 1;
-        code[pos] = 0x09; pos += 1;
-        code[pos] = 0x00; pos += 1;
-        code[pos] = 0x00; pos += 1;
-        code[pos] = 0x00; pos += 1;
-        // pos = 23
+        code[16] = 0x48;
+        code[17] = 0xc7;
+        code[18] = 0xc0;
+        code[19] = 0x09;
+        code[20] = 0x00;
+        code[21] = 0x00;
+        code[22] = 0x00;
 
         // mov rdi, ' ' (0x20)
-        code[pos] = 0x48; pos += 1;
-        code[pos] = 0xc7; pos += 1;
-        code[pos] = 0xc7; pos += 1;
-        code[pos] = 0x20; pos += 1;  // space
-        code[pos] = 0x00; pos += 1;
-        code[pos] = 0x00; pos += 1;
-        code[pos] = 0x00; pos += 1;
-        // pos = 30
+        code[23] = 0x48;
+        code[24] = 0xc7;
+        code[25] = 0xc7;
+        code[26] = 0x20;  // space
+        code[27] = 0x00;
+        code[28] = 0x00;
+        code[29] = 0x00;
 
         // syscall
-        code[pos] = 0x0f; pos += 1;
-        code[pos] = 0x05; pos += 1;
-        // pos = 32
+        code[30] = 0x0f;
+        code[31] = 0x05;
 
-        // === READ_LOOP === (pos 32)
-
+        // === READ_LOOP === (pos 32-40)
         // mov rax, 8 (READ_KEY)
-        code[pos] = 0x48; pos += 1;
-        code[pos] = 0xc7; pos += 1;
-        code[pos] = 0xc0; pos += 1;
-        code[pos] = 0x08; pos += 1;
-        code[pos] = 0x00; pos += 1;
-        code[pos] = 0x00; pos += 1;
-        code[pos] = 0x00; pos += 1;
-        // pos = 39
+        code[32] = 0x48;
+        code[33] = 0xc7;
+        code[34] = 0xc0;
+        code[35] = 0x08;
+        code[36] = 0x00;
+        code[37] = 0x00;
+        code[38] = 0x00;
 
         // syscall
-        code[pos] = 0x0f; pos += 1;
-        code[pos] = 0x05; pos += 1;
-        // pos = 41
+        code[39] = 0x0f;
+        code[40] = 0x05;
 
         // test rax, rax (check if key available)
-        code[pos] = 0x48; pos += 1;  // REX.W
-        code[pos] = 0x85; pos += 1;  // TEST r/m64, r64
-        code[pos] = 0xc0; pos += 1;  // ModR/M: RAX, RAX
-        // pos = 44
+        code[41] = 0x48;  // REX.W
+        code[42] = 0x85;  // TEST r/m64, r64
+        code[43] = 0xc0;  // ModR/M: RAX, RAX
 
-        // jz yield_and_retry (offset calculated below)
-        // jz will be at pos 44-45
-        // yield_and_retry will be at pos ~70
-        code[pos] = 0x74; pos += 1;  // JZ rel8
-        code[pos] = 0x1a; pos += 1;  // offset: 26 bytes forward (to pos 72)
-        // pos = 46
+        // jz yield_and_retry (jump to pos 64)
+        // From pos 46 to pos 64 = 18 bytes forward
+        code[44] = 0x74;  // JZ rel8
+        code[45] = 18;    // offset
 
-        // cmp rax, 13 (Enter key - CR)
-        code[pos] = 0x48; pos += 1;  // REX.W
-        code[pos] = 0x83; pos += 1;  // CMP r/m64, imm8
-        code[pos] = 0xf8; pos += 1;  // ModR/M: RAX
-        code[pos] = 0x0d; pos += 1;  // 13 (CR)
-        // pos = 50
-
-        // je newline (jump if Enter pressed)
-        // newline will be at pos 62
-        code[pos] = 0x74; pos += 1;  // JE rel8
-        code[pos] = 0x0c; pos += 1;  // offset: 12 bytes forward (to pos 64)
-        // pos = 52
-
-        // === ECHO CHARACTER ===
+        // === ECHO CHARACTER === (pos 46-54)
         // mov rdi, rax (character to write)
-        code[pos] = 0x48; pos += 1;  // REX.W
-        code[pos] = 0x89; pos += 1;  // MOV r/m64, r64
-        code[pos] = 0xc7; pos += 1;  // ModR/M: RDI, RAX
-        // pos = 55
+        code[46] = 0x48;  // REX.W
+        code[47] = 0x89;  // MOV r/m64, r64
+        code[48] = 0xc7;  // ModR/M: RDI, RAX
 
         // mov rax, 9 (WRITE_CHAR)
-        code[pos] = 0x48; pos += 1;
-        code[pos] = 0xc7; pos += 1;
-        code[pos] = 0xc0; pos += 1;
-        code[pos] = 0x09; pos += 1;
-        code[pos] = 0x00; pos += 1;
-        code[pos] = 0x00; pos += 1;
-        code[pos] = 0x00; pos += 1;
-        // pos = 62
+        code[49] = 0x48;
+        code[50] = 0xc7;
+        code[51] = 0xc0;
+        code[52] = 0x09;
+        code[53] = 0x00;
+        code[54] = 0x00;
+        code[55] = 0x00;
 
         // syscall
-        code[pos] = 0x0f; pos += 1;
-        code[pos] = 0x05; pos += 1;
-        // pos = 64
+        code[56] = 0x0f;
+        code[57] = 0x05;
 
         // jmp read_loop (back to pos 32)
-        code[pos] = 0xeb; pos += 1;  // JMP rel8
-        code[pos] = (256 - 34) as u8; pos += 1;  // -34 = 0xDE (back to pos 32)
-        // pos = 66
+        // From pos 60 to pos 32 = -28 = 0xE4
+        code[58] = 0xeb;  // JMP rel8
+        code[59] = 0xe4;  // -28
 
-        // === NEWLINE === (pos 66, adjusted from 64)
-        // Actually pos 66, need to recalculate jump offset
-        // Let me recalculate...
+        // Padding to align yield_and_retry at pos 64
+        code[60] = 0x90;  // NOP
+        code[61] = 0x90;  // NOP
+        code[62] = 0x90;  // NOP
+        code[63] = 0x90;  // NOP
 
-        // mov rax, 9 (WRITE_CHAR)
-        code[pos] = 0x48; pos += 1;
-        code[pos] = 0xc7; pos += 1;
-        code[pos] = 0xc0; pos += 1;
-        code[pos] = 0x09; pos += 1;
-        code[pos] = 0x00; pos += 1;
-        code[pos] = 0x00; pos += 1;
-        code[pos] = 0x00; pos += 1;
-        // pos = 73
-
-        // mov rdi, 10 (newline LF)
-        code[pos] = 0x48; pos += 1;
-        code[pos] = 0xc7; pos += 1;
-        code[pos] = 0xc7; pos += 1;
-        code[pos] = 0x0a; pos += 1;  // LF
-        code[pos] = 0x00; pos += 1;
-        code[pos] = 0x00; pos += 1;
-        code[pos] = 0x00; pos += 1;
-        // pos = 80
-
-        // syscall
-        code[pos] = 0x0f; pos += 1;
-        code[pos] = 0x05; pos += 1;
-        // pos = 82
-
-        // jmp shell_start (back to pos 0)
-        code[pos] = 0xeb; pos += 1;  // JMP rel8
-        code[pos] = (256 - 84) as u8; pos += 1;  // -84 = 0xAC (back to pos 0)
-        // pos = 84
-
-        // === YIELD_AND_RETRY === (pos 84)
-        // This is where jz jumps to - need to fix offset
-
+        // === YIELD_AND_RETRY === (pos 64-74)
         // mov rax, 7 (YIELD)
-        code[pos] = 0x48; pos += 1;
-        code[pos] = 0xc7; pos += 1;
-        code[pos] = 0xc0; pos += 1;
-        code[pos] = 0x07; pos += 1;
-        code[pos] = 0x00; pos += 1;
-        code[pos] = 0x00; pos += 1;
-        code[pos] = 0x00; pos += 1;
-        // pos = 91
+        code[64] = 0x48;
+        code[65] = 0xc7;
+        code[66] = 0xc0;
+        code[67] = 0x07;
+        code[68] = 0x00;
+        code[69] = 0x00;
+        code[70] = 0x00;
 
         // syscall
-        code[pos] = 0x0f; pos += 1;
-        code[pos] = 0x05; pos += 1;
-        // pos = 93
+        code[71] = 0x0f;
+        code[72] = 0x05;
 
         // jmp read_loop (back to pos 32)
-        code[pos] = 0xeb; pos += 1;  // JMP rel8
-        code[pos] = (256 - 63) as u8; // -63 = 0xC1 (from pos 95 back to pos 32)
-        // pos = 95
-
-        // Fix the jz offset at pos 45 - should jump to pos 84 (yield_and_retry)
-        // From pos 46 to pos 84 = 38 bytes
-        code[45] = 0x26; // 38 bytes forward
-
-        // Fix the je offset at pos 51 - should jump to pos 66 (newline)
-        // From pos 52 to pos 66 = 14 bytes
-        code[51] = 0x0e; // 14 bytes forward
+        // From pos 75 to pos 32 = -43 = 0xD5
+        code[73] = 0xeb;  // JMP rel8
+        code[74] = 0xd5;  // -43
 
         ShellProgram { code }
     }
 
     pub const fn code_size() -> usize {
-        95 // Total bytes of actual code
+        75 // Total bytes of actual code
     }
 }
 
