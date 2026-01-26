@@ -1,0 +1,24 @@
+[package]
+name = "intent-bus"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Core async runtime
+tokio = { version = "1.35", features = ["full"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# For future AI integration
+# sentence-transformers = { version = "0.1", optional = true }
+# onnxruntime = { version = "0.0.14", optional = true }
+
+[features]
+default = []
+ai = [] # Will enable when ready for neural routing
+
+[[bin]]
+name = "intent-bus"
+path = "src/main.rs"
