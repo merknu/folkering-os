@@ -118,6 +118,10 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
         arch::x86_64::apic_init();
         serial_strln!("[APIC] Timer interrupts enabled\n");
 
+        // Initialize keyboard driver (after IDT and PIC setup)
+        serial_strln!("[INIT] Initializing PS/2 keyboard driver...");
+        drivers::keyboard::init();
+
         // Verify dynamic allocations work
         use alloc::vec::Vec;
         use alloc::string::String;
@@ -228,7 +232,20 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
         }
         serial_strln!("[BOOT] IPC capabilities granted");
 
-        serial_strln!("[BOOT] All IPC test tasks spawned, starting scheduler...\n");
+        // Spawn Task 4 - Shell (keyboard echo)
+        serial_strln!("[BOOT] Spawning Task 4 (shell)...");
+        match task::spawn_raw(&userspace_test::SHELL_PROGRAM.code[..userspace_test::ShellProgram::code_size()], 0) {
+            Ok(task_id) => {
+                serial_str!("[BOOT] Task 4 (shell) spawned, id=");
+                drivers::serial::write_dec(task_id);
+                serial_strln!("");
+            }
+            Err(_e) => {
+                serial_strln!("[BOOT] Task 4 (shell) spawn FAILED (continuing anyway)");
+            }
+        }
+
+        serial_strln!("[BOOT] All tasks spawned, starting scheduler...\n");
 
         // Enable timer interrupts for preemption
         serial_strln!("[BOOT] Enabling APIC timer for preemption...");

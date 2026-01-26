@@ -1041,6 +1041,9 @@ extern "C" fn syscall_handler(
         5 => syscall_spawn(arg1, arg2),
         6 => syscall_exit(arg1),
         7 => syscall_yield(),
+        8 => syscall_read_key(),
+        9 => syscall_write_char(arg1),
+        10 => syscall_get_pid(),
         _ => {
             crate::drivers::serial::write_str("[HANDLER] Invalid syscall!\n");
             u64::MAX // Return error
@@ -1519,6 +1522,30 @@ fn syscall_yield() -> u64 {
     // This should never be called - yield is handled directly in syscall_entry
     crate::serial_println!("[SYSCALL] ERROR: yield handler called (should be handled in assembly!)");
     0
+}
+
+/// Read a key from the keyboard buffer (non-blocking)
+/// Returns: key code if available, 0 if no key, u64::MAX on error
+fn syscall_read_key() -> u64 {
+    match crate::drivers::keyboard::read_key() {
+        Some(key) => key as u64,
+        None => 0, // No key available
+    }
+}
+
+/// Write a character to the console (serial for now)
+/// arg1: character to write (low byte)
+/// Returns: 0 on success
+fn syscall_write_char(char_code: u64) -> u64 {
+    let ch = (char_code & 0xFF) as u8;
+    crate::drivers::serial::write_byte(ch);
+    0 // Success
+}
+
+/// Get current task's PID
+/// Returns: current task ID
+fn syscall_get_pid() -> u64 {
+    crate::task::task::get_current_task() as u64
 }
 
 /// Debug: Print RAX value at syscall entry

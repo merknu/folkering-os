@@ -17,6 +17,9 @@ lazy_static! {
         // Timer interrupt (vector 32)
         idt[32].set_handler_fn(timer_interrupt_handler);
 
+        // Keyboard interrupt (vector 33 = IRQ1)
+        idt[33].set_handler_fn(keyboard_interrupt_handler);
+
         idt
     };
 }
@@ -91,4 +94,9 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
     // Note: We don't force preemption here yet because the timer interrupt
     // arrives while we're in user mode, and we need proper interrupt-context
     // task switching. For now, tasks yield voluntarily via syscall.
+}
+
+extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    // Handle keyboard interrupt
+    crate::drivers::keyboard::handle_interrupt();
 }

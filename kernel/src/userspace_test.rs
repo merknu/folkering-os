@@ -323,6 +323,260 @@ impl IpcReceiverProgram {
 pub static IPC_SENDER: IpcSenderProgram = IpcSenderProgram::new();
 pub static IPC_RECEIVER: IpcReceiverProgram = IpcReceiverProgram::new();
 
+/// Simple Shell Program (keyboard echo + prompt)
+///
+/// This program:
+/// 1. Prints a prompt "> "
+/// 2. Reads keyboard input
+/// 3. Echoes characters as they're typed
+/// 4. On Enter, prints newline and new prompt
+///
+/// Syscalls used:
+/// - 8: READ_KEY (returns key or 0 if none)
+/// - 9: WRITE_CHAR (writes character to console)
+/// - 7: YIELD (when no key available)
+///
+/// Assembly:
+/// ```asm
+/// shell_start:
+///     ; Print prompt "> "
+///     mov rax, 9          ; WRITE_CHAR
+///     mov rdi, '>'        ; character
+///     syscall
+///     mov rax, 9          ; WRITE_CHAR
+///     mov rdi, ' '        ; space
+///     syscall
+/// read_loop:
+///     mov rax, 8          ; READ_KEY
+///     syscall
+///     test rax, rax       ; check if key available
+///     jz yield_and_retry  ; no key, yield
+///     cmp rax, 13         ; is it Enter (CR)?
+///     je newline          ; yes, print newline
+///     ; Echo the character
+///     mov rdi, rax        ; character to write
+///     mov rax, 9          ; WRITE_CHAR
+///     syscall
+///     jmp read_loop
+/// newline:
+///     mov rax, 9          ; WRITE_CHAR
+///     mov rdi, 10         ; newline (LF)
+///     syscall
+///     jmp shell_start     ; new prompt
+/// yield_and_retry:
+///     mov rax, 7          ; YIELD
+///     syscall
+///     jmp read_loop
+/// ```
+#[repr(align(4096))]
+pub struct ShellProgram {
+    pub code: [u8; 4096],
+}
+
+impl ShellProgram {
+    pub const fn new() -> Self {
+        let mut code = [0u8; 4096];
+        let mut pos = 0;
+
+        // === PRINT PROMPT "> " ===
+        // shell_start: (pos 0)
+
+        // mov rax, 9 (WRITE_CHAR)
+        code[pos] = 0x48; pos += 1;  // REX.W
+        code[pos] = 0xc7; pos += 1;  // MOV r/m64, imm32
+        code[pos] = 0xc0; pos += 1;  // ModR/M: RAX
+        code[pos] = 0x09; pos += 1;  // Immediate: 9
+        code[pos] = 0x00; pos += 1;
+        code[pos] = 0x00; pos += 1;
+        code[pos] = 0x00; pos += 1;
+        // pos = 7
+
+        // mov rdi, '>' (0x3e)
+        code[pos] = 0x48; pos += 1;  // REX.W
+        code[pos] = 0xc7; pos += 1;  // MOV r/m64, imm32
+        code[pos] = 0xc7; pos += 1;  // ModR/M: RDI
+        code[pos] = 0x3e; pos += 1;  // Immediate: '>'
+        code[pos] = 0x00; pos += 1;
+        code[pos] = 0x00; pos += 1;
+        code[pos] = 0x00; pos += 1;
+        // pos = 14
+
+        // syscall
+        code[pos] = 0x0f; pos += 1;
+        code[pos] = 0x05; pos += 1;
+        // pos = 16
+
+        // mov rax, 9 (WRITE_CHAR)
+        code[pos] = 0x48; pos += 1;
+        code[pos] = 0xc7; pos += 1;
+        code[pos] = 0xc0; pos += 1;
+        code[pos] = 0x09; pos += 1;
+        code[pos] = 0x00; pos += 1;
+        code[pos] = 0x00; pos += 1;
+        code[pos] = 0x00; pos += 1;
+        // pos = 23
+
+        // mov rdi, ' ' (0x20)
+        code[pos] = 0x48; pos += 1;
+        code[pos] = 0xc7; pos += 1;
+        code[pos] = 0xc7; pos += 1;
+        code[pos] = 0x20; pos += 1;  // space
+        code[pos] = 0x00; pos += 1;
+        code[pos] = 0x00; pos += 1;
+        code[pos] = 0x00; pos += 1;
+        // pos = 30
+
+        // syscall
+        code[pos] = 0x0f; pos += 1;
+        code[pos] = 0x05; pos += 1;
+        // pos = 32
+
+        // === READ_LOOP === (pos 32)
+
+        // mov rax, 8 (READ_KEY)
+        code[pos] = 0x48; pos += 1;
+        code[pos] = 0xc7; pos += 1;
+        code[pos] = 0xc0; pos += 1;
+        code[pos] = 0x08; pos += 1;
+        code[pos] = 0x00; pos += 1;
+        code[pos] = 0x00; pos += 1;
+        code[pos] = 0x00; pos += 1;
+        // pos = 39
+
+        // syscall
+        code[pos] = 0x0f; pos += 1;
+        code[pos] = 0x05; pos += 1;
+        // pos = 41
+
+        // test rax, rax (check if key available)
+        code[pos] = 0x48; pos += 1;  // REX.W
+        code[pos] = 0x85; pos += 1;  // TEST r/m64, r64
+        code[pos] = 0xc0; pos += 1;  // ModR/M: RAX, RAX
+        // pos = 44
+
+        // jz yield_and_retry (offset calculated below)
+        // jz will be at pos 44-45
+        // yield_and_retry will be at pos ~70
+        code[pos] = 0x74; pos += 1;  // JZ rel8
+        code[pos] = 0x1a; pos += 1;  // offset: 26 bytes forward (to pos 72)
+        // pos = 46
+
+        // cmp rax, 13 (Enter key - CR)
+        code[pos] = 0x48; pos += 1;  // REX.W
+        code[pos] = 0x83; pos += 1;  // CMP r/m64, imm8
+        code[pos] = 0xf8; pos += 1;  // ModR/M: RAX
+        code[pos] = 0x0d; pos += 1;  // 13 (CR)
+        // pos = 50
+
+        // je newline (jump if Enter pressed)
+        // newline will be at pos 62
+        code[pos] = 0x74; pos += 1;  // JE rel8
+        code[pos] = 0x0c; pos += 1;  // offset: 12 bytes forward (to pos 64)
+        // pos = 52
+
+        // === ECHO CHARACTER ===
+        // mov rdi, rax (character to write)
+        code[pos] = 0x48; pos += 1;  // REX.W
+        code[pos] = 0x89; pos += 1;  // MOV r/m64, r64
+        code[pos] = 0xc7; pos += 1;  // ModR/M: RDI, RAX
+        // pos = 55
+
+        // mov rax, 9 (WRITE_CHAR)
+        code[pos] = 0x48; pos += 1;
+        code[pos] = 0xc7; pos += 1;
+        code[pos] = 0xc0; pos += 1;
+        code[pos] = 0x09; pos += 1;
+        code[pos] = 0x00; pos += 1;
+        code[pos] = 0x00; pos += 1;
+        code[pos] = 0x00; pos += 1;
+        // pos = 62
+
+        // syscall
+        code[pos] = 0x0f; pos += 1;
+        code[pos] = 0x05; pos += 1;
+        // pos = 64
+
+        // jmp read_loop (back to pos 32)
+        code[pos] = 0xeb; pos += 1;  // JMP rel8
+        code[pos] = (256 - 34) as u8; pos += 1;  // -34 = 0xDE (back to pos 32)
+        // pos = 66
+
+        // === NEWLINE === (pos 66, adjusted from 64)
+        // Actually pos 66, need to recalculate jump offset
+        // Let me recalculate...
+
+        // mov rax, 9 (WRITE_CHAR)
+        code[pos] = 0x48; pos += 1;
+        code[pos] = 0xc7; pos += 1;
+        code[pos] = 0xc0; pos += 1;
+        code[pos] = 0x09; pos += 1;
+        code[pos] = 0x00; pos += 1;
+        code[pos] = 0x00; pos += 1;
+        code[pos] = 0x00; pos += 1;
+        // pos = 73
+
+        // mov rdi, 10 (newline LF)
+        code[pos] = 0x48; pos += 1;
+        code[pos] = 0xc7; pos += 1;
+        code[pos] = 0xc7; pos += 1;
+        code[pos] = 0x0a; pos += 1;  // LF
+        code[pos] = 0x00; pos += 1;
+        code[pos] = 0x00; pos += 1;
+        code[pos] = 0x00; pos += 1;
+        // pos = 80
+
+        // syscall
+        code[pos] = 0x0f; pos += 1;
+        code[pos] = 0x05; pos += 1;
+        // pos = 82
+
+        // jmp shell_start (back to pos 0)
+        code[pos] = 0xeb; pos += 1;  // JMP rel8
+        code[pos] = (256 - 84) as u8; pos += 1;  // -84 = 0xAC (back to pos 0)
+        // pos = 84
+
+        // === YIELD_AND_RETRY === (pos 84)
+        // This is where jz jumps to - need to fix offset
+
+        // mov rax, 7 (YIELD)
+        code[pos] = 0x48; pos += 1;
+        code[pos] = 0xc7; pos += 1;
+        code[pos] = 0xc0; pos += 1;
+        code[pos] = 0x07; pos += 1;
+        code[pos] = 0x00; pos += 1;
+        code[pos] = 0x00; pos += 1;
+        code[pos] = 0x00; pos += 1;
+        // pos = 91
+
+        // syscall
+        code[pos] = 0x0f; pos += 1;
+        code[pos] = 0x05; pos += 1;
+        // pos = 93
+
+        // jmp read_loop (back to pos 32)
+        code[pos] = 0xeb; pos += 1;  // JMP rel8
+        code[pos] = (256 - 63) as u8; // -63 = 0xC1 (from pos 95 back to pos 32)
+        // pos = 95
+
+        // Fix the jz offset at pos 45 - should jump to pos 84 (yield_and_retry)
+        // From pos 46 to pos 84 = 38 bytes
+        code[45] = 0x26; // 38 bytes forward
+
+        // Fix the je offset at pos 51 - should jump to pos 66 (newline)
+        // From pos 52 to pos 66 = 14 bytes
+        code[51] = 0x0e; // 14 bytes forward
+
+        ShellProgram { code }
+    }
+
+    pub const fn code_size() -> usize {
+        95 // Total bytes of actual code
+    }
+}
+
+/// Static shell program instance
+pub static SHELL_PROGRAM: ShellProgram = ShellProgram::new();
+
 /// Load user program into memory at specified address
 ///
 /// # Arguments
