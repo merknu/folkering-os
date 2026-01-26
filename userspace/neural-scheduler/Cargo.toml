@@ -6,6 +6,9 @@ authors = ["Folkering OS Team"]
 description = "Neural predictive scheduler for Folkering OS - the Fast Brain"
 
 [dependencies]
+# Brain Bridge integration
+libfolkering = { path = "../libfolkering" }
+
 # Time series
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

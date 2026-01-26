@@ -5,11 +5,13 @@
 
 use crate::ipc::message::{ShmemId, TaskId};
 use crate::memory::{alloc_pages, free_pages};
+use crate::memory::paging;
 use alloc::vec::Vec;
 use hashbrown::{HashMap, hash_map::DefaultHashBuilder};
 use spin::Mutex;
 use core::sync::atomic::{AtomicU32, Ordering};
 use core::num::NonZeroU32;
+use x86_64::structures::paging::PageTableFlags;
 
 /// Physical address (platform-specific)
 pub type PhysAddr = usize;
@@ -103,6 +105,10 @@ pub enum ShmemError {
     IdOverflow,
     /// Invalid size (must be multiple of page size)
     InvalidSize,
+    /// Failed to map page into address space
+    MapFailed,
+    /// Failed to unmap page from address space
+    UnmapFailed,
 }
 
 /// Create new shared memory region
@@ -402,45 +408,77 @@ pub fn shmem_revoke(id: ShmemId, task: TaskId) -> Result<(), ShmemError> {
 /// Map a single page into virtual address space
 ///
 /// Platform-specific implementation (x86-64).
-/// In real kernel, this would interact with page tables.
+/// Delegates to the kernel's page table management system.
 ///
 /// # Arguments
 /// - `virt`: Virtual address (page-aligned)
 /// - `phys`: Physical address (page-aligned)
 /// - `flags`: Page protection flags
-fn map_page(virt: VirtAddr, phys: PhysAddr, _flags: PageFlags) -> Result<(), ShmemError> {
-    // TODO: Implement actual page table manipulation
-    // This is a placeholder for the real implementation
-    // which would involve:
-    // 1. Walking page tables (PML4 -> PDPT -> PD -> PT)
-    // 2. Creating missing page table levels
-    // 3. Setting PTE with physical address and flags
-    // 4. Flushing TLB
-
-    // For now, just validate addresses are page-aligned
+fn map_page(virt: VirtAddr, phys: PhysAddr, flags: PageFlags) -> Result<(), ShmemError> {
+    // Validate addresses are page-aligned
     if virt % PAGE_SIZE != 0 || phys % PAGE_SIZE != 0 {
         return Err(ShmemError::InvalidSize);
     }
 
-    Ok(())
+    // Convert PageFlags to PageTableFlags
+    let pt_flags = convert_page_flags(flags);
+
+    // Call kernel paging system to perform actual mapping
+    paging::map_page(virt, phys, pt_flags)
+        .map_err(|e| match e {
+            paging::MapError::MapperNotInitialized => ShmemError::MapFailed,
+            paging::MapError::MapFailed => ShmemError::MapFailed,
+            paging::MapError::OutOfMemory => ShmemError::OutOfMemory,
+            _ => ShmemError::MapFailed,
+        })
 }
 
 /// Unmap a single page from virtual address space
 ///
 /// Platform-specific implementation (x86-64).
+/// Delegates to the kernel's page table management system.
 fn unmap_page(virt: VirtAddr) -> Result<(), ShmemError> {
-    // TODO: Implement actual page table manipulation
-    // This would:
-    // 1. Walk page tables to find PTE
-    // 2. Clear PTE
-    // 3. Flush TLB entry
-
     // Validate address is page-aligned
     if virt % PAGE_SIZE != 0 {
         return Err(ShmemError::InvalidSize);
     }
 
-    Ok(())
+    // Call kernel paging system to perform actual unmapping
+    paging::unmap_page(virt)
+        .map(|_phys| ()) // Discard physical address - shared memory owns the pages
+        .map_err(|e| match e {
+            paging::MapError::MapperNotInitialized => ShmemError::UnmapFailed,
+            paging::MapError::UnmapFailed => ShmemError::UnmapFailed,
+            paging::MapError::PageNotMapped => ShmemError::UnmapFailed,
+            _ => ShmemError::UnmapFailed,
+        })
+}
+
+/// Convert shared memory PageFlags to kernel PageTableFlags
+///
+/// Maps the simplified PageFlags used by shared memory to the
+/// detailed PageTableFlags used by the kernel's paging system.
+///
+/// # Security
+/// Shared memory pages are always mapped with NO_EXECUTE to prevent
+/// code execution attacks via shared data regions.
+fn convert_page_flags(flags: PageFlags) -> PageTableFlags {
+    let mut pt_flags = PageTableFlags::PRESENT;
+
+    // Check for writable flag
+    if flags.bits & PageFlags::WRITABLE.bits != 0 {
+        pt_flags |= PageTableFlags::WRITABLE;
+    }
+
+    // Check for user-accessible flag
+    if flags.bits & PageFlags::USER.bits != 0 {
+        pt_flags |= PageTableFlags::USER_ACCESSIBLE;
+    }
+
+    // Always set NO_EXECUTE for security (shared memory should not contain code)
+    pt_flags |= PageTableFlags::NO_EXECUTE;
+
+    pt_flags
 }
 
 #[cfg(test)]

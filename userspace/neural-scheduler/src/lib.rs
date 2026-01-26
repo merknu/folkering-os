@@ -9,7 +9,9 @@
 pub mod types;
 pub mod predictor;
 pub mod scheduler;
+pub mod bridge_integration;
 
 pub use types::*;
 pub use predictor::ResourcePredictor;
 pub use scheduler::NeuralScheduler;
+pub use bridge_integration::SchedulerBridgeWriter;

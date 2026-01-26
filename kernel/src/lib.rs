@@ -119,14 +119,18 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
 
         serial_println!("[BOOT] Starting Phase 3: IPC & Task Management...\n");
 
+        serial_println!("[DEBUG] About to call ipc::init()...");
         // Initialize IPC subsystem
         serial_println!("[INIT] Initializing IPC subsystem...");
         ipc::init();
+        serial_println!("[DEBUG] ipc::init() returned OK");
         serial_println!("[IPC] IPC subsystem ready\n");
 
+        serial_println!("[DEBUG] About to call scheduler_init()...");
         // Initialize scheduler
         serial_println!("[INIT] Initializing scheduler...");
         task::scheduler_init();
+        serial_println!("[DEBUG] scheduler_init() returned OK");
         serial_println!("[SCHED] Scheduler ready\n");
 
         // Note: Kernel doesn't need its own Task structure
@@ -144,46 +148,68 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
         // - Receiver as task 2
         // - Sender as task 3 (sends to task 2)
 
-        serial_println!("[BOOT] Spawning IPC test tasks...\n");
+        serial_println!("[TEST] Spawning ONLY task 1 (yield loop) for debugging...\n");
 
-        // Spawn dummy idle task first (task ID 1)
-        serial_println!("[BOOT] Spawning dummy idle task...");
-        match task::spawn_raw(&userspace_test::USER_PROGRAM.code[..userspace_test::UserProgram::code_size()], 0) {
+        // TEST: Simple yield loop using SYSCALL instruction
+        static YIELD_LOOP: [u8; 11] = [
+            // loop_start:
+            0x48, 0xc7, 0xc0, 0x07, 0x00, 0x00, 0x00,  // mov rax, 7 (YIELD syscall)
+            0x0f, 0x05,                                 // syscall
+            0xeb, 0xf7,                                 // jmp loop_start (back 9 bytes)
+        ];
+        serial_println!("[BOOT] Spawning infinite yield loop task...");
+        match task::spawn_raw(&YIELD_LOOP, 0) {
             Ok(task_id) => {
+                serial_println!("[BOOT] spawn_raw OK, task_id={}", task_id);
                 serial_println!("[BOOT] Dummy task spawned (id={})\n", task_id);
             }
             Err(e) => {
-                serial_println!("[BOOT] Failed to spawn dummy task: {:?}\n", e);
+                serial_println!("[BOOT] spawn_raw FAILED: {:?}\n", e);
                 loop { x86_64::instructions::hlt(); }
             }
         }
 
-        // Spawn IPC receiver (task ID 2)
-        serial_println!("[BOOT] Spawning IPC receiver task...");
-        match task::spawn_raw(&userspace_test::IPC_RECEIVER.code, 0) {
-            Ok(task_id) => {
-                serial_println!("[BOOT] IPC receiver spawned (id={})\n", task_id);
-            }
-            Err(e) => {
-                serial_println!("[BOOT] Failed to spawn IPC receiver: {:?}\n", e);
+        // DISABLED for testing - only spawning task 1
+        /*
+        // Spawn task 2 - IPC receive loop
+        static IPC_RECEIVE_LOOP: [u8; 15] = [
+            // loop_start:
+            0x48, 0x31, 0xff,                           // xor rdi, rdi (from=0, receive from any)
+            0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00,  // mov rax, 1 (IPC_RECEIVE)
+            0x0f, 0x05,                                 // syscall
+            0xeb, 0xf3,                                 // jmp loop_start
+            0xf4,                                       // hlt
+        ];
+        serial_println!("[BOOT] Spawning task 2 (IPC receiver)...");
+        match task::spawn_raw(&IPC_RECEIVE_LOOP, 0) {
+            Ok(_) => { serial_println!("[BOOT] Task 2 spawned OK"); }
+            Err(_) => {
+                serial_println!("[BOOT] Task 2 spawn FAILED");
                 loop { x86_64::instructions::hlt(); }
             }
         }
 
-        // Spawn IPC sender (task ID 3, but it sends to task 3... itself?)
-        // Wait - let me check what ID the sender targets
-        serial_println!("[BOOT] Spawning IPC sender task...");
-        match task::spawn_raw(&userspace_test::IPC_SENDER.code, 0) {
-            Ok(task_id) => {
-                serial_println!("[BOOT] IPC sender spawned (id={})\n", task_id);
-            }
-            Err(e) => {
-                serial_println!("[BOOT] Failed to spawn IPC sender: {:?}\n", e);
+        // Spawn task 3 - TEST: IPC send (single, no loop)
+        // Use static to avoid stack overflow (kernel stack is limited)
+        static IPC_SEND_CODE: [u8; 27] = [
+            0x48, 0xc7, 0xc7, 0x02, 0x00, 0x00, 0x00,  // mov rdi, 2 (target task 2)
+            0x48, 0xc7, 0xc6, 0xAA, 0x00, 0x00, 0x00,  // mov rsi, 0xAA (payload0)
+            0x48, 0x31, 0xd2,                           // xor rdx, rdx (payload1=0)
+            0x48, 0xc7, 0xc0, 0x00, 0x00, 0x00, 0x00,  // mov rax, 0 (IPC_SEND)
+            0x0f, 0x05,                                 // syscall
+            0xf4,                                       // hlt
+        ];
+        serial_println!("[TEST] Spawning task 3 with IPC send (no loop)...");
+        match task::spawn_raw(&IPC_SEND_CODE, 0) {
+            Ok(_) => { serial_println!("[TEST] Task 3 (IPC send) spawned OK"); }
+            Err(_) => {
+                serial_println!("[TEST] Task 3 spawn FAILED");
                 loop { x86_64::instructions::hlt(); }
             }
         }
+        */
 
-        serial_println!("[BOOT] Starting scheduler...\n");
+        serial_println!("[BOOT] All tasks spawned, starting scheduler...\n");
         serial_println!("==============================================\n");
 
         // Start scheduler (does not return)
@@ -199,6 +225,7 @@ extern crate alloc;
 extern crate lazy_static;
 
 pub mod arch;
+pub mod bridge;
 pub mod capability;
 pub mod drivers;
 pub mod ipc;
