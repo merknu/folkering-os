@@ -245,13 +245,73 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
             }
         }
 
+        // ===== Ramdisk Initialization =====
+        // Try to load Folk-Pack initrd from boot module
+        let ramdisk = if boot_info.initrd_size > 0 {
+            serial_strln!("[RAMDISK] Parsing Folk-Pack initrd...");
+            serial_str!("[RAMDISK] Address: ");
+            drivers::serial::write_hex(boot_info.initrd_start as u64);
+            serial_str!(", size: ");
+            drivers::serial::write_dec(boot_info.initrd_size as u32);
+            serial_strln!(" bytes");
+
+            match fs::ramdisk::Ramdisk::from_memory(boot_info.initrd_start, boot_info.initrd_size) {
+                Ok(rd) => {
+                    serial_str!("[RAMDISK] Found Folk-Pack image: ");
+                    drivers::serial::write_dec(rd.entry_count() as u32);
+                    serial_strln!(" entries");
+
+                    for entry in rd.entries() {
+                        serial_str!("[RAMDISK] Entry ");
+                        drivers::serial::write_dec(entry.id as u32);
+                        serial_str!(": \"");
+                        serial_str!(entry.name_str());
+                        serial_str!("\" (");
+                        if entry.is_elf() { serial_str!("ELF"); } else { serial_str!("DATA"); }
+                        serial_str!(", ");
+                        drivers::serial::write_dec(entry.size as u32);
+                        serial_strln!(" bytes)");
+                    }
+
+                    Some(rd)
+                }
+                Err(e) => {
+                    serial_str!("[RAMDISK] Failed to parse initrd: ");
+                    match e {
+                        fs::ramdisk::RamdiskError::TooSmall => { serial_strln!("TooSmall"); }
+                        fs::ramdisk::RamdiskError::BadMagic => { serial_strln!("BadMagic"); }
+                        fs::ramdisk::RamdiskError::BadVersion => { serial_strln!("BadVersion"); }
+                        fs::ramdisk::RamdiskError::EntryTableOverflow => { serial_strln!("EntryTableOverflow"); }
+                        fs::ramdisk::RamdiskError::EntryDataOverflow => { serial_strln!("EntryDataOverflow"); }
+                    }
+                    None
+                }
+            }
+        } else {
+            serial_strln!("[RAMDISK] No initrd provided, using embedded fallback");
+            None
+        };
+
         // Spawn Task 5 - Rust Shell (libfolk-based, ELF binary)
+        // Try ramdisk first, fall back to include_bytes! if not available
         serial_strln!("[BOOT] Spawning Task 5 (Rust shell from libfolk)...");
-        static RUST_SHELL_ELF: &[u8] = include_bytes!("../../userspace/target/x86_64-folkering-userspace/release/shell");
+
+        let shell_elf: &[u8] = if let Some(ref rd) = ramdisk {
+            if let Some(entry) = rd.find("shell") {
+                serial_strln!("[BOOT] Loading shell from ramdisk...");
+                rd.read(entry)
+            } else {
+                serial_strln!("[BOOT] Shell not found in ramdisk, using embedded fallback");
+                include_bytes!("../../userspace/target/x86_64-folkering-userspace/release/shell")
+            }
+        } else {
+            include_bytes!("../../userspace/target/x86_64-folkering-userspace/release/shell")
+        };
+
         serial_str!("[BOOT] Rust shell ELF size: ");
-        drivers::serial::write_dec(RUST_SHELL_ELF.len() as u32);
+        drivers::serial::write_dec(shell_elf.len() as u32);
         serial_strln!(" bytes");
-        match task::spawn(RUST_SHELL_ELF, &[]) {
+        match task::spawn(shell_elf, &[]) {
             Ok(task_id) => {
                 serial_str!("[BOOT] Task 5 (Rust shell) spawned, id=");
                 drivers::serial::write_dec(task_id);
@@ -264,6 +324,42 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
                     task::SpawnError::OutOfMemory => { serial_strln!("OutOfMemory"); }
                     task::SpawnError::PermissionDenied => { serial_strln!("PermissionDenied"); }
                     task::SpawnError::NotFound => { serial_strln!("NotFound"); }
+                }
+            }
+        }
+
+        // Spawn any additional ELF entries from the ramdisk
+        if let Some(ref rd) = ramdisk {
+            for entry in rd.entries() {
+                // Skip "shell" — already spawned above
+                if entry.name_str() == "shell" {
+                    continue;
+                }
+                if entry.is_elf() {
+                    serial_str!("[BOOT] Spawning \"");
+                    serial_str!(entry.name_str());
+                    serial_strln!("\" from ramdisk...");
+                    let elf_data = rd.read(entry);
+                    match task::spawn(elf_data, &[]) {
+                        Ok(task_id) => {
+                            serial_str!("[BOOT] Spawned \"");
+                            serial_str!(entry.name_str());
+                            serial_str!("\", id=");
+                            drivers::serial::write_dec(task_id);
+                            serial_strln!("");
+                        }
+                        Err(e) => {
+                            serial_str!("[BOOT] Failed to spawn \"");
+                            serial_str!(entry.name_str());
+                            serial_str!("\": ");
+                            match e {
+                                task::SpawnError::InvalidElf(_) => { serial_strln!("InvalidElf"); }
+                                task::SpawnError::OutOfMemory => { serial_strln!("OutOfMemory"); }
+                                task::SpawnError::PermissionDenied => { serial_strln!("PermissionDenied"); }
+                                task::SpawnError::NotFound => { serial_strln!("NotFound"); }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -292,6 +388,7 @@ pub mod arch;
 pub mod bridge;
 pub mod capability;
 pub mod drivers;
+pub mod fs;
 pub mod ipc;
 pub mod memory;
 pub mod panic;
@@ -314,6 +411,10 @@ pub mod boot {
         pub hhdm_offset: usize,
         pub rsdp_addr: usize,
         pub memory_map: &'static [&'static Entry],
+        /// Physical address of the initrd (Folk-Pack image), 0 if none
+        pub initrd_start: usize,
+        /// Size of the initrd in bytes
+        pub initrd_size: usize,
     }
 }
 

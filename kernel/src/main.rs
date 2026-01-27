@@ -6,7 +6,7 @@
 use limine::BaseRevision;
 use limine::request::{
     RequestsStartMarker, RequestsEndMarker,
-    FramebufferRequest, MemoryMapRequest, HhdmRequest, RsdpRequest
+    FramebufferRequest, MemoryMapRequest, HhdmRequest, RsdpRequest, ModuleRequest
 };
 
 // Import kernel library
@@ -36,6 +36,11 @@ static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
 #[used]
 #[link_section = ".requests"]
 static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
+
+// Request boot modules (initrd)
+#[used]
+#[link_section = ".requests"]
+static MODULE_REQUEST: ModuleRequest = ModuleRequest::new();
 
 // Request markers
 #[used]
@@ -781,6 +786,29 @@ unsafe extern "C" fn kmain() -> ! {
         (empty, 0, 0)
     };
 
+    // Get initrd module (first module = Folk-Pack image)
+    // Limine loads modules into physical memory and provides HHDM-mapped virtual addresses
+    let (initrd_start, initrd_size) = if let Some(mod_resp) = MODULE_REQUEST.get_response() {
+        let modules = mod_resp.modules();
+        if !modules.is_empty() {
+            let module = &modules[0];
+            let virt_addr = module.addr() as usize;
+            let size = module.size() as usize;
+            serial_write("[BOOT] Found initrd module at virt ");
+            write_hex(virt_addr as u64);
+            serial_write(", size ");
+            write_hex(size as u64);
+            serial_write(" bytes\n");
+            (virt_addr, size)
+        } else {
+            serial_write("[BOOT] No boot modules found (no initrd)\n");
+            (0, 0)
+        }
+    } else {
+        serial_write("[BOOT] ModuleRequest not responded (no initrd)\n");
+        (0, 0)
+    };
+
     let boot_info = folkering_kernel::boot::BootInfo {
         bootloader_name: "Limine",
         bootloader_version: "8.7.0",
@@ -791,6 +819,8 @@ unsafe extern "C" fn kmain() -> ! {
         hhdm_offset,
         rsdp_addr,
         memory_map: memory_map_slice,
+        initrd_start,
+        initrd_size,
     };
 
     serial_write("[Folkering OS] Boot info ready, calling kernel_main...\n\n");

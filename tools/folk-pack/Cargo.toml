@@ -1,0 +1,8 @@
+[package]
+name = "folk-pack"
+version = "0.1.0"
+edition = "2021"
+description = "Host-side tool to pack userspace binaries into Folk-Pack (FPK) initrd images"
+
+[dependencies]
+sha2 = "0.10"
