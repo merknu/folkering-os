@@ -268,7 +268,13 @@ pub fn map_and_load_user_code_in_table(pml4_phys: u64, code: &[u8], base_addr: u
     use crate::memory;
     use crate::memory::paging::flags;
 
-    crate::serial_println!("[USER_CODE] Mapping user code at {:#x} in table {:#x}, len={}", base_addr, pml4_phys, code.len());
+    crate::serial_str!("[USER_CODE] Mapping code at ");
+    crate::drivers::serial::write_hex(base_addr);
+    crate::serial_str!(" in table ");
+    crate::drivers::serial::write_hex(pml4_phys);
+    crate::serial_str!(", len=");
+    crate::drivers::serial::write_dec(code.len() as u32);
+    crate::drivers::serial::write_newline();
 
     // Calculate number of pages needed
     let code_len = code.len();
@@ -276,21 +282,27 @@ pub fn map_and_load_user_code_in_table(pml4_phys: u64, code: &[u8], base_addr: u
     // Allocate physical page for user code
     let code_page_addr = memory::physical::alloc_page()
         .expect("Failed to allocate user code page");
-    crate::serial_println!("[USER_CODE] Physical page: {:#x}", code_page_addr);
+    crate::serial_str!("[USER_CODE] Physical page: ");
+    crate::drivers::serial::write_hex(code_page_addr as u64);
+    crate::drivers::serial::write_newline();
 
     // Map into the task's page table
-    crate::serial_println!("[USER_CODE] Mapping with flags USER_CODE (PRESENT | USER_ACCESSIBLE)");
+    crate::serial_strln!("[USER_CODE] Mapping with flags USER_CODE");
     memory::paging::map_page_in_table(
         pml4_phys,
         base_addr as usize,
         code_page_addr,
         flags::USER_CODE,
     ).expect("Failed to map user code page in task table");
-    crate::serial_println!("[USER_CODE] Page mapped successfully");
+    crate::serial_strln!("[USER_CODE] Page mapped");
 
     // Copy code to the page via HHDM
     let hhdm_addr = crate::phys_to_virt(code_page_addr);
-    crate::serial_println!("[USER_CODE] Copying {} bytes via HHDM at {:#x}", code_len, hhdm_addr);
+    crate::serial_str!("[USER_CODE] Copying ");
+    crate::drivers::serial::write_dec(code_len as u32);
+    crate::serial_str!(" bytes via HHDM at ");
+    crate::drivers::serial::write_hex(hhdm_addr as u64);
+    crate::drivers::serial::write_newline();
     unsafe {
         core::ptr::copy_nonoverlapping(
             code.as_ptr(),
@@ -298,9 +310,9 @@ pub fn map_and_load_user_code_in_table(pml4_phys: u64, code: &[u8], base_addr: u
             code_len,
         );
     }
-    crate::serial_println!("[USER_CODE] Code copied");
+    crate::serial_strln!("[USER_CODE] Code copied");
 
-    crate::serial_println!("[USER_CODE] User code setup complete in task table");
+    crate::serial_strln!("[USER_CODE] User code setup complete");
     VirtAddr::new(base_addr)
 }
 
@@ -318,22 +330,23 @@ pub fn allocate_user_stack_in_table(pml4_phys: u64, stack_base: u64) -> VirtAddr
     use crate::memory;
     use crate::memory::paging::flags;
 
-    crate::serial_println!("[USER_STACK] Allocating user stack at {:#x} in table {:#x}", stack_base, pml4_phys);
+    crate::serial_str!("[USER_STACK] Allocating at ");
+    crate::drivers::serial::write_hex(stack_base);
+    crate::serial_str!(" in table ");
+    crate::drivers::serial::write_hex(pml4_phys);
+    crate::drivers::serial::write_newline();
 
     // Allocate one page for user stack
     let stack_page_addr = memory::physical::alloc_page()
         .expect("Failed to allocate user stack page");
-    crate::serial_println!("[USER_STACK] Physical page: {:#x}", stack_page_addr);
 
     // Map into the task's page table
-    crate::serial_println!("[USER_STACK] Mapping with flags USER_STACK");
     memory::paging::map_page_in_table(
         pml4_phys,
         stack_base as usize,
         stack_page_addr,
         flags::USER_STACK,
     ).expect("Failed to map user stack page in task table");
-    crate::serial_println!("[USER_STACK] Page mapped");
 
     // Zero the stack page via HHDM
     let hhdm_addr = crate::phys_to_virt(stack_page_addr);
@@ -342,7 +355,8 @@ pub fn allocate_user_stack_in_table(pml4_phys: u64, stack_base: u64) -> VirtAddr
     }
 
     let stack_top = stack_base + 4096 - 8;
-    crate::serial_println!("[USER_STACK] Stack top: {:#x}", stack_top);
-    crate::serial_println!("[USER_STACK] User stack setup complete in task table");
+    crate::serial_str!("[USER_STACK] Stack top: ");
+    crate::drivers::serial::write_hex(stack_top);
+    crate::drivers::serial::write_newline();
     VirtAddr::new(stack_top)
 }

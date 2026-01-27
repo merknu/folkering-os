@@ -227,13 +227,13 @@ static SCHEDULER: Mutex<EnhancedScheduler> = Mutex::new(EnhancedScheduler::new()
 /// Initialize scheduler
 pub fn init() {
     // Enhanced scheduler is already initialized
-    crate::serial_println!("[SCHED] Priority + Deadline Scheduler initialized");
-    crate::serial_println!("[SCHED] Features:");
-    crate::serial_println!("[SCHED]   - Priority scheduling (0-255)");
-    crate::serial_println!("[SCHED]   - Deadline support for time-critical tasks");
-    crate::serial_println!("[SCHED]   - Dynamic priority adjustment via BrainBridge");
-    crate::serial_println!("[SCHED]   - Aging to prevent starvation");
-    crate::serial_println!("[SCHED] Brain Bridge integration enabled (hints checked every 10ms)");
+    crate::serial_strln!("[SCHED] Priority + Deadline Scheduler initialized");
+    crate::serial_strln!("[SCHED] Features:");
+    crate::serial_strln!("[SCHED]   - Priority scheduling (0-255)");
+    crate::serial_strln!("[SCHED]   - Deadline support for time-critical tasks");
+    crate::serial_strln!("[SCHED]   - Dynamic priority adjustment via BrainBridge");
+    crate::serial_strln!("[SCHED]   - Aging to prevent starvation");
+    crate::serial_strln!("[SCHED] Brain Bridge integration enabled (hints checked every 10ms)");
 
     // Note: BrainBridge reader will be initialized later when shared memory is set up
     // via bridge::reader_init(phys_addr) after userspace creates the bridge page
@@ -444,7 +444,7 @@ fn apply_brain_hint(hint: &BrainBridgeSnapshot, cpu_boost: &mut bool) {
 
 /// Start scheduler (enter idle loop)
 pub fn start() -> ! {
-    crate::serial_println!("[SCHED] Scheduler started, entering task execution loop");
+    crate::serial_strln!("[SCHED] Scheduler started, entering task execution loop");
 
     // Disable interrupts during initial context switch
     x86_64::instructions::interrupts::disable();
@@ -455,7 +455,11 @@ pub fn start() -> ! {
         // Print syscall counter every 1000 iterations
         if iterations % 1000 == 0 && iterations > 0 {
             let count = crate::arch::x86_64::syscall::get_syscall_count();
-            crate::serial_println!("[SCHED] Iteration {}, syscalls: {}", iterations, count);
+            crate::serial_str!("[SCHED] Iteration ");
+            crate::drivers::serial::write_dec(iterations as u32);
+            crate::serial_str!(", syscalls: ");
+            crate::drivers::serial::write_dec(count as u32);
+            crate::drivers::serial::write_newline();
         }
         iterations += 1;
 
@@ -466,7 +470,7 @@ pub fn start() -> ! {
             }
         } else {
             // No tasks runnable, halt until interrupt
-            crate::serial_println!("[SCHED] No runnable tasks, halting");
+            crate::serial_strln!("[SCHED] No runnable tasks, halting");
             x86_64::instructions::interrupts::enable();
             x86_64::instructions::hlt();
             x86_64::instructions::interrupts::disable();

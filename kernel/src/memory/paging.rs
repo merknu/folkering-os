@@ -34,7 +34,7 @@ unsafe impl FrameAllocator<Size4KiB> for BootFrameAllocator {
 ///
 /// Sets up recursive page table mapping and creates kernel page table mapper.
 pub fn init(boot_info: &BootInfo) {
-    crate::serial_println!("[PAGING] Initializing page table management...");
+    crate::serial_strln!("[PAGING] Initializing page table management...");
 
     // Get active level 4 page table from CR3
     let level_4_table = unsafe { active_level_4_table() };
@@ -46,7 +46,7 @@ pub fn init(boot_info: &BootInfo) {
 
     *MAPPER.lock() = Some(mapper);
 
-    crate::serial_println!("[PAGING] Page table management initialized");
+    crate::serial_strln!("[PAGING] Page table management initialized");
 }
 
 /// Get active level 4 page table

@@ -189,7 +189,7 @@ pub unsafe extern "C" fn int_syscall_entry() {
 pub fn init() {
     // Set initialization marker to verify new code is loaded
     DEBUG_MARKER.store(0xBEEF, core::sync::atomic::Ordering::Relaxed);
-    crate::serial_println!("[SYSCALL_INIT] DEBUG_MARKER initialized to 0xBEEF");
+    crate::serial_strln!("[SYSCALL_INIT] DEBUG_MARKER initialized to 0xBEEF");
 
     // Enable SYSCALL/SYSRET extensions
     unsafe {
@@ -200,18 +200,27 @@ pub fn init() {
 
     // Verify SYSCALL is enabled
     let efer = Efer::read();
-    crate::serial_println!("[SYSCALL_INIT] EFER.SCE = {}", efer.contains(EferFlags::SYSTEM_CALL_EXTENSIONS));
+    crate::serial_str!("[SYSCALL_INIT] EFER.SCE = ");
+    if efer.contains(EferFlags::SYSTEM_CALL_EXTENSIONS) {
+        crate::serial_strln!("true");
+    } else {
+        crate::serial_strln!("false");
+    }
 
     // Set syscall handler entry point
     let entry_addr = syscall_entry as u64;
-    crate::serial_println!("[SYSCALL_INIT] syscall_entry function address: {:#x}", entry_addr);
+    crate::serial_str!("[SYSCALL_INIT] syscall_entry address: ");
+    crate::drivers::serial::write_hex(entry_addr);
+    crate::drivers::serial::write_newline();
     LStar::write(VirtAddr::new(entry_addr));
 
     let lstar_check = LStar::read();
-    crate::serial_println!("[SYSCALL_INIT] LSTAR set to {:#x}", lstar_check.as_u64());
+    crate::serial_str!("[SYSCALL_INIT] LSTAR set to ");
+    crate::drivers::serial::write_hex(lstar_check.as_u64());
+    crate::drivers::serial::write_newline();
 
     if lstar_check.as_u64() != entry_addr {
-        crate::serial_println!("[SYSCALL_INIT] WARNING: LSTAR mismatch!");
+        crate::serial_strln!("[SYSCALL_INIT] WARNING: LSTAR mismatch!");
     }
 
     // Configure STAR MSR for SYSCALL/SYSRET
@@ -226,8 +235,13 @@ pub fn init() {
         ((kernel_cs.0 as u64) << 32) |   // Kernel CS for SYSCALL
         ((kernel_data.0 as u64) << 48);  // Base for SYSRET
 
-    crate::serial_println!("[SYSCALL_INIT] Setting STAR to {:#x} (kernel_cs={:#x}, sysret_base={:#x})",
-        star_value, kernel_cs.0, kernel_data.0);
+    crate::serial_str!("[SYSCALL_INIT] STAR = ");
+    crate::drivers::serial::write_hex(star_value);
+    crate::serial_str!(" (kernel_cs=");
+    crate::drivers::serial::write_hex(kernel_cs.0 as u64);
+    crate::serial_str!(", sysret_base=");
+    crate::drivers::serial::write_hex(kernel_data.0 as u64);
+    crate::serial_strln!(")");
 
     unsafe {
         use x86_64::registers::model_specific::Msr;

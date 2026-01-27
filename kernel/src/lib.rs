@@ -141,18 +141,14 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
 
         serial_strln!("[BOOT] Starting Phase 3: IPC & Task Management...\n");
 
-        serial_strln!("[DEBUG] About to call ipc::init()...");
         // Initialize IPC subsystem
         serial_strln!("[INIT] Initializing IPC subsystem...");
         ipc::init();
-        serial_strln!("[DEBUG] ipc::init() returned OK");
         serial_strln!("[IPC] IPC subsystem ready\n");
 
-        serial_strln!("[DEBUG] About to call scheduler_init()...");
         // Initialize scheduler
         serial_strln!("[INIT] Initializing scheduler...");
         task::scheduler_init();
-        serial_strln!("[DEBUG] scheduler_init() returned OK");
         serial_strln!("[SCHED] Scheduler ready\n");
 
         // Note: Kernel doesn't need its own Task structure
@@ -332,7 +328,14 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
         if let Some(ref rd) = ramdisk {
             for entry in rd.entries() {
                 // Skip "shell" — already spawned above
-                if entry.name_str() == "shell" {
+                let name = entry.name_str();
+                let is_shell = name.len() == 5
+                    && name.as_bytes()[0] == b's'
+                    && name.as_bytes()[1] == b'h'
+                    && name.as_bytes()[2] == b'e'
+                    && name.as_bytes()[3] == b'l'
+                    && name.as_bytes()[4] == b'l';
+                if is_shell {
                     continue;
                 }
                 if entry.is_elf() {
@@ -461,11 +464,12 @@ macro_rules! serial_print {
     };
 }
 
-/// Serial println macro (uses format_args - may hang on toolchain bug)
+/// Serial println macro (uses format_args)
 #[macro_export]
 macro_rules! serial_println {
     () => ($crate::serial_print!("\n"));
-    ($($arg:tt)*) => ($crate::serial_print!("{}\n", format_args!($($arg)*)));
+    ($fmt:expr) => ($crate::drivers::serial::_print(format_args!(concat!($fmt, "\n"))));
+    ($fmt:expr, $($arg:tt)*) => ($crate::drivers::serial::_print(format_args!(concat!($fmt, "\n"), $($arg)*)));
 }
 
 /// Simple string print (bypasses format! - toolchain safe)

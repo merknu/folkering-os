@@ -23,7 +23,7 @@ use x86_64::PhysAddr;
 pub unsafe fn switch_to(target_id: TaskId) {
     use super::task::get_current_task;
 
-    crate::serial_println!("[SWITCH] switch_to(target_id={})", target_id);
+    crate::serial_str!("[SWITCH] switch_to(target_id="); crate::drivers::serial::write_dec(target_id as u32); crate::serial_strln!(")");
 
     let current_id = get_current_task();
 
@@ -67,11 +67,11 @@ pub unsafe fn switch_to(target_id: TaskId) {
     let target_ctx_ptr = {
         let target_locked = target.lock();
         let ctx_ptr = &target_locked.context as *const Context as usize;
-        crate::serial_println!("[SWITCH] Target task {} context pointer: {:#x}", target_id, ctx_ptr);
+        crate::serial_str!("[SWITCH] Target task "); crate::drivers::serial::write_dec(target_id as u32); crate::serial_str!(" context pointer: "); crate::drivers::serial::write_hex(ctx_ptr as u64); crate::drivers::serial::write_newline();
 
         // DEBUG: Check if this looks like a valid heap address
         if ctx_ptr < 0xFFFF_FF00_0000_0000 {
-            crate::serial_println!("[SWITCH] WARNING: Context pointer {:#x} looks like kernel data/code, not heap!", ctx_ptr);
+            crate::serial_str!("[SWITCH] WARNING: Context pointer "); crate::drivers::serial::write_hex(ctx_ptr as u64); crate::serial_strln!(" looks like kernel data/code, not heap!");
         }
         ctx_ptr
     };
@@ -80,7 +80,7 @@ pub unsafe fn switch_to(target_id: TaskId) {
     {
         let target_locked = target.lock();
         if target_locked.page_table_phys != 0 {
-            crate::serial_println!("[SWITCH] Switching to page table {:#x}", target_locked.page_table_phys);
+            crate::serial_str!("[SWITCH] Switching to page table "); crate::drivers::serial::write_hex(target_locked.page_table_phys as u64); crate::drivers::serial::write_newline();
             unsafe {
                 crate::memory::paging::switch_page_table(target_locked.page_table_phys);
             }
@@ -91,17 +91,17 @@ pub unsafe fn switch_to(target_id: TaskId) {
     set_current_task(target_id);
 
     // Update current context pointer for fast syscall access
-    crate::serial_println!("[SWITCH] Setting CURRENT_CONTEXT_PTR to {:#x} for task {}", target_ctx_ptr, target_id);
+    crate::serial_str!("[SWITCH] Setting CURRENT_CONTEXT_PTR to "); crate::drivers::serial::write_hex(target_ctx_ptr as u64); crate::serial_str!(" for task "); crate::drivers::serial::write_dec(target_id as u32); crate::drivers::serial::write_newline();
     crate::arch::x86_64::syscall::set_current_context_ptr(target_ctx_ptr as *mut Context);
 
     // Perform actual register switch (assembly)
     if current_ctx_ptr == 0 {
         // First switch from kernel - just restore new task, don't save
-        crate::serial_println!("[SWITCH] First switch from kernel, calling restore_context_only()");
+        crate::serial_strln!("[SWITCH] First switch from kernel, calling restore_context_only()");
         restore_context_only(target_ctx_ptr);
     } else {
         // Normal switch - save current, restore new
-        crate::serial_println!("[SWITCH] Normal switch, calling switch_context()");
+        crate::serial_strln!("[SWITCH] Normal switch, calling switch_context()");
         switch_context(current_ctx_ptr, target_ctx_ptr);
     }
 }
@@ -350,12 +350,12 @@ extern "C" fn debug_switch_iretq_frame(frame_rsp: usize) {
         let rflags = *frame.add(2);
         let rsp = *frame.add(3);
         let ss = *frame.add(4);
-        crate::serial_println!("[IRETQ-FRAME] RSP={:#x}", frame_rsp);
-        crate::serial_println!("[IRETQ-FRAME] [RSP+0]  RIP:    {:#x}", rip);
-        crate::serial_println!("[IRETQ-FRAME] [RSP+8]  CS:     {:#x}", cs);
-        crate::serial_println!("[IRETQ-FRAME] [RSP+16] RFLAGS: {:#x}", rflags);
-        crate::serial_println!("[IRETQ-FRAME] [RSP+24] RSP:    {:#x}", rsp);
-        crate::serial_println!("[IRETQ-FRAME] [RSP+32] SS:     {:#x}", ss);
+        crate::serial_str!("[IRETQ-FRAME] RSP="); crate::drivers::serial::write_hex(frame_rsp as u64); crate::drivers::serial::write_newline();
+        crate::serial_str!("[IRETQ-FRAME] [RSP+0]  RIP:    "); crate::drivers::serial::write_hex(rip); crate::drivers::serial::write_newline();
+        crate::serial_str!("[IRETQ-FRAME] [RSP+8]  CS:     "); crate::drivers::serial::write_hex(cs); crate::drivers::serial::write_newline();
+        crate::serial_str!("[IRETQ-FRAME] [RSP+16] RFLAGS: "); crate::drivers::serial::write_hex(rflags); crate::drivers::serial::write_newline();
+        crate::serial_str!("[IRETQ-FRAME] [RSP+24] RSP:    "); crate::drivers::serial::write_hex(rsp); crate::drivers::serial::write_newline();
+        crate::serial_str!("[IRETQ-FRAME] [RSP+32] SS:     "); crate::drivers::serial::write_hex(ss); crate::drivers::serial::write_newline();
     }
 }
 

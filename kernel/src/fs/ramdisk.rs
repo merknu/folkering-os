@@ -90,10 +90,22 @@ impl Ramdisk {
         if name_bytes.len() >= FPK_NAME_LEN {
             return None;
         }
-        self.entries().iter().find(|e| {
+        for e in self.entries() {
             let len = e.name.iter().position(|&b| b == 0).unwrap_or(FPK_NAME_LEN);
-            len == name_bytes.len() && e.name[..len] == *name_bytes
-        })
+            if len == name_bytes.len() {
+                let mut matched = true;
+                for j in 0..len {
+                    if e.name[j] != name_bytes[j] {
+                        matched = false;
+                        break;
+                    }
+                }
+                if matched {
+                    return Some(e);
+                }
+            }
+        }
+        None
     }
 
     /// Get the raw bytes for an entry

@@ -48,21 +48,29 @@ pub fn spawn(binary: &[u8], _args: &[&str]) -> Result<TaskId, SpawnError> {
     use super::elf::pf;
     use core::mem::MaybeUninit;
 
-    crate::serial_println!("[SPAWN_ELF] Starting ELF spawn, binary size={}", binary.len());
+    crate::serial_str!("[SPAWN_ELF] Starting ELF spawn, binary size=");
+    crate::drivers::serial::write_dec(binary.len() as u32);
+    crate::drivers::serial::write_newline();
 
     // 1. Parse ELF binary
     let elf = ElfBinary::parse(binary)?;
     let entry_point = elf.entry_point();
-    crate::serial_println!("[SPAWN_ELF] ELF parsed, entry={:#x}", entry_point);
+    crate::serial_str!("[SPAWN_ELF] ELF parsed, entry=");
+    crate::drivers::serial::write_hex(entry_point);
+    crate::drivers::serial::write_newline();
 
     // 2. Allocate new task ID
     let task_id = allocate_task_id();
-    crate::serial_println!("[SPAWN_ELF] Allocated task ID: {}", task_id);
+    crate::serial_str!("[SPAWN_ELF] Allocated task ID: ");
+    crate::drivers::serial::write_dec(task_id);
+    crate::drivers::serial::write_newline();
 
     // 3. Create per-task page table (copies kernel mappings)
     let page_table_phys = paging::create_task_page_table()
         .map_err(|_| SpawnError::OutOfMemory)?;
-    crate::serial_println!("[SPAWN_ELF] Page table created at phys {:#x}", page_table_phys);
+    crate::serial_str!("[SPAWN_ELF] Page table created at phys ");
+    crate::drivers::serial::write_hex(page_table_phys as u64);
+    crate::drivers::serial::write_newline();
 
     // 4. Load all PT_LOAD segments into the task's address space
     for segment in elf.loadable_segments() {
@@ -72,8 +80,15 @@ pub fn spawn(binary: &[u8], _args: &[&str]) -> Result<TaskId, SpawnError> {
         let offset = segment.p_offset as usize;
         let seg_flags = segment.p_flags;
 
-        crate::serial_println!("[SPAWN_ELF] Loading segment: vaddr={:#x}, filesz={}, memsz={}, flags={:#x}",
-                              vaddr, filesz, memsz, seg_flags);
+        crate::serial_str!("[SPAWN_ELF] Loading segment: vaddr=");
+        crate::drivers::serial::write_hex(vaddr);
+        crate::serial_str!(", filesz=");
+        crate::drivers::serial::write_dec(filesz as u32);
+        crate::serial_str!(", memsz=");
+        crate::drivers::serial::write_dec(memsz as u32);
+        crate::serial_str!(", flags=");
+        crate::drivers::serial::write_hex(seg_flags as u64);
+        crate::drivers::serial::write_newline();
 
         // Skip empty segments
         if memsz == 0 {
@@ -86,8 +101,13 @@ pub fn spawn(binary: &[u8], _args: &[&str]) -> Result<TaskId, SpawnError> {
         let end_page = (end_addr + 0xFFF) & !0xFFF; // Page-align end (round up)
         let num_pages = ((end_page - start_page) / 4096) as usize;
 
-        crate::serial_println!("[SPAWN_ELF] Segment spans {} pages: {:#x} - {:#x}",
-                              num_pages, start_page, end_page);
+        crate::serial_str!("[SPAWN_ELF] Segment spans ");
+        crate::drivers::serial::write_dec(num_pages as u32);
+        crate::serial_str!(" pages: ");
+        crate::drivers::serial::write_hex(start_page);
+        crate::serial_str!(" - ");
+        crate::drivers::serial::write_hex(end_page);
+        crate::drivers::serial::write_newline();
 
         // Determine page flags based on segment flags
         let page_flags = if seg_flags & pf::W != 0 {
@@ -176,7 +196,11 @@ pub fn spawn(binary: &[u8], _args: &[&str]) -> Result<TaskId, SpawnError> {
     ).map_err(|_| SpawnError::OutOfMemory)?;
 
     let user_stack_top = stack_base + 4096 - 8;
-    crate::serial_println!("[SPAWN_ELF] User stack at {:#x}, top={:#x}", stack_base, user_stack_top);
+    crate::serial_str!("[SPAWN_ELF] User stack at ");
+    crate::drivers::serial::write_hex(stack_base);
+    crate::serial_str!(", top=");
+    crate::drivers::serial::write_hex(user_stack_top);
+    crate::drivers::serial::write_newline();
 
     // 6. Create placeholder PageTablePtr (legacy, will be removed)
     let page_table_box: Box<PageTable> = unsafe {
@@ -192,8 +216,13 @@ pub fn spawn(binary: &[u8], _args: &[&str]) -> Result<TaskId, SpawnError> {
     task.context.rsp = user_stack_top;
     task.context.rbp = user_stack_top;
 
-    crate::serial_println!("[SPAWN_ELF] Task created: id={}, entry={:#x}, rsp={:#x}",
-                          task_id, entry_point, user_stack_top);
+    crate::serial_str!("[SPAWN_ELF] Task created: id=");
+    crate::drivers::serial::write_dec(task_id);
+    crate::serial_str!(", entry=");
+    crate::drivers::serial::write_hex(entry_point);
+    crate::serial_str!(", rsp=");
+    crate::drivers::serial::write_hex(user_stack_top);
+    crate::drivers::serial::write_newline();
 
     // 8. Insert into global task table
     insert_task(task);
@@ -201,7 +230,9 @@ pub fn spawn(binary: &[u8], _args: &[&str]) -> Result<TaskId, SpawnError> {
     // 9. Add to scheduler runqueue
     crate::task::scheduler::enqueue(task_id);
 
-    crate::serial_println!("[SPAWN_ELF] Task {} spawn complete!", task_id);
+    crate::serial_str!("[SPAWN_ELF] Task ");
+    crate::drivers::serial::write_dec(task_id);
+    crate::serial_strln!(" spawn complete!");
     Ok(task_id)
 }
 
@@ -231,14 +262,19 @@ pub fn spawn_raw(code: &[u8], entry_offset: u64) -> Result<TaskId, SpawnError> {
     let task_id = allocate_task_id();
 
     // 2. Create per-task page table (copies kernel mappings)
-    crate::serial_println!("[SPAWN_RAW] Step 2: Creating per-task page table...");
+    crate::serial_strln!("[SPAWN_RAW] Step 2: Creating per-task page table...");
     let page_table_phys = paging::create_task_page_table()
         .map_err(|_| SpawnError::OutOfMemory)?;
-    crate::serial_println!("[SPAWN_RAW] Step 2: Page table created at phys {:#x}", page_table_phys);
+    crate::serial_str!("[SPAWN_RAW] Step 2: Page table created at phys ");
+    crate::drivers::serial::write_hex(page_table_phys as u64);
+    crate::drivers::serial::write_newline();
 
     // 3. Map and load code into task's page table at task-specific address
     // Each task gets 1 GB of address space: 0x400000 + (task_id - 1) * 0x40000000
     let code_base = 0x400000u64 + ((task_id - 1) as u64 * 0x40000000);
+    crate::serial_str!("[SPAWN_RAW] Step 3: About to map code at ");
+    crate::drivers::serial::write_hex(code_base);
+    crate::drivers::serial::write_newline();
     let entry_point = map_and_load_user_code_in_table(page_table_phys, code, code_base);
     let entry_addr = entry_point.as_u64() + entry_offset;
 
@@ -257,31 +293,39 @@ pub fn spawn_raw(code: &[u8], entry_offset: u64) -> Result<TaskId, SpawnError> {
     };
     let page_table_ptr = PageTablePtr::new(Box::into_raw(page_table_box));
 
-    crate::serial_println!("[SPAWN_RAW] Step 6: about to call Task::new()...");
+    crate::serial_strln!("[SPAWN_RAW] Step 6: about to call Task::new()...");
     // 6. Create task structure using global buffer
     let mut task = Task::new(task_id, page_table_ptr, entry_addr);
-    crate::serial_println!("[SPAWN_RAW] Step 6: Task::new() returned");
+    crate::serial_strln!("[SPAWN_RAW] Step 6: Task::new() returned");
 
     // 7. Set the per-task page table physical address
     task.page_table_phys = page_table_phys;
-    crate::serial_println!("[SPAWN_RAW] Step 7: page_table_phys set to {:#x}", page_table_phys);
+    crate::serial_str!("[SPAWN_RAW] Step 7: page_table_phys set to ");
+    crate::drivers::serial::write_hex(page_table_phys as u64);
+    crate::drivers::serial::write_newline();
 
     // 8. Update task's stack pointer in context
-    crate::serial_println!("[SPAWN_RAW] Step 8: updating context.rsp/rbp to {:#x}", user_stack.as_u64());
+    crate::serial_str!("[SPAWN_RAW] Step 8: updating context.rsp/rbp to ");
+    crate::drivers::serial::write_hex(user_stack.as_u64());
+    crate::drivers::serial::write_newline();
     task.context.rsp = user_stack.as_u64();
     task.context.rbp = user_stack.as_u64();
-    crate::serial_println!("[SPAWN_RAW] Step 8: context updated");
+    crate::serial_strln!("[SPAWN_RAW] Step 8: context updated");
 
     // 9. Insert into global task table
-    crate::serial_println!("[SPAWN_RAW] Step 9: about to insert_task()...");
+    crate::serial_strln!("[SPAWN_RAW] Step 9: about to insert_task()...");
     insert_task(task);
-    crate::serial_println!("[SPAWN_RAW] Step 9: insert_task() done");
+    crate::serial_strln!("[SPAWN_RAW] Step 9: insert_task() done");
 
     // 10. Add to scheduler runqueue
-    crate::serial_println!("[SPAWN_RAW] Step 10: about to enqueue()...");
+    crate::serial_strln!("[SPAWN_RAW] Step 10: about to enqueue()...");
     crate::task::scheduler::enqueue(task_id);
-    crate::serial_println!("[SPAWN_RAW] Step 10: enqueue() done");
+    crate::serial_strln!("[SPAWN_RAW] Step 10: enqueue() done");
 
-    crate::serial_println!("[SPAWN_RAW] Task {} spawn complete with page table {:#x}!", task_id, page_table_phys);
+    crate::serial_str!("[SPAWN_RAW] Task ");
+    crate::drivers::serial::write_dec(task_id);
+    crate::serial_str!(" spawn complete with page table ");
+    crate::drivers::serial::write_hex(page_table_phys as u64);
+    crate::serial_strln!("!");
     Ok(task_id)
 }
