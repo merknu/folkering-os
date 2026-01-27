@@ -301,6 +301,14 @@ static USER_R15_SAVE: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomic
 #[no_mangle]
 static USER_R12_SAVE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// Temporary storage for user RSI during syscall (RSI clobbered by function calls)
+#[no_mangle]
+static USER_RSI_SAVE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Temporary storage for user RDX during syscall (RDX clobbered by function calls)
+#[no_mangle]
+static USER_RDX_SAVE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Temporary storage for user R13 during syscall (R13 is used for saved RFLAGS)
 #[no_mangle]
 static USER_R13_SAVE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -563,6 +571,15 @@ extern "C" fn syscall_entry() {
         "mov r12, rcx",  // R12 = user RIP (from SYSCALL)
         "mov r13, r11",  // R13 = user RFLAGS (from SYSCALL)
 
+        // Save RSI and RDX to statics BEFORE any function calls
+        // (caller-saved registers, clobbered by debug_entry_hit and get_ctx_fn)
+        "push rax",
+        "mov rax, rsi",
+        "mov qword ptr [rip + {user_rsi_save}], rax",
+        "mov rax, rdx",
+        "mov qword ptr [rip + {user_rdx_save}], rax",
+        "pop rax",
+
         // DEBUG: Save RCX (user RIP) from R12
         "push rax",
         "mov rax, r12",
@@ -682,13 +699,17 @@ extern "C" fn syscall_entry() {
         //                 rip, rflags, cs, ss
         // NOTE: RIP and RFLAGS already saved above! R12/R13 also already saved!
 
+        // Restore original RSI/RDX from statics before saving to Context
+        "mov rsi, qword ptr [rip + {user_rsi_save}]",
+        "mov rdx, qword ptr [rip + {user_rdx_save}]",
+
         "mov [r15 + 0], r14",      // RSP (user RSP saved before stack switch)
         "mov [r15 + 8], rbp",      // RBP
         "mov [r15 + 16], rax",     // RAX (syscall number)
         "mov [r15 + 24], rbx",     // RBX
         "mov [r15 + 32], rcx",     // RCX (NOTE: Contains user RIP after SYSCALL, not user's RCX!)
-        "mov [r15 + 40], rdx",     // RDX
-        "mov [r15 + 48], rsi",     // RSI
+        "mov [r15 + 40], rdx",     // RDX (restored from static)
+        "mov [r15 + 48], rsi",     // RSI (restored from static)
         "mov [r15 + 56], rdi",     // RDI
         "mov [r15 + 64], r8",      // R8
         "mov [r15 + 72], r9",      // R9
@@ -789,6 +810,10 @@ extern "C" fn syscall_entry() {
         "mov rbx, 0xBC",
         "mov qword ptr [rip + {debug_marker}], rbx",
         "pop rbx",
+
+        // Restore original RSI and RDX from statics (clobbered by earlier function calls)
+        "mov rsi, qword ptr [rip + {user_rsi_save}]",
+        "mov rdx, qword ptr [rip + {user_rdx_save}]",
 
         "push rax",
         "mov r9, r8",
@@ -1018,6 +1043,8 @@ extern "C" fn syscall_entry() {
         debug_verify_ctx_fn = sym debug_verify_context_before_iretq,
         user_r12_save = sym USER_R12_SAVE,
         user_r13_save = sym USER_R13_SAVE,
+        user_rsi_save = sym USER_RSI_SAVE,
+        user_rdx_save = sym USER_RDX_SAVE,
     );
 }
 
@@ -1080,6 +1107,7 @@ extern "C" fn syscall_handler(
         10 => syscall_get_pid(),
         11 => syscall_task_list(),
         12 => syscall_uptime(),
+        13 => syscall_fs_read_dir(arg1, arg2),
         _ => {
             crate::drivers::serial::write_str("[HANDLER] Invalid syscall!\n");
             u64::MAX // Return error
@@ -1631,6 +1659,51 @@ fn syscall_task_list() -> u64 {
 /// Returns: number of milliseconds since boot
 fn syscall_uptime() -> u64 {
     crate::timer::uptime_ms()
+}
+
+/// Read directory entries from the ramdisk into a userspace buffer.
+///
+/// Arguments:
+/// - buf_ptr: pointer to userspace buffer for DirEntry structs
+/// - buf_size: size of the buffer in bytes
+///
+/// Returns: number of entries written, 0 if no ramdisk, u64::MAX on error
+fn syscall_fs_read_dir(buf_ptr: u64, buf_size: u64) -> u64 {
+    use crate::fs::format::DirEntry;
+
+    if buf_ptr == 0 || buf_size == 0 {
+        return u64::MAX;
+    }
+
+    let rd = match crate::fs::ramdisk() {
+        Some(rd) => rd,
+        None => return 0,
+    };
+
+    let entry_size = core::mem::size_of::<DirEntry>(); // 44 bytes
+    let max_entries = buf_size as usize / entry_size;
+    let entries = rd.entries();
+    let count = entries.len().min(max_entries);
+
+    for i in 0..count {
+        let fpk = &entries[i];
+        let dir_entry = DirEntry {
+            id: fpk.id,
+            entry_type: fpk.entry_type,
+            name: fpk.name,
+            size: fpk.size,
+        };
+        unsafe {
+            let dst = (buf_ptr as *mut u8).add(i * entry_size);
+            core::ptr::copy_nonoverlapping(
+                &dir_entry as *const DirEntry as *const u8,
+                dst,
+                entry_size,
+            );
+        }
+    }
+
+    count as u64
 }
 
 /// Debug: Print RAX value at syscall entry

@@ -94,6 +94,7 @@ fn execute_command() {
     match command {
         "help" => cmd_help(),
         "echo" => cmd_echo(parts),
+        "ls" => cmd_ls(),
         "ps" => cmd_ps(),
         "uptime" => cmd_uptime(),
         "pid" => cmd_pid(),
@@ -110,11 +111,33 @@ fn cmd_help() {
     println!("Available commands:");
     println!("  help     - Show this help message");
     println!("  echo     - Echo text back");
+    println!("  ls       - List files in ramdisk");
     println!("  ps       - List running tasks");
     println!("  uptime   - Show system uptime");
     println!("  pid      - Show current process ID");
     println!("  clear    - Clear the screen");
     println!("  exit     - Exit the shell");
+}
+
+fn cmd_ls() {
+    let mut entries = [libfolk::sys::fs::DirEntry {
+        id: 0, entry_type: 0, name: [0u8; 32], size: 0
+    }; 16];
+
+    let count = libfolk::sys::fs::read_dir(&mut entries);
+    if count == 0 {
+        println!("(no files)");
+        return;
+    }
+
+    println!();
+    for i in 0..count {
+        let e = entries[i];
+        let kind = if e.is_elf() { "ELF " } else { "DATA" };
+        let size = e.size;
+        println!("  {} {:>8} {}", kind, size, e.name_str());
+    }
+    println!("\n{} file(s)", count);
 }
 
 fn cmd_echo<'a>(mut args: impl Iterator<Item = &'a str>) {

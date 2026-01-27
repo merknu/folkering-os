@@ -243,7 +243,7 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
 
         // ===== Ramdisk Initialization =====
         // Try to load Folk-Pack initrd from boot module
-        let ramdisk = if boot_info.initrd_size > 0 {
+        let has_ramdisk = if boot_info.initrd_size > 0 {
             serial_strln!("[RAMDISK] Parsing Folk-Pack initrd...");
             serial_str!("[RAMDISK] Address: ");
             drivers::serial::write_hex(boot_info.initrd_start as u64);
@@ -269,7 +269,9 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
                         serial_strln!(" bytes)");
                     }
 
-                    Some(rd)
+                    // Store ramdisk globally for syscall access
+                    fs::init_ramdisk(rd);
+                    true
                 }
                 Err(e) => {
                     serial_str!("[RAMDISK] Failed to parse initrd: ");
@@ -280,19 +282,19 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
                         fs::ramdisk::RamdiskError::EntryTableOverflow => { serial_strln!("EntryTableOverflow"); }
                         fs::ramdisk::RamdiskError::EntryDataOverflow => { serial_strln!("EntryDataOverflow"); }
                     }
-                    None
+                    false
                 }
             }
         } else {
             serial_strln!("[RAMDISK] No initrd provided, using embedded fallback");
-            None
+            false
         };
 
         // Spawn Task 5 - Rust Shell (libfolk-based, ELF binary)
         // Try ramdisk first, fall back to include_bytes! if not available
         serial_strln!("[BOOT] Spawning Task 5 (Rust shell from libfolk)...");
 
-        let shell_elf: &[u8] = if let Some(ref rd) = ramdisk {
+        let shell_elf: &[u8] = if let Some(rd) = fs::ramdisk() {
             if let Some(entry) = rd.find("shell") {
                 serial_strln!("[BOOT] Loading shell from ramdisk...");
                 rd.read(entry)
@@ -325,7 +327,7 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
         }
 
         // Spawn any additional ELF entries from the ramdisk
-        if let Some(ref rd) = ramdisk {
+        if let Some(rd) = fs::ramdisk() {
             for entry in rd.entries() {
                 // Skip "shell" — already spawned above
                 let name = entry.name_str();

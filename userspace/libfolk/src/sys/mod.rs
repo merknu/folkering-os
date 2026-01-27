@@ -7,6 +7,7 @@ pub mod io;
 pub mod ipc;
 pub mod memory;
 pub mod system;
+pub mod fs;
 
 // Re-export commonly used functions at the sys level
 pub use task::{exit, yield_cpu, get_pid, spawn};

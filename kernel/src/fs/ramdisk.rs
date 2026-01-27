@@ -26,6 +26,11 @@ pub struct Ramdisk {
     size: usize,
 }
 
+// Safety: Ramdisk points to boot-time memory that lives for the entire kernel lifetime.
+// The data is read-only after init, so sharing across contexts is safe.
+unsafe impl Send for Ramdisk {}
+unsafe impl Sync for Ramdisk {}
+
 impl Ramdisk {
     /// Parse a Folk-Pack image from a virtual memory address.
     ///

@@ -71,6 +71,25 @@ pub struct FpkEntry {
 
 const _: () = assert!(core::mem::size_of::<FpkEntry>() == 64);
 
+/// Directory entry for userspace (subset of FpkEntry, no offset/hash)
+///
+/// Shared between kernel and userspace via the FS_READ_DIR syscall.
+#[derive(Debug, Clone, Copy)]
+#[repr(C, packed)]
+pub struct DirEntry {
+    /// Unique entry ID (0-based)
+    pub id: u16,
+    /// Entry type (0 = ELF, 1 = DATA)
+    pub entry_type: u16,
+    /// Null-padded name (max 32 bytes)
+    pub name: [u8; FPK_NAME_LEN],
+    /// File size in bytes
+    pub size: u64,
+}
+
+// 2 + 2 + 32 + 8 = 44 bytes (packed, no padding)
+const _: () = assert!(core::mem::size_of::<DirEntry>() == 44);
+
 impl FpkEntry {
     /// Get the entry name as a &str (up to first null byte)
     pub fn name_str(&self) -> &str {
