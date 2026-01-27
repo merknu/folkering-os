@@ -1,0 +1,11 @@
+# Folkering OS Userspace Workspace
+# Only includes #![no_std] programs that target the OS
+
+[workspace]
+members = ["libfolk", "shell"]
+resolver = "2"
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = "s"

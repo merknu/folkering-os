@@ -232,16 +232,39 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
         }
         serial_strln!("[BOOT] IPC capabilities granted");
 
-        // Spawn Task 4 - Shell (keyboard echo)
-        serial_strln!("[BOOT] Spawning Task 4 (shell)...");
+        // Spawn Task 4 - Simple shell (assembly-based keyboard echo)
+        serial_strln!("[BOOT] Spawning Task 4 (simple shell)...");
         match task::spawn_raw(&userspace_test::SHELL_PROGRAM.code[..userspace_test::ShellProgram::code_size()], 0) {
             Ok(task_id) => {
-                serial_str!("[BOOT] Task 4 (shell) spawned, id=");
+                serial_str!("[BOOT] Task 4 (simple shell) spawned, id=");
                 drivers::serial::write_dec(task_id);
                 serial_strln!("");
             }
             Err(_e) => {
-                serial_strln!("[BOOT] Task 4 (shell) spawn FAILED (continuing anyway)");
+                serial_strln!("[BOOT] Task 4 (simple shell) spawn FAILED (continuing anyway)");
+            }
+        }
+
+        // Spawn Task 5 - Rust Shell (libfolk-based, ELF binary)
+        serial_strln!("[BOOT] Spawning Task 5 (Rust shell from libfolk)...");
+        static RUST_SHELL_ELF: &[u8] = include_bytes!("../../userspace/target/x86_64-folkering-userspace/release/shell");
+        serial_str!("[BOOT] Rust shell ELF size: ");
+        drivers::serial::write_dec(RUST_SHELL_ELF.len() as u32);
+        serial_strln!(" bytes");
+        match task::spawn(RUST_SHELL_ELF, &[]) {
+            Ok(task_id) => {
+                serial_str!("[BOOT] Task 5 (Rust shell) spawned, id=");
+                drivers::serial::write_dec(task_id);
+                serial_strln!("");
+            }
+            Err(e) => {
+                serial_str!("[BOOT] Task 5 (Rust shell) spawn FAILED: ");
+                match e {
+                    task::SpawnError::InvalidElf(_) => { serial_strln!("InvalidElf"); }
+                    task::SpawnError::OutOfMemory => { serial_strln!("OutOfMemory"); }
+                    task::SpawnError::PermissionDenied => { serial_strln!("PermissionDenied"); }
+                    task::SpawnError::NotFound => { serial_strln!("NotFound"); }
+                }
             }
         }
 

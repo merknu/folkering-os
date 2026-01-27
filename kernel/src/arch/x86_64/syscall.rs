@@ -283,6 +283,14 @@ static DEBUG_RCX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64:
 #[no_mangle]
 static USER_R15_SAVE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// Temporary storage for user R12 during syscall (R12 is used for saved RIP)
+#[no_mangle]
+static USER_R12_SAVE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Temporary storage for user R13 during syscall (R13 is used for saved RFLAGS)
+#[no_mangle]
+static USER_R13_SAVE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Get the current syscall count
 pub fn get_syscall_count() -> u64 {
     SYSCALL_COUNT.load(core::sync::atomic::Ordering::Relaxed)
@@ -527,9 +535,17 @@ extern "C" fn syscall_entry() {
         // SYSCALL doesn't switch stacks, so RSP still points to user stack
         "mov r14, rsp",  // R14 = user RSP (BEFORE any pushes!)
 
-        // CRITICAL SECOND STEP: Save RCX and R11 to safe registers
+        // Save user R12 and R13 to statics BEFORE overwriting them
+        // (R12/R13 will be used to hold saved RIP/RFLAGS from SYSCALL)
+        "push rax",
+        "mov rax, r12",
+        "mov qword ptr [rip + {user_r12_save}], rax",
+        "mov rax, r13",
+        "mov qword ptr [rip + {user_r13_save}], rax",
+        "pop rax",
+
+        // CRITICAL SECOND STEP: Save RCX and R11 to callee-saved registers
         // These are caller-saved and will be corrupted by function calls
-        // We can't push them yet because we're still on user stack
         "mov r12, rcx",  // R12 = user RIP (from SYSCALL)
         "mov r13, r11",  // R13 = user RFLAGS (from SYSCALL)
 
@@ -614,11 +630,13 @@ extern "C" fn syscall_entry() {
         "pop rdi",
         "pop rax",
 
-        // Save actual user R12/R13 values to their slots (these are different from above!)
-        // We need to get these from somewhere... but we never saved them!
-        // For now, save R12/R13 which contain user RIP/RFLAGS (will be wrong for user R12/R13)
-        "mov [r15 + 96], r12",   // R12 slot (WRONG: This is user RIP, not user's R12!)
-        "mov [r15 + 104], r13",  // R13 slot (WRONG: This is user RFLAGS, not user's R13!)
+        // Restore actual user R12/R13 values from statics into their Context slots
+        "push rbx",
+        "mov rbx, qword ptr [rip + {user_r12_save}]",
+        "mov [r15 + 96], rbx",   // R12 slot: actual user R12
+        "mov rbx, qword ptr [rip + {user_r13_save}]",
+        "mov [r15 + 104], rbx",  // R13 slot: actual user R13
+        "pop rbx",
 
         // Restore all saved registers
         "pop r14",       // User RSP
@@ -984,6 +1002,8 @@ extern "C" fn syscall_entry() {
         debug_rip_after_save_fn = sym debug_rip_after_save,
         debug_context_rip_saved_fn = sym debug_context_rip_saved,
         debug_verify_ctx_fn = sym debug_verify_context_before_iretq,
+        user_r12_save = sym USER_R12_SAVE,
+        user_r13_save = sym USER_R13_SAVE,
     );
 }
 
