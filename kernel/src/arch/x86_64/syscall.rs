@@ -1108,6 +1108,7 @@ extern "C" fn syscall_handler(
         11 => syscall_task_list(),
         12 => syscall_uptime(),
         13 => syscall_fs_read_dir(arg1, arg2),
+        14 => syscall_fs_read_file(arg1, arg2, arg3),
         _ => {
             crate::drivers::serial::write_str("[HANDLER] Invalid syscall!\n");
             u64::MAX // Return error
@@ -1704,6 +1705,60 @@ fn syscall_fs_read_dir(buf_ptr: u64, buf_size: u64) -> u64 {
     }
 
     count as u64
+}
+
+/// Read a file's contents from the ramdisk into a userspace buffer.
+///
+/// Arguments:
+/// - name_ptr: pointer to null-terminated filename (max 32 bytes)
+/// - buf_ptr: userspace destination buffer
+/// - buf_size: max bytes to write
+///
+/// Returns: number of bytes written, u64::MAX on error
+fn syscall_fs_read_file(name_ptr: u64, buf_ptr: u64, buf_size: u64) -> u64 {
+    if name_ptr == 0 || buf_ptr == 0 || buf_size == 0 {
+        return u64::MAX;
+    }
+
+    // Read filename from userspace (byte-by-byte, max 32 bytes)
+    let mut name_buf = [0u8; 32];
+    let name_src = name_ptr as *const u8;
+    let mut name_len = 0;
+    for i in 0..32 {
+        let b = unsafe { core::ptr::read(name_src.add(i)) };
+        if b == 0 { break; }
+        name_buf[i] = b;
+        name_len = i + 1;
+    }
+
+    let name = match core::str::from_utf8(&name_buf[..name_len]) {
+        Ok(s) => s,
+        Err(_) => return u64::MAX,
+    };
+
+    // Look up file in ramdisk
+    let rd = match crate::fs::ramdisk() {
+        Some(rd) => rd,
+        None => return u64::MAX,
+    };
+
+    let entry = match rd.find(name) {
+        Some(e) => e,
+        None => return u64::MAX,
+    };
+
+    let data = rd.read(entry);
+    let copy_len = data.len().min(buf_size as usize);
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            data.as_ptr(),
+            buf_ptr as *mut u8,
+            copy_len,
+        );
+    }
+
+    copy_len as u64
 }
 
 /// Debug: Print RAX value at syscall entry

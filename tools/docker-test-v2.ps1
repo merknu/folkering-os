@@ -31,7 +31,7 @@ if ($LASTEXITCODE -ne 0) {
     $shellPath = "userspace\target\x86_64-folkering-userspace\release\shell"
     if (Test-Path $shellPath) {
         Write-Host "Creating initrd.fpk..." -ForegroundColor Cyan
-        & $folkPackExe create "boot\iso_root\boot\initrd.fpk" --add "shell:elf:$shellPath"
+        & $folkPackExe create "boot\iso_root\boot\initrd.fpk" --add "shell:elf:$shellPath" --add "hello.txt:data:boot\hello.txt"
         if ($LASTEXITCODE -ne 0) {
             Write-Host "folk-pack create failed, continuing without initrd" -ForegroundColor Yellow
         } else {

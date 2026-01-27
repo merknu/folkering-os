@@ -95,6 +95,7 @@ fn execute_command() {
         "help" => cmd_help(),
         "echo" => cmd_echo(parts),
         "ls" => cmd_ls(),
+        "cat" => cmd_cat(parts),
         "ps" => cmd_ps(),
         "uptime" => cmd_uptime(),
         "pid" => cmd_pid(),
@@ -112,6 +113,7 @@ fn cmd_help() {
     println!("  help     - Show this help message");
     println!("  echo     - Echo text back");
     println!("  ls       - List files in ramdisk");
+    println!("  cat <file> - Display file contents");
     println!("  ps       - List running tasks");
     println!("  uptime   - Show system uptime");
     println!("  pid      - Show current process ID");
@@ -138,6 +140,34 @@ fn cmd_ls() {
         println!("  {} {:>8} {}", kind, size, e.name_str());
     }
     println!("\n{} file(s)", count);
+}
+
+fn cmd_cat<'a>(mut args: impl Iterator<Item = &'a str>) {
+    let filename = match args.next() {
+        Some(f) => f,
+        None => {
+            println!("usage: cat <filename>");
+            return;
+        }
+    };
+
+    let mut buf = [0u8; 4096];
+    let n = libfolk::sys::fs::read_file(filename, &mut buf);
+
+    if n == 0 {
+        println!("cat: {}: not found or empty", filename);
+        return;
+    }
+
+    // Print contents — handle common whitespace, replace other non-printable bytes with dots
+    for &b in &buf[..n] {
+        if b == b'\n' || b == b'\r' || b == b'\t' || (b >= 0x20 && b < 0x7F) {
+            print!("{}", b as char);
+        } else {
+            print!(".");
+        }
+    }
+    println!();
 }
 
 fn cmd_echo<'a>(mut args: impl Iterator<Item = &'a str>) {

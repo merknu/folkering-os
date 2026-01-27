@@ -2,9 +2,10 @@
 //!
 //! Provides access to the kernel's filesystem (ramdisk) from userspace.
 
-use crate::syscall::syscall2;
+use crate::syscall::{syscall2, syscall3};
 
 const SYS_FS_READ_DIR: u64 = 13;
+const SYS_FS_READ_FILE: u64 = 14;
 
 /// Directory entry returned by the kernel (matches kernel's DirEntry layout).
 #[repr(C, packed)]
@@ -42,5 +43,24 @@ pub fn read_dir(buf: &mut [DirEntry]) -> usize {
     let ptr = buf.as_mut_ptr() as u64;
     let size = (buf.len() * core::mem::size_of::<DirEntry>()) as u64;
     let ret = unsafe { syscall2(SYS_FS_READ_DIR, ptr, size) };
+    if ret == u64::MAX { 0 } else { ret as usize }
+}
+
+/// Read a file's contents into the provided buffer.
+/// Returns the number of bytes read, or 0 on error/not found.
+pub fn read_file(name: &str, buf: &mut [u8]) -> usize {
+    let mut name_buf = [0u8; 32];
+    let len = name.len().min(31);
+    name_buf[..len].copy_from_slice(&name.as_bytes()[..len]);
+    // name_buf[len] is already 0 (null terminator)
+
+    let ret = unsafe {
+        syscall3(
+            SYS_FS_READ_FILE,
+            name_buf.as_ptr() as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+        )
+    };
     if ret == u64::MAX { 0 } else { ret as usize }
 }

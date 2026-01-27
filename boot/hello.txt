@@ -1,0 +1,2 @@
+Hello from Folkering OS!
+This file lives in the ramdisk.
