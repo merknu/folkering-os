@@ -82,47 +82,26 @@ pub enum Errno {
 /// ```
 #[inline(never)] // Prevent inlining to keep instruction cache clean
 pub fn ipc_send(target: TaskId, msg: &IpcMessage) -> Result<IpcMessage, Errno> {
-    crate::drivers::serial::write_str("[IPC_SEND] target=");
-    crate::drivers::serial::write_dec(target);
-    crate::drivers::serial::write_newline();
-
-    crate::drivers::serial::write_str("[IPC_SEND] About to call get_task()\n");
-
     // 1. Validate target task exists
     let target_task = get_task(target).ok_or(Errno::EINVAL)?;
 
-    crate::drivers::serial::write_str("[IPC_SEND] get_task() returned\n");
-
     // Check if target is dead
-    crate::drivers::serial::write_str("[IPC_SEND] About to lock target_task\n");
     if target_task.lock().state == TaskState::Exited {
-        crate::drivers::serial::write_str("[IPC_SEND] ERROR: target dead\n");
         return Err(Errno::EDEAD);
     }
-    crate::drivers::serial::write_str("[IPC_SEND] Target is alive\n");
 
     // 2. Check IpcSend capability
-    crate::drivers::serial::write_str("[IPC_SEND] About to call current_task()\n");
     let current = current_task();
-    crate::drivers::serial::write_str("[IPC_SEND] current_task() returned\n");
 
-    crate::drivers::serial::write_str("[IPC_SEND] Checking capability\n");
     if !capability_check(&current, target) {
-        crate::drivers::serial::write_str("[IPC_SEND] ERROR: no capability\n");
         return Err(Errno::EPERM);
     }
-    crate::drivers::serial::write_str("[IPC_SEND] Capability OK\n");
 
     // 3. Copy message to kernel buffer (64 bytes - exactly one cache line)
-    // Use read_unaligned to avoid SSE alignment requirements on potentially unaligned stack
-    crate::drivers::serial::write_str("[IPC_SEND] Copying message (unaligned)\n");
-    let mut kernel_msg = unsafe { core::ptr::read_unaligned(msg) };
-    crate::drivers::serial::write_str("[IPC_SEND] Message copied\n");
+    let mut kernel_msg = *msg;
 
     // 4. Set sender field (security: authenticated by kernel)
-    crate::drivers::serial::write_str("[IPC_SEND] About to lock current for sender\n");
     kernel_msg.sender = current.lock().id;
-    crate::drivers::serial::write_str("[IPC_SEND] Sender set\n");
     kernel_msg.msg_type = IpcType::Request;
 
     // Assign unique message ID
@@ -223,8 +202,8 @@ pub fn ipc_send_async(target: TaskId, msg: &IpcMessage) -> Result<(), Errno> {
         return Err(Errno::EPERM);
     }
 
-    // 3. Copy message to kernel buffer (use unaligned read to avoid SSE alignment requirements)
-    let mut kernel_msg = unsafe { core::ptr::read_unaligned(msg) };
+    // 3. Copy message to kernel buffer
+    let mut kernel_msg = *msg;
 
     // 4. Set sender field (authenticated by kernel)
     kernel_msg.sender = current.lock().id;

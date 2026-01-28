@@ -1016,11 +1016,7 @@ extern "C" fn syscall_handler(
     crate::task::statistics::record_syscall(current_task);
 
     match syscall_num {
-        0 => {
-            crate::drivers::serial::write_str("[HANDLER] Calling syscall_ipc_send\n");
-            DEBUG_MARKER.store(0xC6, core::sync::atomic::Ordering::Relaxed);
-            syscall_ipc_send(arg1, arg2, arg3)
-        }
+        0 => syscall_ipc_send(arg1, arg2, arg3),
         1 => syscall_ipc_receive(arg1),
         2 => syscall_ipc_reply(arg1, arg2),
         3 => syscall_shmem_create(arg1),
@@ -1049,83 +1045,20 @@ extern "C" fn syscall_handler(
 // This allows the simple test programs to work without stack allocation
 
 fn syscall_ipc_send(target: u64, payload0: u64, payload1: u64) -> u64 {
-    crate::drivers::serial::write_str("[IPC_SEND_SYSCALL] Entered\n");
-    DEBUG_MARKER.store(0xD0, core::sync::atomic::Ordering::Relaxed);
-
-    // Print current RSP for debugging
-    let rsp: u64;
-    unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp); }
-    crate::drivers::serial::write_str("[IPC_SEND_SYSCALL] RSP=");
-    crate::drivers::serial::write_hex(rsp);
-    crate::drivers::serial::write_newline();
-
-    crate::drivers::serial::write_str("[IPC_SEND_SYSCALL] About to create IpcMessage\n");
-    DEBUG_MARKER.store(0xD1, core::sync::atomic::Ordering::Relaxed);
-
-    // Try just creating a simple array first (no struct)
-    let _test_array: [u64; 4] = [payload0, payload1, 0, 0];
-    crate::drivers::serial::write_str("[IPC_SEND_SYSCALL] Test array created\n");
-    DEBUG_MARKER.store(0xD1A, core::sync::atomic::Ordering::Relaxed);
-
-    // Try allocating larger array to test stack
-    crate::drivers::serial::write_str("[IPC_SEND_SYSCALL] Trying 64-byte array\n");
-    DEBUG_MARKER.store(0xD1B, core::sync::atomic::Ordering::Relaxed);
-
-    let _big_array: [u64; 8] = [payload0, payload1, 0, 0, 0, 0, 0, 0];
-    crate::drivers::serial::write_str("[IPC_SEND_SYSCALL] 64-byte array created!\n");
-    DEBUG_MARKER.store(0xD1C, core::sync::atomic::Ordering::Relaxed);
-
-    // Import only IpcMessage first
-    crate::drivers::serial::write_str("[IPC_SEND_SYSCALL] About to import IpcMessage only\n");
-    DEBUG_MARKER.store(0xD1D, core::sync::atomic::Ordering::Relaxed);
-
-    use crate::ipc::IpcMessage;
-
-    crate::drivers::serial::write_str("[IPC_SEND_SYSCALL] Import done\n");
-    DEBUG_MARKER.store(0xD1E, core::sync::atomic::Ordering::Relaxed);
-
-    // Try calling the constructor
-    crate::drivers::serial::write_str("[IPC_SEND_SYSCALL] Calling new_request\n");
-    DEBUG_MARKER.store(0xD1F, core::sync::atomic::Ordering::Relaxed);
-
-    let mut msg = IpcMessage::new_request([payload0, payload1, 0, 0]);
-
-    crate::drivers::serial::write_str("[IPC_SEND_SYSCALL] new_request returned!\n");
-    DEBUG_MARKER.store(0xD20, core::sync::atomic::Ordering::Relaxed);
-
-    use crate::ipc::ipc_send;
+    use crate::ipc::{IpcMessage, ipc_send};
     use crate::task::task::get_current_task;
 
-    crate::drivers::serial::write_str("[IPC_SEND_SYSCALL] IpcMessage created\n");
-    DEBUG_MARKER.store(0xD2, core::sync::atomic::Ordering::Relaxed);
-
-    // Set sender (will be overridden by IPC subsystem, but set for clarity)
+    let mut msg = IpcMessage::new_request([payload0, payload1, 0, 0]);
     msg.sender = get_current_task();
 
-    crate::drivers::serial::write_str("[IPC_SEND_SYSCALL] Sender set to ");
-    crate::drivers::serial::write_dec(msg.sender);
-    crate::drivers::serial::write_newline();
-    DEBUG_MARKER.store(0xD3, core::sync::atomic::Ordering::Relaxed);
-
-    // Send message
     let target_id = target as u32;
-    crate::drivers::serial::write_str("[IPC_SEND_SYSCALL] Calling ipc_send to target ");
-    crate::drivers::serial::write_dec(target_id);
-    crate::drivers::serial::write_newline();
-    DEBUG_MARKER.store(0xD4, core::sync::atomic::Ordering::Relaxed);
-
     match ipc_send(target_id, &msg) {
         Ok(reply) => {
-            crate::drivers::serial::write_str("[IPC_SEND_SYSCALL] ipc_send returned OK\n");
-            DEBUG_MARKER.store(0xD5, core::sync::atomic::Ordering::Relaxed);
-            // Record IPC send
             crate::task::statistics::record_ipc_sent(get_current_task());
-            reply.payload[0] // Return first payload slot as result
+            reply.payload[0]
         }
         Err(_err) => {
-            crate::drivers::serial::write_str("[IPC_SEND_SYSCALL] ipc_send returned ERROR\n");
-            DEBUG_MARKER.store(0xD6, core::sync::atomic::Ordering::Relaxed);
-            u64::MAX // Error
+            u64::MAX
         }
     }
 }
@@ -1173,19 +1106,13 @@ fn syscall_ipc_receive(_from_filter: u64) -> u64 {
     // so we use a different error code to avoid that.
     match ipc_receive() {
         Ok(msg) => {
-            crate::drivers::serial::write_str("[IPC_RECV_SYSCALL] Got message from sender ");
-            crate::drivers::serial::write_dec(msg.sender);
-            crate::drivers::serial::write_newline();
-
             // Record IPC receive
             let current_task_id = crate::task::task::get_current_task();
             crate::task::statistics::record_ipc_received(current_task_id);
 
-            // CRITICAL: Save received message for later reply
-            // This allows syscall_ipc_reply to know who to reply to
+            // Save received message for later reply
             if let Some(task) = crate::task::task::get_task(current_task_id) {
                 task.lock().ipc_reply = Some(msg);
-                crate::drivers::serial::write_str("[IPC_RECV_SYSCALL] Saved for reply\n");
             }
 
             // Return sender ID in lower 32 bits, first payload in upper 32 bits
@@ -1195,13 +1122,10 @@ fn syscall_ipc_receive(_from_filter: u64) -> u64 {
         Err(Errno::EWOULDBLOCK) => {
             // No messages available - return -3 as error code
             // IMPORTANT: NOT 0xFFFFFFFFFFFFFFFE which triggers yield_path!
-            // Userspace checks for negative (high bit set) and retries
-            crate::drivers::serial::write_str("[IPC_RECV_SYSCALL] No message (EWOULDBLOCK)\n");
-            0xFFFF_FFFF_FFFF_FFFD // -3 in signed, avoids yield_path trigger
+            0xFFFF_FFFF_FFFF_FFFD
         }
         Err(_err) => {
-            crate::drivers::serial::write_str("[IPC_RECV_SYSCALL] Error\n");
-            0xFFFF_FFFF_FFFF_FFFC // -4 in signed
+            0xFFFF_FFFF_FFFF_FFFC
         }
     }
 }

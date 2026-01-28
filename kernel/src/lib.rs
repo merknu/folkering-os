@@ -186,9 +186,31 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
             }
         }
 
-        // IPC test tasks disabled — GPF in ipc_send copy path (MOVAPS alignment issue)
-        // TODO: Fix IPC message copy alignment, then re-enable
-        // Task 2 (IPC receiver) and Task 3 (IPC sender) skipped
+        // Spawn Task 2 - IPC Receiver
+        serial_strln!("[BOOT] Spawning Task 2 (IPC receiver)...");
+        match task::spawn_raw(&userspace_test::IPC_RECEIVER.code[..userspace_test::IpcReceiverProgram::code_size()], 0) {
+            Ok(task_id) => {
+                serial_str!("[BOOT] Task 2 (IPC receiver) spawned, id=");
+                drivers::serial::write_dec(task_id);
+                serial_strln!("");
+            }
+            Err(_e) => {
+                serial_strln!("[BOOT] Task 2 (IPC receiver) spawn FAILED");
+            }
+        }
+
+        // Spawn Task 3 - IPC Sender
+        serial_strln!("[BOOT] Spawning Task 3 (IPC sender)...");
+        match task::spawn_raw(&userspace_test::IPC_SENDER.code[..userspace_test::IpcSenderProgram::code_size()], 0) {
+            Ok(task_id) => {
+                serial_str!("[BOOT] Task 3 (IPC sender) spawned, id=");
+                drivers::serial::write_dec(task_id);
+                serial_strln!("");
+            }
+            Err(_e) => {
+                serial_strln!("[BOOT] Task 3 (IPC sender) spawn FAILED");
+            }
+        }
 
         // Simple assembly shell disabled — competes for keyboard buffer with Rust shell
         // TODO: Route keyboard input to focused task only
