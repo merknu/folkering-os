@@ -157,63 +157,34 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
 
         serial_strln!("[BOOT] ✅ Phase 3 COMPLETE - IPC & Task system operational\n");
 
-        // ===== IPC Test Setup =====
+        // ===== Userspace Task Setup =====
         // Task layout:
-        // - Task 1: Dummy yield loop (to occupy ID 1)
-        // - Task 2: IPC Receiver (receives messages and replies)
-        // - Task 3: IPC Sender (sends to task 2)
+        // - Task 1: Idle task (simple yield loop)
+        // - Task 2: Synapse (Data Kernel - IPC service)
+        // - Task 3+: Shell and other applications
+        //
+        // Note: Synapse MUST be Task 2 per the protocol (SYNAPSE_TASK_ID = 2)
 
-        serial_strln!("[TEST] Spawning IPC test tasks (sender + receiver)...\n");
+        serial_strln!("[BOOT] Setting up userspace tasks...\n");
 
-        // Simple yield loop for Task 1 (dummy)
-        static YIELD_LOOP: [u8; 11] = [
+        // Task 1: Simple idle loop (occupies ID 1)
+        static IDLE_LOOP: [u8; 11] = [
             0x48, 0xc7, 0xc0, 0x07, 0x00, 0x00, 0x00,  // mov rax, 7 (YIELD)
             0x0f, 0x05,                                 // syscall
             0xeb, 0xf5,                                 // jmp -11
         ];
 
-        // Spawn Task 1 - dummy yield loop (occupies ID 1)
-        serial_strln!("[BOOT] Spawning Task 1 (dummy yield)...");
-        match task::spawn_raw(&YIELD_LOOP, 0) {
+        serial_strln!("[BOOT] Spawning Task 1 (idle)...");
+        match task::spawn_raw(&IDLE_LOOP, 0) {
             Ok(task_id) => {
-                serial_str!("[BOOT] Task 1 spawned, id=");
+                serial_str!("[BOOT] Task 1 (idle) spawned, id=");
                 drivers::serial::write_dec(task_id);
                 serial_strln!("");
             }
             Err(_e) => {
-                serial_strln!("[BOOT] Task 1 spawn FAILED\n");
-                loop { x86_64::instructions::hlt(); }
+                serial_strln!("[BOOT] Task 1 spawn FAILED");
             }
         }
-
-        // Spawn Task 2 - IPC Receiver
-        serial_strln!("[BOOT] Spawning Task 2 (IPC receiver)...");
-        match task::spawn_raw(&userspace_test::IPC_RECEIVER.code[..userspace_test::IpcReceiverProgram::code_size()], 0) {
-            Ok(task_id) => {
-                serial_str!("[BOOT] Task 2 (IPC receiver) spawned, id=");
-                drivers::serial::write_dec(task_id);
-                serial_strln!("");
-            }
-            Err(_e) => {
-                serial_strln!("[BOOT] Task 2 (IPC receiver) spawn FAILED");
-            }
-        }
-
-        // Spawn Task 3 - IPC Sender
-        serial_strln!("[BOOT] Spawning Task 3 (IPC sender)...");
-        match task::spawn_raw(&userspace_test::IPC_SENDER.code[..userspace_test::IpcSenderProgram::code_size()], 0) {
-            Ok(task_id) => {
-                serial_str!("[BOOT] Task 3 (IPC sender) spawned, id=");
-                drivers::serial::write_dec(task_id);
-                serial_strln!("");
-            }
-            Err(_e) => {
-                serial_strln!("[BOOT] Task 3 (IPC sender) spawn FAILED");
-            }
-        }
-
-        // Simple assembly shell disabled — competes for keyboard buffer with Rust shell
-        // TODO: Route keyboard input to focused task only
 
         // ===== Ramdisk Initialization =====
         // Try to load Folk-Pack initrd from boot module
@@ -264,72 +235,88 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
             false
         };
 
-        // Spawn Task 5 - Rust Shell (libfolk-based, ELF binary)
-        // Try ramdisk first, fall back to include_bytes! if not available
-        serial_strln!("[BOOT] Spawning Task 5 (Rust shell from libfolk)...");
+        // ===== Spawn Core Services =====
+        // Task 2: Synapse (Data Kernel) - MUST be spawned first for correct task ID
+        // Task 3: Shell
 
-        let shell_elf: &[u8] = if let Some(rd) = fs::ramdisk() {
-            if let Some(entry) = rd.find("shell") {
-                serial_strln!("[BOOT] Loading shell from ramdisk...");
-                rd.read(entry)
-            } else {
-                serial_strln!("[BOOT] Shell not found in ramdisk, using embedded fallback");
-                include_bytes!("../../userspace/target/x86_64-folkering-userspace/release/shell")
-            }
-        } else {
-            include_bytes!("../../userspace/target/x86_64-folkering-userspace/release/shell")
-        };
-
-        serial_str!("[BOOT] Rust shell ELF size: ");
-        drivers::serial::write_dec(shell_elf.len() as u32);
-        serial_strln!(" bytes");
-        match task::spawn(shell_elf, &[]) {
-            Ok(task_id) => {
-                serial_str!("[BOOT] Task 5 (Rust shell) spawned, id=");
-                drivers::serial::write_dec(task_id);
-                serial_strln!("");
-            }
-            Err(e) => {
-                serial_str!("[BOOT] Task 5 (Rust shell) spawn FAILED: ");
-                match e {
-                    task::SpawnError::InvalidElf(_) => { serial_strln!("InvalidElf"); }
-                    task::SpawnError::OutOfMemory => { serial_strln!("OutOfMemory"); }
-                    task::SpawnError::PermissionDenied => { serial_strln!("PermissionDenied"); }
-                    task::SpawnError::NotFound => { serial_strln!("NotFound"); }
-                }
-            }
-        }
-
-        // Spawn any additional ELF entries from the ramdisk
         if let Some(rd) = fs::ramdisk() {
+            // Spawn Synapse first (Task 2)
+            if let Some(entry) = rd.find("synapse") {
+                serial_strln!("[BOOT] Spawning Task 2 (Synapse - Data Kernel)...");
+                let synapse_elf = rd.read(entry);
+                serial_str!("[BOOT] Synapse ELF size: ");
+                drivers::serial::write_dec(synapse_elf.len() as u32);
+                serial_strln!(" bytes");
+                match task::spawn(synapse_elf, &[]) {
+                    Ok(task_id) => {
+                        serial_str!("[BOOT] Synapse spawned, id=");
+                        drivers::serial::write_dec(task_id);
+                        serial_strln!("");
+                    }
+                    Err(e) => {
+                        serial_str!("[BOOT] Synapse spawn FAILED: ");
+                        match e {
+                            task::SpawnError::InvalidElf(_) => { serial_strln!("InvalidElf"); }
+                            task::SpawnError::OutOfMemory => { serial_strln!("OutOfMemory"); }
+                            task::SpawnError::PermissionDenied => { serial_strln!("PermissionDenied"); }
+                            task::SpawnError::NotFound => { serial_strln!("NotFound"); }
+                        }
+                    }
+                }
+            } else {
+                serial_strln!("[BOOT] WARNING: Synapse not found in ramdisk!");
+            }
+
+            // Spawn Shell (Task 3)
+            if let Some(entry) = rd.find("shell") {
+                serial_strln!("[BOOT] Spawning Task 3 (Shell)...");
+                let shell_elf = rd.read(entry);
+                serial_str!("[BOOT] Shell ELF size: ");
+                drivers::serial::write_dec(shell_elf.len() as u32);
+                serial_strln!(" bytes");
+                match task::spawn(shell_elf, &[]) {
+                    Ok(task_id) => {
+                        serial_str!("[BOOT] Shell spawned, id=");
+                        drivers::serial::write_dec(task_id);
+                        serial_strln!("");
+                    }
+                    Err(e) => {
+                        serial_str!("[BOOT] Shell spawn FAILED: ");
+                        match e {
+                            task::SpawnError::InvalidElf(_) => { serial_strln!("InvalidElf"); }
+                            task::SpawnError::OutOfMemory => { serial_strln!("OutOfMemory"); }
+                            task::SpawnError::PermissionDenied => { serial_strln!("PermissionDenied"); }
+                            task::SpawnError::NotFound => { serial_strln!("NotFound"); }
+                        }
+                    }
+                }
+            } else {
+                serial_strln!("[BOOT] WARNING: Shell not found in ramdisk!");
+            }
+
+            // Spawn any additional ELF entries (skip synapse and shell)
             for entry in rd.entries() {
-                // Skip "shell" — already spawned above
                 let name = entry.name_str();
-                let is_shell = name.len() == 5
-                    && name.as_bytes()[0] == b's'
-                    && name.as_bytes()[1] == b'h'
-                    && name.as_bytes()[2] == b'e'
-                    && name.as_bytes()[3] == b'l'
-                    && name.as_bytes()[4] == b'l';
-                if is_shell {
+                // Skip already-spawned services
+                if name == "synapse" || name == "shell" {
                     continue;
                 }
                 if entry.is_elf() {
                     serial_str!("[BOOT] Spawning \"");
-                    serial_str!(entry.name_str());
+                    serial_str!(name);
                     serial_strln!("\" from ramdisk...");
                     let elf_data = rd.read(entry);
                     match task::spawn(elf_data, &[]) {
                         Ok(task_id) => {
                             serial_str!("[BOOT] Spawned \"");
-                            serial_str!(entry.name_str());
+                            serial_str!(name);
                             serial_str!("\", id=");
                             drivers::serial::write_dec(task_id);
                             serial_strln!("");
                         }
                         Err(e) => {
                             serial_str!("[BOOT] Failed to spawn \"");
-                            serial_str!(entry.name_str());
+                            serial_str!(name);
                             serial_str!("\": ");
                             match e {
                                 task::SpawnError::InvalidElf(_) => { serial_strln!("InvalidElf"); }
@@ -341,6 +328,8 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
                     }
                 }
             }
+        } else {
+            serial_strln!("[BOOT] ERROR: No ramdisk available!");
         }
 
         serial_strln!("[BOOT] All tasks spawned, starting scheduler...\n");
