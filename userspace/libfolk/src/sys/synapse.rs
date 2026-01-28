@@ -23,8 +23,7 @@
 //!
 //! Replies use the same format with status in payload[0].
 
-use crate::syscall::{syscall3, SYS_IPC_SEND, SYS_IPC_RECEIVE};
-use crate::sys::ipc::{IpcError, IpcMessage, receive, reply};
+use crate::syscall::{syscall3, SYS_IPC_SEND};
 
 // ============================================================================
 // Well-Known Task IDs
@@ -50,10 +49,26 @@ pub const SYN_OP_LIST_FILES: u64 = 0x0001;
 /// Reply: [size, entry_type, 0, 0]
 pub const SYN_OP_FILE_INFO: u64 = 0x0002;
 
-/// Read file contents
+/// Read file contents (legacy - returns metadata only)
 /// Request: [OP, file_id, offset, length]
 /// Reply: [bytes_read, data_lo, data_hi, 0] (for small reads)
 pub const SYN_OP_READ_FILE: u64 = 0x0003;
+
+/// Look up file by name hash
+/// Request: op | (name_hash << 16)
+/// Reply: (size << 32) | file_id, or SYN_STATUS_NOT_FOUND
+pub const SYN_OP_READ_FILE_BY_NAME: u64 = 0x0006;
+
+/// Read 8-byte chunk from file
+/// Request: op | (file_id << 16), offset as second arg
+/// Reply: 8 bytes of file data (or fewer at EOF, padded with zeros)
+pub const SYN_OP_READ_FILE_CHUNK: u64 = 0x0007;
+
+/// Read file via shared memory (zero-copy)
+/// Request: op | (name_hash << 16)
+/// Reply: (size << 32) | shmem_handle, or SYN_STATUS_NOT_FOUND
+/// The caller must map the shmem_handle to read the file contents
+pub const SYN_OP_READ_FILE_SHMEM: u64 = 0x0008;
 
 /// Get file count
 /// Request: [OP, 0, 0, 0]
@@ -214,4 +229,116 @@ pub fn hash_name(name: &str) -> u32 {
         hash = hash.wrapping_mul(0x01000193);
     }
     hash
+}
+
+/// File info returned from read_file_by_name
+#[derive(Debug, Clone, Copy)]
+pub struct FileInfo {
+    pub file_id: u16,
+    pub size: u32,
+}
+
+/// Look up a file by name and get its ID and size
+/// This is the first step in reading a file via Synapse
+pub fn read_file_by_name(name: &str) -> SynapseResult<FileInfo> {
+    let name_hash = hash_name(name);
+
+    // Pack: op in low 16 bits, name_hash in upper bits
+    let request = SYN_OP_READ_FILE_BY_NAME | ((name_hash as u64) << 16);
+
+    let ret = unsafe {
+        syscall3(SYS_IPC_SEND, SYNAPSE_TASK_ID as u64, request, 0)
+    };
+
+    if ret == u64::MAX {
+        return Err(SynapseError::ServiceUnavailable);
+    }
+
+    if ret == SYN_STATUS_NOT_FOUND {
+        return Err(SynapseError::NotFound);
+    }
+
+    // Decode: file_id in low 16 bits, size in upper 32 bits
+    let file_id = (ret & 0xFFFF) as u16;
+    let size = ((ret >> 32) & 0xFFFFFFFF) as u32;
+
+    Ok(FileInfo { file_id, size })
+}
+
+/// Read an 8-byte chunk from a file at the given offset
+/// Returns the chunk data (may be less than 8 bytes at EOF, padded with zeros)
+pub fn read_file_chunk(file_id: u16, offset: u32) -> SynapseResult<u64> {
+    // Pack everything into payload0 since IPC only passes first payload
+    // Format: (offset << 32) | (file_id << 16) | op
+    let request = SYN_OP_READ_FILE_CHUNK
+        | ((file_id as u64) << 16)
+        | ((offset as u64) << 32);
+
+    let ret = unsafe {
+        syscall3(SYS_IPC_SEND, SYNAPSE_TASK_ID as u64, request, 0)
+    };
+
+    if ret == u64::MAX {
+        return Err(SynapseError::ServiceUnavailable);
+    }
+
+    // Note: SYN_STATUS_NOT_FOUND (1) is a valid return value at EOF
+    // We just return the data as-is; caller checks if offset >= size
+
+    Ok(ret)
+}
+
+/// Response from zero-copy file read
+#[derive(Debug, Clone, Copy)]
+pub struct ShmemFileResponse {
+    /// Shared memory handle (pass to shmem_map)
+    pub shmem_handle: u32,
+    /// File size in bytes
+    pub size: u32,
+}
+
+/// Read a file via shared memory (zero-copy)
+///
+/// This is the high-performance way to read files. Synapse loads the file
+/// into a shared memory buffer and grants access to the caller.
+///
+/// # Usage
+/// 1. Call `read_file_shmem(filename)` to get shmem_handle and size
+/// 2. Call `shmem_map(handle, your_virt_addr)` to map the buffer
+/// 3. Read directly from the mapped memory
+///
+/// # Arguments
+/// * `name` - The filename to read
+///
+/// # Returns
+/// * `Ok(ShmemFileResponse)` - Contains shmem_handle and file size
+/// * `Err(...)` - File not found or other error
+pub fn read_file_shmem(name: &str) -> SynapseResult<ShmemFileResponse> {
+    let name_hash = hash_name(name);
+
+    // Pack: op in low 16 bits, name_hash in upper bits
+    let request = SYN_OP_READ_FILE_SHMEM | ((name_hash as u64) << 16);
+
+    let ret = unsafe {
+        syscall3(SYS_IPC_SEND, SYNAPSE_TASK_ID as u64, request, 0)
+    };
+
+    if ret == u64::MAX {
+        return Err(SynapseError::ServiceUnavailable);
+    }
+
+    if ret == SYN_STATUS_NOT_FOUND {
+        return Err(SynapseError::NotFound);
+    }
+
+    // Decode: shmem_handle in low 32 bits, size in upper 32 bits
+    let shmem_handle = (ret & 0xFFFFFFFF) as u32;
+    let size = ((ret >> 32) & 0xFFFFFFFF) as u32;
+
+    // Handle 0 is invalid (error case)
+    if shmem_handle == 0 {
+        return Err(SynapseError::IpcFailed);
+    }
+
+    Ok(ShmemFileResponse { shmem_handle, size })
 }

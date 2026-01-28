@@ -268,6 +268,29 @@ static DEBUG_RAX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64:
 #[no_mangle]
 static DEBUG_RSP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// Debug: Return value before IRETQ (for syscall 13)
+#[no_mangle]
+static DEBUG_RETURN_VAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Debug: Handler result for syscall 13 (to compare with assembly)
+/// Using a raw mutable static for direct assembly access
+#[no_mangle]
+pub static mut SYSCALL_RESULT: u64 = 0;
+
+/// Old atomic version for comparison
+#[no_mangle]
+static DEBUG_HANDLER_RESULT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Helper function to get SYSCALL_RESULT value
+/// This avoids RIP-relative addressing issues in naked functions
+/// NOTE: Must NOT print anything - that would trigger syscalls that overwrite R14!
+#[no_mangle]
+#[inline(never)]
+extern "C" fn get_syscall_result() -> u64 {
+    // Use volatile read to prevent optimization
+    unsafe { core::ptr::read_volatile(&SYSCALL_RESULT) }
+}
+
 /// Debug: RFLAGS value before IRETQ
 #[no_mangle]
 static DEBUG_RFLAGS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -340,6 +363,16 @@ pub fn get_debug_rsp() -> u64 {
 /// Get the debug RFLAGS value
 pub fn get_debug_rflags() -> u64 {
     DEBUG_RFLAGS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Get the debug return value (RAX before IRETQ)
+pub fn get_debug_return_val() -> u64 {
+    DEBUG_RETURN_VAL.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Get the handler result (what the Rust handler returned)
+pub fn get_debug_handler_result() -> u64 {
+    DEBUG_HANDLER_RESULT.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Get the debug RCX value (saved RIP from SYSCALL)
@@ -784,6 +817,21 @@ extern "C" fn syscall_entry() {
 
         "call {handler}",
 
+        // CRITICAL: Handler RAX return is unreliable (0), so use helper function
+        // that reads SYSCALL_RESULT which was stored by the handler
+
+        // Call helper function to get SYSCALL_RESULT
+        "call {get_result_fn}",
+        // RAX now has SYSCALL_RESULT value from helper
+
+        // Save helper result to DEBUG_RETURN_VAL for debugging
+        "push rbx",
+        "mov rbx, rax",
+        "mov qword ptr [rip + {debug_return_val}], rbx",
+        "pop rbx",
+
+        // RAX already has the result we want - no need for further logic
+
         // DEBUG: 0xBE = Handler returned
         "push rbx",
         "mov rbx, 0xBE",
@@ -793,18 +841,30 @@ extern "C" fn syscall_entry() {
         // Handler returned with result in RAX
         // Check if result is 0xFFFF_FFFF_FFFF_FFFE (EWOULDBLOCK - should yield)
         "mov r14, rax",           // R14 = return value
+
         "mov r13, 0xFFFFFFFFFFFFFFFE", // R13 = EWOULDBLOCK marker
         "cmp rax, r13",
         "je yield_path",          // If EWOULDBLOCK, go to yield path
 
         // Normal return path - restore and return to user
         // Step 4: Restore from (possibly same) task's Context
+        // BUGFIX: Explicitly save R14 (return value) before call, since
+        // the compiler might not preserve it correctly in all cases
+        "push r14",
         "call {get_ctx_fn}",
         "mov r15, rax",
+        "pop r14",        // Restore return value
 
         // Restore all registers from Context (EXCEPT RAX - use return value!)
         "mov r11, [r15 + 136]",   // RFLAGS
         "mov rcx, [r15 + 128]",   // RIP
+
+        // DEBUG: Save RIP to debug static to verify it's correct before IRETQ
+        "push rax",
+        "mov rax, rcx",
+        "mov qword ptr [rip + {debug_rip}], rax",
+        "pop rax",
+
         // Skip RAX - use handler return value (in R14)
         "mov rbx, [r15 + 24]",
         "mov rdx, [r15 + 40]",
@@ -821,6 +881,10 @@ extern "C" fn syscall_entry() {
         "mov r14, [r15 + 112]",   // Now restore R14
 
         // NOTE: MSR restore removed - caused format! crashes at boot
+
+        // CRITICAL: Disable interrupts during the final restore sequence
+        // to prevent any interrupt from corrupting RAX before IRETQ
+        "cli",
 
         // Build IRETQ frame: SS, RSP, RFLAGS, CS, RIP
         "push qword ptr [r15 + 152]",  // SS
@@ -998,11 +1062,14 @@ extern "C" fn syscall_entry() {
         user_r13_save = sym USER_R13_SAVE,
         user_rsi_save = sym USER_RSI_SAVE,
         user_rdx_save = sym USER_RDX_SAVE,
+        debug_return_val = sym DEBUG_RETURN_VAL,
+        get_result_fn = sym get_syscall_result,
     );
 }
 
 /// Syscall handler (called from assembly)
 #[no_mangle]
+#[inline(never)]
 extern "C" fn syscall_handler(
     syscall_num: u64,
     arg1: u64,
@@ -1015,7 +1082,7 @@ extern "C" fn syscall_handler(
     let current_task = crate::task::task::get_current_task();
     crate::task::statistics::record_syscall(current_task);
 
-    match syscall_num {
+    let result = match syscall_num {
         0 => syscall_ipc_send(arg1, arg2, arg3),
         1 => syscall_ipc_receive(arg1),
         2 => syscall_ipc_reply(arg1, arg2),
@@ -1031,11 +1098,19 @@ extern "C" fn syscall_handler(
         12 => syscall_uptime(),
         13 => syscall_fs_read_dir(arg1, arg2),
         14 => syscall_fs_read_file(arg1, arg2, arg3),
+        15 => syscall_shmem_grant(arg1, arg2),
         _ => {
             crate::drivers::serial::write_str("[HANDLER] Invalid syscall!\n");
             u64::MAX // Return error
         }
-    }
+    };
+
+    // WORKAROUND: Save result to static because RAX is being clobbered
+    // somewhere between function return and assembly reading it
+    // Store for ALL syscalls so get_result_fn always returns the right value
+    unsafe { SYSCALL_RESULT = result; }
+
+    result
 }
 
 // ===== Syscall Implementations =====
@@ -1378,6 +1453,30 @@ fn syscall_shmem_map(shmem_id: u64, virt_addr: u64) -> u64 {
     }
 }
 
+/// Grant another task access to a shared memory region
+/// This allows zero-copy data transfer between tasks
+fn syscall_shmem_grant(shmem_id: u64, target_task: u64) -> u64 {
+    use crate::ipc::shared_memory::shmem_grant;
+    use core::num::NonZeroU32;
+
+    // 1. Validate shmem_id
+    let id = match NonZeroU32::new(shmem_id as u32) {
+        Some(id) => id,
+        None => return u64::MAX, // EINVAL
+    };
+
+    // 2. Validate target task ID
+    if target_task == 0 || target_task > u32::MAX as u64 {
+        return u64::MAX; // EINVAL
+    }
+
+    // 3. Grant access to the target task
+    match shmem_grant(id, target_task as u32) {
+        Ok(()) => 0, // Success
+        Err(_) => u64::MAX, // Error
+    }
+}
+
 fn syscall_spawn(binary_ptr: u64, binary_len: u64) -> u64 {
     use crate::task::spawn;
 
@@ -1516,7 +1615,6 @@ fn syscall_fs_read_dir(buf_ptr: u64, buf_size: u64) -> u64 {
 
         // CRITICAL: Use volatile reads to prevent LLVM from generating SSE instructions
         // that may cause GPF due to alignment assumptions in syscall context.
-        // See: https://github.com/rust-lang/rust/issues/XXXXX for background
         let fpk_ptr = fpk as *const _ as *const u8;
 
         // Read fields using volatile reads (offsets based on FpkEntry #[repr(C)] layout)
@@ -1540,7 +1638,6 @@ fn syscall_fs_read_dir(buf_ptr: u64, buf_size: u64) -> u64 {
         };
 
         let dst = (buf_ptr as *mut u8).wrapping_add(i * entry_size);
-
         unsafe {
             let src = &dir_entry as *const DirEntry as *const u8;
             core::ptr::copy_nonoverlapping(src, dst, entry_size);

@@ -16,6 +16,7 @@ pub const SYS_IPC_RECEIVE: u64 = 1;
 pub const SYS_IPC_REPLY: u64 = 2;
 pub const SYS_SHMEM_CREATE: u64 = 3;
 pub const SYS_SHMEM_MAP: u64 = 4;
+pub const SYS_SHMEM_GRANT: u64 = 15;
 pub const SYS_SPAWN: u64 = 5;
 pub const SYS_EXIT: u64 = 6;
 pub const SYS_YIELD: u64 = 7;

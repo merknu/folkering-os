@@ -6,7 +6,8 @@
 #![no_main]
 
 use libfolk::{entry, print, println};
-use libfolk::sys::{read_key, yield_cpu, get_pid, exit, task_list, uptime};
+use libfolk::sys::{read_key, yield_cpu, get_pid, exit, task_list, uptime, shmem_map};
+use libfolk::sys::synapse::read_file_shmem;
 
 entry!(main);
 
@@ -142,6 +143,10 @@ fn cmd_ls() {
     println!("\n{} file(s)", count);
 }
 
+/// Virtual address for Shell's shared memory buffer mapping
+/// Using a fixed address that won't conflict with code/stack
+const SHELL_SHMEM_VADDR: usize = 0x20000000;
+
 fn cmd_cat<'a>(mut args: impl Iterator<Item = &'a str>) {
     let filename = match args.next() {
         Some(f) => f,
@@ -151,18 +156,39 @@ fn cmd_cat<'a>(mut args: impl Iterator<Item = &'a str>) {
         }
     };
 
-    let mut buf = [0u8; 4096];
-    let n = libfolk::sys::fs::read_file(filename, &mut buf);
+    // Step 1: Request file via Synapse IPC (zero-copy)
+    // Synapse will create shared memory, load the file, and grant us access
+    let response = match read_file_shmem(filename) {
+        Ok(r) => r,
+        Err(_) => {
+            println!("cat: {}: not found", filename);
+            return;
+        }
+    };
 
-    if n == 0 {
-        println!("cat: {}: not found or empty", filename);
+    if response.size == 0 {
+        println!("cat: {}: empty file", filename);
         return;
     }
 
-    // Print contents — handle common whitespace, replace other non-printable bytes with dots
-    for &b in &buf[..n] {
+    // Step 2: Map the shared memory into our address space
+    if shmem_map(response.shmem_handle, SHELL_SHMEM_VADDR).is_err() {
+        println!("cat: failed to map file buffer");
+        return;
+    }
+
+    // Step 3: Read directly from mapped memory (ZERO-COPY!)
+    let buffer = unsafe {
+        core::slice::from_raw_parts(SHELL_SHMEM_VADDR as *const u8, response.size as usize)
+    };
+
+    // Print the file contents
+    for &b in buffer {
         if b == b'\n' || b == b'\r' || b == b'\t' || (b >= 0x20 && b < 0x7F) {
             print!("{}", b as char);
+        } else if b == 0 {
+            // Stop at null terminator for text files
+            break;
         } else {
             print!(".");
         }

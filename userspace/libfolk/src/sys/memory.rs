@@ -2,7 +2,7 @@
 //!
 //! Functions for creating and mapping shared memory regions.
 
-use crate::syscall::{syscall1, syscall2, SYS_SHMEM_CREATE, SYS_SHMEM_MAP};
+use crate::syscall::{syscall1, syscall2, SYS_SHMEM_CREATE, SYS_SHMEM_MAP, SYS_SHMEM_GRANT};
 
 /// Error codes for shared memory operations
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +45,27 @@ pub fn shmem_create(size: usize) -> Result<u32, ShmemError> {
 /// * `Err(error)` - Error code on failure
 pub fn shmem_map(shmem_id: u32, virt_addr: usize) -> Result<(), ShmemError> {
     let ret = unsafe { syscall2(SYS_SHMEM_MAP, shmem_id as u64, virt_addr as u64) };
+    if ret == u64::MAX {
+        Err(ShmemError::Unknown)
+    } else {
+        Ok(())
+    }
+}
+
+/// Grant another task access to a shared memory region
+///
+/// This enables zero-copy data transfer between tasks. The granting task
+/// must be in the shared memory's access list (typically the creator).
+///
+/// # Arguments
+/// * `shmem_id` - The shared memory region ID
+/// * `target_task` - The task ID to grant access to
+///
+/// # Returns
+/// * `Ok(())` - Access granted successfully
+/// * `Err(error)` - Error code on failure
+pub fn shmem_grant(shmem_id: u32, target_task: u32) -> Result<(), ShmemError> {
+    let ret = unsafe { syscall2(SYS_SHMEM_GRANT, shmem_id as u64, target_task as u64) };
     if ret == u64::MAX {
         Err(ShmemError::Unknown)
     } else {

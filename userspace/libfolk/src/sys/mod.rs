@@ -14,7 +14,7 @@ pub mod synapse;
 pub use task::{exit, yield_cpu, get_pid, spawn};
 pub use io::{read_key, write_char};
 pub use ipc::{send, receive, reply};
-pub use memory::{shmem_create, shmem_map};
+pub use memory::{shmem_create, shmem_map, shmem_grant};
 pub use system::{task_list, uptime};
 
 // Re-export Synapse protocol
