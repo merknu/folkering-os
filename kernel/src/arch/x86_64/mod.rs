@@ -6,7 +6,6 @@ pub mod interrupts;
 pub mod apic;
 pub mod acpi;
 pub mod syscall;
-pub mod syscall_stack;  // NEW: Stack-based syscall handler
 pub mod usermode;
 pub mod cpu_freq;
 pub mod interrupt_frame;

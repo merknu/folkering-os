@@ -11,5 +11,5 @@ pub fn uptime_ms() -> u64 {
 
 /// Increment uptime (called by timer interrupt)
 pub fn tick() {
-    UPTIME_MS.fetch_add(1, Ordering::Relaxed);
+    UPTIME_MS.fetch_add(10, Ordering::Relaxed);
 }

@@ -208,7 +208,7 @@ extern "C" fn irq_timer() {
         // Return from interrupt
         "iretq",
 
-        tick_fn = sym folkering_kernel::arch::x86_64::apic::tick,
+        tick_fn = sym folkering_kernel::timer::tick,
         eoi_fn = sym folkering_kernel::arch::x86_64::apic::send_eoi,
     );
 }
