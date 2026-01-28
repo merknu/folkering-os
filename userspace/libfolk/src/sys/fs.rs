@@ -8,30 +8,28 @@ const SYS_FS_READ_DIR: u64 = 13;
 const SYS_FS_READ_FILE: u64 = 14;
 
 /// Directory entry returned by the kernel (matches kernel's DirEntry layout).
-#[repr(C, packed)]
+/// Note: NOT packed to avoid alignment issues. 48 bytes total.
+#[repr(C)]
 #[derive(Clone, Copy)]
 pub struct DirEntry {
     pub id: u16,
     pub entry_type: u16,
     pub name: [u8; 32],
+    // 4 bytes implicit padding here for u64 alignment
     pub size: u64,
 }
 
 impl DirEntry {
     /// Get the entry name as a string slice (up to first null byte).
-    /// Copies name to a local buffer to avoid unaligned access on packed struct.
     pub fn name_str(&self) -> &str {
-        let name = self.name; // copy out of packed struct
-        let len = name.iter().position(|&b| b == 0).unwrap_or(32);
+        let len = self.name.iter().position(|&b| b == 0).unwrap_or(32);
         // Safety: name bytes are ASCII, written by folk-pack tool.
-        // We return a reference to the packed field's data which is byte-aligned.
         unsafe { core::str::from_utf8_unchecked(&self.name[..len]) }
     }
 
     /// Check if this entry is an ELF executable.
     pub fn is_elf(&self) -> bool {
-        let et = self.entry_type; // copy out of packed struct
-        et == 0
+        self.entry_type == 0
     }
 }
 

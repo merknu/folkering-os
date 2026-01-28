@@ -12,5 +12,8 @@
   "panic-strategy": "abort",
   "disable-redzone": true,
   "code-model": "small",
-  "relocation-model": "static"
+  "relocation-model": "static",
+  "pre-link-args": {
+    "ld.lld": ["-Tlink.ld"]
+  }
 }

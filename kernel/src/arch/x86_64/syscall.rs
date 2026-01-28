@@ -1506,26 +1506,44 @@ fn syscall_fs_read_dir(buf_ptr: u64, buf_size: u64) -> u64 {
         None => return 0,
     };
 
-    let entry_size = core::mem::size_of::<DirEntry>(); // 44 bytes
+    let entry_size = core::mem::size_of::<DirEntry>(); // 48 bytes
     let max_entries = buf_size as usize / entry_size;
     let entries = rd.entries();
     let count = entries.len().min(max_entries);
 
     for i in 0..count {
         let fpk = &entries[i];
+
+        // CRITICAL: Use volatile reads to prevent LLVM from generating SSE instructions
+        // that may cause GPF due to alignment assumptions in syscall context.
+        // See: https://github.com/rust-lang/rust/issues/XXXXX for background
+        let fpk_ptr = fpk as *const _ as *const u8;
+
+        // Read fields using volatile reads (offsets based on FpkEntry #[repr(C)] layout)
+        let id = unsafe { core::ptr::read_volatile(fpk_ptr as *const u16) };
+        let entry_type = unsafe { core::ptr::read_volatile(fpk_ptr.add(2) as *const u16) };
+
+        let mut name = [0u8; 32];
+        for j in 0..32 {
+            name[j] = unsafe { core::ptr::read_volatile(fpk_ptr.add(4 + j)) };
+        }
+
+        // FpkEntry layout: id(2) + type(2) + name(32) + pad(4) + offset(8) + size(8) + hash(8)
+        // size is at offset 48
+        let size = unsafe { core::ptr::read_volatile(fpk_ptr.add(48) as *const u64) };
+
         let dir_entry = DirEntry {
-            id: fpk.id,
-            entry_type: fpk.entry_type,
-            name: fpk.name,
-            size: fpk.size,
+            id,
+            entry_type,
+            name,
+            size,
         };
+
+        let dst = (buf_ptr as *mut u8).wrapping_add(i * entry_size);
+
         unsafe {
-            let dst = (buf_ptr as *mut u8).add(i * entry_size);
-            core::ptr::copy_nonoverlapping(
-                &dir_entry as *const DirEntry as *const u8,
-                dst,
-                entry_size,
-            );
+            let src = &dir_entry as *const DirEntry as *const u8;
+            core::ptr::copy_nonoverlapping(src, dst, entry_size);
         }
     }
 

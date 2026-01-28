@@ -74,8 +74,10 @@ const _: () = assert!(core::mem::size_of::<FpkEntry>() == 64);
 /// Directory entry for userspace (subset of FpkEntry, no offset/hash)
 ///
 /// Shared between kernel and userspace via the FS_READ_DIR syscall.
+/// Note: NOT packed to avoid alignment issues with SSE instructions.
+/// Layout: id(2) + entry_type(2) + name(32) + padding(4) + size(8) = 48 bytes
 #[derive(Debug, Clone, Copy)]
-#[repr(C, packed)]
+#[repr(C)]
 pub struct DirEntry {
     /// Unique entry ID (0-based)
     pub id: u16,
@@ -87,8 +89,8 @@ pub struct DirEntry {
     pub size: u64,
 }
 
-// 2 + 2 + 32 + 8 = 44 bytes (packed, no padding)
-const _: () = assert!(core::mem::size_of::<DirEntry>() == 44);
+// 2 + 2 + 32 + 4(padding) + 8 = 48 bytes (natural alignment)
+const _: () = assert!(core::mem::size_of::<DirEntry>() == 48);
 
 impl FpkEntry {
     /// Get the entry name as a &str (up to first null byte)
