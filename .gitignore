@@ -38,3 +38,6 @@ __pycache__/
 
 # WSL/Docker
 .wslconfig
+
+# Windows reserved names
+nul
