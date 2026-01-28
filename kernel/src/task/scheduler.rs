@@ -255,64 +255,38 @@ pub fn enqueue(task_id: TaskId) {
 pub fn yield_cpu() {
     use super::task;
 
-    // CRITICAL DEBUG: Print immediately at function entry
-    let marker_value = crate::arch::x86_64::syscall::get_debug_marker();
-    crate::serial_println!("[YIELD_CPU] Function entered! DEBUG_MARKER = {:#x}", marker_value);
-
     // Record voluntary yield
     let current_id = task::get_current_task();
     super::statistics::record_voluntary_yield(current_id);
 
-    // DEBUG: Set marker 100 at yield entry
-    crate::arch::x86_64::syscall::set_debug_marker(100);
-
     // Disable interrupts during context switch
     x86_64::instructions::interrupts::disable();
-
-    // DEBUG: Set marker 101 after disable interrupts
-    crate::arch::x86_64::syscall::set_debug_marker(101);
 
     // Get next task to run
     let next_id = match schedule_next() {
         Some(id) => id,
         None => {
-            // No tasks to run, re-enable interrupts and return
             x86_64::instructions::interrupts::enable();
             return;
         }
     };
 
-    // DEBUG: Set marker 102 after schedule_next
-    crate::arch::x86_64::syscall::set_debug_marker(102);
-
     // Get current task ID
     let current_id = task::get_current_task();
 
-    // DEBUG: Set marker 103 after get_current_task
-    crate::arch::x86_64::syscall::set_debug_marker(103);
-
     if current_id == next_id {
         // Same task, just return
-        // CRITICAL FIX: Must update context pointer before returning!
-        // Otherwise next syscall will get stale/NULL pointer
         if let Some(task_arc) = task::get_task(current_id) {
             let task_locked = task_arc.lock();
             let ctx_ptr = &task_locked.context as *const task::Context as usize;
             crate::arch::x86_64::syscall::set_current_context_ptr(ctx_ptr as *mut task::Context);
-            crate::serial_println!("[YIELD_CPU] Same task, updated context ptr to {:#x}", ctx_ptr);
         }
         x86_64::instructions::interrupts::enable();
         return;
     }
 
-    // DEBUG: Set marker 104 before get_task
-    crate::arch::x86_64::syscall::set_debug_marker(104);
-
     // Get target task's context pointer and page table
     let target = task::get_task(next_id).expect("Target task not found");
-
-    // DEBUG: Set marker 105 after get_task
-    crate::arch::x86_64::syscall::set_debug_marker(105);
 
     let (target_ctx_ptr, target_page_table_phys) = {
         let target_locked = target.lock();
@@ -322,12 +296,8 @@ pub fn yield_cpu() {
         )
     };
 
-    // DEBUG: Set marker 106 after getting context pointer
-    crate::arch::x86_64::syscall::set_debug_marker(106);
-
     // Switch to target task's page table
     if target_page_table_phys != 0 {
-        crate::serial_println!("[YIELD_CPU] Switching to page table {:#x}", target_page_table_phys);
         unsafe {
             crate::memory::paging::switch_page_table(target_page_table_phys);
         }
@@ -342,26 +312,12 @@ pub fn yield_cpu() {
     // Update current context pointer for syscalls
     crate::arch::x86_64::syscall::set_current_context_ptr(target_ctx_ptr as *mut task::Context);
 
-    // CANARY CHECKPOINT #2: SWITCH_POINT - Verify target task Context before switch
-    crate::serial_println!("[YIELD_CPU] About to switch to task {}", next_id);
-    crate::arch::x86_64::syscall::verify_task_context(next_id, "SWITCH_POINT");
-
-    // If we're switching AWAY from a task, also verify we saved its context correctly
-    if current_id != 0 && current_id != next_id {
-        crate::serial_println!("[YIELD_CPU] Also verifying outgoing task {}", current_id);
-        crate::arch::x86_64::syscall::verify_task_context(current_id, "SWITCH_POINT_OUTGOING");
-    }
-
-    // DEBUG: Set marker 107 before restore_context_only
-    crate::arch::x86_64::syscall::set_debug_marker(107);
-
     // Jump to new task using IRETQ (does not return!)
-    // Note: Current task's context was saved when it last yielded via syscall
     unsafe {
         super::switch::restore_context_only(target_ctx_ptr);
     }
 
-    // Never reached - restore_context_only does not return
+    // Never reached
 }
 
 /// Get next task to run

@@ -212,7 +212,44 @@ extern "C" fn irq_timer() {
         eoi_fn = sym folkering_kernel::arch::x86_64::apic::send_eoi,
     );
 }
-make_exception_handler!(irq_33, 33, "\n[IRQ1] Keyboard (Vector 33)!");
+/// Keyboard interrupt handler (Vector 33 / IRQ1)
+///
+/// Reads scancode, translates to ASCII, buffers it.
+/// PIC EOI is sent inside handle_interrupt().
+#[unsafe(naked)]
+extern "C" fn irq_keyboard() {
+    core::arch::naked_asm!(
+        // Save caller-saved registers
+        "push rax",
+        "push rcx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+
+        // Call keyboard driver's handle_interrupt() (includes PIC EOI)
+        "call {kbd_fn}",
+
+        // Restore registers
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop rcx",
+        "pop rax",
+
+        // Return from interrupt
+        "iretq",
+
+        kbd_fn = sym folkering_kernel::drivers::keyboard::handle_interrupt,
+    );
+}
 make_exception_handler!(irq_34, 34, "\n[IRQ2] Cascade (Vector 34)!");
 make_exception_handler!(irq_35, 35, "\n[IRQ3] COM2 (Vector 35)!");
 make_exception_handler!(irq_36, 36, "\n[IRQ4] COM1 (Vector 36)!");
@@ -639,7 +676,7 @@ unsafe fn init_idt() {
     IDT[31].set_handler(core::mem::transmute(exc_reserved31 as *const ()));
     // IRQ handlers (32+)
     IDT[32].set_handler(core::mem::transmute(irq_timer as *const ())); // Timer
-    IDT[33].set_handler(core::mem::transmute(irq_33 as *const ()));
+    IDT[33].set_handler(core::mem::transmute(irq_keyboard as *const ()));
     IDT[34].set_handler(core::mem::transmute(irq_34 as *const ()));
     IDT[35].set_handler(core::mem::transmute(irq_35 as *const ()));
     IDT[36].set_handler(core::mem::transmute(irq_36 as *const ()));

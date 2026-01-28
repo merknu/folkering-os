@@ -32,34 +32,11 @@ pub enum Syscall {
 /// Debug function called from int_syscall_entry
 #[no_mangle]
 extern "C" fn debug_int_entry() {
-    static mut ENTRY_COUNT: u64 = 0;
-    unsafe {
-        ENTRY_COUNT += 1;
-        if ENTRY_COUNT <= 5 {
-            crate::serial_println!("[INT_ENTRY] int_syscall_entry() started (call #{})", ENTRY_COUNT);
-        } else if ENTRY_COUNT == 6 {
-            let syscall_count = SYSCALL_COUNT.load(core::sync::atomic::Ordering::Relaxed);
-            let marker = DEBUG_MARKER.load(core::sync::atomic::Ordering::Relaxed);
-            crate::serial_println!("[INT_ENTRY] (suppressing further messages, syscall loop running...)");
-            crate::serial_println!("[INT_ENTRY] Current syscall counter: {}", syscall_count);
-            crate::serial_println!("[INT_ENTRY] Current debug marker: {:#x}", marker);
-        } else if ENTRY_COUNT % 100 == 0 {
-            let syscall_count = SYSCALL_COUNT.load(core::sync::atomic::Ordering::Relaxed);
-            crate::serial_println!("[INT_ENTRY] Syscall count at entry #{}: {}", ENTRY_COUNT, syscall_count);
-        }
-    }
 }
 
 /// Debug function called after yield returns
 #[no_mangle]
 extern "C" fn debug_after_yield() {
-    static mut AFTER_YIELD_COUNT: u64 = 0;
-    unsafe {
-        AFTER_YIELD_COUNT += 1;
-        if AFTER_YIELD_COUNT <= 5 {
-            crate::serial_println!("[INT_ENTRY] After yield returned (count={})", AFTER_YIELD_COUNT);
-        }
-    }
 }
 
 /// INT 0x80 syscall entry
@@ -247,6 +224,12 @@ pub fn init() {
         use x86_64::registers::model_specific::Msr;
         let mut star = Msr::new(0xC0000081); // IA32_STAR
         star.write(star_value);
+
+        // Set FMASK MSR - clear IF and DF on SYSCALL entry
+        // This prevents interrupts during the critical section before kernel stack switch
+        let mut fmask = Msr::new(0xC0000084); // IA32_FMASK
+        fmask.write(0x600); // Clear IF (bit 9) and DF (bit 10)
+        crate::serial_strln!("[SYSCALL_INIT] FMASK set to 0x600 (clear IF+DF on SYSCALL)");
     }
 }
 
@@ -424,39 +407,18 @@ extern "C" fn debug_show_iretq_frame(ctx_ptr: u64) {
 
 /// Set the current context pointer (called during task switch)
 pub fn set_current_context_ptr(ptr: *mut crate::task::task::Context) {
-    let ptr_val = ptr as usize;
-    crate::serial_println!("[SET_CTX_PTR] Setting CURRENT_CONTEXT_PTR to {:#x}", ptr_val);
-    CURRENT_CONTEXT_PTR.store(ptr_val, core::sync::atomic::Ordering::Release);
-    // Verify it was stored
-    let stored = CURRENT_CONTEXT_PTR.load(core::sync::atomic::Ordering::Acquire);
-    crate::serial_println!("[SET_CTX_PTR] Verified stored value: {:#x}", stored);
+    CURRENT_CONTEXT_PTR.store(ptr as usize, core::sync::atomic::Ordering::Release);
 }
 
 /// Get current task's context pointer (lock-free, fast path for syscalls)
 #[no_mangle]
 extern "C" fn get_current_task_context_ptr() -> *mut crate::task::task::Context {
-    let ptr = CURRENT_CONTEXT_PTR.load(core::sync::atomic::Ordering::Acquire) as *mut _;
-    static mut CALL_COUNT: u64 = 0;
-    unsafe {
-        CALL_COUNT += 1;
-        // Only print first few calls to reduce noise
-        if CALL_COUNT <= 5 {
-            crate::serial_println!("[GET_CTX #{}] -> {:#x}", CALL_COUNT, ptr as usize);
-        }
-    }
-    ptr
+    CURRENT_CONTEXT_PTR.load(core::sync::atomic::Ordering::Acquire) as *mut _
 }
 
 /// Yield CPU from syscall (may not return if task switch)
 #[no_mangle]
 extern "C" fn syscall_do_yield() {
-    static mut YIELD_COUNT: u64 = 0;
-    unsafe {
-        YIELD_COUNT += 1;
-        if YIELD_COUNT <= 5 {
-            crate::serial_println!("[YIELD] syscall_do_yield called (count={})", YIELD_COUNT);
-        }
-    }
     crate::task::scheduler::yield_cpu();
 }
 
@@ -485,18 +447,9 @@ extern "C" fn debug_context_saved(ctx_ptr: usize) {
     }
 }
 
-/// Debug: Increment entry counter
+/// Debug: Increment entry counter (quiet)
 #[no_mangle]
-extern "C" fn debug_syscall_entry_hit(rax: u64) {
-    static mut COUNT: u64 = 0;
-    unsafe {
-        COUNT += 1;
-        // Print for first few syscalls
-        if COUNT <= 7 {
-            let rcx_val = DEBUG_RCX.load(core::sync::atomic::Ordering::Relaxed);
-            crate::serial_println!("[SYSCALL #{}] RAX={}, RCX_at_entry={:#x}", COUNT, rax, rcx_val);
-        }
-    }
+extern "C" fn debug_syscall_entry_hit(_rax: u64) {
 }
 
 #[no_mangle]
@@ -1059,35 +1012,8 @@ extern "C" fn syscall_handler(
     arg5: u64,
     arg6: u64,
 ) -> u64 {
-    // DEBUG: Mark entry into syscall_handler
-    crate::drivers::serial::write_str("[HANDLER] Entered, syscall=");
-    crate::drivers::serial::write_dec(syscall_num as u32);
-    crate::drivers::serial::write_newline();
-
-    // DEBUG: Set marker to 0xC0 = inside handler
-    DEBUG_MARKER.store(0xC0, core::sync::atomic::Ordering::Relaxed);
-
-    // Record syscall invocation
-    crate::drivers::serial::write_str("[HANDLER] About to get_current_task\n");
-    DEBUG_MARKER.store(0xC1, core::sync::atomic::Ordering::Relaxed);
-
     let current_task = crate::task::task::get_current_task();
-
-    crate::drivers::serial::write_str("[HANDLER] Got task ");
-    crate::drivers::serial::write_dec(current_task);
-    crate::drivers::serial::write_newline();
-    DEBUG_MARKER.store(0xC2, core::sync::atomic::Ordering::Relaxed);
-
-    crate::drivers::serial::write_str("[HANDLER] About to record_syscall\n");
-    DEBUG_MARKER.store(0xC3, core::sync::atomic::Ordering::Relaxed);
-
     crate::task::statistics::record_syscall(current_task);
-
-    crate::drivers::serial::write_str("[HANDLER] record_syscall done\n");
-    DEBUG_MARKER.store(0xC4, core::sync::atomic::Ordering::Relaxed);
-
-    crate::drivers::serial::write_str("[HANDLER] About to dispatch\n");
-    DEBUG_MARKER.store(0xC5, core::sync::atomic::Ordering::Relaxed);
 
     match syscall_num {
         0 => {
@@ -1355,14 +1281,12 @@ fn syscall_ipc_reply(payload0: u64, payload1: u64) -> u64 {
 
 /// Debug function to print R12 value before saving to Context.rip
 #[no_mangle]
-extern "C" fn debug_r12_before_save(r12_value: u64) {
-    crate::serial_println!("[DEBUG_R12] R12 value BEFORE save to Context.rip: {:#x}", r12_value);
+extern "C" fn debug_r12_before_save(_r12_value: u64) {
 }
 
 /// Debug function to print what was saved to Context.rip
 #[no_mangle]
-extern "C" fn debug_rip_after_save(rip_value: u64) {
-    crate::serial_println!("[DEBUG_RIP] Value saved to Context.rip: {:#x}", rip_value);
+extern "C" fn debug_rip_after_save(_rip_value: u64) {
 }
 
 /// Debug function to print RIP value saved during YIELD
@@ -1385,35 +1309,12 @@ extern "C" fn get_current_task_id() -> u64 {
 
 /// Debug function to print RIP value immediately after saving to Context
 #[no_mangle]
-extern "C" fn debug_context_rip_saved(rip_value: u64) {
-    let task_id = crate::task::task::get_current_task();
-    crate::serial_println!("[CONTEXT_SAVE] Task {} - Context.rip = {:#x}", task_id, rip_value);
+extern "C" fn debug_context_rip_saved(_rip_value: u64) {
 }
 
 /// Debug function to verify Context values before IRETQ frame build
 #[no_mangle]
-extern "C" fn debug_verify_context_before_iretq(ctx_ptr: usize) {
-    use crate::task::task::Context;
-
-    let ctx = unsafe { &*(ctx_ptr as *const Context) };
-
-    crate::serial_println!("[PRE-IRETQ-CHECK] Context at {:#x}:", ctx_ptr);
-    crate::serial_println!("  RIP:    {:#x}", ctx.rip);
-    crate::serial_println!("  RSP:    {:#x}", ctx.rsp);
-    crate::serial_println!("  CS:     {:#x}", ctx.cs);
-    crate::serial_println!("  SS:     {:#x}", ctx.ss);
-    crate::serial_println!("  RFLAGS: {:#x}", ctx.rflags);
-
-    // Check for obvious corruption
-    if ctx.cs != 0x23 {
-        crate::serial_println!("[PRE-IRETQ-CHECK] ERROR: CS is {:#x}, expected 0x23!", ctx.cs);
-    }
-    if ctx.ss != 0x1B {
-        crate::serial_println!("[PRE-IRETQ-CHECK] ERROR: SS is {:#x}, expected 0x1B!", ctx.ss);
-    }
-    if ctx.rip < 0x400000 || ctx.rip > 0x7FFFFFFFFFFF {
-        crate::serial_println!("[PRE-IRETQ-CHECK] ERROR: RIP {:#x} not in user space!", ctx.rip);
-    }
+extern "C" fn debug_verify_context_before_iretq(_ctx_ptr: usize) {
 }
 
 /// CANARY: Verify Task Context integrity at critical points

@@ -175,27 +175,34 @@ pub fn spawn(binary: &[u8], _args: &[&str]) -> Result<TaskId, SpawnError> {
         }
     }
 
-    // 5. Allocate user stack
+    // 5. Allocate user stack (64KB = 16 pages)
     // Stack at a high address in user space
-    let stack_base = 0x7FFF_FFFE_F000u64;
-    let stack_phys = memory::physical::alloc_page()
-        .ok_or(SpawnError::OutOfMemory)?;
+    let stack_pages = 16usize;
+    let stack_size = stack_pages * 4096; // 64KB
+    let stack_top_addr = 0x7FFF_FFFF_0000u64;
+    let stack_base = stack_top_addr - stack_size as u64;
 
-    // Zero the stack
-    let stack_hhdm = crate::phys_to_virt(stack_phys);
-    unsafe {
-        core::ptr::write_bytes(stack_hhdm as *mut u8, 0, 4096);
+    for i in 0..stack_pages {
+        let page_vaddr = stack_base + (i * 4096) as u64;
+        let page_phys = memory::physical::alloc_page()
+            .ok_or(SpawnError::OutOfMemory)?;
+
+        // Zero the page
+        let hhdm = crate::phys_to_virt(page_phys);
+        unsafe {
+            core::ptr::write_bytes(hhdm as *mut u8, 0, 4096);
+        }
+
+        // Map into task's page table
+        paging::map_page_in_table(
+            page_table_phys,
+            page_vaddr as usize,
+            page_phys,
+            flags::USER_STACK,
+        ).map_err(|_| SpawnError::OutOfMemory)?;
     }
 
-    // Map stack into task's page table
-    paging::map_page_in_table(
-        page_table_phys,
-        stack_base as usize,
-        stack_phys,
-        flags::USER_STACK,
-    ).map_err(|_| SpawnError::OutOfMemory)?;
-
-    let user_stack_top = stack_base + 4096 - 8;
+    let user_stack_top = stack_top_addr - 8;
     crate::serial_str!("[SPAWN_ELF] User stack at ");
     crate::drivers::serial::write_hex(stack_base);
     crate::serial_str!(", top=");

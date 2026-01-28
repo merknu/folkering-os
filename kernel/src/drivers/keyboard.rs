@@ -169,69 +169,67 @@ pub fn init() {
 
 /// Handle keyboard interrupt (called from IDT handler)
 pub fn handle_interrupt() {
+    // Always read scancode from port 0x60 to clear the keyboard controller
+    let scancode = unsafe {
+        let mut data_port = Port::<u8>::new(KEYBOARD_DATA_PORT);
+        data_port.read()
+    };
+
+    // Send EOI to PIC immediately (must happen for every interrupt)
+    unsafe {
+        let mut pic1_cmd = Port::<u8>::new(0x20);
+        pic1_cmd.write(0x20);
+    }
+
     if !KEYBOARD_INIT.load(Ordering::Relaxed) {
         return;
     }
 
-    unsafe {
-        let mut data_port = Port::<u8>::new(KEYBOARD_DATA_PORT);
-        let scancode = data_port.read();
-
-        // Handle key release (bit 7 set)
-        if scancode & 0x80 != 0 {
-            let released = scancode & 0x7F;
-            if released == SCANCODE_LSHIFT || released == SCANCODE_RSHIFT {
-                SHIFT_PRESSED.store(false, Ordering::Relaxed);
-            }
-            return;
+    // Handle key release (bit 7 set)
+    if scancode & 0x80 != 0 {
+        let released = scancode & 0x7F;
+        if released == SCANCODE_LSHIFT || released == SCANCODE_RSHIFT {
+            SHIFT_PRESSED.store(false, Ordering::Relaxed);
         }
-
-        // Handle special keys
-        match scancode {
-            SCANCODE_LSHIFT | SCANCODE_RSHIFT => {
-                SHIFT_PRESSED.store(true, Ordering::Relaxed);
-                return;
-            }
-            SCANCODE_CAPS_LOCK => {
-                let current = CAPS_LOCK.load(Ordering::Relaxed);
-                CAPS_LOCK.store(!current, Ordering::Relaxed);
-                return;
-            }
-            _ => {}
-        }
-
-        // Convert scancode to ASCII
-        let shift = SHIFT_PRESSED.load(Ordering::Relaxed);
-        let caps = CAPS_LOCK.load(Ordering::Relaxed);
-
-        let ascii = if shift {
-            SCANCODE_TO_ASCII_SHIFT[scancode as usize]
-        } else {
-            SCANCODE_TO_ASCII[scancode as usize]
-        };
-
-        // Apply caps lock (only affects a-z)
-        let ascii = if caps && ascii >= b'a' && ascii <= b'z' {
-            ascii - 32 // To uppercase
-        } else if caps && ascii >= b'A' && ascii <= b'Z' && !shift {
-            ascii + 32 // To lowercase (caps + no shift = lowercase)
-        } else {
-            ascii
-        };
-
-        // Push to buffer if valid
-        if ascii != 0 {
-            KEY_BUFFER.lock().push(ascii);
-
-            // Echo to serial for debugging
-            crate::drivers::serial::write_byte(ascii);
-        }
+        return;
     }
 
-    // Send EOI to PIC
-    unsafe {
-        let mut pic1_cmd = Port::<u8>::new(0x20);
-        pic1_cmd.write(0x20);
+    // Handle special keys
+    match scancode {
+        SCANCODE_LSHIFT | SCANCODE_RSHIFT => {
+            SHIFT_PRESSED.store(true, Ordering::Relaxed);
+            return;
+        }
+        SCANCODE_CAPS_LOCK => {
+            let current = CAPS_LOCK.load(Ordering::Relaxed);
+            CAPS_LOCK.store(!current, Ordering::Relaxed);
+            return;
+        }
+        _ => {}
+    }
+
+    // Convert scancode to ASCII
+    let shift = SHIFT_PRESSED.load(Ordering::Relaxed);
+    let caps = CAPS_LOCK.load(Ordering::Relaxed);
+
+    let ascii = if shift {
+        unsafe { SCANCODE_TO_ASCII_SHIFT[scancode as usize] }
+    } else {
+        unsafe { SCANCODE_TO_ASCII[scancode as usize] }
+    };
+
+    // Apply caps lock (only affects a-z)
+    let ascii = if caps && ascii >= b'a' && ascii <= b'z' {
+        ascii - 32 // To uppercase
+    } else if caps && ascii >= b'A' && ascii <= b'Z' && !shift {
+        ascii + 32 // To lowercase (caps + no shift = lowercase)
+    } else {
+        ascii
+    };
+
+    // Push to buffer if valid
+    if ascii != 0 {
+        KEY_BUFFER.lock().push(ascii);
     }
 }
 

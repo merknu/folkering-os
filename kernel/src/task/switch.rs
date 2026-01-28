@@ -23,8 +23,6 @@ use x86_64::PhysAddr;
 pub unsafe fn switch_to(target_id: TaskId) {
     use super::task::get_current_task;
 
-    crate::serial_str!("[SWITCH] switch_to(target_id="); crate::drivers::serial::write_dec(target_id as u32); crate::serial_strln!(")");
-
     let current_id = get_current_task();
 
     // Check if this is the first switch (from kernel context, no task)
@@ -66,21 +64,13 @@ pub unsafe fn switch_to(target_id: TaskId) {
     // Get target task's context pointer
     let target_ctx_ptr = {
         let target_locked = target.lock();
-        let ctx_ptr = &target_locked.context as *const Context as usize;
-        crate::serial_str!("[SWITCH] Target task "); crate::drivers::serial::write_dec(target_id as u32); crate::serial_str!(" context pointer: "); crate::drivers::serial::write_hex(ctx_ptr as u64); crate::drivers::serial::write_newline();
-
-        // DEBUG: Check if this looks like a valid heap address
-        if ctx_ptr < 0xFFFF_FF00_0000_0000 {
-            crate::serial_str!("[SWITCH] WARNING: Context pointer "); crate::drivers::serial::write_hex(ctx_ptr as u64); crate::serial_strln!(" looks like kernel data/code, not heap!");
-        }
-        ctx_ptr
+        &target_locked.context as *const Context as usize
     };
 
     // Switch to target task's page table if it has one
     {
         let target_locked = target.lock();
         if target_locked.page_table_phys != 0 {
-            crate::serial_str!("[SWITCH] Switching to page table "); crate::drivers::serial::write_hex(target_locked.page_table_phys as u64); crate::drivers::serial::write_newline();
             unsafe {
                 crate::memory::paging::switch_page_table(target_locked.page_table_phys);
             }
@@ -91,17 +81,14 @@ pub unsafe fn switch_to(target_id: TaskId) {
     set_current_task(target_id);
 
     // Update current context pointer for fast syscall access
-    crate::serial_str!("[SWITCH] Setting CURRENT_CONTEXT_PTR to "); crate::drivers::serial::write_hex(target_ctx_ptr as u64); crate::serial_str!(" for task "); crate::drivers::serial::write_dec(target_id as u32); crate::drivers::serial::write_newline();
     crate::arch::x86_64::syscall::set_current_context_ptr(target_ctx_ptr as *mut Context);
 
     // Perform actual register switch (assembly)
     if current_ctx_ptr == 0 {
         // First switch from kernel - just restore new task, don't save
-        crate::serial_strln!("[SWITCH] First switch from kernel, calling restore_context_only()");
         restore_context_only(target_ctx_ptr);
     } else {
         // Normal switch - save current, restore new
-        crate::serial_strln!("[SWITCH] Normal switch, calling switch_context()");
         switch_context(current_ctx_ptr, target_ctx_ptr);
     }
 }
@@ -203,33 +190,10 @@ extern "C" fn switch_context(_old_ctx: usize, _new_ctx: usize) {
     );
 }
 
-/// Debug helper: print context before restore (using bypass functions)
+/// Debug helper: print context before restore (kept as no-op)
 #[inline(never)]
-pub fn debug_context_before_restore(ctx_ptr: usize) {
-    let ctx = unsafe { &*(ctx_ptr as *const Context) };
-    crate::drivers::serial::write_str("[RESTORE] RIP=");
-    crate::drivers::serial::write_hex(ctx.rip);
-    crate::drivers::serial::write_str(", RSP=");
-    crate::drivers::serial::write_hex(ctx.rsp);
-    crate::drivers::serial::write_str(", CS=");
-    crate::drivers::serial::write_hex(ctx.cs);
-    crate::drivers::serial::write_str(", SS=");
-    crate::drivers::serial::write_hex(ctx.ss);
-    crate::drivers::serial::write_str(", RFLAGS=");
-    crate::drivers::serial::write_hex(ctx.rflags);
-    crate::drivers::serial::write_newline();
-
-    // CRITICAL: Verify CS and SS are correct (not swapped!)
-    if ctx.cs != 0x23 {
-        crate::drivers::serial::write_str("[RESTORE] ERROR: CS=");
-        crate::drivers::serial::write_hex(ctx.cs);
-        crate::drivers::serial::write_str(" should be 0x23!\n");
-    }
-    if ctx.ss != 0x1B {
-        crate::drivers::serial::write_str("[RESTORE] ERROR: SS=");
-        crate::drivers::serial::write_hex(ctx.ss);
-        crate::drivers::serial::write_str(" should be 0x1B!\n");
-    }
+pub fn debug_context_before_restore(_ctx_ptr: usize) {
+    // Intentionally empty — was debug noise
 }
 
 /// Restore task context without saving (for first switch from kernel to user)
@@ -306,57 +270,16 @@ pub unsafe extern "C" fn restore_context_only(_new_ctx: usize) {
     );
 }
 
-/// Debug function called before IRETQ (using bypass functions)
+/// Debug function called before IRETQ (kept as no-op, referenced from asm)
 #[no_mangle]
-extern "C" fn debug_before_iretq_fn(ctx_ptr: usize) {
-    let ctx = unsafe { &*(ctx_ptr as *const Context) };
-    crate::drivers::serial::write_str("[PRE-IRETQ] RIP=");
-    crate::drivers::serial::write_hex(ctx.rip);
-    crate::drivers::serial::write_str(", RSP=");
-    crate::drivers::serial::write_hex(ctx.rsp);
-    crate::drivers::serial::write_str(", CS=");
-    crate::drivers::serial::write_hex(ctx.cs);
-    crate::drivers::serial::write_str(", SS=");
-    crate::drivers::serial::write_hex(ctx.ss);
-    crate::drivers::serial::write_str(", RFLAGS=");
-    crate::drivers::serial::write_hex(ctx.rflags);
-    crate::drivers::serial::write_newline();
-
-    let marker = crate::arch::x86_64::syscall::get_debug_marker();
-    crate::drivers::serial::write_str("[PRE-IRETQ] DEBUG_MARKER before user mode: ");
-    crate::drivers::serial::write_hex(marker);
-    crate::drivers::serial::write_newline();
-    crate::drivers::serial::write_str("[PRE-IRETQ] About to IRETQ to user mode...\n");
-
-    // Verify CS/SS are correct before IRETQ
-    if ctx.cs != 0x23 || ctx.ss != 0x1B {
-        crate::drivers::serial::write_str("[PRE-IRETQ] CRITICAL: CS/SS corrupted before IRETQ!\n");
-        crate::drivers::serial::write_str("  CS should be 0x23, got ");
-        crate::drivers::serial::write_hex(ctx.cs);
-        crate::drivers::serial::write_str("\n  SS should be 0x1B, got ");
-        crate::drivers::serial::write_hex(ctx.ss);
-        crate::drivers::serial::write_newline();
-    }
+extern "C" fn debug_before_iretq_fn(_ctx_ptr: usize) {
+    // Intentionally empty — was debug noise
 }
 
-/// Debug function called after IRETQ frame is built to dump stack
-/// Arguments: RDI = current RSP (top of IRETQ frame)
+/// Debug function for IRETQ frame inspection (kept as no-op)
 #[no_mangle]
-extern "C" fn debug_switch_iretq_frame(frame_rsp: usize) {
-    unsafe {
-        let frame = frame_rsp as *const u64;
-        let rip = *frame.add(0);
-        let cs = *frame.add(1);
-        let rflags = *frame.add(2);
-        let rsp = *frame.add(3);
-        let ss = *frame.add(4);
-        crate::serial_str!("[IRETQ-FRAME] RSP="); crate::drivers::serial::write_hex(frame_rsp as u64); crate::drivers::serial::write_newline();
-        crate::serial_str!("[IRETQ-FRAME] [RSP+0]  RIP:    "); crate::drivers::serial::write_hex(rip); crate::drivers::serial::write_newline();
-        crate::serial_str!("[IRETQ-FRAME] [RSP+8]  CS:     "); crate::drivers::serial::write_hex(cs); crate::drivers::serial::write_newline();
-        crate::serial_str!("[IRETQ-FRAME] [RSP+16] RFLAGS: "); crate::drivers::serial::write_hex(rflags); crate::drivers::serial::write_newline();
-        crate::serial_str!("[IRETQ-FRAME] [RSP+24] RSP:    "); crate::drivers::serial::write_hex(rsp); crate::drivers::serial::write_newline();
-        crate::serial_str!("[IRETQ-FRAME] [RSP+32] SS:     "); crate::drivers::serial::write_hex(ss); crate::drivers::serial::write_newline();
-    }
+extern "C" fn debug_switch_iretq_frame(_frame_rsp: usize) {
+    // Intentionally empty — was debug noise
 }
 
 /// Initialize a new task's context

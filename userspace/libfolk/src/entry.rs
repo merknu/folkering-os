@@ -26,7 +26,6 @@ macro_rules! entry {
     ($main:path) => {
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn _start() -> ! {
-            // Call the user's main function
             let f: fn() -> ! = $main;
             f()
         }
