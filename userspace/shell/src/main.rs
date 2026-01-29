@@ -6,9 +6,15 @@
 #![no_main]
 
 use libfolk::{entry, print, println};
-use libfolk::sys::{read_key, yield_cpu, get_pid, exit, task_list, uptime, shmem_map};
-use libfolk::sys::synapse::{read_file_shmem, file_count};
+use libfolk::sys::{read_key, yield_cpu, get_pid, exit, task_list, uptime, shmem_map, shmem_create, shmem_grant};
+use libfolk::sys::synapse::{
+    read_file_shmem, file_count, embedding_count,
+    vector_search, get_embedding, SYNAPSE_TASK_ID,
+};
 use libfolk::sys::fs::DirEntry;
+
+/// Embedding size in bytes (384 dimensions × 4 bytes)
+const EMBEDDING_SIZE: usize = 1536;
 
 entry!(main);
 
@@ -99,6 +105,7 @@ fn execute_command() {
         "ls" => cmd_ls(),
         "cat" => cmd_cat(parts),
         "sql" => cmd_sql(cmd),
+        "search" => cmd_search(parts),
         "ps" => cmd_ps(),
         "uptime" => cmd_uptime(),
         "pid" => cmd_pid(),
@@ -113,16 +120,19 @@ fn execute_command() {
 
 fn cmd_help() {
     println!("Available commands:");
-    println!("  help       - Show this help message");
-    println!("  echo       - Echo text back");
-    println!("  ls         - List files in ramdisk");
-    println!("  cat <file> - Display file contents");
-    println!("  sql \"...\"  - Execute SQL query on files database");
-    println!("  ps         - List running tasks");
-    println!("  uptime     - Show system uptime");
-    println!("  pid        - Show current process ID");
-    println!("  clear      - Clear the screen");
-    println!("  exit       - Exit the shell");
+    println!("  help              - Show this help message");
+    println!("  echo              - Echo text back");
+    println!("  ls                - List files in ramdisk");
+    println!("  cat <file>        - Display file contents");
+    println!("  sql \"...\"         - Execute SQL query on files database");
+    println!("  search <keyword>  - Search files by keyword");
+    println!("  search -s <file>  - Find files similar to <file>");
+    println!("  search <kw> -s <f> - Hybrid search (keyword + semantic)");
+    println!("  ps                - List running tasks");
+    println!("  uptime            - Show system uptime");
+    println!("  pid               - Show current process ID");
+    println!("  clear             - Clear the screen");
+    println!("  exit              - Exit the shell");
 }
 
 fn cmd_ls() {
@@ -149,6 +159,12 @@ fn cmd_ls() {
 /// Virtual address for Shell's shared memory buffer mapping
 /// Using a fixed address that won't conflict with code/stack
 const SHELL_SHMEM_VADDR: usize = 0x20000000;
+
+/// Virtual address for vector search query embedding
+const VECTOR_QUERY_VADDR: usize = 0x21000000;
+
+/// Virtual address for vector search results
+const VECTOR_RESULTS_VADDR: usize = 0x22000000;
 
 fn cmd_cat<'a>(mut args: impl Iterator<Item = &'a str>) {
     let filename = match args.next() {
@@ -298,6 +314,584 @@ fn cmd_sql(full_cmd: &str) {
         }
     }
     println!("\n({} rows)", dir_count.min(count));
+}
+
+/// Search for files by keyword, similarity, or hybrid
+///
+/// Usage:
+///   search <keyword>           - Search filenames containing keyword
+///   search -s <filename>       - Find files semantically similar to a file
+///   search <keyword> -s <file> - Hybrid search (keyword + semantic RRF)
+fn cmd_search<'a>(args: impl Iterator<Item = &'a str>) {
+    // Parse arguments to find keyword and/or -s flag
+    let mut keyword: Option<&str> = None;
+    let mut similar_file: Option<&str> = None;
+    let mut collected_args: [&str; 8] = [""; 8];
+    let mut arg_count = 0;
+
+    // Collect all arguments first
+    for arg in args {
+        if arg_count < 8 {
+            collected_args[arg_count] = arg;
+            arg_count += 1;
+        }
+    }
+
+    if arg_count == 0 {
+        println!("usage: search <keyword>");
+        println!("       search -s <filename>  (semantic search)");
+        println!("       search <keyword> -s <file>  (hybrid search)");
+        return;
+    }
+
+    // Parse arguments
+    let mut i = 0;
+    while i < arg_count {
+        let arg = collected_args[i];
+        if arg == "-s" || arg == "--similar" {
+            if i + 1 < arg_count {
+                similar_file = Some(collected_args[i + 1]);
+                i += 2;
+            } else {
+                println!("search: -s requires a filename");
+                return;
+            }
+        } else {
+            keyword = Some(arg);
+            i += 1;
+        }
+    }
+
+    // Dispatch to appropriate search mode
+    match (keyword, similar_file) {
+        (Some(kw), Some(sf)) => {
+            // Hybrid search: keyword + semantic with RRF
+            cmd_search_hybrid(kw, sf);
+        }
+        (None, Some(sf)) => {
+            // Semantic-only search
+            cmd_search_similar(sf);
+        }
+        (Some(kw), None) => {
+            // Keyword-only search
+            cmd_search_keyword(kw);
+        }
+        (None, None) => {
+            println!("usage: search <keyword>");
+            println!("       search -s <filename>  (semantic search)");
+            println!("       search <keyword> -s <file>  (hybrid search)");
+        }
+    }
+}
+
+/// Keyword-only search
+fn cmd_search_keyword(query: &str) {
+    // Convert query to lowercase
+    let mut query_lower = [0u8; 64];
+    let mut query_len = 0;
+    for &b in query.as_bytes() {
+        if query_len < query_lower.len() - 1 {
+            query_lower[query_len] = if b >= b'A' && b <= b'Z' { b + 32 } else { b };
+            query_len += 1;
+        }
+    }
+    let query_str = unsafe { core::str::from_utf8_unchecked(&query_lower[..query_len]) };
+
+    // Get file list
+    let mut entries = [DirEntry {
+        id: 0, entry_type: 0, name: [0u8; 32], size: 0
+    }; 16];
+    let dir_count = libfolk::sys::fs::read_dir(&mut entries);
+
+    if dir_count == 0 {
+        println!("No files available.");
+        return;
+    }
+
+    // Find matches
+    let mut found = 0;
+    println!();
+
+    for i in 0..dir_count {
+        let entry = &entries[i];
+        let name = entry.name_str();
+        let name_lower = name_to_lowercase(name);
+
+        if contains_substring(&name_lower, query_str) {
+            let kind = if entry.is_elf() { "ELF " } else { "DATA" };
+            println!("  {} {:>8} {} (keyword match)", kind, entry.size, name);
+            found += 1;
+        }
+    }
+
+    if found == 0 {
+        println!("  No files matching '{}'", query);
+
+        // Suggest semantic/hybrid search if embeddings available
+        if let Ok(emb_count) = embedding_count() {
+            if emb_count > 0 {
+                println!("\n  Tip: Try 'search {} -s <file>' for hybrid search", query);
+                println!("       ({} files have embeddings)", emb_count);
+            }
+        }
+    } else {
+        println!("\n{} file(s) found", found);
+    }
+}
+
+/// RRF constant (standard value from literature)
+const RRF_K: u32 = 60;
+
+/// Maximum results for hybrid search
+const MAX_HYBRID_RESULTS: usize = 16;
+
+/// Hybrid search result entry
+#[derive(Clone, Copy)]
+struct HybridResult {
+    file_id: u32,
+    keyword_rank: u32,    // 0 = not in keyword results, 1+ = rank
+    semantic_rank: u32,   // 0 = not in semantic results, 1+ = rank
+    semantic_sim: f32,    // Raw similarity score for display
+    rrf_score: u32,       // RRF score × 1000 for integer comparison
+}
+
+impl Default for HybridResult {
+    fn default() -> Self {
+        Self {
+            file_id: 0,
+            keyword_rank: 0,
+            semantic_rank: 0,
+            semantic_sim: 0.0,
+            rrf_score: 0,
+        }
+    }
+}
+
+/// Hybrid search: combines keyword matching with semantic similarity using RRF
+fn cmd_search_hybrid(keyword: &str, similar_file: &str) {
+    // Check if semantic search is available
+    let emb_count = match embedding_count() {
+        Ok(c) => c,
+        Err(_) => {
+            println!("search: Synapse not available");
+            return;
+        }
+    };
+
+    if emb_count == 0 {
+        println!("search: No embeddings for hybrid search, falling back to keyword");
+        cmd_search_keyword(keyword);
+        return;
+    }
+
+    // Get file list
+    let mut entries = [DirEntry {
+        id: 0, entry_type: 0, name: [0u8; 32], size: 0
+    }; 16];
+    let dir_count = libfolk::sys::fs::read_dir(&mut entries);
+
+    if dir_count == 0 {
+        println!("No files available.");
+        return;
+    }
+
+    // Find the reference file for semantic search
+    let source_entry = entries[..dir_count]
+        .iter()
+        .find(|e| e.name_str() == similar_file);
+
+    let source_file_id = match source_entry {
+        Some(e) => e.id as u32,
+        None => {
+            println!("search: reference file '{}' not found", similar_file);
+            return;
+        }
+    };
+
+    // === STEP 1: Keyword Search ===
+    let mut results: [HybridResult; MAX_HYBRID_RESULTS] = [HybridResult::default(); MAX_HYBRID_RESULTS];
+    let mut result_count = 0;
+
+    // Convert keyword to lowercase
+    let mut keyword_lower = [0u8; 64];
+    let mut keyword_len = 0;
+    for &b in keyword.as_bytes() {
+        if keyword_len < keyword_lower.len() - 1 {
+            keyword_lower[keyword_len] = if b >= b'A' && b <= b'Z' { b + 32 } else { b };
+            keyword_len += 1;
+        }
+    }
+    let keyword_str = unsafe { core::str::from_utf8_unchecked(&keyword_lower[..keyword_len]) };
+
+    let mut keyword_rank = 1u32;
+    for i in 0..dir_count {
+        let entry = &entries[i];
+        let name_lower = name_to_lowercase(entry.name_str());
+
+        if contains_substring(&name_lower, keyword_str) {
+            if result_count < MAX_HYBRID_RESULTS {
+                results[result_count].file_id = entry.id as u32;
+                results[result_count].keyword_rank = keyword_rank;
+                result_count += 1;
+                keyword_rank += 1;
+            }
+        }
+    }
+
+    // === STEP 2: Semantic Search ===
+    // Get embedding for reference file
+    let embedding_response = match get_embedding(source_file_id) {
+        Ok(r) => r,
+        Err(_) => {
+            println!("search: reference file '{}' has no embedding", similar_file);
+            println!("Falling back to keyword-only search.\n");
+            cmd_search_keyword(keyword);
+            return;
+        }
+    };
+
+    // Map the embedding
+    if shmem_map(embedding_response.shmem_handle, VECTOR_QUERY_VADDR).is_err() {
+        println!("search: failed to map embedding");
+        return;
+    }
+
+    // Create query buffer for Synapse
+    let query_shmem = match shmem_create(4096) {
+        Ok(h) => h,
+        Err(_) => {
+            println!("search: failed to create query buffer");
+            return;
+        }
+    };
+
+    if shmem_grant(query_shmem, SYNAPSE_TASK_ID).is_err() {
+        println!("search: failed to grant query buffer");
+        return;
+    }
+
+    if shmem_map(query_shmem, VECTOR_RESULTS_VADDR).is_err() {
+        println!("search: failed to map query buffer");
+        return;
+    }
+
+    // Copy embedding to query buffer
+    unsafe {
+        let src = VECTOR_QUERY_VADDR as *const u8;
+        let dst = VECTOR_RESULTS_VADDR as *mut u8;
+        core::ptr::copy_nonoverlapping(src, dst, EMBEDDING_SIZE);
+    }
+
+    // Perform vector search (get more results for better RRF fusion)
+    let k = 10;
+    let search_response = match vector_search(query_shmem, k) {
+        Ok(r) => r,
+        Err(_) => {
+            println!("search: vector search failed, falling back to keyword");
+            cmd_search_keyword(keyword);
+            return;
+        }
+    };
+
+    // Map results
+    if search_response.count > 0 {
+        if shmem_map(search_response.shmem_handle, VECTOR_RESULTS_VADDR).is_err() {
+            println!("search: failed to map results");
+            return;
+        }
+
+        // Process semantic results
+        let results_ptr = VECTOR_RESULTS_VADDR as *const u8;
+        let mut semantic_rank = 1u32;
+
+        for i in 0..search_response.count {
+            let offset = i * 8;
+            let file_id = unsafe {
+                let ptr = results_ptr.add(offset) as *const u32;
+                *ptr
+            };
+            let similarity = unsafe {
+                let ptr = results_ptr.add(offset + 4) as *const f32;
+                *ptr
+            };
+
+            // Skip the reference file itself
+            if file_id == source_file_id {
+                continue;
+            }
+
+            // Check if this file is already in results (from keyword search)
+            let existing = results[..result_count]
+                .iter_mut()
+                .find(|r| r.file_id == file_id);
+
+            if let Some(result) = existing {
+                result.semantic_rank = semantic_rank;
+                result.semantic_sim = similarity;
+            } else if result_count < MAX_HYBRID_RESULTS {
+                // Add new result (semantic-only)
+                results[result_count].file_id = file_id;
+                results[result_count].semantic_rank = semantic_rank;
+                results[result_count].semantic_sim = similarity;
+                result_count += 1;
+            }
+
+            semantic_rank += 1;
+        }
+    }
+
+    // === STEP 3: Calculate RRF Scores ===
+    for result in results[..result_count].iter_mut() {
+        let mut score = 0u32;
+
+        // Keyword contribution: 1/(k + rank)
+        if result.keyword_rank > 0 {
+            score += 1000 / (RRF_K + result.keyword_rank);
+        }
+
+        // Semantic contribution: 1/(k + rank)
+        if result.semantic_rank > 0 {
+            score += 1000 / (RRF_K + result.semantic_rank);
+        }
+
+        result.rrf_score = score;
+    }
+
+    // === STEP 4: Sort by RRF Score (descending) ===
+    // Simple bubble sort (small array)
+    for i in 0..result_count {
+        for j in (i + 1)..result_count {
+            if results[j].rrf_score > results[i].rrf_score {
+                let tmp = results[i];
+                results[i] = results[j];
+                results[j] = tmp;
+            }
+        }
+    }
+
+    // === STEP 5: Display Results ===
+    if result_count == 0 {
+        println!("\nNo files match '{}' or are similar to '{}'", keyword, similar_file);
+        return;
+    }
+
+    println!("\nHybrid search: '{}' + similar to '{}':\n", keyword, similar_file);
+
+    let display_count = result_count.min(8);
+    for result in results[..display_count].iter() {
+        // Find filename
+        let name = entries[..dir_count]
+            .iter()
+            .find(|e| e.id as u32 == result.file_id)
+            .map(|e| e.name_str())
+            .unwrap_or("???");
+
+        // Build match type indicator
+        let match_type = match (result.keyword_rank > 0, result.semantic_rank > 0) {
+            (true, true) => "K+S",   // Both keyword and semantic
+            (true, false) => "K  ",  // Keyword only
+            (false, true) => "  S",  // Semantic only
+            (false, false) => "   ", // Shouldn't happen
+        };
+
+        // Show similarity if available
+        if result.semantic_rank > 0 {
+            let sim_pct = (result.semantic_sim * 100.0) as u32;
+            println!("  [{}] {:<16} {:>3}% sim  (RRF: {})",
+                     match_type, name, sim_pct, result.rrf_score);
+        } else {
+            println!("  [{}] {:<16}          (RRF: {})",
+                     match_type, name, result.rrf_score);
+        }
+    }
+
+    println!("\n{} result(s) - [K]=keyword [S]=semantic", display_count);
+}
+
+/// Search for files semantically similar to a given file
+fn cmd_search_similar(filename: &str) {
+    // Step 1: Check if semantic search is available
+    let emb_count = match embedding_count() {
+        Ok(c) => c,
+        Err(_) => {
+            println!("search: Synapse not available");
+            return;
+        }
+    };
+
+    if emb_count == 0 {
+        println!("search: No embeddings available");
+        println!("        Build with 'folk-pack create-sqlite --embed'");
+        return;
+    }
+
+    // Step 2: Find the file ID for the given filename
+    let mut entries = [DirEntry {
+        id: 0, entry_type: 0, name: [0u8; 32], size: 0
+    }; 16];
+    let dir_count = libfolk::sys::fs::read_dir(&mut entries);
+
+    let source_file = entries[..dir_count]
+        .iter()
+        .find(|e| e.name_str() == filename);
+
+    let source_entry = match source_file {
+        Some(e) => e,
+        None => {
+            println!("search: '{}' not found", filename);
+            return;
+        }
+    };
+
+    let file_id = source_entry.id as u32;
+
+    // Step 3: Get the embedding for this file
+    let embedding_response = match get_embedding(file_id) {
+        Ok(r) => r,
+        Err(_) => {
+            println!("search: '{}' has no embedding", filename);
+            return;
+        }
+    };
+
+    // Step 4: Map the embedding to our address space
+    if shmem_map(embedding_response.shmem_handle, VECTOR_QUERY_VADDR).is_err() {
+        println!("search: failed to map embedding");
+        return;
+    }
+
+    // Step 5: Create shared memory for the query (Synapse needs to read from it)
+    let query_shmem = match shmem_create(4096) {
+        Ok(h) => h,
+        Err(_) => {
+            println!("search: failed to create query buffer");
+            return;
+        }
+    };
+
+    // Grant Synapse access to read the query
+    if shmem_grant(query_shmem, SYNAPSE_TASK_ID).is_err() {
+        println!("search: failed to grant query buffer");
+        return;
+    }
+
+    // Map query buffer and copy the embedding
+    if shmem_map(query_shmem, VECTOR_RESULTS_VADDR).is_err() {
+        println!("search: failed to map query buffer");
+        return;
+    }
+
+    // Copy embedding from source to query buffer
+    unsafe {
+        let src = VECTOR_QUERY_VADDR as *const u8;
+        let dst = VECTOR_RESULTS_VADDR as *mut u8;
+        core::ptr::copy_nonoverlapping(src, dst, EMBEDDING_SIZE);
+    }
+
+    // Step 6: Perform vector search
+    let k = 5; // Get top 5 results
+    let search_response = match vector_search(query_shmem, k) {
+        Ok(r) => r,
+        Err(_) => {
+            println!("search: vector search failed");
+            return;
+        }
+    };
+
+    if search_response.count == 0 {
+        println!("No similar files found.");
+        return;
+    }
+
+    // Step 7: Map results and display
+    if shmem_map(search_response.shmem_handle, VECTOR_RESULTS_VADDR).is_err() {
+        println!("search: failed to map results");
+        return;
+    }
+
+    println!("\nFiles similar to '{}':\n", filename);
+
+    // Read results from shared memory
+    let results_ptr = VECTOR_RESULTS_VADDR as *const u8;
+    for i in 0..search_response.count {
+        let offset = i * 8;
+
+        // Read file_id (4 bytes, little-endian)
+        let result_file_id = unsafe {
+            let ptr = results_ptr.add(offset) as *const u32;
+            *ptr
+        };
+
+        // Read similarity (4 bytes, little-endian f32)
+        let similarity = unsafe {
+            let ptr = results_ptr.add(offset + 4) as *const f32;
+            *ptr
+        };
+
+        // Skip the source file itself
+        if result_file_id == file_id {
+            continue;
+        }
+
+        // Find the filename for this file_id
+        let result_name = entries[..dir_count]
+            .iter()
+            .find(|e| e.id as u32 == result_file_id)
+            .map(|e| e.name_str())
+            .unwrap_or("???");
+
+        // Display with similarity score (as percentage)
+        let sim_pct = (similarity * 100.0) as u32;
+        println!("  {:<16} ({:>3}% similar)", result_name, sim_pct);
+    }
+    println!();
+}
+
+/// Convert filename to lowercase (in-place buffer)
+fn name_to_lowercase(name: &str) -> [u8; 32] {
+    let mut lower = [0u8; 32];
+    for (i, &b) in name.as_bytes().iter().enumerate() {
+        if i >= 32 {
+            break;
+        }
+        lower[i] = if b >= b'A' && b <= b'Z' { b + 32 } else { b };
+    }
+    lower
+}
+
+/// Check if haystack contains needle (case-insensitive)
+fn contains_substring(haystack: &[u8; 32], needle: &str) -> bool {
+    let needle_bytes = needle.as_bytes();
+    if needle_bytes.is_empty() {
+        return true;
+    }
+
+    // Find the actual length of haystack (stop at null)
+    let mut haystack_len = 0;
+    for &b in haystack.iter() {
+        if b == 0 {
+            break;
+        }
+        haystack_len += 1;
+    }
+
+    if haystack_len < needle_bytes.len() {
+        return false;
+    }
+
+    for i in 0..=(haystack_len - needle_bytes.len()) {
+        let mut matches = true;
+        for (j, &needle_byte) in needle_bytes.iter().enumerate() {
+            if haystack[i + j] != needle_byte {
+                matches = false;
+                break;
+            }
+        }
+        if matches {
+            return true;
+        }
+    }
+    false
 }
 
 /// Simple uppercase conversion for ASCII strings

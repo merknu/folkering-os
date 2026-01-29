@@ -91,8 +91,23 @@ pub const SYN_OP_PING: u64 = 0x0000;
 /// Results via shared memory for complex queries
 pub const SYN_OP_SQL_QUERY: u64 = 0x0010;
 
+/// Semantic vector search
+/// Request: op | (k << 16) | (shmem_handle << 32)
+///   where shmem_handle contains 1536-byte query embedding
+/// Reply: (result_count << 32) | shmem_handle (contains VectorSearchResult entries)
+pub const SYN_OP_VECTOR_SEARCH: u64 = 0x0020;
+
+/// Get embedding for a file
+/// Request: op | (file_id << 16)
+/// Reply: (size << 32) | shmem_handle (contains 1536-byte embedding), or SYN_STATUS_NOT_FOUND
+pub const SYN_OP_GET_EMBEDDING: u64 = 0x0021;
+
+/// Get embedding count
+/// Request: [OP, 0, 0, 0]
+/// Reply: [count, 0, 0, 0]
+pub const SYN_OP_EMBEDDING_COUNT: u64 = 0x0022;
+
 // Future operations
-// pub const SYN_OP_VECTOR_SEARCH: u64 = 0x0020; // Semantic search
 // pub const SYN_OP_WRITE_FILE: u64 = 0x0030;  // Write (when we have writable FS)
 
 // ============================================================================
@@ -346,4 +361,135 @@ pub fn read_file_shmem(name: &str) -> SynapseResult<ShmemFileResponse> {
     }
 
     Ok(ShmemFileResponse { shmem_handle, size })
+}
+
+// ============================================================================
+// Vector Search API
+// ============================================================================
+
+/// Result from vector search
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct VectorSearchResult {
+    /// File ID
+    pub file_id: u32,
+    /// Cosine similarity score (higher = more similar)
+    pub similarity: f32,
+}
+
+impl Default for VectorSearchResult {
+    fn default() -> Self {
+        Self {
+            file_id: 0,
+            similarity: -1.0,
+        }
+    }
+}
+
+/// Response from vector search
+#[derive(Debug, Clone, Copy)]
+pub struct VectorSearchResponse {
+    /// Number of results
+    pub count: usize,
+    /// Shared memory handle containing results
+    pub shmem_handle: u32,
+}
+
+/// Response from get_embedding
+#[derive(Debug, Clone, Copy)]
+pub struct EmbeddingResponse {
+    /// Size of embedding in bytes (should be 1536)
+    pub size: u32,
+    /// Shared memory handle containing embedding
+    pub shmem_handle: u32,
+}
+
+/// Perform semantic vector search
+///
+/// # Arguments
+/// * `query_shmem` - Shared memory handle containing 1536-byte query embedding
+/// * `k` - Maximum number of results to return
+///
+/// # Returns
+/// * `Ok(VectorSearchResponse)` - Contains result count and shmem handle
+/// * `Err(...)` - Error occurred
+pub fn vector_search(query_shmem: u32, k: usize) -> SynapseResult<VectorSearchResponse> {
+    let k = k.min(255) as u64; // Limit k to fit in 8 bits
+    // Pack: op in bits 0-15, k in bits 16-23, shmem_handle in bits 32-63
+    let request = SYN_OP_VECTOR_SEARCH | (k << 16) | ((query_shmem as u64) << 32);
+
+    let ret = unsafe {
+        syscall3(SYS_IPC_SEND, SYNAPSE_TASK_ID as u64, request, 0)
+    };
+
+    if ret == u64::MAX {
+        return Err(SynapseError::ServiceUnavailable);
+    }
+
+    if ret == SYN_STATUS_NOT_FOUND {
+        return Err(SynapseError::NotFound);
+    }
+
+    if ret == SYN_STATUS_ERROR {
+        return Err(SynapseError::IpcFailed);
+    }
+
+    let shmem_handle = (ret & 0xFFFFFFFF) as u32;
+    let count = ((ret >> 32) & 0xFFFFFFFF) as usize;
+
+    if shmem_handle == 0 {
+        return Err(SynapseError::IpcFailed);
+    }
+
+    Ok(VectorSearchResponse { count, shmem_handle })
+}
+
+/// Get embedding for a specific file
+///
+/// # Arguments
+/// * `file_id` - File ID to get embedding for
+///
+/// # Returns
+/// * `Ok(EmbeddingResponse)` - Contains size and shmem handle
+/// * `Err(NotFound)` - File has no embedding
+pub fn get_embedding(file_id: u32) -> SynapseResult<EmbeddingResponse> {
+    let request = SYN_OP_GET_EMBEDDING | ((file_id as u64) << 16);
+
+    let ret = unsafe {
+        syscall3(SYS_IPC_SEND, SYNAPSE_TASK_ID as u64, request, 0)
+    };
+
+    if ret == u64::MAX {
+        return Err(SynapseError::ServiceUnavailable);
+    }
+
+    if ret == SYN_STATUS_NOT_FOUND {
+        return Err(SynapseError::NotFound);
+    }
+
+    if ret == SYN_STATUS_ERROR {
+        return Err(SynapseError::IpcFailed);
+    }
+
+    let shmem_handle = (ret & 0xFFFFFFFF) as u32;
+    let size = ((ret >> 32) & 0xFFFFFFFF) as u32;
+
+    if shmem_handle == 0 {
+        return Err(SynapseError::IpcFailed);
+    }
+
+    Ok(EmbeddingResponse { size, shmem_handle })
+}
+
+/// Get the count of embeddings in the database
+pub fn embedding_count() -> SynapseResult<usize> {
+    let ret = unsafe {
+        syscall3(SYS_IPC_SEND, SYNAPSE_TASK_ID as u64, SYN_OP_EMBEDDING_COUNT, 0)
+    };
+
+    if ret == u64::MAX {
+        return Err(SynapseError::ServiceUnavailable);
+    }
+
+    Ok(ret as usize)
 }

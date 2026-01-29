@@ -1,2 +1,1 @@
-Hello from Folkering OS!
-This file lives in the ramdisk.
+Hello from Folkering OS with vector search!

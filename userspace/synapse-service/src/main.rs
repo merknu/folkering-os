@@ -27,19 +27,21 @@ use libfolk::sys::synapse::{
     SYN_OP_PING, SYN_OP_LIST_FILES, SYN_OP_FILE_COUNT, SYN_OP_FILE_BY_INDEX,
     SYN_OP_FILE_INFO, SYN_OP_READ_FILE, SYN_OP_READ_FILE_BY_NAME, SYN_OP_READ_FILE_CHUNK,
     SYN_OP_READ_FILE_SHMEM, SYN_OP_SQL_QUERY,
+    SYN_OP_VECTOR_SEARCH, SYN_OP_GET_EMBEDDING, SYN_OP_EMBEDDING_COUNT,
     SYN_STATUS_NOT_FOUND, SYN_STATUS_INVALID, SYN_STATUS_ERROR,
     SYNAPSE_VERSION, hash_name,
 };
 use libfolk::sys::{shmem_create, shmem_map, shmem_grant};
 use libsqlite::{SqliteDb, Value};
+use libsqlite::vector::{Embedding, SearchResult, search_similar, get_embedding_by_file_id, count_embeddings, EMBEDDING_SIZE};
 
 entry!(main);
 
 /// Maximum cached directory entries (for FPK fallback)
 const MAX_ENTRIES: usize = 16;
 
-/// Maximum SQLite database size (64KB should be plenty for initrd)
-const MAX_DB_SIZE: usize = 65536;
+/// Maximum SQLite database size (128KB for initrd with embeddings)
+const MAX_DB_SIZE: usize = 131072;
 
 /// SQLite database filename
 const DB_FILENAME: &str = "files.db";
@@ -110,9 +112,36 @@ fn main() -> ! {
         println!("[SYNAPSE] SQLite backend initialized");
         unsafe { BACKEND = Backend::Sqlite; }
 
-        // Count files in database
-        let count = count_sqlite_files();
-        println!("[SYNAPSE] Ready - database: {} ({} files)", DB_FILENAME, count);
+        // Count files
+        let file_count = count_sqlite_files();
+
+        // Count embeddings - cap at file_count since we have 1:1 file:embedding
+        let embedding_count = if let Some(db) = get_sqlite_db() {
+            if let Ok(scanner) = db.table_scan("embeddings") {
+                let mut cnt = 0;
+                for result in scanner {
+                    // Only count valid records
+                    if result.is_ok() {
+                        cnt += 1;
+                    }
+                    // Cap at file count (1:1 relationship)
+                    if cnt >= file_count { break; }
+                }
+                cnt
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
+        if embedding_count > 0 {
+            println!("[SYNAPSE] Ready - {} ({} files, {} embeddings)",
+                     DB_FILENAME, file_count, embedding_count);
+            println!("[SYNAPSE] Vector search enabled");
+        } else {
+            println!("[SYNAPSE] Ready - {} ({} files)", DB_FILENAME, file_count);
+        }
     } else {
         println!("[SYNAPSE] SQLite not found, using FPK backend");
         unsafe { BACKEND = Backend::Fpk; }
@@ -220,6 +249,9 @@ fn handle_request(msg: IpcMessage) {
         SYN_OP_READ_FILE_CHUNK => handle_read_file_chunk(msg),
         SYN_OP_READ_FILE_SHMEM => handle_read_file_shmem(msg),
         SYN_OP_SQL_QUERY => handle_sql_query(msg),
+        SYN_OP_VECTOR_SEARCH => handle_vector_search(msg),
+        SYN_OP_GET_EMBEDDING => handle_get_embedding(msg),
+        SYN_OP_EMBEDDING_COUNT => handle_embedding_count(msg),
         _ => {
             let _ = reply(SYN_STATUS_INVALID, 0);
         }
@@ -657,4 +689,218 @@ fn handle_sql_query(msg: IpcMessage) {
             let _ = reply(SYN_STATUS_INVALID, 0);
         }
     }
+}
+
+// ============================================================================
+// Vector Search Handlers (Phase 5)
+// ============================================================================
+
+/// Virtual address for vector search query embedding mapping
+const VECTOR_QUERY_VADDR: usize = 0x11000000;
+
+/// Virtual address for vector search results mapping
+const VECTOR_RESULTS_VADDR: usize = 0x12000000;
+
+/// Handle VECTOR_SEARCH request
+/// Request format: op | (k << 16) | (shmem_handle << 32)
+/// Reply: (result_count << 32) | shmem_handle_with_results
+fn handle_vector_search(msg: IpcMessage) {
+    let k = ((msg.payload0 >> 16) & 0xFF) as usize;
+    let query_shmem = (msg.payload0 >> 32) as u32;
+    let requester_task = msg.sender;
+
+    // Only SQLite backend supports vector search
+    if unsafe { BACKEND } != Backend::Sqlite {
+        let _ = reply(SYN_STATUS_INVALID, 0);
+        return;
+    }
+
+    // Validate k
+    if k == 0 || k > 100 {
+        let _ = reply(SYN_STATUS_INVALID, 0);
+        return;
+    }
+
+    // Map the query embedding from shared memory
+    if query_shmem == 0 {
+        let _ = reply(SYN_STATUS_INVALID, 0);
+        return;
+    }
+
+    if shmem_map(query_shmem, VECTOR_QUERY_VADDR).is_err() {
+        let _ = reply(SYN_STATUS_ERROR, 0);
+        return;
+    }
+
+    // Read the query embedding from shared memory
+    let query_ptr = VECTOR_QUERY_VADDR as *const u8;
+    let query_slice = unsafe { core::slice::from_raw_parts(query_ptr, EMBEDDING_SIZE) };
+
+    let query_embedding = match Embedding::from_blob(query_slice) {
+        Ok(e) => e,
+        Err(_) => {
+            let _ = reply(SYN_STATUS_INVALID, 0);
+            return;
+        }
+    };
+
+    // Perform the search
+    let db = match get_sqlite_db() {
+        Some(db) => db,
+        None => {
+            let _ = reply(SYN_STATUS_ERROR, 0);
+            return;
+        }
+    };
+
+    // Stack-allocated results buffer (max 100 results)
+    let mut results = [SearchResult::default(); 100];
+    let result_count = match search_similar(&db, &query_embedding, k, &mut results) {
+        Ok(count) => count,
+        Err(_) => {
+            let _ = reply(SYN_STATUS_ERROR, 0);
+            return;
+        }
+    };
+
+    if result_count == 0 {
+        // Return zero results (no shmem needed)
+        let _ = reply(0, 0);
+        return;
+    }
+
+    // Create shared memory for results
+    // Each result is 8 bytes (4 bytes file_id + 4 bytes similarity)
+    let results_size = result_count * 8;
+    let buffer_size = ((results_size + 4095) / 4096) * 4096;
+    let buffer_size = if buffer_size == 0 { 4096 } else { buffer_size };
+
+    let result_shmem = match shmem_create(buffer_size) {
+        Ok(handle) => handle,
+        Err(_) => {
+            let _ = reply(SYN_STATUS_ERROR, 0);
+            return;
+        }
+    };
+
+    if shmem_grant(result_shmem, requester_task).is_err() {
+        let _ = reply(SYN_STATUS_ERROR, 0);
+        return;
+    }
+
+    if shmem_map(result_shmem, VECTOR_RESULTS_VADDR).is_err() {
+        let _ = reply(SYN_STATUS_ERROR, 0);
+        return;
+    }
+
+    // Copy results to shared memory
+    let results_ptr = VECTOR_RESULTS_VADDR as *mut u8;
+    unsafe {
+        for (i, result) in results[..result_count].iter().enumerate() {
+            let offset = i * 8;
+            // Write file_id (4 bytes, little-endian)
+            let file_id_bytes = result.file_id.to_le_bytes();
+            core::ptr::copy_nonoverlapping(
+                file_id_bytes.as_ptr(),
+                results_ptr.add(offset),
+                4
+            );
+            // Write similarity (4 bytes, little-endian f32)
+            let sim_bytes = result.similarity.to_le_bytes();
+            core::ptr::copy_nonoverlapping(
+                sim_bytes.as_ptr(),
+                results_ptr.add(offset + 4),
+                4
+            );
+        }
+    }
+
+    // Reply with count and shmem handle
+    let response = ((result_count as u64) << 32) | (result_shmem as u64);
+    let _ = reply(response, 0);
+}
+
+/// Handle GET_EMBEDDING request
+/// Request format: op | (file_id << 16)
+/// Reply: (size << 32) | shmem_handle
+fn handle_get_embedding(msg: IpcMessage) {
+    let file_id = ((msg.payload0 >> 16) & 0xFFFF) as u32;
+    let requester_task = msg.sender;
+
+    // Only SQLite backend supports embeddings
+    if unsafe { BACKEND } != Backend::Sqlite {
+        let _ = reply(SYN_STATUS_INVALID, 0);
+        return;
+    }
+
+    let db = match get_sqlite_db() {
+        Some(db) => db,
+        None => {
+            let _ = reply(SYN_STATUS_ERROR, 0);
+            return;
+        }
+    };
+
+    // Look up the embedding
+    let embedding = match get_embedding_by_file_id(&db, file_id) {
+        Ok(Some(e)) => e,
+        Ok(None) => {
+            let _ = reply(SYN_STATUS_NOT_FOUND, 0);
+            return;
+        }
+        Err(_) => {
+            let _ = reply(SYN_STATUS_ERROR, 0);
+            return;
+        }
+    };
+
+    // Create shared memory for the embedding
+    let shmem_handle = match shmem_create(4096) {
+        Ok(handle) => handle,
+        Err(_) => {
+            let _ = reply(SYN_STATUS_ERROR, 0);
+            return;
+        }
+    };
+
+    if shmem_grant(shmem_handle, requester_task).is_err() {
+        let _ = reply(SYN_STATUS_ERROR, 0);
+        return;
+    }
+
+    if shmem_map(shmem_handle, VECTOR_QUERY_VADDR).is_err() {
+        let _ = reply(SYN_STATUS_ERROR, 0);
+        return;
+    }
+
+    // Copy embedding to shared memory
+    let buffer_ptr = VECTOR_QUERY_VADDR as *mut u8;
+    let buffer_slice = unsafe {
+        core::slice::from_raw_parts_mut(buffer_ptr, EMBEDDING_SIZE)
+    };
+    embedding.to_blob(buffer_slice);
+
+    // Reply with size and shmem handle
+    let response = ((EMBEDDING_SIZE as u64) << 32) | (shmem_handle as u64);
+    let _ = reply(response, 0);
+}
+
+/// Handle EMBEDDING_COUNT request
+fn handle_embedding_count(_msg: IpcMessage) {
+    // Only SQLite backend has embeddings
+    if unsafe { BACKEND } != Backend::Sqlite {
+        let _ = reply(0, 0);
+        return;
+    }
+
+    let db = match get_sqlite_db() {
+        Some(db) => db,
+        None => {
+            let _ = reply(0, 0);
+            return;
+        }
+    };
+
+    let count = count_embeddings(&db).unwrap_or(0);
+    let _ = reply(count as u64, 0);
 }

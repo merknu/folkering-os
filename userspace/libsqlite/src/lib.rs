@@ -2,18 +2,40 @@
 //!
 //! This library provides read-only access to SQLite databases,
 //! supporting table scans and key lookups via B-tree traversal.
+//!
+//! # Features
+//!
+//! - **B-tree traversal**: Read any SQLite table via `table_scan()`
+//! - **Record parsing**: Decode all SQLite value types (NULL, int, float, text, blob)
+//! - **Vector search**: Semantic similarity search via the `vector` module (Phase 5)
+//!
+//! # Example
+//!
+//! ```ignore
+//! use libsqlite::{SqliteDb, Value};
+//!
+//! let db = SqliteDb::open(data)?;
+//! for record in db.table_scan("files")? {
+//!     let record = record?;
+//!     if let Some(Value::Text(name)) = record.get(1) {
+//!         println!("File: {}", name);
+//!     }
+//! }
+//! ```
 
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
 mod header;
 mod varint;
 mod page;
 mod btree;
 mod record;
+pub mod vector;
 
 pub use header::DbHeader;
 pub use record::{Record, Value};
 pub use btree::TableScanner;
+pub use vector::{Embedding, SearchResult, EMBEDDING_DIM, EMBEDDING_SIZE};
 
 /// Errors that can occur when reading SQLite databases
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +58,8 @@ pub enum Error {
     TableNotFound,
     /// Column not found in record
     ColumnNotFound,
+    /// Invalid embedding (wrong size or format)
+    InvalidEmbedding,
 }
 
 /// SQLite database reader
