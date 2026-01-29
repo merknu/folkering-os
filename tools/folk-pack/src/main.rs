@@ -1,21 +1,31 @@
-//! folk-pack: Host-side tool to create Folk-Pack (FPK) initrd images
+//! folk-pack: Host-side tool to create Folk-Pack (FPK) and SQLite initrd images
 //!
 //! Usage:
-//!   folk-pack create <output> --add <name>:<type>:<path> [--add ...]
+//!   folk-pack create <output.fpk> --add <name>:<type>:<path> [--add ...]
+//!   folk-pack create-sqlite <output.db> --add <name>:<type>:<path> [--add ...]
 //!
 //! Example:
 //!   folk-pack create initrd.fpk \
-//!     --add shell:elf:userspace/target/x86_64-folkering-userspace/release/shell \
-//!     --add hello:elf:userspace/target/x86_64-folkering-userspace/release/hello
+//!     --add shell:elf:userspace/target/x86_64-folkering-userspace/release/shell
+//!
+//!   folk-pack create-sqlite initrd.db \
+//!     --add synapse:elf:path/to/synapse \
+//!     --add shell:elf:path/to/shell \
+//!     --add hello.txt:data:path/to/hello.txt
 
 mod format;
 
 use format::*;
+use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::process;
+
+/// File type constants for SQLite 'kind' column
+const KIND_ELF: i32 = 0;
+const KIND_DATA: i32 = 1;
 
 struct AddEntry {
     name: String,
@@ -23,28 +33,30 @@ struct AddEntry {
     path: String,
 }
 
-fn parse_args() -> (String, Vec<AddEntry>) {
-    let args: Vec<String> = std::env::args().collect();
+enum Command {
+    Create(String, Vec<AddEntry>),
+    CreateSqlite(String, Vec<AddEntry>),
+}
 
-    if args.len() < 3 {
-        eprintln!("Usage: folk-pack create <output.fpk> --add <name>:<type>:<path> [--add ...]");
-        eprintln!();
-        eprintln!("Types: elf, data");
-        eprintln!();
-        eprintln!("Example:");
-        eprintln!("  folk-pack create initrd.fpk --add shell:elf:path/to/shell");
-        process::exit(1);
-    }
+fn print_usage() {
+    eprintln!("folk-pack: Tool to create initrd images for Folkering OS");
+    eprintln!();
+    eprintln!("Usage:");
+    eprintln!("  folk-pack create <output.fpk> --add <name>:<type>:<path> [--add ...]");
+    eprintln!("  folk-pack create-sqlite <output.db> --add <name>:<type>:<path> [--add ...]");
+    eprintln!();
+    eprintln!("Types: elf, data");
+    eprintln!();
+    eprintln!("Examples:");
+    eprintln!("  folk-pack create initrd.fpk --add shell:elf:path/to/shell");
+    eprintln!("  folk-pack create-sqlite initrd.db --add synapse:elf:path/to/synapse");
+    process::exit(1);
+}
 
-    if args[1] != "create" {
-        eprintln!("Unknown command: {}. Only 'create' is supported.", args[1]);
-        process::exit(1);
-    }
-
-    let output = args[2].clone();
+fn parse_add_entries(args: &[String], start_index: usize) -> Vec<AddEntry> {
     let mut entries = Vec::new();
+    let mut i = start_index;
 
-    let mut i = 3;
     while i < args.len() {
         if args[i] == "--add" {
             i += 1;
@@ -87,17 +99,40 @@ fn parse_args() -> (String, Vec<AddEntry>) {
         process::exit(1);
     }
 
-    (output, entries)
+    entries
+}
+
+fn parse_args() -> Command {
+    let args: Vec<String> = std::env::args().collect();
+
+    if args.len() < 3 {
+        print_usage();
+    }
+
+    match args[1].as_str() {
+        "create" => {
+            let output = args[2].clone();
+            let entries = parse_add_entries(&args, 3);
+            Command::Create(output, entries)
+        }
+        "create-sqlite" => {
+            let output = args[2].clone();
+            let entries = parse_add_entries(&args, 3);
+            Command::CreateSqlite(output, entries)
+        }
+        other => {
+            eprintln!("Unknown command: {}. Use 'create' or 'create-sqlite'.", other);
+            process::exit(1);
+        }
+    }
 }
 
 fn align_up(value: usize, align: usize) -> usize {
     (value + align - 1) & !(align - 1)
 }
 
-fn main() {
-    let (output_path, add_entries) = parse_args();
-
-    println!("folk-pack: Creating {} with {} entries", output_path, add_entries.len());
+fn create_fpk(output_path: String, add_entries: Vec<AddEntry>) {
+    println!("folk-pack: Creating FPK {} with {} entries", output_path, add_entries.len());
 
     // Read all input files
     let mut file_data: Vec<(AddEntry, Vec<u8>)> = Vec::new();
@@ -123,22 +158,18 @@ fn main() {
     let entry_count = file_data.len();
 
     // Calculate offsets
-    // Header: 64 bytes
-    // Entry table: 64 bytes × N
-    // Then page-aligned data for each entry
     let header_size = std::mem::size_of::<FpkHeader>();
     let entry_table_size = std::mem::size_of::<FpkEntry>() * entry_count;
     let data_start = align_up(header_size + entry_table_size, FPK_PAGE_SIZE);
 
     // Calculate per-entry offsets
     let mut current_offset = data_start;
-    let mut entries_with_offsets: Vec<(usize, usize, [u8; 8])> = Vec::new(); // (offset, size, hash)
+    let mut entries_with_offsets: Vec<(usize, usize, [u8; 8])> = Vec::new();
 
     for (_entry, data) in &file_data {
         let offset = current_offset;
         let size = data.len();
 
-        // Compute truncated SHA-256 hash
         let mut hasher = Sha256::new();
         hasher.update(data);
         let full_hash = hasher.finalize();
@@ -210,13 +241,11 @@ fn main() {
             align_up(prev_offset + prev_size, FPK_PAGE_SIZE)
         };
 
-        // Verify alignment
         assert_eq!(current_file_pos, expected_offset,
             "Offset mismatch for entry {}: expected {}, got {}", i, expected_offset, current_file_pos);
 
         output.write_all(data).unwrap();
 
-        // Pad to next page boundary (except for last entry)
         if i + 1 < file_data.len() {
             let next_offset = entries_with_offsets[i + 1].0;
             let pad_size = next_offset - (expected_offset + data.len());
@@ -237,5 +266,105 @@ fn main() {
         println!("  Entry {}: \"{}\" at offset {:#x} ({} bytes, hash {:02x}{:02x}{:02x}{:02x}...)",
             i, name, entry.offset, entry.size,
             entry.hash[0], entry.hash[1], entry.hash[2], entry.hash[3]);
+    }
+}
+
+fn create_sqlite(output_path: String, add_entries: Vec<AddEntry>) {
+    println!("folk-pack: Creating SQLite database {} with {} entries", output_path, add_entries.len());
+
+    // Remove existing file if it exists
+    if Path::new(&output_path).exists() {
+        fs::remove_file(&output_path).unwrap_or_else(|e| {
+            eprintln!("Error removing existing file '{}': {}", output_path, e);
+            process::exit(1);
+        });
+    }
+
+    // Create SQLite database
+    let conn = Connection::open(&output_path).unwrap_or_else(|e| {
+        eprintln!("Error creating database '{}': {}", output_path, e);
+        process::exit(1);
+    });
+
+    // Set page size to 4096 for alignment with OS page size
+    conn.execute_batch("PRAGMA page_size = 4096;").unwrap();
+
+    // Create the files table
+    conn.execute(
+        "CREATE TABLE files (
+            id INTEGER PRIMARY KEY,
+            name TEXT UNIQUE NOT NULL,
+            kind INTEGER NOT NULL,
+            size INTEGER NOT NULL,
+            data BLOB
+        )",
+        [],
+    ).unwrap_or_else(|e| {
+        eprintln!("Error creating table: {}", e);
+        process::exit(1);
+    });
+
+    // Insert all files
+    let mut total_size = 0usize;
+    for (i, entry) in add_entries.iter().enumerate() {
+        let path = Path::new(&entry.path);
+        if !path.exists() {
+            eprintln!("Error: File not found: {}", entry.path);
+            process::exit(1);
+        }
+
+        let data = fs::read(path).unwrap_or_else(|e| {
+            eprintln!("Error reading '{}': {}", entry.path, e);
+            process::exit(1);
+        });
+
+        let kind = if entry.entry_type == ENTRY_TYPE_ELF { KIND_ELF } else { KIND_DATA };
+        let size = data.len();
+        total_size += size;
+
+        conn.execute(
+            "INSERT INTO files (id, name, kind, size, data) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![i as i64, entry.name, kind, size as i64, data],
+        ).unwrap_or_else(|e| {
+            eprintln!("Error inserting file '{}': {}", entry.name, e);
+            process::exit(1);
+        });
+
+        println!("  [{}] {} ({} bytes, kind={})",
+            i,
+            entry.name,
+            size,
+            if kind == KIND_ELF { "elf" } else { "data" }
+        );
+    }
+
+    // Force database to write all pages
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
+
+    // Close connection
+    drop(conn);
+
+    // Get final file size
+    let db_size = fs::metadata(&output_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    println!("folk-pack: Created {} ({} bytes, {} entries, {} bytes data)",
+        output_path, db_size, add_entries.len(), total_size);
+    println!();
+    println!("Schema:");
+    println!("  CREATE TABLE files (");
+    println!("      id INTEGER PRIMARY KEY,");
+    println!("      name TEXT UNIQUE NOT NULL,");
+    println!("      kind INTEGER NOT NULL,  -- 0=ELF, 1=Data");
+    println!("      size INTEGER NOT NULL,");
+    println!("      data BLOB");
+    println!("  );");
+}
+
+fn main() {
+    match parse_args() {
+        Command::Create(output, entries) => create_fpk(output, entries),
+        Command::CreateSqlite(output, entries) => create_sqlite(output, entries),
     }
 }

@@ -10,3 +10,4 @@ path = "src/main.rs"
 
 [dependencies]
 libfolk = { path = "../libfolk" }
+libsqlite = { path = "../libsqlite" }

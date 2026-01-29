@@ -1,0 +1,13 @@
+[package]
+name = "libsqlite"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal no_std SQLite B-tree reader for Folkering OS"
+
+[lib]
+crate-type = ["rlib"]
+
+[features]
+default = []
+
+[dependencies]

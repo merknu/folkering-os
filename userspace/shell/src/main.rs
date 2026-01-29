@@ -7,7 +7,8 @@
 
 use libfolk::{entry, print, println};
 use libfolk::sys::{read_key, yield_cpu, get_pid, exit, task_list, uptime, shmem_map};
-use libfolk::sys::synapse::read_file_shmem;
+use libfolk::sys::synapse::{read_file_shmem, file_count};
+use libfolk::sys::fs::DirEntry;
 
 entry!(main);
 
@@ -97,6 +98,7 @@ fn execute_command() {
         "echo" => cmd_echo(parts),
         "ls" => cmd_ls(),
         "cat" => cmd_cat(parts),
+        "sql" => cmd_sql(cmd),
         "ps" => cmd_ps(),
         "uptime" => cmd_uptime(),
         "pid" => cmd_pid(),
@@ -111,15 +113,16 @@ fn execute_command() {
 
 fn cmd_help() {
     println!("Available commands:");
-    println!("  help     - Show this help message");
-    println!("  echo     - Echo text back");
-    println!("  ls       - List files in ramdisk");
+    println!("  help       - Show this help message");
+    println!("  echo       - Echo text back");
+    println!("  ls         - List files in ramdisk");
     println!("  cat <file> - Display file contents");
-    println!("  ps       - List running tasks");
-    println!("  uptime   - Show system uptime");
-    println!("  pid      - Show current process ID");
-    println!("  clear    - Clear the screen");
-    println!("  exit     - Exit the shell");
+    println!("  sql \"...\"  - Execute SQL query on files database");
+    println!("  ps         - List running tasks");
+    println!("  uptime     - Show system uptime");
+    println!("  pid        - Show current process ID");
+    println!("  clear      - Clear the screen");
+    println!("  exit       - Exit the shell");
 }
 
 fn cmd_ls() {
@@ -194,6 +197,163 @@ fn cmd_cat<'a>(mut args: impl Iterator<Item = &'a str>) {
         }
     }
     println!();
+}
+
+/// Execute SQL query on files database
+/// Supports simple SELECT queries:
+/// - SELECT name FROM files
+/// - SELECT name, size FROM files
+/// - SELECT * FROM files
+fn cmd_sql(full_cmd: &str) {
+    // Extract the query from quotes: sql "SELECT ..."
+    let query = if let Some(start) = full_cmd.find('"') {
+        if let Some(end) = full_cmd[start + 1..].find('"') {
+            &full_cmd[start + 1..start + 1 + end]
+        } else {
+            println!("sql: missing closing quote");
+            return;
+        }
+    } else {
+        // Try without quotes: sql SELECT ...
+        let trimmed = full_cmd.strip_prefix("sql ").unwrap_or("");
+        if trimmed.is_empty() {
+            println!("usage: sql \"SELECT ... FROM files\"");
+            return;
+        }
+        trimmed
+    };
+
+    let query_upper = query.to_uppercase_simple();
+
+    // Parse the SELECT query
+    if !query_upper.starts_with("SELECT ") {
+        println!("sql: only SELECT queries are supported");
+        return;
+    }
+
+    // Check if it's a query on 'files' table
+    if !query_upper.contains(" FROM FILES") {
+        println!("sql: only 'files' table is available");
+        return;
+    }
+
+    // Determine which columns to show
+    let columns_part = &query[7..]; // Skip "SELECT "
+    let from_pos = columns_part.to_uppercase_simple().find(" FROM");
+    let columns_str = match from_pos {
+        Some(pos) => columns_part[..pos].trim(),
+        None => {
+            println!("sql: invalid query syntax");
+            return;
+        }
+    };
+
+    // Parse column names
+    let show_name = columns_str == "*" ||
+                   columns_str.to_uppercase_simple().contains("NAME");
+    let show_size = columns_str == "*" ||
+                   columns_str.to_uppercase_simple().contains("SIZE");
+    let show_kind = columns_str == "*" ||
+                   columns_str.to_uppercase_simple().contains("KIND") ||
+                   columns_str.to_uppercase_simple().contains("TYPE");
+
+    // Get file count from Synapse
+    let count = match file_count() {
+        Ok(c) => c,
+        Err(_) => {
+            println!("sql: Synapse not available");
+            return;
+        }
+    };
+
+    if count == 0 {
+        println!("(0 rows)");
+        return;
+    }
+
+    // Fetch and display each file
+    // We need to get file names from ls since Synapse only returns metadata
+    let mut entries = [DirEntry {
+        id: 0, entry_type: 0, name: [0u8; 32], size: 0
+    }; 16];
+    let dir_count = libfolk::sys::fs::read_dir(&mut entries);
+
+    println!();
+    for i in 0..dir_count.min(count) {
+        let entry = &entries[i];
+        let name = entry.name_str();
+
+        if show_name && show_size && show_kind {
+            let kind = if entry.is_elf() { "elf" } else { "data" };
+            println!("{:<16} {:>8} {}", name, entry.size, kind);
+        } else if show_name && show_size {
+            println!("{:<16} {:>8}", name, entry.size);
+        } else if show_name && show_kind {
+            let kind = if entry.is_elf() { "elf" } else { "data" };
+            println!("{:<16} {}", name, kind);
+        } else if show_name {
+            println!("{}", name);
+        } else if show_size {
+            println!("{}", entry.size);
+        }
+    }
+    println!("\n({} rows)", dir_count.min(count));
+}
+
+/// Simple uppercase conversion for ASCII strings
+trait ToUppercaseSimple {
+    fn to_uppercase_simple(&self) -> SimpleUpper;
+}
+
+impl ToUppercaseSimple for &str {
+    fn to_uppercase_simple(&self) -> SimpleUpper {
+        SimpleUpper { s: self }
+    }
+}
+
+struct SimpleUpper<'a> {
+    s: &'a str,
+}
+
+impl<'a> SimpleUpper<'a> {
+    fn starts_with(&self, prefix: &str) -> bool {
+        if self.s.len() < prefix.len() {
+            return false;
+        }
+        for (a, b) in self.s.bytes().zip(prefix.bytes()) {
+            let a_upper = if a >= b'a' && a <= b'z' { a - 32 } else { a };
+            if a_upper != b {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn contains(&self, needle: &str) -> bool {
+        if needle.is_empty() {
+            return true;
+        }
+        for i in 0..=self.s.len().saturating_sub(needle.len()) {
+            let slice = &self.s[i..];
+            if (SimpleUpper { s: slice }).starts_with(needle) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn find(&self, needle: &str) -> Option<usize> {
+        if needle.is_empty() {
+            return Some(0);
+        }
+        for i in 0..=self.s.len().saturating_sub(needle.len()) {
+            let slice = &self.s[i..];
+            if (SimpleUpper { s: slice }).starts_with(needle) {
+                return Some(i);
+            }
+        }
+        None
+    }
 }
 
 fn cmd_echo<'a>(mut args: impl Iterator<Item = &'a str>) {

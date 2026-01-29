@@ -6,3 +6,4 @@ description = "Host-side tool to pack userspace binaries into Folk-Pack (FPK) in
 
 [dependencies]
 sha2 = "0.10"
+rusqlite = { version = "0.31", features = ["bundled"] }

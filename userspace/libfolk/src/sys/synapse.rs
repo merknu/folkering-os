@@ -85,8 +85,13 @@ pub const SYN_OP_FILE_BY_INDEX: u64 = 0x0005;
 /// Reply: [magic ^ 0x5959, version, 0, 0]
 pub const SYN_OP_PING: u64 = 0x0000;
 
-// Future operations (Phase 2+)
-// pub const SYN_OP_QUERY: u64 = 0x0010;      // SQL-like query
+/// Execute SQL query on files database
+/// Request: op | (query_type << 16)
+/// For simple lookups: query_type encodes operation
+/// Results via shared memory for complex queries
+pub const SYN_OP_SQL_QUERY: u64 = 0x0010;
+
+// Future operations
 // pub const SYN_OP_VECTOR_SEARCH: u64 = 0x0020; // Semantic search
 // pub const SYN_OP_WRITE_FILE: u64 = 0x0030;  // Write (when we have writable FS)
 
