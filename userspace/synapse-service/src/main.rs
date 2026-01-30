@@ -33,7 +33,11 @@ use libfolk::sys::synapse::{
 };
 use libfolk::sys::{shmem_create, shmem_map, shmem_grant};
 use libsqlite::{SqliteDb, Value};
-use libsqlite::vector::{Embedding, SearchResult, search_similar, get_embedding_by_file_id, count_embeddings, EMBEDDING_SIZE};
+use libsqlite::vector::{
+    Embedding, SearchResult, search_similar_auto,
+    get_embedding_by_file_id, count_embeddings, EMBEDDING_SIZE
+};
+use libsqlite::shadow::has_shadow_tables;
 
 entry!(main);
 
@@ -136,9 +140,22 @@ fn main() -> ! {
         };
 
         if embedding_count > 0 {
-            println!("[SYNAPSE] Ready - {} ({} files, {} embeddings)",
-                     DB_FILENAME, file_count, embedding_count);
-            println!("[SYNAPSE] Vector search enabled");
+            // Check for quantized index
+            let has_quantized = if let Some(db) = get_sqlite_db() {
+                has_shadow_tables(&db)
+            } else {
+                false
+            };
+
+            if has_quantized {
+                println!("[SYNAPSE] Ready - {} ({} files, {} embeddings)",
+                         DB_FILENAME, file_count, embedding_count);
+                println!("[SYNAPSE] Vector search enabled (quantized BQ+SQ8)");
+            } else {
+                println!("[SYNAPSE] Ready - {} ({} files, {} embeddings)",
+                         DB_FILENAME, file_count, embedding_count);
+                println!("[SYNAPSE] Vector search enabled (brute-force)");
+            }
         } else {
             println!("[SYNAPSE] Ready - {} ({} files)", DB_FILENAME, file_count);
         }
@@ -755,7 +772,8 @@ fn handle_vector_search(msg: IpcMessage) {
 
     // Stack-allocated results buffer (max 100 results)
     let mut results = [SearchResult::default(); 100];
-    let result_count = match search_similar(&db, &query_embedding, k, &mut results) {
+    // Use auto search: quantized if available, brute-force otherwise
+    let result_count = match search_similar_auto(&db, &query_embedding, k, &mut results) {
         Ok(count) => count,
         Err(_) => {
             let _ = reply(SYN_STATUS_ERROR, 0);

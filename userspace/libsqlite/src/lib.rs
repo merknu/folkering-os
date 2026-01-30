@@ -31,11 +31,20 @@ mod page;
 mod btree;
 mod record;
 pub mod vector;
+pub mod quantize;
+pub mod simd;
+pub mod shadow;
 
 pub use header::DbHeader;
 pub use record::{Record, Value};
 pub use btree::TableScanner;
 pub use vector::{Embedding, SearchResult, EMBEDDING_DIM, EMBEDDING_SIZE};
+pub use quantize::{BinaryVector, ScalarVector, quantize_binary, quantize_scalar, BQ_SIZE, SQ8_SIZE};
+pub use simd::{CpuFeatures, detect_cpu_features};
+pub use shadow::{has_shadow_tables, BQChunkReader, SQ8ChunkReader};
+
+#[cfg(test)]
+mod bench_test;
 
 /// Errors that can occur when reading SQLite databases
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

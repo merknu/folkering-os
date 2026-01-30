@@ -46,7 +46,7 @@ struct AddEntry {
 
 enum Command {
     Create(String, Vec<AddEntry>),
-    CreateSqlite(String, Vec<AddEntry>, bool), // bool = generate embeddings
+    CreateSqlite(String, Vec<AddEntry>, bool, bool), // (embed, quantize)
 }
 
 fn print_usage() {
@@ -54,17 +54,20 @@ fn print_usage() {
     eprintln!();
     eprintln!("Usage:");
     eprintln!("  folk-pack create <output.fpk> --add <name>:<type>:<path> [--add ...]");
-    eprintln!("  folk-pack create-sqlite <output.db> --add <name>:<type>:<path> [--add ...] [--embed]");
+    eprintln!("  folk-pack create-sqlite <output.db> --add <name>:<type>:<path> [--add ...] [--embed] [--quantize]");
     eprintln!();
     eprintln!("Types: elf, data");
     eprintln!();
     eprintln!("Options:");
-    eprintln!("  --embed    Generate semantic embeddings for vector search (requires Python)");
+    eprintln!("  --embed     Generate semantic embeddings for vector search (requires Python)");
+    eprintln!("  --quantize  Create quantized shadow tables for fast vector search (implies --embed)");
+    eprintln!("              Creates shadow_bq (binary), shadow_sq8 (scalar), synapse_meta_index tables");
     eprintln!();
     eprintln!("Examples:");
     eprintln!("  folk-pack create initrd.fpk --add shell:elf:path/to/shell");
     eprintln!("  folk-pack create-sqlite initrd.db --add synapse:elf:path/to/synapse");
     eprintln!("  folk-pack create-sqlite initrd.db --add hello.txt:data:hello.txt --embed");
+    eprintln!("  folk-pack create-sqlite initrd.db --add hello.txt:data:hello.txt --quantize");
     process::exit(1);
 }
 
@@ -72,11 +75,13 @@ fn print_usage() {
 struct ParseResult {
     entries: Vec<AddEntry>,
     embed: bool,
+    quantize: bool,
 }
 
 fn parse_add_entries(args: &[String], start_index: usize) -> ParseResult {
     let mut entries = Vec::new();
     let mut embed = false;
+    let mut quantize = false;
     let mut i = start_index;
 
     while i < args.len() {
@@ -111,6 +116,9 @@ fn parse_add_entries(args: &[String], start_index: usize) -> ParseResult {
             entries.push(AddEntry { name, entry_type, path });
         } else if args[i] == "--embed" {
             embed = true;
+        } else if args[i] == "--quantize" {
+            quantize = true;
+            embed = true; // --quantize implies --embed
         } else {
             eprintln!("Unknown argument: {}", args[i]);
             process::exit(1);
@@ -123,7 +131,7 @@ fn parse_add_entries(args: &[String], start_index: usize) -> ParseResult {
         process::exit(1);
     }
 
-    ParseResult { entries, embed }
+    ParseResult { entries, embed, quantize }
 }
 
 fn parse_args() -> Command {
@@ -137,15 +145,15 @@ fn parse_args() -> Command {
         "create" => {
             let output = args[2].clone();
             let result = parse_add_entries(&args, 3);
-            if result.embed {
-                eprintln!("Warning: --embed is only supported with create-sqlite");
+            if result.embed || result.quantize {
+                eprintln!("Warning: --embed/--quantize are only supported with create-sqlite");
             }
             Command::Create(output, result.entries)
         }
         "create-sqlite" => {
             let output = args[2].clone();
             let result = parse_add_entries(&args, 3);
-            Command::CreateSqlite(output, result.entries, result.embed)
+            Command::CreateSqlite(output, result.entries, result.embed, result.quantize)
         }
         other => {
             eprintln!("Unknown command: {}. Use 'create' or 'create-sqlite'.", other);
@@ -453,9 +461,78 @@ fn check_embedding_dependencies() -> Result<(), String> {
     Ok(())
 }
 
-fn create_sqlite(output_path: String, add_entries: Vec<AddEntry>, generate_embeddings: bool) {
+// ============================================================================
+// Quantization for Shadow Tables
+// ============================================================================
+
+/// Size of binary quantized vector (384 bits / 8 = 48 bytes)
+const BQ_SIZE: usize = EMBEDDING_DIM / 8;
+
+/// Size of scalar quantized vector (384 i8 + scale f32 + offset f32 = 392 bytes)
+const SQ8_SERIALIZED_SIZE: usize = EMBEDDING_DIM + 8;
+
+/// Number of BQ vectors per chunk (64 × 48 = 3072 bytes, fits in 4KB page)
+const BQ_CHUNK_SIZE: usize = 64;
+
+/// Number of SQ8 vectors per chunk (8 × 392 = 3136 bytes, fits in 4KB page)
+const SQ8_CHUNK_SIZE: usize = 8;
+
+/// Quantize embedding to binary (sign-based)
+fn quantize_binary(embedding: &[f32]) -> Vec<u8> {
+    let mut bits = vec![0u8; BQ_SIZE];
+
+    for (i, &value) in embedding.iter().enumerate() {
+        if value >= 0.0 {
+            let byte_idx = i / 8;
+            let bit_idx = i % 8;
+            bits[byte_idx] |= 1 << bit_idx;
+        }
+    }
+
+    bits
+}
+
+/// Quantize embedding to scalar (min/max calibration)
+fn quantize_scalar(embedding: &[f32]) -> Vec<u8> {
+    // Find min and max
+    let mut min_val = embedding[0];
+    let mut max_val = embedding[0];
+    for &v in &embedding[1..] {
+        if v < min_val { min_val = v; }
+        if v > max_val { max_val = v; }
+    }
+
+    let range = max_val - min_val;
+    let (scale, offset) = if range < 1e-10 {
+        (1.0f32, min_val)
+    } else {
+        let offset = (min_val + max_val) / 2.0;
+        let scale = 254.0 / range;
+        (scale, offset)
+    };
+
+    // Quantize values
+    let mut result = Vec::with_capacity(SQ8_SERIALIZED_SIZE);
+
+    for &value in embedding {
+        let normalized = (value - offset) * scale;
+        let clamped = normalized.clamp(-127.0, 127.0) as i8;
+        result.push(clamped as u8);
+    }
+
+    // Append scale and offset
+    result.extend_from_slice(&scale.to_le_bytes());
+    result.extend_from_slice(&offset.to_le_bytes());
+
+    result
+}
+
+fn create_sqlite(output_path: String, add_entries: Vec<AddEntry>, generate_embeddings: bool, generate_quantized: bool) {
     println!("folk-pack: Creating SQLite database {} with {} entries", output_path, add_entries.len());
 
+    if generate_quantized {
+        println!("folk-pack: Quantized index generation enabled (--quantize)");
+    }
     if generate_embeddings {
         println!("folk-pack: Embedding generation enabled (--embed)");
         if let Err(e) = check_embedding_dependencies() {
@@ -536,9 +613,56 @@ fn create_sqlite(output_path: String, add_entries: Vec<AddEntry>, generate_embed
         process::exit(1);
     });
 
+    // Create shadow tables for quantized search (if --quantize)
+    if generate_quantized {
+        // BQ shadow table: 64 vectors × 48 bytes = 3072 bytes per chunk
+        conn.execute(
+            "CREATE TABLE shadow_bq (
+                chunk_id INTEGER PRIMARY KEY,
+                data BLOB NOT NULL
+            )",
+            [],
+        ).unwrap_or_else(|e| {
+            eprintln!("Error creating shadow_bq table: {}", e);
+            process::exit(1);
+        });
+
+        // SQ8 shadow table: 8 vectors × 392 bytes = 3136 bytes per chunk
+        conn.execute(
+            "CREATE TABLE shadow_sq8 (
+                chunk_id INTEGER PRIMARY KEY,
+                data BLOB NOT NULL
+            )",
+            [],
+        ).unwrap_or_else(|e| {
+            eprintln!("Error creating shadow_sq8 table: {}", e);
+            process::exit(1);
+        });
+
+        // Meta index: maps user rowid to chunk positions
+        conn.execute(
+            "CREATE TABLE synapse_meta_index (
+                user_rowid INTEGER PRIMARY KEY,
+                bq_chunk_id INTEGER NOT NULL,
+                bq_offset_idx INTEGER NOT NULL,
+                sq8_chunk_id INTEGER NOT NULL,
+                sq8_offset_idx INTEGER NOT NULL
+            )",
+            [],
+        ).unwrap_or_else(|e| {
+            eprintln!("Error creating synapse_meta_index table: {}", e);
+            process::exit(1);
+        });
+
+        println!("folk-pack: Shadow tables created (shadow_bq, shadow_sq8, synapse_meta_index)");
+    }
+
     // Insert all files
     let mut total_size = 0usize;
     let mut embedding_count = 0usize;
+
+    // Collect embeddings for quantization (if --quantize)
+    let mut all_embeddings: Vec<(i64, Vec<f32>)> = Vec::new();
 
     for (i, entry) in add_entries.iter().enumerate() {
         let path = Path::new(&entry.path);
@@ -602,6 +726,11 @@ fn create_sqlite(output_path: String, add_entries: Vec<AddEntry>, generate_embed
                         process::exit(1);
                     });
 
+                    // Store embedding for quantization
+                    if generate_quantized {
+                        all_embeddings.push((i as i64, embedding.clone()));
+                    }
+
                     embedding_count += 1;
                     println!("embedded ({} bytes)", blob.len());
                 }
@@ -620,6 +749,115 @@ fn create_sqlite(output_path: String, add_entries: Vec<AddEntry>, generate_embed
         }
     }
 
+    // Generate quantized shadow tables
+    if generate_quantized && !all_embeddings.is_empty() {
+        println!();
+        println!("folk-pack: Generating quantized shadow tables...");
+
+        // Build BQ chunks
+        let mut bq_chunks: Vec<Vec<u8>> = Vec::new();
+        let mut current_bq_chunk: Vec<u8> = Vec::new();
+        let mut bq_chunk_count = 0;
+
+        // Build SQ8 chunks
+        let mut sq8_chunks: Vec<Vec<u8>> = Vec::new();
+        let mut current_sq8_chunk: Vec<u8> = Vec::new();
+        let mut sq8_chunk_count = 0;
+
+        // Track meta index entries
+        let mut meta_entries: Vec<(i64, i64, i64, i64, i64)> = Vec::new(); // (rowid, bq_chunk, bq_off, sq8_chunk, sq8_off)
+
+        for (file_id, embedding) in &all_embeddings {
+            // Quantize to BQ
+            let bq = quantize_binary(embedding);
+            let bq_offset = current_bq_chunk.len() / BQ_SIZE;
+
+            // Check if BQ chunk is full
+            if bq_offset >= BQ_CHUNK_SIZE {
+                bq_chunks.push(current_bq_chunk);
+                current_bq_chunk = Vec::new();
+                bq_chunk_count += 1;
+            }
+
+            let bq_chunk_id = bq_chunk_count as i64;
+            let bq_offset_in_chunk = (current_bq_chunk.len() / BQ_SIZE) as i64;
+            current_bq_chunk.extend_from_slice(&bq);
+
+            // Quantize to SQ8
+            let sq8 = quantize_scalar(embedding);
+            let sq8_offset = current_sq8_chunk.len() / SQ8_SERIALIZED_SIZE;
+
+            // Check if SQ8 chunk is full
+            if sq8_offset >= SQ8_CHUNK_SIZE {
+                sq8_chunks.push(current_sq8_chunk);
+                current_sq8_chunk = Vec::new();
+                sq8_chunk_count += 1;
+            }
+
+            let sq8_chunk_id = sq8_chunk_count as i64;
+            let sq8_offset_in_chunk = (current_sq8_chunk.len() / SQ8_SERIALIZED_SIZE) as i64;
+            current_sq8_chunk.extend_from_slice(&sq8);
+
+            // Record meta entry
+            meta_entries.push((*file_id, bq_chunk_id, bq_offset_in_chunk, sq8_chunk_id, sq8_offset_in_chunk));
+        }
+
+        // Flush remaining chunks
+        if !current_bq_chunk.is_empty() {
+            // Pad to full chunk size for consistent reads
+            while current_bq_chunk.len() < BQ_CHUNK_SIZE * BQ_SIZE {
+                current_bq_chunk.push(0);
+            }
+            bq_chunks.push(current_bq_chunk);
+        }
+        if !current_sq8_chunk.is_empty() {
+            while current_sq8_chunk.len() < SQ8_CHUNK_SIZE * SQ8_SERIALIZED_SIZE {
+                current_sq8_chunk.push(0);
+            }
+            sq8_chunks.push(current_sq8_chunk);
+        }
+
+        // Insert BQ chunks
+        for (chunk_id, chunk_data) in bq_chunks.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO shadow_bq (chunk_id, data) VALUES (?1, ?2)",
+                params![chunk_id as i64, chunk_data],
+            ).unwrap_or_else(|e| {
+                eprintln!("Error inserting BQ chunk {}: {}", chunk_id, e);
+                process::exit(1);
+            });
+        }
+
+        // Insert SQ8 chunks
+        for (chunk_id, chunk_data) in sq8_chunks.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO shadow_sq8 (chunk_id, data) VALUES (?1, ?2)",
+                params![chunk_id as i64, chunk_data],
+            ).unwrap_or_else(|e| {
+                eprintln!("Error inserting SQ8 chunk {}: {}", chunk_id, e);
+                process::exit(1);
+            });
+        }
+
+        // Insert meta index entries
+        for (rowid, bq_chunk, bq_off, sq8_chunk, sq8_off) in &meta_entries {
+            conn.execute(
+                "INSERT INTO synapse_meta_index (user_rowid, bq_chunk_id, bq_offset_idx, sq8_chunk_id, sq8_offset_idx) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![rowid, bq_chunk, bq_off, sq8_chunk, sq8_off],
+            ).unwrap_or_else(|e| {
+                eprintln!("Error inserting meta index: {}", e);
+                process::exit(1);
+            });
+        }
+
+        println!("folk-pack: Quantized index created:");
+        println!("  BQ chunks: {} ({} bytes each, {} total vectors)",
+                 bq_chunks.len(), BQ_CHUNK_SIZE * BQ_SIZE, all_embeddings.len());
+        println!("  SQ8 chunks: {} ({} bytes each)",
+                 sq8_chunks.len(), SQ8_CHUNK_SIZE * SQ8_SERIALIZED_SIZE);
+        println!("  Meta index: {} entries", meta_entries.len());
+    }
+
     // Force database to write all pages
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
 
@@ -631,7 +869,11 @@ fn create_sqlite(output_path: String, add_entries: Vec<AddEntry>, generate_embed
         .map(|m| m.len())
         .unwrap_or(0);
 
-    if generate_embeddings {
+    if generate_quantized {
+        println!();
+        println!("folk-pack: Created {} ({} bytes, {} entries, {} bytes data, {} embeddings, quantized)",
+            output_path, db_size, add_entries.len(), total_size, embedding_count);
+    } else if generate_embeddings {
         println!();
         println!("folk-pack: Created {} ({} bytes, {} entries, {} bytes data, {} embeddings)",
             output_path, db_size, add_entries.len(), total_size, embedding_count);
@@ -663,11 +905,31 @@ fn create_sqlite(output_path: String, add_entries: Vec<AddEntry>, generate_embed
     println!("      extracted_text TEXT,");
     println!("      FOREIGN KEY (file_id) REFERENCES files(id)");
     println!("  );");
+
+    if generate_quantized {
+        println!();
+        println!("  -- Quantized shadow tables for fast vector search");
+        println!("  CREATE TABLE shadow_bq (");
+        println!("      chunk_id INTEGER PRIMARY KEY,");
+        println!("      data BLOB NOT NULL  -- {} vectors × {} bytes = {} bytes/chunk", BQ_CHUNK_SIZE, BQ_SIZE, BQ_CHUNK_SIZE * BQ_SIZE);
+        println!("  );");
+        println!();
+        println!("  CREATE TABLE shadow_sq8 (");
+        println!("      chunk_id INTEGER PRIMARY KEY,");
+        println!("      data BLOB NOT NULL  -- {} vectors × {} bytes = {} bytes/chunk", SQ8_CHUNK_SIZE, SQ8_SERIALIZED_SIZE, SQ8_CHUNK_SIZE * SQ8_SERIALIZED_SIZE);
+        println!("  );");
+        println!();
+        println!("  CREATE TABLE synapse_meta_index (");
+        println!("      user_rowid INTEGER PRIMARY KEY,");
+        println!("      bq_chunk_id INTEGER, bq_offset_idx INTEGER,");
+        println!("      sq8_chunk_id INTEGER, sq8_offset_idx INTEGER");
+        println!("  );");
+    }
 }
 
 fn main() {
     match parse_args() {
         Command::Create(output, entries) => create_fpk(output, entries),
-        Command::CreateSqlite(output, entries, embed) => create_sqlite(output, entries, embed),
+        Command::CreateSqlite(output, entries, embed, quantize) => create_sqlite(output, entries, embed, quantize),
     }
 }
