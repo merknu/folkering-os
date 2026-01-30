@@ -237,11 +237,14 @@ pub fn init() {
 /// This is set during context switch to avoid mutex locking in syscall path
 static CURRENT_CONTEXT_PTR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
-/// Kernel syscall stack (16KB)
+/// Kernel syscall stack (16KB) - Must be 16-byte aligned for x86-64 ABI!
 /// Used for handling syscalls - SYSCALL doesn't switch stacks automatically
+#[repr(C, align(16))]
+struct AlignedStack([u8; 16384]);
+
 #[no_mangle]
 #[link_section = ".bss"]
-static mut SYSCALL_STACK: [u8; 16384] = [0; 16384];
+static mut SYSCALL_STACK: AlignedStack = AlignedStack([0; 16384]);
 
 /// Syscall counter for debugging
 #[no_mangle]
@@ -815,6 +818,10 @@ extern "C" fn syscall_entry() {
         "mov qword ptr [rip + {debug_marker}], rbx",
         "pop rbx",
 
+        // CRITICAL: Align stack to 16 bytes before call (x86-64 ABI requirement)
+        // This prevents #GP from SSE instructions that require 16-byte alignment
+        "and rsp, 0xFFFFFFFFFFFFFFF0",
+
         "call {handler}",
 
         // CRITICAL: Handler RAX return is unreliable (0), so use helper function
@@ -1107,6 +1114,8 @@ extern "C" fn syscall_handler(
         // Phase 6: Reply-Later IPC
         0x20 => syscall_ipc_recv_async(),
         0x21 => syscall_ipc_reply_token(arg1, arg2, arg3),
+        0x22 => syscall_ipc_get_recv_payload(),
+        0x23 => syscall_ipc_get_recv_sender(),
         _ => {
             crate::drivers::serial::write_str("[HANDLER] Invalid syscall!\n");
             u64::MAX // Return error
@@ -1933,8 +1942,9 @@ extern "C" fn yield_cpu_from_syscall_asm() {
 /// Async IPC receive - returns CallerToken for deferred reply (syscall 0x20)
 ///
 /// Returns:
-/// - On success: lower 32 bits = sender_id, upper 32 bits = first payload word
-///               The CallerToken is stored in the task's ipc_reply field for later retrieval
+/// - On success: the raw CallerToken value (64 bits) that must be used for reply_with_token.
+///               The sender ID can be decoded from token: ((token ^ KEY) >> 32) as u32
+///               The payload is stored in task's ipc_reply for separate retrieval.
 /// - On no messages: 0xFFFF_FFFF_FFFF_FFFD (EWOULDBLOCK)
 /// - On error: 0xFFFF_FFFF_FFFF_FFFC
 fn syscall_ipc_recv_async() -> u64 {
@@ -1942,26 +1952,16 @@ fn syscall_ipc_recv_async() -> u64 {
 
     match ipc_recv_async() {
         Ok((token, msg)) => {
-            // Store the token in the task for later use by userspace
-            // Userspace will retrieve it via a separate mechanism or we encode it here
             let current_task_id = crate::task::task::get_current_task();
             crate::task::statistics::record_ipc_received(current_task_id);
 
-            // Return: token in upper 32 bits, packed sender+payload in lower
-            // Format: [token_raw (64 bits)] returned via second register mechanism
-            // For simplicity: return sender in lower 32, payload[0] in upper 32
-            // Token is available via separate syscall or stored in task
-
-            // Store token for retrieval
+            // Store the original message for payload retrieval
             if let Some(task) = crate::task::task::get_task(current_task_id) {
-                // Abuse ipc_reply to store the original message (includes msg_id for token reconstruction)
                 task.lock().ipc_reply = Some(msg);
             }
 
-            // Return: lower 32 = sender, next 16 bits = 0, upper 16 = token indicator (0xCAFE)
-            // Userspace can then call a "get_token" syscall or compute from saved msg
-            let result = ((msg.payload[0] & 0xFFFF_FFFF) << 32) | (msg.sender as u64);
-            result
+            // Return the raw token value - userspace MUST use this for reply_with_token
+            token.as_raw()
         }
         Err(Errno::EWOULDBLOCK) => {
             0xFFFF_FFFF_FFFF_FFFD
@@ -1998,4 +1998,44 @@ fn syscall_ipc_reply_token(token_raw: u64, payload0: u64, payload1: u64) -> u64 
             u64::MAX
         }
     }
+}
+
+/// Get payload from last recv_async (syscall 0x22)
+///
+/// Returns the full 64-bit payload[0] from the last received message.
+/// Sender can be retrieved separately via syscall 0x23.
+///
+/// Returns:
+/// - On success: full 64-bit payload[0]
+/// - On error (no stored message): u64::MAX
+fn syscall_ipc_get_recv_payload() -> u64 {
+    let current_task_id = crate::task::task::get_current_task();
+
+    if let Some(task) = crate::task::task::get_task(current_task_id) {
+        let task_guard = task.lock();
+        if let Some(ref msg) = task_guard.ipc_reply {
+            // Return full 64-bit payload[0]
+            return msg.payload[0];
+        }
+    }
+
+    u64::MAX
+}
+
+/// Get sender from last recv_async (syscall 0x23)
+///
+/// Returns:
+/// - On success: sender task ID
+/// - On error (no stored message): u64::MAX
+fn syscall_ipc_get_recv_sender() -> u64 {
+    let current_task_id = crate::task::task::get_current_task();
+
+    if let Some(task) = crate::task::task::get_task(current_task_id) {
+        let task_guard = task.lock();
+        if let Some(ref msg) = task_guard.ipc_reply {
+            return msg.sender as u64;
+        }
+    }
+
+    u64::MAX
 }
