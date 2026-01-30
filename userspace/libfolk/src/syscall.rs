@@ -34,6 +34,14 @@ pub const SYS_SHMEM_DESTROY: u64 = 20;
 // Phase 6: Reply-Later IPC
 pub const SYS_IPC_RECV_ASYNC: u64 = 0x20;  // 32 - Async receive with CallerToken
 pub const SYS_IPC_REPLY_TOKEN: u64 = 0x21; // 33 - Reply using CallerToken
+pub const SYS_IPC_GET_RECV_PAYLOAD: u64 = 0x22; // 34 - Get payload from last recv_async
+pub const SYS_IPC_GET_RECV_SENDER: u64 = 0x23;  // 35 - Get sender from last recv_async
+
+// Phase 6.2: Physical memory mapping
+pub const SYS_MAP_PHYSICAL: u64 = 0x24;  // 36 - Map physical memory with capability check
+
+// Phase 7: Input
+pub const SYS_READ_MOUSE: u64 = 0x25;    // 37 - Read mouse event (packed buttons/dx/dy)
 
 /// Execute a syscall with no arguments
 #[inline(always)]

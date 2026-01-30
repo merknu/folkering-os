@@ -51,6 +51,33 @@ static _START_MARKER: RequestsStartMarker = RequestsStartMarker::new();
 #[link_section = ".requests_end_marker"]
 static _END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
 
+// Framebuffer info statics (populated from Limine response, read by kernel_main)
+use core::sync::atomic::AtomicUsize;
+static FRAMEBUFFER_INFO: AtomicUsize = AtomicUsize::new(0);
+static FRAMEBUFFER_WIDTH: AtomicUsize = AtomicUsize::new(0);
+static FRAMEBUFFER_HEIGHT: AtomicUsize = AtomicUsize::new(0);
+static FRAMEBUFFER_PITCH: AtomicUsize = AtomicUsize::new(0);
+static FRAMEBUFFER_BPP: AtomicUsize = AtomicUsize::new(0);
+static FRAMEBUFFER_RED_SHIFT: AtomicUsize = AtomicUsize::new(0);
+static FRAMEBUFFER_GREEN_SHIFT: AtomicUsize = AtomicUsize::new(0);
+static FRAMEBUFFER_BLUE_SHIFT: AtomicUsize = AtomicUsize::new(0);
+
+/// Get framebuffer info for kernel_main to use
+#[no_mangle]
+pub fn get_framebuffer_info() -> (usize, usize, usize, usize, usize, usize, usize, usize) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        FRAMEBUFFER_INFO.load(Relaxed),
+        FRAMEBUFFER_WIDTH.load(Relaxed),
+        FRAMEBUFFER_HEIGHT.load(Relaxed),
+        FRAMEBUFFER_PITCH.load(Relaxed),
+        FRAMEBUFFER_BPP.load(Relaxed),
+        FRAMEBUFFER_RED_SHIFT.load(Relaxed),
+        FRAMEBUFFER_GREEN_SHIFT.load(Relaxed),
+        FRAMEBUFFER_BLUE_SHIFT.load(Relaxed),
+    )
+}
+
 /// IDT Entry structure
 #[derive(Copy, Clone)]
 #[repr(C, packed)]
@@ -169,15 +196,38 @@ make_exception_handler!(exc_sx, 30, "\n[#SX] Security Exception (Vector 30)!");
 make_exception_handler!(exc_reserved31, 31, "\n[RESERVED] Vector 31!");
 // IRQ handlers
 
-/// Timer interrupt handler (Vector 32)
+/// Timer interrupt handler (Vector 32) - PREEMPTIVE VERSION
 ///
 /// This handler is called ~100 times per second (10ms interval).
-/// Currently just increments tick counter and sends EOI.
-/// Preemption from timer will be implemented in a future enhancement.
+/// It checks if we were in userspace (CS has RPL=3) and only attempts
+/// preemption in that case. Kernel-mode interrupts just increment tick and return.
+///
+/// Stack layout from userspace interrupt (has privilege change):
+///   [RSP+0]   rip    (pushed by CPU)
+///   [RSP+8]   cs     (pushed by CPU)
+///   [RSP+16]  rflags (pushed by CPU)
+///   [RSP+24]  rsp    (pushed by CPU)
+///   [RSP+32]  ss     (pushed by CPU)
+///
+/// Stack layout from kernel interrupt (no privilege change):
+///   [RSP+0]   rip    (pushed by CPU)
+///   [RSP+8]   cs     (pushed by CPU)
+///   [RSP+16]  rflags (pushed by CPU)
 #[unsafe(naked)]
 extern "C" fn irq_timer() {
     core::arch::naked_asm!(
-        // Save caller-saved registers
+        // First, check if we came from userspace by looking at CS on stack
+        // CS is at [RSP+8], and RPL is in bits 0-1
+        "push rax",
+        "mov rax, [rsp + 16]",     // CS is at RSP+8, but we pushed RAX (+8), so RSP+16
+        "and rax, 3",              // Get RPL (Ring Privilege Level)
+        "cmp rax, 3",              // Check if RPL == 3 (userspace)
+        "pop rax",
+        "je 1f",                   // Jump to preemptive path if from userspace
+
+        // =========================================
+        // KERNEL MODE PATH - Simple tick and return
+        // =========================================
         "push rax",
         "push rcx",
         "push rdx",
@@ -205,11 +255,86 @@ extern "C" fn irq_timer() {
         "pop rcx",
         "pop rax",
 
-        // Return from interrupt
+        // Return from interrupt (kernel -> kernel, no RSP/SS on stack)
+        "iretq",
+
+        // =========================================
+        // USERSPACE PATH - Full preemptive handling
+        // =========================================
+        "1:",
+        // Save ALL registers for potential task switch
+        "push rax",
+        "push rbx",
+        "push rcx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push rbp",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+
+        // Align stack to 16 bytes before call (15 pushes = 120 bytes, need 8 more)
+        "sub rsp, 8",
+
+        // Pass pointer to saved context as first argument
+        "lea rdi, [rsp + 8]",
+
+        // Call preemption handler - returns pointer to Context to restore
+        "call {preempt_fn}",
+
+        // RAX now contains pointer to Context structure to restore from
+        // Remove alignment padding
+        "add rsp, 8",
+
+        // Move returned context pointer to R11
+        "mov r11, rax",
+
+        // Discard our saved registers (we'll restore from context)
+        "add rsp, 120",  // Skip all 15 pushed registers
+
+        // Now RSP points to the CPU's interrupt frame (rip, cs, rflags, rsp, ss)
+        // Overwrite it with values from the returned Context
+
+        "mov rax, [r11 + 152]",   // SS from context
+        "mov [rsp + 32], rax",
+        "mov rax, [r11 + 0]",     // RSP from context
+        "mov [rsp + 24], rax",
+        "mov rax, [r11 + 136]",   // RFLAGS from context
+        "mov [rsp + 16], rax",
+        "mov rax, [r11 + 144]",   // CS from context
+        "mov [rsp + 8], rax",
+        "mov rax, [r11 + 128]",   // RIP from context
+        "mov [rsp], rax",
+
+        // Restore general purpose registers from context
+        "mov rax, [r11 + 16]",
+        "mov rbx, [r11 + 24]",
+        "mov rcx, [r11 + 32]",
+        "mov rdx, [r11 + 40]",
+        "mov rsi, [r11 + 48]",
+        "mov rdi, [r11 + 56]",
+        "mov rbp, [r11 + 8]",
+        "mov r8,  [r11 + 64]",
+        "mov r9,  [r11 + 72]",
+        "mov r10, [r11 + 80]",
+        "mov r12, [r11 + 96]",
+        "mov r13, [r11 + 104]",
+        "mov r14, [r11 + 112]",
+        "mov r15, [r11 + 120]",
+        "mov r11, [r11 + 88]",
+
+        // Return from interrupt (user -> user, has RSP/SS on stack)
         "iretq",
 
         tick_fn = sym folkering_kernel::timer::tick,
         eoi_fn = sym folkering_kernel::arch::x86_64::apic::send_eoi,
+        preempt_fn = sym folkering_kernel::task::preempt::timer_preempt_handler,
     );
 }
 /// Keyboard interrupt handler (Vector 33 / IRQ1)
@@ -250,6 +375,45 @@ extern "C" fn irq_keyboard() {
         kbd_fn = sym folkering_kernel::drivers::keyboard::handle_interrupt,
     );
 }
+/// Mouse interrupt handler (Vector 44 / IRQ12)
+///
+/// Reads mouse byte, processes packet, buffers event.
+/// Sends EOI to both PICs (mouse is on PIC2).
+#[unsafe(naked)]
+extern "C" fn irq_mouse() {
+    core::arch::naked_asm!(
+        // Save caller-saved registers
+        "push rax",
+        "push rcx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+
+        // Call mouse driver's handle_interrupt() (includes PIC EOI)
+        "call {mouse_fn}",
+
+        // Restore registers
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop rcx",
+        "pop rax",
+
+        // Return from interrupt
+        "iretq",
+
+        mouse_fn = sym folkering_kernel::drivers::mouse::handle_interrupt,
+    );
+}
+
 make_exception_handler!(irq_34, 34, "\n[IRQ2] Cascade (Vector 34)!");
 make_exception_handler!(irq_35, 35, "\n[IRQ3] COM2 (Vector 35)!");
 make_exception_handler!(irq_36, 36, "\n[IRQ4] COM1 (Vector 36)!");
@@ -617,6 +781,25 @@ unsafe fn write_hex(mut num: u64) {
     }
 }
 
+/// Write a single byte as 2 hex digits
+unsafe fn write_hex_byte(byte: u8) {
+    let hex_chars = b"0123456789ABCDEF";
+    let high = hex_chars[(byte >> 4) as usize];
+    let low = hex_chars[(byte & 0xF) as usize];
+    core::arch::asm!(
+        "out dx, al",
+        in("dx") 0x3F8u16,
+        in("al") high,
+        options(nostack)
+    );
+    core::arch::asm!(
+        "out dx, al",
+        in("dx") 0x3F8u16,
+        in("al") low,
+        options(nostack)
+    );
+}
+
 /// Initialize IDT with generic exception handlers
 #[inline(never)]
 unsafe fn init_idt() {
@@ -714,10 +897,30 @@ unsafe fn init_idt() {
     IDT[31].set_handler(core::mem::transmute(exc_reserved31 as *const ()));
     // IRQ handlers (32+)
     IDT[32].set_handler(core::mem::transmute(irq_timer as *const ())); // Timer
+
+    // DEBUG: Print IDT[32] raw bytes to verify format
+    serial_write("[IDT] IDT[32] raw bytes: ");
+    let idt32_ptr = &IDT[32] as *const IdtEntry as *const u8;
+    for i in 0..16 {
+        let byte = core::ptr::read_volatile(idt32_ptr.add(i));
+        write_hex_byte(byte);
+        serial_write(" ");
+    }
+    serial_write("\n");
+    serial_write("[IDT] IDT[32] selector: ");
+    write_hex(IDT[32].selector as u64);
+    serial_write(", type_attr: ");
+    write_hex(IDT[32].type_attr as u64);
+    serial_write(", ist: ");
+    write_hex(IDT[32].ist as u64);
+    serial_write("\n");
+
     IDT[33].set_handler(core::mem::transmute(irq_keyboard as *const ()));
     IDT[34].set_handler(core::mem::transmute(irq_34 as *const ()));
     IDT[35].set_handler(core::mem::transmute(irq_35 as *const ()));
     IDT[36].set_handler(core::mem::transmute(irq_36 as *const ()));
+    // IRQ12 = Mouse (on PIC2, vector 32+12=44)
+    IDT[44].set_handler(core::mem::transmute(irq_mouse as *const ()));
     // Special vectors
     IDT[128].set_handler(core::mem::transmute(vec_128 as *const ())); // INT 0x80
     IDT[254].set_handler(core::mem::transmute(vec_254 as *const ()));
@@ -887,6 +1090,40 @@ unsafe extern "C" fn kmain() -> ! {
         serial_write("[BOOT] ModuleRequest not responded (no initrd)\n");
         (0, 0)
     };
+
+    // Get framebuffer info for graphics support
+    // Store in static for kernel_main to access later
+    if let Some(fb_resp) = FRAMEBUFFER_REQUEST.get_response() {
+        let mut framebuffers = fb_resp.framebuffers();
+        if let Some(fb) = framebuffers.next() {
+            serial_write("[BOOT] Found framebuffer:\n");
+            serial_write("  Address: ");
+            write_hex(fb.addr() as u64);
+            serial_write("\n  Resolution: ");
+            write_hex(fb.width() as u64);
+            serial_write("x");
+            write_hex(fb.height() as u64);
+            serial_write(" @ ");
+            write_hex(fb.bpp() as u64);
+            serial_write("bpp\n  Pitch: ");
+            write_hex(fb.pitch() as u64);
+            serial_write(" bytes/line\n");
+
+            // Store framebuffer info in static for later use
+            FRAMEBUFFER_INFO.store(fb.addr() as usize, core::sync::atomic::Ordering::Relaxed);
+            FRAMEBUFFER_WIDTH.store(fb.width() as usize, core::sync::atomic::Ordering::Relaxed);
+            FRAMEBUFFER_HEIGHT.store(fb.height() as usize, core::sync::atomic::Ordering::Relaxed);
+            FRAMEBUFFER_PITCH.store(fb.pitch() as usize, core::sync::atomic::Ordering::Relaxed);
+            FRAMEBUFFER_BPP.store(fb.bpp() as usize, core::sync::atomic::Ordering::Relaxed);
+            FRAMEBUFFER_RED_SHIFT.store(fb.red_mask_shift() as usize, core::sync::atomic::Ordering::Relaxed);
+            FRAMEBUFFER_GREEN_SHIFT.store(fb.green_mask_shift() as usize, core::sync::atomic::Ordering::Relaxed);
+            FRAMEBUFFER_BLUE_SHIFT.store(fb.blue_mask_shift() as usize, core::sync::atomic::Ordering::Relaxed);
+        } else {
+            serial_write("[BOOT] No framebuffers available\n");
+        }
+    } else {
+        serial_write("[BOOT] Framebuffer request not responded\n");
+    }
 
     let boot_info = folkering_kernel::boot::BootInfo {
         bootloader_name: "Limine",

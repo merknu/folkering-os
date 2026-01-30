@@ -437,4 +437,75 @@ pub mod flags {
 
     /// Guard page - not present (triggers page fault on access)
     pub const GUARD: PTF = PTF::empty();
+
+    /// Framebuffer mapping - Write-Combining (PAT index 4)
+    /// Uses bit 7 (PAT bit for 4K pages) to select PAT index 4
+    /// Note: We use from_bits_truncate since BIT_7/PAT isn't directly exposed
+    pub const USER_FRAMEBUFFER_WC: PTF = PTF::PRESENT
+        .union(PTF::WRITABLE)
+        .union(PTF::USER_ACCESSIBLE)
+        .union(PTF::NO_EXECUTE)
+        .union(PTF::from_bits_truncate(0x80));  // PAT bit (bit 7) for index 4 (Write-Combining)
+
+    /// Uncached MMIO mapping
+    pub const USER_MMIO_UNCACHED: PTF = PTF::PRESENT
+        .union(PTF::WRITABLE)
+        .union(PTF::USER_ACCESSIBLE)
+        .union(PTF::NO_EXECUTE)
+        .union(PTF::NO_CACHE)
+        .union(PTF::WRITE_THROUGH);
+}
+
+/// Map a page with Write-Combining caching (PAT index 4)
+///
+/// This is used for framebuffer mappings where write-combining
+/// improves performance by batching sequential writes.
+///
+/// # Arguments
+/// * `virt_addr` - Virtual address to map
+/// * `phys_addr` - Physical address to map to
+///
+/// # Returns
+/// `Ok(())` on success, `Err` if mapping fails.
+pub fn map_page_wc(virt_addr: usize, phys_addr: usize) -> Result<(), MapError> {
+    map_page(virt_addr, phys_addr, flags::USER_FRAMEBUFFER_WC)
+}
+
+/// Map a page with Write-Combining in a specific task's page table
+///
+/// # Arguments
+/// * `pml4_phys` - Physical address of the task's PML4
+/// * `virt_addr` - Virtual address to map
+/// * `phys_addr` - Physical address to map to
+pub fn map_page_wc_in_table(
+    pml4_phys: u64,
+    virt_addr: usize,
+    phys_addr: usize,
+) -> Result<(), MapError> {
+    map_page_in_table(pml4_phys, virt_addr, phys_addr, flags::USER_FRAMEBUFFER_WC)
+}
+
+/// Map a range of pages with Write-Combining
+///
+/// # Arguments
+/// * `pml4_phys` - Physical address of the task's PML4
+/// * `virt_start` - Starting virtual address
+/// * `phys_start` - Starting physical address
+/// * `num_pages` - Number of pages to map
+pub fn map_range_wc_in_table(
+    pml4_phys: u64,
+    virt_start: usize,
+    phys_start: usize,
+    num_pages: usize,
+) -> Result<(), MapError> {
+    let virt_aligned = virt_start & !(PAGE_SIZE - 1);
+    let phys_aligned = phys_start & !(PAGE_SIZE - 1);
+
+    for i in 0..num_pages {
+        let virt = virt_aligned + i * PAGE_SIZE;
+        let phys = phys_aligned + i * PAGE_SIZE;
+        map_page_wc_in_table(pml4_phys, virt, phys)?;
+    }
+
+    Ok(())
 }

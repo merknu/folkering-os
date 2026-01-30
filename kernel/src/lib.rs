@@ -93,6 +93,17 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
         arch::x86_64::gdt_init();
         serial_strln!("[GDT] Done\n");
 
+        // DEBUG: Verify SS is 0x10 right after GDT init
+        let ss_after_gdt: u16;
+        unsafe { core::arch::asm!("mov {0:x}, ss", out(reg) ss_after_gdt); }
+        serial_str!("[GDT] SS after init: 0x");
+        drivers::serial::write_hex(ss_after_gdt as u64);
+        serial_strln!("");
+
+        // Initialize PAT for Write-Combining support (before MMIO/framebuffer mapping)
+        serial_strln!("[INIT] Initializing PAT for Write-Combining...");
+        arch::x86_64::pat_init();
+
         // Initialize syscall support (requires GDT to be loaded first)
         serial_strln!("[INIT] Initializing SYSCALL/SYSRET support...");
         arch::x86_64::syscall_init();
@@ -121,6 +132,48 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
         // Initialize keyboard driver (after IDT and PIC setup)
         serial_strln!("[INIT] Initializing PS/2 keyboard driver...");
         drivers::keyboard::init();
+
+        // Initialize mouse driver (IRQ12, vector 44)
+        serial_strln!("[INIT] Initializing PS/2 mouse driver...");
+        drivers::mouse::init();
+
+        // Initialize boot info for userspace handoff
+        serial_strln!("[INIT] Initializing boot info page...");
+        if let Err(e) = boot_info::init() {
+            serial_str!("[BOOT_INFO] Init failed: ");
+            serial_strln!(e);
+        }
+
+        // Set RSDP address in boot info
+        boot_info::set_rsdp(boot_info.rsdp_addr as u64);
+
+        // Get framebuffer info from main.rs statics and set in boot info
+        extern "Rust" {
+            fn get_framebuffer_info() -> (usize, usize, usize, usize, usize, usize, usize, usize);
+        }
+        let (fb_addr, fb_width, fb_height, fb_pitch, fb_bpp, red_shift, green_shift, blue_shift) =
+            get_framebuffer_info();
+
+        if fb_addr != 0 {
+            // Convert from HHDM virtual address to physical address
+            let fb_phys = virt_to_phys(fb_addr).unwrap_or(fb_addr);
+            let fb_config = boot_info::FramebufferConfig {
+                physical_address: fb_phys as u64,
+                width: fb_width as u32,
+                height: fb_height as u32,
+                pitch: fb_pitch as u32,
+                bpp: fb_bpp as u16,
+                memory_model: 1, // RGB
+                red_mask_size: 8,
+                red_mask_shift: red_shift as u8,
+                green_mask_size: 8,
+                green_mask_shift: green_shift as u8,
+                blue_mask_size: 8,
+                blue_mask_shift: blue_shift as u8,
+                _reserved: [0; 3],
+            };
+            boot_info::set_framebuffer(fb_config);
+        }
 
         // Verify dynamic allocations work
         use alloc::vec::Vec;
@@ -297,8 +350,11 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
             // Spawn any additional ELF entries (skip synapse and shell)
             for entry in rd.entries() {
                 let name = entry.name_str();
-                // Skip already-spawned services
-                if name == "synapse" || name == "shell" {
+                // Use byte comparison to avoid potential str comparison issues
+                let is_shell = name.as_bytes() == b"shell";
+                let is_synapse = name.as_bytes() == b"synapse";
+                let is_compositor = name.as_bytes() == b"compositor";
+                if is_shell || is_synapse {
                     continue;
                 }
                 if entry.is_elf() {
@@ -313,6 +369,41 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
                             serial_str!("\", id=");
                             drivers::serial::write_dec(task_id);
                             serial_strln!("");
+
+                            // Grant framebuffer capability to compositor
+                            if is_compositor && fb_addr != 0 {
+                                let fb_size = fb_pitch * fb_height;
+                                // Convert HHDM virtual address to physical address
+                                let fb_phys = virt_to_phys(fb_addr).unwrap_or(fb_addr);
+                                if capability::grant_framebuffer(task_id, fb_phys as u64, fb_size as u64).is_ok() {
+                                    serial_str!("[BOOT] Granted framebuffer capability to compositor (task ");
+                                    drivers::serial::write_dec(task_id);
+                                    serial_strln!(")");
+
+                                    // Also map the boot info page into compositor's address space
+                                    if let Err(e) = boot_info::map_for_task(task_id) {
+                                        serial_str!("[BOOT] Failed to map boot info for compositor: ");
+                                        serial_strln!(e);
+                                    } else {
+                                        serial_strln!("[BOOT] Boot info page mapped for compositor");
+
+                                        // DEBUG: Verify boot info content before compositor runs
+                                        let bi = boot_info::get_boot_info();
+                                        serial_str!("[BOOT_DEBUG] Kernel sees: magic=");
+                                        drivers::serial::write_hex(bi.magic);
+                                        serial_str!(", flags=");
+                                        drivers::serial::write_hex(bi.flags);
+                                        drivers::serial::write_newline();
+                                        serial_str!("[BOOT_DEBUG] FB: ");
+                                        drivers::serial::write_dec(bi.framebuffer.width);
+                                        serial_str!("x");
+                                        drivers::serial::write_dec(bi.framebuffer.height);
+                                        serial_str!(" @ ");
+                                        drivers::serial::write_hex(bi.framebuffer.physical_address);
+                                        drivers::serial::write_newline();
+                                    }
+                                }
+                            }
                         }
                         Err(e) => {
                             serial_str!("[BOOT] Failed to spawn \"");
@@ -334,9 +425,102 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
 
         serial_strln!("[BOOT] All tasks spawned, starting scheduler...\n");
 
-        // Enable timer interrupts for preemption
-        serial_strln!("[BOOT] Enabling APIC timer for preemption...");
+        // Grant IPC capabilities to all userspace tasks
+        // Task 2 = Synapse, Task 3 = Shell, Task 4 = Compositor
+        serial_strln!("[BOOT] Granting IPC capabilities...");
+        for task_id in 2..=4 {
+            if capability::grant_ipc_send_any(task_id).is_ok() {
+                serial_str!("[BOOT] Task ");
+                drivers::serial::write_dec(task_id);
+                serial_strln!(" granted IpcSendAny");
+            }
+        }
+
+        // ============================================
+        // KERNEL-MODE TIMER TEST
+        // Test that timer interrupt works in CPL 0 before switching to user mode
+        // ============================================
+        serial_strln!("[TIMER-TEST] Testing timer interrupt in kernel mode (CPL 0)...");
+
+        // DEBUG: Check SS register value - it should be 0x10 (kernel data segment)
+        let ss_value: u16;
+        unsafe {
+            core::arch::asm!("mov {0:x}, ss", out(reg) ss_value);
+        }
+        serial_str!("[TIMER-TEST] SS register before timer enable: 0x");
+        drivers::serial::write_hex(ss_value as u64);
+        serial_strln!("");
+
+        if ss_value != 0x10 {
+            serial_strln!("[TIMER-TEST] ERROR: SS is NOT 0x10 (kernel data segment)!");
+            serial_strln!("[TIMER-TEST] SS should be 0x10, but it got corrupted!");
+            serial_strln!("[TIMER-TEST] Investigating SS corruption...");
+
+            // Print DS, ES, FS, GS too
+            let ds_value: u16;
+            let es_value: u16;
+            unsafe {
+                core::arch::asm!("mov {0:x}, ds", out(reg) ds_value);
+                core::arch::asm!("mov {0:x}, es", out(reg) es_value);
+            }
+            serial_str!("[TIMER-TEST] DS=0x");
+            drivers::serial::write_hex(ds_value as u64);
+            serial_str!(", ES=0x");
+            drivers::serial::write_hex(es_value as u64);
+            serial_strln!("");
+        }
+
+        // Get initial tick count - use timer::uptime_ms() because that's what irq_timer calls
+        let ticks_before = timer::uptime_ms();
+        serial_str!("[TIMER-TEST] Initial uptime_ms: ");
+        drivers::serial::write_dec(ticks_before as u32);
+        serial_strln!("");
+
+        // Enable interrupts and timer
+        serial_strln!("[TIMER-TEST] Enabling interrupts (STI)...");
+        unsafe { core::arch::asm!("sti"); }
+
+        serial_strln!("[TIMER-TEST] Enabling APIC timer...");
         arch::x86_64::enable_timer();
+
+        // Spin for a while to let timer fire (busy wait ~50ms)
+        serial_strln!("[TIMER-TEST] Waiting for timer interrupts (busy loop)...");
+        for i in 0..5_000_000u64 {
+            // Prevent optimizer from removing this loop
+            core::hint::spin_loop();
+            if i % 1_000_000 == 0 {
+                serial_str!(".");
+            }
+        }
+        serial_strln!(" done");
+
+        // Disable interrupts to check result safely
+        unsafe { core::arch::asm!("cli"); }
+
+        // Check tick count - use timer::uptime_ms() (what irq_timer updates)
+        let ticks_after = timer::uptime_ms();
+        serial_str!("[TIMER-TEST] Final uptime_ms: ");
+        drivers::serial::write_dec(ticks_after as u32);
+        serial_strln!("");
+
+        let tick_delta = ticks_after - ticks_before;
+        serial_str!("[TIMER-TEST] Uptime delta (ms): ");
+        drivers::serial::write_dec(tick_delta as u32);
+        serial_strln!("");
+
+        if tick_delta > 0 {
+            serial_strln!("[TIMER-TEST] SUCCESS: Timer interrupt works in kernel mode!");
+            serial_str!("[TIMER-TEST] ");
+            drivers::serial::write_dec(tick_delta as u32);
+            serial_strln!("ms elapsed - timer is firing correctly!");
+        } else {
+            serial_strln!("[TIMER-TEST] FAILURE: No timer interrupts in kernel mode!");
+            serial_strln!("[TIMER-TEST] Check IDT[32] setup and APIC configuration");
+        }
+
+        // Keep timer enabled for preemptive scheduling!
+        serial_strln!("[TIMER-TEST] Keeping timer ENABLED for preemptive scheduling...");
+        // Timer stays enabled - no disable_timer() call
 
         serial_strln!("==============================================\n");
 
@@ -353,6 +537,7 @@ extern crate alloc;
 extern crate lazy_static;
 
 pub mod arch;
+pub mod boot_info;
 pub mod bridge;
 pub mod capability;
 pub mod drivers;

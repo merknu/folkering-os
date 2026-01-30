@@ -1116,6 +1116,10 @@ extern "C" fn syscall_handler(
         0x21 => syscall_ipc_reply_token(arg1, arg2, arg3),
         0x22 => syscall_ipc_get_recv_payload(),
         0x23 => syscall_ipc_get_recv_sender(),
+        // Phase 6.2: Physical memory mapping
+        0x24 => syscall_map_physical(arg1, arg2, arg3, arg4, arg5),
+        // Phase 7: Input
+        0x25 => syscall_read_mouse(),
         _ => {
             crate::drivers::serial::write_str("[HANDLER] Invalid syscall!\n");
             u64::MAX // Return error
@@ -1606,6 +1610,22 @@ fn syscall_read_key() -> u64 {
     0 // No key available
 }
 
+/// Read a mouse event from the input buffer
+/// Returns: packed u64 with buttons, dx, dy; or 0 if no event
+/// Format: bits 0-7: buttons, bits 8-23: dx (signed), bits 24-39: dy (signed)
+/// High bit (63) set indicates valid event
+fn syscall_read_mouse() -> u64 {
+    if let Some(event) = crate::drivers::mouse::read_event() {
+        let buttons = event.buttons as u64;
+        let dx = (event.dx as u16) as u64;
+        let dy = (event.dy as u16) as u64;
+
+        (1u64 << 63) | (dy << 24) | (dx << 8) | buttons
+    } else {
+        0 // No event available
+    }
+}
+
 /// Set interrupt flag on current task
 fn set_current_task_interrupt() {
     let task_id = crate::task::task::get_current_task();
@@ -2038,4 +2058,126 @@ fn syscall_ipc_get_recv_sender() -> u64 {
     }
 
     u64::MAX
+}
+
+// ============================================================================
+// Phase 6.2: Physical Memory Mapping Syscall
+// ============================================================================
+
+/// Map physical memory flags
+pub mod map_flags {
+    /// Allow reading from mapped memory
+    pub const MAP_READ: u64 = 0x01;
+    /// Allow writing to mapped memory
+    pub const MAP_WRITE: u64 = 0x02;
+    /// Allow executing from mapped memory (usually not used for MMIO)
+    pub const MAP_EXEC: u64 = 0x04;
+    /// Use Write-Combining caching (PAT index 4) - for framebuffer
+    pub const MAP_CACHE_WC: u64 = 0x10;
+    /// Use Uncached mode - for MMIO devices
+    pub const MAP_CACHE_UC: u64 = 0x20;
+}
+
+/// Map physical memory into current task's address space (syscall 0x24)
+///
+/// This syscall allows userspace drivers (like the compositor) to map
+/// physical device memory (like the framebuffer) into their address space.
+///
+/// # Arguments
+/// * `phys_addr` - Physical address to map (must be page-aligned)
+/// * `virt_addr` - Virtual address to map to (must be page-aligned, in userspace)
+/// * `size` - Size in bytes to map (rounded up to page boundary)
+/// * `flags` - Mapping flags (MAP_READ, MAP_WRITE, MAP_CACHE_WC, etc.)
+/// * `_reserved` - Reserved for future use
+///
+/// # Returns
+/// * 0 on success
+/// * u64::MAX on error (permission denied, invalid address, etc.)
+///
+/// # Security
+/// This syscall requires a Framebuffer capability that covers the requested
+/// physical address range. Without this capability, the call fails.
+fn syscall_map_physical(phys_addr: u64, virt_addr: u64, size: u64, flags: u64, _reserved: u64) -> u64 {
+    use crate::capability;
+    use crate::memory::paging;
+    use crate::task::task::{get_current_task, get_task};
+    use x86_64::structures::paging::PageTableFlags as PTF;
+
+    let task_id = get_current_task();
+
+    // Validate alignment
+    if phys_addr & 0xFFF != 0 || virt_addr & 0xFFF != 0 {
+        crate::serial_println!("[MAP_PHYSICAL] Error: Address not page-aligned");
+        return u64::MAX;
+    }
+
+    // Validate virtual address is in userspace (< 0x8000_0000_0000_0000)
+    if virt_addr >= 0x8000_0000_0000_0000 {
+        crate::serial_println!("[MAP_PHYSICAL] Error: Virtual address in kernel space");
+        return u64::MAX;
+    }
+
+    // Validate size
+    if size == 0 || size > 256 * 1024 * 1024 {
+        // Max 256MB
+        crate::serial_println!("[MAP_PHYSICAL] Error: Invalid size");
+        return u64::MAX;
+    }
+
+    // Check capability
+    if !capability::has_framebuffer_access(task_id, phys_addr, size) {
+        crate::serial_println!("[MAP_PHYSICAL] Error: No framebuffer capability for range");
+        return u64::MAX;
+    }
+
+    // Get task's page table physical address
+    let pml4_phys = match get_task(task_id) {
+        Some(task) => task.lock().page_table_phys,
+        None => {
+            crate::serial_println!("[MAP_PHYSICAL] Error: Task not found");
+            return u64::MAX;
+        }
+    };
+
+    // Build page table flags based on request
+    let mut ptf = PTF::PRESENT.union(PTF::USER_ACCESSIBLE).union(PTF::NO_EXECUTE);
+
+    if flags & map_flags::MAP_WRITE != 0 {
+        ptf = ptf.union(PTF::WRITABLE);
+    }
+
+    // Note: MAP_EXEC would remove NO_EXECUTE, but we don't allow it for MMIO
+
+    if flags & map_flags::MAP_CACHE_WC != 0 {
+        // Write-Combining: PAT index 4 would need PAT bit (bit 7)
+        // But x86_64 crate rejects bit 7 as HUGE_PAGE in intermediate entries
+        // For now, use uncached instead of WC (slower but works)
+        // TODO: Implement proper PAT bit setting after map_to()
+        ptf = ptf.union(PTF::NO_CACHE);
+        crate::serial_println!("[MAP_PHYSICAL] Note: WC requested but using UC (PAT not supported by crate)");
+    } else if flags & map_flags::MAP_CACHE_UC != 0 {
+        // Uncached: PAT index 3 (set PCD and PWT)
+        ptf = ptf.union(PTF::NO_CACHE).union(PTF::WRITE_THROUGH);
+    }
+
+    // Calculate number of pages
+    let num_pages = ((size + 0xFFF) / 0x1000) as usize;
+
+    crate::serial_println!("[MAP_PHYSICAL] Mapping {} pages from phys {:#x} to virt {:#x}",
+                          num_pages, phys_addr, virt_addr);
+
+    // Map each page
+    for i in 0..num_pages {
+        let phys = phys_addr as usize + i * 0x1000;
+        let virt = virt_addr as usize + i * 0x1000;
+
+        if let Err(_) = paging::map_page_in_table(pml4_phys, virt, phys, ptf) {
+            crate::serial_println!("[MAP_PHYSICAL] Error: Failed to map page at {:#x}", virt);
+            // TODO: Unmap already mapped pages on failure
+            return u64::MAX;
+        }
+    }
+
+    crate::serial_println!("[MAP_PHYSICAL] Successfully mapped {} pages", num_pages);
+    0
 }
