@@ -1,0 +1,21 @@
+[package]
+name = "compositor"
+version = "0.1.0"
+edition = "2021"
+description = "Blind Compositor for Folkering OS - maintains WorldTree from AccessKit updates"
+authors = ["Folkering OS Team"]
+
+[[bin]]
+name = "compositor"
+path = "src/main.rs"
+
+[lib]
+name = "compositor"
+path = "src/lib.rs"
+
+[dependencies]
+# Core Folkering userspace library
+libfolk = { path = "../libfolk" }
+
+# AccessKit schema for UI tree
+libaccesskit-folk = { path = "../libaccesskit-folk" }

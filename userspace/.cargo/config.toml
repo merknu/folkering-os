@@ -2,5 +2,5 @@
 target = "x86_64-folkering-userspace.json"
 
 [unstable]
-build-std = ["core"]
+build-std = ["core", "alloc"]
 build-std-features = ["compiler-builtins-mem"]

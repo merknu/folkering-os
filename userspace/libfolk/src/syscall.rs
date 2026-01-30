@@ -31,6 +31,10 @@ pub const SYS_CLEAR_INTERRUPT: u64 = 18;
 pub const SYS_SHMEM_UNMAP: u64 = 19;
 pub const SYS_SHMEM_DESTROY: u64 = 20;
 
+// Phase 6: Reply-Later IPC
+pub const SYS_IPC_RECV_ASYNC: u64 = 0x20;  // 32 - Async receive with CallerToken
+pub const SYS_IPC_REPLY_TOKEN: u64 = 0x21; // 33 - Reply using CallerToken
+
 /// Execute a syscall with no arguments
 #[inline(always)]
 pub unsafe fn syscall0(nr: u64) -> u64 {

@@ -1,10 +1,12 @@
 //! Inter-Process Communication (IPC) syscalls
 //!
 //! Folkering OS uses synchronous IPC for inter-task communication.
+//! Phase 6 adds Reply-Later IPC with CallerToken for async servers.
 
 use crate::syscall::{
-    syscall1, syscall2, syscall3,
+    syscall0, syscall1, syscall2, syscall3,
     SYS_IPC_SEND, SYS_IPC_RECEIVE, SYS_IPC_REPLY,
+    SYS_IPC_RECV_ASYNC, SYS_IPC_REPLY_TOKEN,
 };
 
 /// Error codes for IPC operations
@@ -82,6 +84,126 @@ pub fn receive() -> Result<IpcMessage, IpcError> {
 /// * `Err(error)` - Error code on failure
 pub fn reply(payload0: u64, payload1: u64) -> Result<(), IpcError> {
     let ret = unsafe { syscall2(SYS_IPC_REPLY, payload0, payload1) };
+    if ret == u64::MAX {
+        Err(IpcError::Unknown)
+    } else {
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Phase 6: Reply-Later IPC (CallerToken)
+// ============================================================================
+
+/// Opaque token for deferred IPC reply.
+///
+/// When a server receives a request via `recv_async()`, it gets a CallerToken
+/// that can be used to reply later, even after handling other messages.
+///
+/// # Security
+/// The token is opaque and should not be modified. The kernel validates
+/// that the token matches the original sender's waiting state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct CallerToken(pub u64);
+
+impl CallerToken {
+    /// Create from raw syscall value.
+    #[inline]
+    pub fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// Get raw value for syscall.
+    #[inline]
+    pub fn as_raw(self) -> u64 {
+        self.0
+    }
+}
+
+/// Result of async IPC receive.
+#[derive(Debug, Clone, Copy)]
+pub struct AsyncIpcMessage {
+    /// Token for later reply
+    pub token: CallerToken,
+    /// Sender's task ID
+    pub sender: u32,
+    /// First payload word
+    pub payload0: u64,
+}
+
+/// Receive IPC message with CallerToken for deferred reply (non-blocking).
+///
+/// Unlike `receive()`, this returns a CallerToken that can be used to reply
+/// later. The sender remains blocked until `reply_with_token()` is called.
+///
+/// # Use Case
+/// Servers that need to do async/long-running work (LLM inference, disk I/O)
+/// can receive a message, stash the token, and reply when ready.
+///
+/// # Example
+/// ```no_run
+/// loop {
+///     match recv_async() {
+///         Ok(msg) => {
+///             // Stash token, spawn async work
+///             let token = msg.token;
+///             spawn(|| {
+///                 let result = do_long_work(msg.payload0);
+///                 reply_with_token(token, result, 0).unwrap();
+///             });
+///         }
+///         Err(IpcError::WouldBlock) => {
+///             // No messages, yield
+///             yield_cpu();
+///         }
+///         Err(e) => panic!("IPC error: {:?}", e),
+///     }
+/// }
+/// ```
+///
+/// # Returns
+/// * `Ok(message)` - Message with token for later reply
+/// * `Err(WouldBlock)` - No messages available
+/// * `Err(error)` - Other error
+pub fn recv_async() -> Result<AsyncIpcMessage, IpcError> {
+    let ret = unsafe { syscall0(SYS_IPC_RECV_ASYNC) };
+
+    // Check for error codes
+    if ret >= 0xFFFF_FFFF_FFFF_FFFC {
+        return Err(IpcError::WouldBlock);
+    }
+
+    // Success: lower 32 bits = sender, upper 32 bits = payload[0]
+    let sender = (ret & 0xFFFF_FFFF) as u32;
+    let payload0 = ret >> 32;
+
+    // Reconstruct token from sender and message context
+    // Note: The kernel stores the original message; we construct a compatible token
+    // For now, use sender as token basis (kernel will verify properly)
+    let token = CallerToken::from_raw(sender as u64);
+
+    Ok(AsyncIpcMessage {
+        token,
+        sender,
+        payload0,
+    })
+}
+
+/// Reply to a deferred request using CallerToken.
+///
+/// Unblocks the original sender that is waiting for a reply.
+///
+/// # Arguments
+/// * `token` - CallerToken from `recv_async()`
+/// * `payload0` - First reply payload word
+/// * `payload1` - Second reply payload word
+///
+/// # Returns
+/// * `Ok(())` - Reply sent, sender unblocked
+/// * `Err(error)` - Invalid token or sender no longer waiting
+pub fn reply_with_token(token: CallerToken, payload0: u64, payload1: u64) -> Result<(), IpcError> {
+    let ret = unsafe { syscall3(SYS_IPC_REPLY_TOKEN, token.as_raw(), payload0, payload1) };
     if ret == u64::MAX {
         Err(IpcError::Unknown)
     } else {

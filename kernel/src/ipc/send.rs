@@ -45,6 +45,8 @@ pub enum Errno {
     ENOTASK,
     /// Operation would block (syscall should yield)
     EWOULDBLOCK,
+    /// No such process (task no longer exists) - used by reply-later IPC
+    ESRCH,
 }
 
 /// Synchronous IPC send (blocking until reply)

@@ -36,10 +36,10 @@ pub mod receive;
 pub mod shared_memory;
 
 // Re-export main types
-pub use message::{IpcMessage, IpcType, TaskId, CapabilityId, ShmemId};
+pub use message::{IpcMessage, IpcType, TaskId, CapabilityId, ShmemId, CallerToken};
 pub use queue::MessageQueue;
 pub use send::{ipc_send, ipc_send_async, Errno};
-pub use receive::{ipc_receive, ipc_try_receive, ipc_reply};
+pub use receive::{ipc_receive, ipc_try_receive, ipc_reply, ipc_recv_async, ipc_reply_with_token};
 pub use shared_memory::{
     shmem_create, shmem_map, shmem_unmap, shmem_destroy,
     shmem_grant, shmem_revoke, ShmemPerms, ShmemError,

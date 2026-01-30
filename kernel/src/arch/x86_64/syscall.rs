@@ -1104,6 +1104,9 @@ extern "C" fn syscall_handler(
         18 => syscall_clear_interrupt(),
         19 => syscall_shmem_unmap(arg1, arg2),
         20 => syscall_shmem_destroy(arg1),
+        // Phase 6: Reply-Later IPC
+        0x20 => syscall_ipc_recv_async(),
+        0x21 => syscall_ipc_reply_token(arg1, arg2, arg3),
         _ => {
             crate::drivers::serial::write_str("[HANDLER] Invalid syscall!\n");
             u64::MAX // Return error
@@ -1647,6 +1650,11 @@ fn syscall_task_list() -> u64 {
                 serial::write_dec(t);
                 serial::write_str(")");
             }
+            TaskState::WaitingForReply(req_id) => {
+                serial::write_str("WaitingReply(");
+                serial::write_dec(req_id as u32);
+                serial::write_str(")");
+            }
             TaskState::Exited => serial::write_str("Exited"),
         }
         serial::write_str("\n");
@@ -1915,5 +1923,79 @@ extern "C" fn yield_cpu_from_syscall_asm() {
     // Jump to new task using IRETQ (does not return)
     unsafe {
         crate::task::switch::restore_context_only(target_ctx_ptr);
+    }
+}
+
+// ============================================================================
+// Phase 6: Reply-Later IPC Syscalls
+// ============================================================================
+
+/// Async IPC receive - returns CallerToken for deferred reply (syscall 0x20)
+///
+/// Returns:
+/// - On success: lower 32 bits = sender_id, upper 32 bits = first payload word
+///               The CallerToken is stored in the task's ipc_reply field for later retrieval
+/// - On no messages: 0xFFFF_FFFF_FFFF_FFFD (EWOULDBLOCK)
+/// - On error: 0xFFFF_FFFF_FFFF_FFFC
+fn syscall_ipc_recv_async() -> u64 {
+    use crate::ipc::{ipc_recv_async, send::Errno};
+
+    match ipc_recv_async() {
+        Ok((token, msg)) => {
+            // Store the token in the task for later use by userspace
+            // Userspace will retrieve it via a separate mechanism or we encode it here
+            let current_task_id = crate::task::task::get_current_task();
+            crate::task::statistics::record_ipc_received(current_task_id);
+
+            // Return: token in upper 32 bits, packed sender+payload in lower
+            // Format: [token_raw (64 bits)] returned via second register mechanism
+            // For simplicity: return sender in lower 32, payload[0] in upper 32
+            // Token is available via separate syscall or stored in task
+
+            // Store token for retrieval
+            if let Some(task) = crate::task::task::get_task(current_task_id) {
+                // Abuse ipc_reply to store the original message (includes msg_id for token reconstruction)
+                task.lock().ipc_reply = Some(msg);
+            }
+
+            // Return: lower 32 = sender, next 16 bits = 0, upper 16 = token indicator (0xCAFE)
+            // Userspace can then call a "get_token" syscall or compute from saved msg
+            let result = ((msg.payload[0] & 0xFFFF_FFFF) << 32) | (msg.sender as u64);
+            result
+        }
+        Err(Errno::EWOULDBLOCK) => {
+            0xFFFF_FFFF_FFFF_FFFD
+        }
+        Err(_) => {
+            0xFFFF_FFFF_FFFF_FFFC
+        }
+    }
+}
+
+/// Reply using CallerToken (syscall 0x21)
+///
+/// Arguments:
+/// - arg1: CallerToken raw value (u64)
+/// - arg2: payload0
+/// - arg3: payload1
+///
+/// Returns:
+/// - 0 on success
+/// - u64::MAX on error
+fn syscall_ipc_reply_token(token_raw: u64, payload0: u64, payload1: u64) -> u64 {
+    use crate::ipc::{ipc_reply_with_token, CallerToken};
+
+    let token = CallerToken::from_raw(token_raw);
+    let reply_payload = [payload0, payload1, 0, 0];
+
+    match ipc_reply_with_token(token, reply_payload) {
+        Ok(()) => {
+            let current_task_id = crate::task::task::get_current_task();
+            crate::task::statistics::record_ipc_replied(current_task_id);
+            0
+        }
+        Err(_) => {
+            u64::MAX
+        }
     }
 }

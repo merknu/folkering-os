@@ -2,7 +2,14 @@
 # Only includes #![no_std] programs that target the OS
 
 [workspace]
-members = ["libfolk", "libsqlite", "shell", "synapse-service"]
+members = [
+    "libfolk",
+    "libsqlite",
+    "shell",
+    "synapse-service",
+    "libaccesskit-folk",
+    "compositor",
+]
 resolver = "2"
 
 [profile.release]

@@ -245,6 +245,9 @@ pub enum TaskState {
     Running,
     BlockedOnReceive,
     BlockedOnSend(TaskId),
+    /// Waiting for async reply via CallerToken (Phase 6 Reply-Later IPC).
+    /// The u64 is the request_id that will be used to verify the reply.
+    WaitingForReply(u64),
     Exited,
 }
 
