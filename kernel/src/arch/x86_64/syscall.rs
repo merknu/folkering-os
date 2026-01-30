@@ -1099,6 +1099,11 @@ extern "C" fn syscall_handler(
         13 => syscall_fs_read_dir(arg1, arg2),
         14 => syscall_fs_read_file(arg1, arg2, arg3),
         15 => syscall_shmem_grant(arg1, arg2),
+        16 => syscall_poweroff(),
+        17 => syscall_check_interrupt(),
+        18 => syscall_clear_interrupt(),
+        19 => syscall_shmem_unmap(arg1, arg2),
+        20 => syscall_shmem_destroy(arg1),
         _ => {
             crate::drivers::serial::write_str("[HANDLER] Invalid syscall!\n");
             u64::MAX // Return error
@@ -1477,6 +1482,49 @@ fn syscall_shmem_grant(shmem_id: u64, target_task: u64) -> u64 {
     }
 }
 
+/// Unmap a shared memory region from current task's address space
+/// This unmaps the pages but does NOT free the physical memory
+fn syscall_shmem_unmap(shmem_id: u64, virt_addr: u64) -> u64 {
+    use crate::ipc::shared_memory::shmem_unmap;
+    use core::num::NonZeroU32;
+
+    // 1. Validate shmem_id
+    let id = match NonZeroU32::new(shmem_id as u32) {
+        Some(id) => id,
+        None => return u64::MAX, // EINVAL
+    };
+
+    // 2. Validate virtual address
+    if virt_addr == 0 {
+        return u64::MAX; // EINVAL
+    }
+
+    // 3. Unmap the shared memory region
+    match shmem_unmap(id, virt_addr as usize) {
+        Ok(()) => 0, // Success
+        Err(_) => u64::MAX, // Error
+    }
+}
+
+/// Destroy a shared memory region and free physical pages
+/// Only the creator (owner) can destroy the region
+fn syscall_shmem_destroy(shmem_id: u64) -> u64 {
+    use crate::ipc::shared_memory::shmem_destroy;
+    use core::num::NonZeroU32;
+
+    // 1. Validate shmem_id
+    let id = match NonZeroU32::new(shmem_id as u32) {
+        Some(id) => id,
+        None => return u64::MAX, // EINVAL
+    };
+
+    // 2. Destroy the shared memory region
+    match shmem_destroy(id) {
+        Ok(()) => 0, // Success
+        Err(_) => u64::MAX, // Error
+    }
+}
+
 fn syscall_spawn(binary_ptr: u64, binary_len: u64) -> u64 {
     use crate::task::spawn;
 
@@ -1515,10 +1563,42 @@ fn syscall_yield() -> u64 {
 
 /// Read a key from the keyboard buffer (non-blocking)
 /// Returns: key code if available, 0 if no key, u64::MAX on error
+///
+/// NOTE: This function checks BOTH the PS/2 keyboard buffer AND the serial port.
+/// When running QEMU with `-serial stdio`, keyboard input comes via serial.
 fn syscall_read_key() -> u64 {
-    match crate::drivers::keyboard::read_key() {
-        Some(key) => key as u64,
-        None => 0, // No key available
+    // First, check the PS/2 keyboard buffer
+    if let Some(key) = crate::drivers::keyboard::read_key() {
+        // Check for Ctrl+C (ASCII 0x03)
+        if key == 0x03 {
+            set_current_task_interrupt();
+            return 0x03; // Return Ctrl+C so shell can also handle it
+        }
+        return key as u64;
+    }
+
+    // Then, check the serial port for input (QEMU -serial stdio mode)
+    if let Some(byte) = crate::drivers::serial::read_byte() {
+        // Check for Ctrl+C (ASCII 0x03)
+        if byte == 0x03 {
+            set_current_task_interrupt();
+            return 0x03; // Return Ctrl+C so shell can also handle it
+        }
+        // Handle carriage return as newline
+        if byte == b'\r' {
+            return b'\n' as u64;
+        }
+        return byte as u64;
+    }
+
+    0 // No key available
+}
+
+/// Set interrupt flag on current task
+fn set_current_task_interrupt() {
+    let task_id = crate::task::task::get_current_task();
+    if let Some(task_arc) = crate::task::task::get_task(task_id) {
+        task_arc.lock().interrupt_pending = true;
     }
 }
 
@@ -1699,6 +1779,52 @@ fn syscall_fs_read_file(name_ptr: u64, buf_ptr: u64, buf_size: u64) -> u64 {
     }
 
     copy_len as u64
+}
+
+/// Power off the system (exits QEMU)
+/// Uses QEMU's debug exit port to terminate the emulator.
+fn syscall_poweroff() -> u64 {
+    crate::serial_println!("\n[KERNEL] System poweroff requested");
+    crate::serial_println!("[KERNEL] Goodbye!");
+
+    // QEMU debug exit: writing to port 0xf4 exits QEMU
+    // Exit code will be (value << 1) | 1, so 0x10 gives exit code 33
+    unsafe {
+        x86_64::instructions::port::Port::<u32>::new(0xf4).write(0x10);
+    }
+
+    // If debug exit isn't available, try ACPI shutdown
+    // ACPI PM1a control block shutdown (common location)
+    unsafe {
+        x86_64::instructions::port::Port::<u16>::new(0x604).write(0x2000);
+    }
+
+    // Should never reach here
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
+/// Check if interrupt is pending for current task
+/// Returns: 1 if interrupt pending, 0 otherwise
+fn syscall_check_interrupt() -> u64 {
+    let task_id = crate::task::task::get_current_task();
+    if let Some(task_arc) = crate::task::task::get_task(task_id) {
+        if task_arc.lock().interrupt_pending {
+            return 1;
+        }
+    }
+    0
+}
+
+/// Clear interrupt flag for current task
+/// Returns: 0 on success
+fn syscall_clear_interrupt() -> u64 {
+    let task_id = crate::task::task::get_current_task();
+    if let Some(task_arc) = crate::task::task::get_task(task_id) {
+        task_arc.lock().interrupt_pending = false;
+    }
+    0
 }
 
 /// Debug: Print RAX value at syscall entry

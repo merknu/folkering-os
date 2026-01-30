@@ -25,6 +25,11 @@ pub const SYS_WRITE_CHAR: u64 = 9;
 pub const SYS_GET_PID: u64 = 10;
 pub const SYS_TASK_LIST: u64 = 11;
 pub const SYS_UPTIME: u64 = 12;
+pub const SYS_POWEROFF: u64 = 16;
+pub const SYS_CHECK_INTERRUPT: u64 = 17;
+pub const SYS_CLEAR_INTERRUPT: u64 = 18;
+pub const SYS_SHMEM_UNMAP: u64 = 19;
+pub const SYS_SHMEM_DESTROY: u64 = 20;
 
 /// Execute a syscall with no arguments
 #[inline(always)]

@@ -443,6 +443,24 @@ extern "C" fn pf_handler() {
         "mov rdi, {newline}",
         "call {serial_write_fn}",
 
+        // Print DEBUG_RETURN_VAL (RAX before IRETQ)
+        "mov rdi, {retval_msg}",
+        "call {serial_write_fn}",
+        "call {get_retval_fn}",
+        "mov rdi, rax",
+        "call {write_hex_fn}",
+        "mov rdi, {newline}",
+        "call {serial_write_fn}",
+
+        // Print DEBUG_HANDLER_RESULT (what Rust returned)
+        "mov rdi, {handler_result_msg}",
+        "call {serial_write_fn}",
+        "call {get_handler_result_fn}",
+        "mov rdi, rax",
+        "call {write_hex_fn}",
+        "mov rdi, {newline}",
+        "call {serial_write_fn}",
+
         // Halt
         "cli",
         "2:",
@@ -455,10 +473,14 @@ extern "C" fn pf_handler() {
         rip_msg = sym RIP_MSG,
         cs_msg = sym CS_MSG,
         marker_msg = sym MARKER_MSG,
+        retval_msg = sym RETVAL_MSG,
+        handler_result_msg = sym HANDLER_RESULT_MSG,
         newline = sym NEWLINE,
         serial_write_fn = sym serial_write_cstr,
         write_hex_fn = sym write_hex_from_reg,
         get_marker_fn = sym get_debug_marker_wrapper,
+        get_retval_fn = sym get_debug_return_val_wrapper,
+        get_handler_result_fn = sym get_debug_handler_result_wrapper,
     );
 }
 
@@ -483,6 +505,10 @@ static RSP_MSG: &[u8] = b"  RSP: \0";
 static SS_MSG: &[u8] = b"  SS: \0";
 #[link_section = ".rodata"]
 static MARKER_MSG: &[u8] = b"  DEBUG_MARKER: \0";
+#[link_section = ".rodata"]
+static RETVAL_MSG: &[u8] = b"  DEBUG_RETURN_VAL (RAX in asm): \0";
+#[link_section = ".rodata"]
+static HANDLER_RESULT_MSG: &[u8] = b"  DEBUG_HANDLER_RESULT (Rust return): \0";
 #[link_section = ".rodata"]
 static DBG_RIP_MSG: &[u8] = b"  syscall DEBUG_RIP: \0";
 #[link_section = ".rodata"]
@@ -535,6 +561,18 @@ unsafe extern "C" fn get_debug_rsp_wrapper() -> u64 {
 #[no_mangle]
 unsafe extern "C" fn get_debug_rflags_wrapper() -> u64 {
     folkering_kernel::arch::x86_64::syscall::get_debug_rflags()
+}
+
+/// Wrapper to get debug return value (RAX before IRETQ)
+#[no_mangle]
+unsafe extern "C" fn get_debug_return_val_wrapper() -> u64 {
+    folkering_kernel::arch::x86_64::syscall::get_debug_return_val()
+}
+
+/// Wrapper to get handler result (what Rust returned)
+#[no_mangle]
+unsafe extern "C" fn get_debug_handler_result_wrapper() -> u64 {
+    folkering_kernel::arch::x86_64::syscall::get_debug_handler_result()
 }
 
 /// Write a string to COM1 serial port
@@ -748,7 +786,11 @@ unsafe extern "C" fn kmain() -> ! {
         "mov rax, cr4",
         // Set OSFXSR (bit 9) - enable SSE
         // Set OSXMMEXCPT (bit 10) - enable SSE exceptions
-        "or ax, 0x600",    // Set bits 9 and 10
+        "or rax, 0x600",    // Set bits 9 and 10
+        // Clear SMEP (bit 20) and SMAP (bit 21) to allow kernel access to user pages
+        // This is needed for syscalls that copy data to/from userspace
+        "btr rax, 20",      // Clear SMEP
+        "btr rax, 21",      // Clear SMAP
         "mov cr4, rax",
         out("rax") _,
     );

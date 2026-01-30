@@ -6,7 +6,7 @@
 #![no_main]
 
 use libfolk::{entry, print, println};
-use libfolk::sys::{read_key, yield_cpu, get_pid, exit, task_list, uptime, shmem_map, shmem_create, shmem_grant};
+use libfolk::sys::{read_key, yield_cpu, get_pid, exit, task_list, uptime, shmem_map, shmem_create, shmem_grant, shmem_unmap, shmem_destroy, poweroff, check_interrupt, clear_interrupt};
 use libfolk::sys::synapse::{
     read_file_shmem, file_count, embedding_count,
     vector_search, get_embedding, SYNAPSE_TASK_ID,
@@ -24,6 +24,23 @@ const CMD_BUFFER_SIZE: usize = 256;
 /// Command buffer for user input
 static mut CMD_BUFFER: [u8; CMD_BUFFER_SIZE] = [0u8; CMD_BUFFER_SIZE];
 static mut CMD_LEN: usize = 0;
+
+// Helper functions for volatile access to prevent compiler optimizations
+fn get_cmd_len() -> usize {
+    unsafe { core::ptr::read_volatile(&CMD_LEN) }
+}
+
+fn set_cmd_len(len: usize) {
+    unsafe { core::ptr::write_volatile(&mut CMD_LEN, len) }
+}
+
+fn get_cmd_byte(idx: usize) -> u8 {
+    unsafe { core::ptr::read_volatile(&CMD_BUFFER[idx]) }
+}
+
+fn set_cmd_byte(idx: usize, val: u8) {
+    unsafe { core::ptr::write_volatile(&mut CMD_BUFFER[idx], val) }
+}
 
 fn main() -> ! {
     let pid = get_pid();
@@ -46,31 +63,37 @@ fn print_prompt() {
 
 fn handle_key(key: u8) {
     match key {
+        // Ctrl+C - cancel current input
+        0x03 => {
+            println!("^C");
+            clear_buffer();
+            clear_interrupt(); // Clear the interrupt flag
+            print_prompt();
+        }
         // Enter - execute command
         b'\r' | b'\n' => {
             println!();
             execute_command();
             clear_buffer();
+            clear_interrupt(); // Clear any interrupt that happened during command
             print_prompt();
         }
         // Backspace
         0x7F | 0x08 => {
-            unsafe {
-                if CMD_LEN > 0 {
-                    CMD_LEN -= 1;
-                    // Erase character on screen: backspace, space, backspace
-                    print!("\x08 \x08");
-                }
+            let len = get_cmd_len();
+            if len > 0 {
+                set_cmd_len(len - 1);
+                // Erase character on screen: backspace, space, backspace
+                print!("\x08 \x08");
             }
         }
         // Printable characters
         0x20..=0x7E => {
-            unsafe {
-                if CMD_LEN < CMD_BUFFER_SIZE - 1 {
-                    CMD_BUFFER[CMD_LEN] = key;
-                    CMD_LEN += 1;
-                    print!("{}", key as char);
-                }
+            let len = get_cmd_len();
+            if len < CMD_BUFFER_SIZE - 1 {
+                set_cmd_byte(len, key);
+                set_cmd_len(len + 1);
+                print!("{}", key as char);
             }
         }
         // Ignore other keys
@@ -79,15 +102,26 @@ fn handle_key(key: u8) {
 }
 
 fn clear_buffer() {
-    unsafe {
-        CMD_LEN = 0;
-        CMD_BUFFER = [0u8; CMD_BUFFER_SIZE];
+    set_cmd_len(0);
+    for i in 0..CMD_BUFFER_SIZE {
+        set_cmd_byte(i, 0);
     }
 }
 
 fn execute_command() {
+    let len = get_cmd_len();
+    if len == 0 {
+        return;
+    }
+
+    // Copy buffer to local array to avoid volatile reads in loop
+    let mut local_buf = [0u8; CMD_BUFFER_SIZE];
+    for i in 0..len {
+        local_buf[i] = get_cmd_byte(i);
+    }
+
     let cmd = unsafe {
-        core::str::from_utf8_unchecked(&CMD_BUFFER[..CMD_LEN])
+        core::str::from_utf8_unchecked(&local_buf[..len])
     };
 
     let cmd = cmd.trim();
@@ -111,6 +145,7 @@ fn execute_command() {
         "pid" => cmd_pid(),
         "clear" => cmd_clear(),
         "exit" => cmd_exit(),
+        "poweroff" | "shutdown" => cmd_poweroff(),
         _ => {
             println!("Unknown command: {}", command);
             println!("Type 'help' for available commands.");
@@ -133,6 +168,12 @@ fn cmd_help() {
     println!("  pid               - Show current process ID");
     println!("  clear             - Clear the screen");
     println!("  exit              - Exit the shell");
+    println!("  poweroff          - Shut down the system");
+}
+
+fn cmd_poweroff() {
+    println!("Shutting down...");
+    poweroff();
 }
 
 fn cmd_ls() {
@@ -213,6 +254,10 @@ fn cmd_cat<'a>(mut args: impl Iterator<Item = &'a str>) {
         }
     }
     println!();
+
+    // Step 4: Cleanup - unmap the shared memory
+    // Note: We don't destroy since Synapse is the owner
+    let _ = shmem_unmap(response.shmem_handle, SHELL_SHMEM_VADDR);
 }
 
 /// Execute SQL query on files database
@@ -469,6 +514,11 @@ impl Default for HybridResult {
 
 /// Hybrid search: combines keyword matching with semantic similarity using RRF
 fn cmd_search_hybrid(keyword: &str, similar_file: &str) {
+    // Track handles for cleanup
+    let mut embedding_handle: Option<u32> = None;
+    let mut query_handle: Option<u32> = None;
+    let mut results_handle: Option<u32> = None;
+
     // Check if semantic search is available
     let emb_count = match embedding_count() {
         Ok(c) => c,
@@ -555,23 +605,28 @@ fn cmd_search_hybrid(keyword: &str, similar_file: &str) {
         println!("search: failed to map embedding");
         return;
     }
+    embedding_handle = Some(embedding_response.shmem_handle);
 
     // Create query buffer for Synapse
     let query_shmem = match shmem_create(4096) {
         Ok(h) => h,
         Err(_) => {
             println!("search: failed to create query buffer");
+            cleanup_shmem(embedding_handle, None, None);
             return;
         }
     };
+    query_handle = Some(query_shmem);
 
     if shmem_grant(query_shmem, SYNAPSE_TASK_ID).is_err() {
         println!("search: failed to grant query buffer");
+        cleanup_shmem(embedding_handle, query_handle, None);
         return;
     }
 
     if shmem_map(query_shmem, VECTOR_RESULTS_VADDR).is_err() {
         println!("search: failed to map query buffer");
+        cleanup_shmem(embedding_handle, query_handle, None);
         return;
     }
 
@@ -588,6 +643,7 @@ fn cmd_search_hybrid(keyword: &str, similar_file: &str) {
         Ok(r) => r,
         Err(_) => {
             println!("search: vector search failed, falling back to keyword");
+            cleanup_shmem(embedding_handle, query_handle, None);
             cmd_search_keyword(keyword);
             return;
         }
@@ -597,8 +653,10 @@ fn cmd_search_hybrid(keyword: &str, similar_file: &str) {
     if search_response.count > 0 {
         if shmem_map(search_response.shmem_handle, VECTOR_RESULTS_VADDR).is_err() {
             println!("search: failed to map results");
+            cleanup_shmem(embedding_handle, query_handle, None);
             return;
         }
+        results_handle = Some(search_response.shmem_handle);
 
         // Process semantic results
         let results_ptr = VECTOR_RESULTS_VADDR as *const u8;
@@ -672,6 +730,7 @@ fn cmd_search_hybrid(keyword: &str, similar_file: &str) {
     // === STEP 5: Display Results ===
     if result_count == 0 {
         println!("\nNo files match '{}' or are similar to '{}'", keyword, similar_file);
+        cleanup_shmem(embedding_handle, query_handle, results_handle);
         return;
     }
 
@@ -706,10 +765,18 @@ fn cmd_search_hybrid(keyword: &str, similar_file: &str) {
     }
 
     println!("\n{} result(s) - [K]=keyword [S]=semantic", display_count);
+
+    // === STEP 6: Cleanup ===
+    cleanup_shmem(embedding_handle, query_handle, results_handle);
 }
 
 /// Search for files semantically similar to a given file
 fn cmd_search_similar(filename: &str) {
+    // Track handles for cleanup
+    let mut embedding_handle: Option<u32> = None;
+    let mut query_handle: Option<u32> = None;
+    let mut results_handle: Option<u32> = None;
+
     // Step 1: Check if semantic search is available
     let emb_count = match embedding_count() {
         Ok(c) => c,
@@ -759,25 +826,30 @@ fn cmd_search_similar(filename: &str) {
         println!("search: failed to map embedding");
         return;
     }
+    embedding_handle = Some(embedding_response.shmem_handle);
 
     // Step 5: Create shared memory for the query (Synapse needs to read from it)
     let query_shmem = match shmem_create(4096) {
         Ok(h) => h,
         Err(_) => {
             println!("search: failed to create query buffer");
+            cleanup_shmem(embedding_handle, None, None);
             return;
         }
     };
+    query_handle = Some(query_shmem);
 
     // Grant Synapse access to read the query
     if shmem_grant(query_shmem, SYNAPSE_TASK_ID).is_err() {
         println!("search: failed to grant query buffer");
+        cleanup_shmem(embedding_handle, query_handle, None);
         return;
     }
 
     // Map query buffer and copy the embedding
     if shmem_map(query_shmem, VECTOR_RESULTS_VADDR).is_err() {
         println!("search: failed to map query buffer");
+        cleanup_shmem(embedding_handle, query_handle, None);
         return;
     }
 
@@ -794,20 +866,24 @@ fn cmd_search_similar(filename: &str) {
         Ok(r) => r,
         Err(_) => {
             println!("search: vector search failed");
+            cleanup_shmem(embedding_handle, query_handle, None);
             return;
         }
     };
 
     if search_response.count == 0 {
         println!("No similar files found.");
+        cleanup_shmem(embedding_handle, query_handle, None);
         return;
     }
 
     // Step 7: Map results and display
     if shmem_map(search_response.shmem_handle, VECTOR_RESULTS_VADDR).is_err() {
         println!("search: failed to map results");
+        cleanup_shmem(embedding_handle, query_handle, None);
         return;
     }
+    results_handle = Some(search_response.shmem_handle);
 
     println!("\nFiles similar to '{}':\n", filename);
 
@@ -845,6 +921,28 @@ fn cmd_search_similar(filename: &str) {
         println!("  {:<16} ({:>3}% similar)", result_name, sim_pct);
     }
     println!();
+
+    // Step 8: Cleanup - unmap all shared memory, destroy what we own
+    cleanup_shmem(embedding_handle, query_handle, results_handle);
+}
+
+/// Helper to clean up shared memory after search operations
+fn cleanup_shmem(embedding: Option<u32>, query: Option<u32>, results: Option<u32>) {
+    // Unmap embedding (owned by Synapse, just unmap)
+    if let Some(h) = embedding {
+        let _ = shmem_unmap(h, VECTOR_QUERY_VADDR);
+    }
+
+    // Unmap and destroy query buffer (owned by shell)
+    if let Some(h) = query {
+        let _ = shmem_unmap(h, VECTOR_RESULTS_VADDR);
+        let _ = shmem_destroy(h); // Shell created this, so shell can destroy
+    }
+
+    // Unmap results (owned by Synapse, just unmap)
+    if let Some(h) = results {
+        let _ = shmem_unmap(h, VECTOR_RESULTS_VADDR);
+    }
 }
 
 /// Convert filename to lowercase (in-place buffer)

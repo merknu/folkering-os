@@ -2,7 +2,7 @@
 //!
 //! Functions for basic input/output operations.
 
-use crate::syscall::{syscall0, syscall1, SYS_READ_KEY, SYS_WRITE_CHAR};
+use crate::syscall::{syscall0, syscall1, SYS_READ_KEY, SYS_WRITE_CHAR, SYS_POWEROFF, SYS_CHECK_INTERRUPT, SYS_CLEAR_INTERRUPT};
 
 /// Read a key from the keyboard buffer (non-blocking)
 ///
@@ -34,4 +34,21 @@ pub fn write_str(s: &str) {
 pub fn write_line(s: &str) {
     write_str(s);
     write_char(b'\n');
+}
+
+/// Power off the system (exits QEMU)
+pub fn poweroff() -> ! {
+    unsafe { syscall0(SYS_POWEROFF) };
+    // Should never return, but loop just in case
+    loop {}
+}
+
+/// Check if Ctrl+C interrupt is pending for this task
+pub fn check_interrupt() -> bool {
+    unsafe { syscall0(SYS_CHECK_INTERRUPT) != 0 }
+}
+
+/// Clear the interrupt flag (call after handling)
+pub fn clear_interrupt() {
+    unsafe { syscall0(SYS_CLEAR_INTERRUPT) };
 }

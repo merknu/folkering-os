@@ -107,6 +107,9 @@ pub struct Task {
 
     // Statistics fields
     pub stats: TaskStatistics,
+
+    // Interrupt handling
+    pub interrupt_pending: bool,  // Set when Ctrl+C is received
 }
 
 /// CPU context for task switching
@@ -445,6 +448,9 @@ impl Task {
             crate::serial_strln!("[TASK_NEW] Step 11j: writing created_at_ms...");
             ptr::addr_of_mut!((*stats_ptr).created_at_ms).write(current_time);
             crate::serial_strln!("[TASK_NEW] Step 11: stats init OK");
+
+            // Interrupt handling
+            ptr::addr_of_mut!((*task_ptr).interrupt_pending).write(false);
 
             // Move out of buffer (assume_init returns by value, perfect!)
             crate::serial_strln!("[TASK_NEW] Step 12: about to return Task...");

@@ -94,3 +94,28 @@ pub fn write_newline() {
         SERIAL1.lock().send(b'\n');
     });
 }
+
+/// Read a byte from serial port (non-blocking)
+/// Returns None if no data available
+/// Uses proper locking to avoid race conditions with serial output.
+pub fn read_byte() -> Option<u8> {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let _serial = SERIAL1.lock();
+
+        // Check Line Status Register (LSR) at base+5
+        // Bit 0 (DR - Data Ready) is set when data is available
+        let lsr: u8 = unsafe {
+            x86_64::instructions::port::Port::<u8>::new(0x3F8 + 5).read()
+        };
+
+        if (lsr & 0x01) != 0 {
+            // Data available - read from data port
+            let byte: u8 = unsafe {
+                x86_64::instructions::port::Port::<u8>::new(0x3F8).read()
+            };
+            Some(byte)
+        } else {
+            None
+        }
+    })
+}

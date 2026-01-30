@@ -12,9 +12,9 @@ pub mod synapse;
 
 // Re-export commonly used functions at the sys level
 pub use task::{exit, yield_cpu, get_pid, spawn};
-pub use io::{read_key, write_char};
+pub use io::{read_key, write_char, poweroff, check_interrupt, clear_interrupt};
 pub use ipc::{send, receive, reply};
-pub use memory::{shmem_create, shmem_map, shmem_grant};
+pub use memory::{shmem_create, shmem_map, shmem_grant, shmem_unmap, shmem_destroy};
 pub use system::{task_list, uptime};
 
 // Re-export Synapse protocol
