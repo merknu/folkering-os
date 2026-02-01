@@ -9,6 +9,8 @@ pub mod syscall;
 pub mod usermode;
 pub mod cpu_freq;
 pub mod interrupt_frame;
+pub mod pat;
+pub mod pic;
 
 // Re-export with module-specific names
 pub use gdt::init as gdt_init;
@@ -18,3 +20,5 @@ pub use apic::{init as apic_init, enable_timer, disable_timer, tick, send_eoi, g
 pub use acpi::init as acpi_init;
 pub use syscall::init as syscall_init;
 pub use cpu_freq::{init as cpu_freq_init, set_cpu_freq, set_power_save, set_base, set_turbo, current_frequency};
+pub use pat::init as pat_init;
+pub use pic::{init as pic_init, enable_irq, disable_irq, send_eoi as pic_send_eoi};

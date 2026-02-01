@@ -177,8 +177,8 @@ pub fn spawn(binary: &[u8], _args: &[&str]) -> Result<TaskId, SpawnError> {
 
     // 5. Allocate user stack (64KB = 16 pages)
     // Stack at a high address in user space
-    let stack_pages = 16usize;
-    let stack_size = stack_pages * 4096; // 64KB
+    let stack_pages = 64usize;
+    let stack_size = stack_pages * 4096; // 256KB (increased from 64KB for compositor)
     let stack_top_addr = 0x7FFF_FFFF_0000u64;
     let stack_base = stack_top_addr - stack_size as u64;
 

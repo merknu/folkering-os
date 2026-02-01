@@ -174,6 +174,19 @@ pub fn revoke(cap_id: CapabilityId) -> Result<(), CapError> {
     CAP_TABLE.lock().revoke(cap_id)
 }
 
+/// Grant framebuffer capability to a task
+pub fn grant_framebuffer(task_id: TaskId, phys_base: u64, size: u64) -> Result<CapabilityId, CapError> {
+    grant(task_id, CapabilityType::Framebuffer { phys_base, size })
+}
+
+/// Check if task has framebuffer capability covering the given range
+pub fn has_framebuffer_access(task_id: TaskId, phys_addr: u64, size: u64) -> bool {
+    has_capability(task_id, CapabilityType::Framebuffer {
+        phys_base: phys_addr,
+        size,
+    })
+}
+
 /// Transfer a capability from one task to another
 ///
 /// Used during IPC to pass capabilities.

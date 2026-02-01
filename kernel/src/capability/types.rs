@@ -65,6 +65,23 @@ pub enum CapabilityType {
 
     /// Hardware access capability (for drivers)
     Hardware(u32), // Device ID
+
+    /// Framebuffer access capability
+    /// Contains the physical address range allowed
+    Framebuffer {
+        phys_base: u64,
+        size: u64,
+    },
+}
+
+/// Well-known device IDs for Hardware capabilities
+pub mod device_ids {
+    /// Framebuffer device ID
+    pub const FRAMEBUFFER: u32 = 0x0001;
+    /// Keyboard device ID
+    pub const KEYBOARD: u32 = 0x0002;
+    /// Serial port device ID
+    pub const SERIAL: u32 = 0x0003;
 }
 
 impl CapabilityType {
@@ -87,6 +104,13 @@ impl CapabilityType {
                 *b2 >= *b1
                     && (*b2 + *n2 as u64) <= (*b1 + *n1 as u64)
                     && (*w1 || !*w2) // If required is writable, held must be too
+            }
+
+            // Framebuffer capability: check if address range is covered
+            (CapabilityType::Framebuffer { phys_base: b1, size: s1 },
+             CapabilityType::Framebuffer { phys_base: b2, size: s2 }) => {
+                // Held capability must cover the required range
+                *b2 >= *b1 && (*b2 + *s2) <= (*b1 + *s1)
             }
 
             _ => false,

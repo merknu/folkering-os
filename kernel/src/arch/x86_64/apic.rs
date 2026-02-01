@@ -22,6 +22,8 @@ const APIC_VERSION: usize = 0x30;
 const APIC_TPR: usize = 0x80;
 const APIC_EOI: usize = 0xB0;
 const APIC_SPURIOUS: usize = 0xF0;
+const APIC_LVT_LINT0: usize = 0x350;
+const APIC_LVT_LINT1: usize = 0x360;
 const APIC_LVT_TIMER: usize = 0x320;
 const APIC_TIMER_INIT_COUNT: usize = 0x380;
 const APIC_TIMER_CURRENT_COUNT: usize = 0x390;
@@ -65,10 +67,24 @@ pub fn init() {
         let spurious = read_apic_reg(apic_virt, APIC_SPURIOUS);
         write_apic_reg(apic_virt, APIC_SPURIOUS, spurious | 0x100 | 0xFF);
 
-        // 3. Disable legacy PIC (8259A) by masking all interrupts
-        disable_pic();
+        // 2b. Set Task Priority to 0 to accept all interrupts
+        write_apic_reg(apic_virt, APIC_TPR, 0);
 
-        // 4. Set up APIC timer
+        // 3. NOTE: Do NOT disable legacy PIC here - keyboard driver needs IRQ1
+        // disable_pic();
+        crate::drivers::serial::write_str("[APIC] Legacy PIC left enabled for keyboard IRQ1\n");
+
+        // 4. Configure LINT0 for virtual wire mode (ExtINT from PIC)
+        // This allows legacy PIC interrupts to be delivered through APIC LINT0
+        // Delivery mode: ExtINT (111b = 0x700), unmasked (bit 16 = 0)
+        write_apic_reg(apic_virt, APIC_LVT_LINT0, 0x700);
+        crate::drivers::serial::write_str("[APIC] LINT0 configured for ExtINT (virtual wire mode)\n");
+
+        // 5. Configure LINT1 for NMI (standard configuration)
+        // Delivery mode: NMI (100b = 0x400), edge triggered
+        write_apic_reg(apic_virt, APIC_LVT_LINT1, 0x400);
+
+        // 6. Set up APIC timer
         setup_timer(apic_virt);
 
         crate::drivers::serial::write_str("[APIC] Local APIC initialized\n");

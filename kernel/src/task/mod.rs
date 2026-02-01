@@ -6,6 +6,7 @@ pub mod spawn;
 pub mod elf;
 pub mod switch;
 pub mod statistics;
+pub mod preempt;
 
 pub use scheduler::{init as scheduler_init, start as scheduler_start, enqueue, yield_cpu};
 pub use task::Task;

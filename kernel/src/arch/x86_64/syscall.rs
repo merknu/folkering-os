@@ -1585,6 +1585,19 @@ fn syscall_yield() -> u64 {
 fn syscall_read_key() -> u64 {
     // First, check the PS/2 keyboard buffer
     if let Some(key) = crate::drivers::keyboard::read_key() {
+        // Debug: Print which task is getting the key
+        let task_id = crate::task::task::get_current_task();
+        crate::drivers::serial::write_str("[KEY:");
+        crate::drivers::serial::write_dec(task_id as u32);
+        crate::drivers::serial::write_str(":");
+        if key >= 0x20 && key <= 0x7E {
+            crate::drivers::serial::write_byte(key);
+        } else {
+            crate::drivers::serial::write_str("0x");
+            crate::drivers::serial::write_hex(key as u64);
+        }
+        crate::drivers::serial::write_str("]");
+
         // Check for Ctrl+C (ASCII 0x03)
         if key == 0x03 {
             set_current_task_interrupt();

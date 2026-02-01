@@ -1115,9 +1115,19 @@ unsafe extern "C" fn kmain() -> ! {
             FRAMEBUFFER_HEIGHT.store(fb.height() as usize, core::sync::atomic::Ordering::Relaxed);
             FRAMEBUFFER_PITCH.store(fb.pitch() as usize, core::sync::atomic::Ordering::Relaxed);
             FRAMEBUFFER_BPP.store(fb.bpp() as usize, core::sync::atomic::Ordering::Relaxed);
-            FRAMEBUFFER_RED_SHIFT.store(fb.red_mask_shift() as usize, core::sync::atomic::Ordering::Relaxed);
-            FRAMEBUFFER_GREEN_SHIFT.store(fb.green_mask_shift() as usize, core::sync::atomic::Ordering::Relaxed);
-            FRAMEBUFFER_BLUE_SHIFT.store(fb.blue_mask_shift() as usize, core::sync::atomic::Ordering::Relaxed);
+            let r_shift = fb.red_mask_shift();
+            let g_shift = fb.green_mask_shift();
+            let b_shift = fb.blue_mask_shift();
+            serial_write("  Color shifts: R=");
+            write_hex(r_shift as u64);
+            serial_write(" G=");
+            write_hex(g_shift as u64);
+            serial_write(" B=");
+            write_hex(b_shift as u64);
+            serial_write("\n");
+            FRAMEBUFFER_RED_SHIFT.store(r_shift as usize, core::sync::atomic::Ordering::Relaxed);
+            FRAMEBUFFER_GREEN_SHIFT.store(g_shift as usize, core::sync::atomic::Ordering::Relaxed);
+            FRAMEBUFFER_BLUE_SHIFT.store(b_shift as usize, core::sync::atomic::Ordering::Relaxed);
         } else {
             serial_write("[BOOT] No framebuffers available\n");
         }

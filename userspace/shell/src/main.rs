@@ -11,6 +11,10 @@ use libfolk::sys::synapse::{
     read_file_shmem, file_count, embedding_count,
     vector_search, get_embedding, SYNAPSE_TASK_ID,
 };
+use libfolk::sys::compositor::{
+    create_window, update_node, find_node_by_hash, hash_name as comp_hash_name,
+    role, CompError,
+};
 use libfolk::sys::fs::DirEntry;
 
 /// Embedding size in bytes (384 dimensions × 4 bytes)
@@ -47,13 +51,19 @@ fn main() -> ! {
     println!("Folkering Shell v0.1.0 (PID: {})", pid);
     println!("Type 'help' for available commands.\n");
 
+    // NOTE: Keyboard input disabled while compositor handles GUI input
+    // Shell commands can still be run via serial console
+    println!("[SHELL] Keyboard disabled (compositor mode)\n");
+
     print_prompt();
 
     loop {
-        match read_key() {
-            Some(key) => handle_key(key),
-            None => yield_cpu(),
-        }
+        // In compositor mode, shell doesn't poll keyboard - compositor is primary input handler
+        // match read_key() {
+        //     Some(key) => handle_key(key),
+        //     None => yield_cpu(),
+        // }
+        yield_cpu();
     }
 }
 
@@ -140,6 +150,7 @@ fn execute_command() {
         "cat" => cmd_cat(parts),
         "sql" => cmd_sql(cmd),
         "search" => cmd_search(parts),
+        "test-gui" => cmd_test_gui(),
         "ps" => cmd_ps(),
         "uptime" => cmd_uptime(),
         "pid" => cmd_pid(),
@@ -163,6 +174,7 @@ fn cmd_help() {
     println!("  search <keyword>  - Search files by keyword");
     println!("  search -s <file>  - Find files similar to <file>");
     println!("  search <kw> -s <f> - Hybrid search (keyword + semantic)");
+    println!("  test-gui          - Test Semantic Mirror integration");
     println!("  ps                - List running tasks");
     println!("  uptime            - Show system uptime");
     println!("  pid               - Show current process ID");
@@ -174,6 +186,66 @@ fn cmd_help() {
 fn cmd_poweroff() {
     println!("Shutting down...");
     poweroff();
+}
+
+/// Test Semantic Mirror integration.
+///
+/// Performs end-to-end verification:
+/// 1. Creates a window via compositor IPC
+/// 2. Sends a UI tree with a "Submit Form" button
+/// 3. Queries for the button (simulates AI agent)
+/// 4. Verifies the compositor correctly maintains and queries the WorldTree
+fn cmd_test_gui() {
+    println!("=== Semantic Mirror Integration Test ===\n");
+
+    // Step 1: Create window
+    println!("[1] Creating window...");
+    let window_id = match create_window() {
+        Ok(id) => {
+            println!("    Window created: {}", id);
+            id
+        }
+        Err(e) => {
+            println!("    FAIL: {:?}", e);
+            println!("\n    Hint: Is the compositor running?");
+            return;
+        }
+    };
+
+    // Step 2: Send "Submit Form" button (node 42, role=Button)
+    println!("[2] Sending 'Submit Form' button...");
+    let button_name = "Submit Form";
+    let name_hash = comp_hash_name(button_name);
+    let node_id: u64 = 42;
+
+    match update_node(window_id, node_id, role::BUTTON, name_hash) {
+        Ok(()) => {
+            println!("    TreeUpdate sent OK");
+        }
+        Err(_) => {
+            println!("    TreeUpdate FAIL");
+            return;
+        }
+    }
+
+    // Step 3: Query - simulate AI asking "where is Submit?"
+    println!("[3] Querying...");
+    match find_node_by_hash(name_hash) {
+        Ok((true, found_node_id, found_window_id)) => {
+            // Step 4: Verify
+            if found_node_id == node_id && found_window_id == window_id {
+                println!("[SUCCESS] Semantic Mirror verified!");
+            } else {
+                println!("[FAIL] Node/window mismatch");
+            }
+        }
+        Ok((false, _, _)) => {
+            println!("[FAIL] Node not found");
+        }
+        Err(_) => {
+            println!("[FAIL] Query error");
+        }
+    }
 }
 
 fn cmd_ls() {

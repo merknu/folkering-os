@@ -222,6 +222,15 @@ pub unsafe extern "C" fn restore_context_only(_new_ctx: usize) {
         // R11 now has new_ctx pointer again
         // NOTE: MSR restore removed - caused format! crashes at boot
 
+        // Set DS, ES, FS, GS to user data segment (0x1B) before IRETQ
+        // These are NOT restored by IRETQ but must be valid for user mode
+        // In 64-bit mode, the base is ignored but the selector must be valid
+        "mov ax, 0x1B",           // User data segment selector (0x18 | RPL 3)
+        "mov ds, ax",
+        "mov es, ax",
+        "mov fs, ax",
+        "mov gs, ax",
+
         // Build IRETQ frame on stack (required for CPL 0->3 transition)
         // IRETQ pops: SS, RSP, RFLAGS, CS, RIP
         "mov qword ptr [{debug_marker}], 0x1111",   // Marker: starting frame build
@@ -272,8 +281,26 @@ pub unsafe extern "C" fn restore_context_only(_new_ctx: usize) {
 
 /// Debug function called before IRETQ (kept as no-op, referenced from asm)
 #[no_mangle]
-extern "C" fn debug_before_iretq_fn(_ctx_ptr: usize) {
-    // Intentionally empty — was debug noise
+extern "C" fn debug_before_iretq_fn(ctx_ptr: usize) {
+    // Debug: print when we're about to IRETQ
+    static mut IRETQ_COUNT: u64 = 0;
+    unsafe {
+        IRETQ_COUNT += 1;
+        if IRETQ_COUNT <= 5 {
+            let ctx = ctx_ptr as *const crate::task::task::Context;
+            crate::serial_str!("[IRETQ] ctx=");
+            crate::drivers::serial::write_hex(ctx_ptr as u64);
+            crate::serial_str!(", RIP=");
+            crate::drivers::serial::write_hex((*ctx).rip);
+            crate::serial_str!(", RSP=");
+            crate::drivers::serial::write_hex((*ctx).rsp);
+            crate::serial_str!(", CS=");
+            crate::drivers::serial::write_hex((*ctx).cs);
+            crate::serial_str!(", SS=");
+            crate::drivers::serial::write_hex((*ctx).ss);
+            crate::drivers::serial::write_newline();
+        }
+    }
 }
 
 /// Debug function for IRETQ frame inspection (kept as no-op)

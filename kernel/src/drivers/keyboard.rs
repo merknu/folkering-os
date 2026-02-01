@@ -121,47 +121,17 @@ const SCANCODE_ENTER: u8 = 0x1C;
 /// Initialize keyboard driver
 pub fn init() {
     unsafe {
-        // Enable keyboard IRQ (IRQ1) on PIC
-        // The PIC was fully disabled by APIC init, we need to enable IRQ1
-        let mut pic1_data = Port::<u8>::new(0x21);
-
-        // First, reinitialize PIC1 to route IRQ0-7 to vectors 32-39
-        let mut pic1_cmd = Port::<u8>::new(0x20);
-        let mut pic2_cmd = Port::<u8>::new(0xA0);
-        let mut pic2_data = Port::<u8>::new(0xA1);
-
-        // ICW1: Initialize + ICW4 needed
-        pic1_cmd.write(0x11);
-        pic2_cmd.write(0x11);
-
-        // ICW2: Vector offset (32 for PIC1, 40 for PIC2)
-        pic1_data.write(32);
-        pic2_data.write(40);
-
-        // ICW3: Tell PICs about each other
-        pic1_data.write(4);  // IRQ2 has slave
-        pic2_data.write(2);  // Slave ID 2
-
-        // ICW4: 8086 mode
-        pic1_data.write(0x01);
-        pic2_data.write(0x01);
-
-        // Mask all interrupts except IRQ1 (keyboard)
-        // Bit 0 = IRQ0 (timer) - masked
-        // Bit 1 = IRQ1 (keyboard) - enabled (0)
-        // Bit 2 = IRQ2 (cascade) - enabled for PIC2
-        pic1_data.write(0b11111001);  // Only IRQ1 and IRQ2 enabled
-        pic2_data.write(0xFF);         // All PIC2 interrupts masked
-
-        // Clear any pending keyboard data
+        // Clear any pending keyboard data before enabling interrupt
         let mut status = Port::<u8>::new(KEYBOARD_STATUS_PORT);
         let mut data = Port::<u8>::new(KEYBOARD_DATA_PORT);
         while status.read() & 1 != 0 {
             let _ = data.read();
         }
 
+        // Enable IRQ1 (keyboard) using centralized PIC module
+        crate::arch::x86_64::pic::enable_irq(1);
+
         crate::drivers::serial::write_str("[KEYBOARD] PS/2 keyboard driver initialized\n");
-        crate::drivers::serial::write_str("[KEYBOARD] IRQ1 enabled (vector 33)\n");
     }
 
     KEYBOARD_INIT.store(true, Ordering::Relaxed);
@@ -175,11 +145,11 @@ pub fn handle_interrupt() {
         data_port.read()
     };
 
-    // Send EOI to PIC immediately (must happen for every interrupt)
-    unsafe {
-        let mut pic1_cmd = Port::<u8>::new(0x20);
-        pic1_cmd.write(0x20);
-    }
+    // Send EOI to PIC (IRQ1 is on PIC1)
+    crate::arch::x86_64::pic::send_eoi(1);
+
+    // Also send EOI to APIC (needed in virtual wire mode)
+    crate::arch::x86_64::apic::send_eoi();
 
     if !KEYBOARD_INIT.load(Ordering::Relaxed) {
         return;

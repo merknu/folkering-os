@@ -26,6 +26,13 @@
 //! - **Zero-Copy**: TreeUpdates are read directly from shared memory
 //! - **Semantic Mirror**: AI sees UI through accessibility tree, not pixels
 //!
+//! # Phase 6.2 - "First Light"
+//!
+//! The compositor now has basic graphics capabilities:
+//! - Framebuffer access via SYS_MAP_PHYSICAL syscall
+//! - Software rasterizer with Write-Combining optimization
+//! - VGA 8x16 font for text rendering
+//!
 //! # Example
 //!
 //! ```ignore
@@ -43,12 +50,47 @@
 
 #![no_std]
 
+// Graphics modules (Phase 6.2)
+pub mod framebuffer;
+pub mod font;
+
 extern crate alloc;
 
 use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 use libaccesskit_folk::{Node, NodeId, Role, TreeUpdate};
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
+/// FNV-1a hash for name matching (matches libfolk::sys::compositor::hash_name)
+fn hash_name(name: &str) -> u32 {
+    let mut hash: u32 = 0x811c9dc5;
+    for byte in name.bytes() {
+        hash ^= byte as u32;
+        hash = hash.wrapping_mul(0x01000193);
+    }
+    hash
+}
+
+/// Parse a "__hash_XXXXXX" formatted name to extract the hash value.
+/// Returns None if the name is not in this format.
+fn parse_hash_name(name: &str) -> Option<u32> {
+    // Expected format: "__hash_" followed by 6 hex digits (24-bit truncated hash)
+    let prefix = "__hash_";
+    if !name.starts_with(prefix) {
+        return None;
+    }
+
+    let hex_part = &name[prefix.len()..];
+    // Parse hex string - should be exactly 6 characters for our format
+    if hex_part.len() != 6 {
+        return None;
+    }
+    u32::from_str_radix(hex_part, 16).ok()
+}
 
 /// Window identifier (assigned by compositor).
 pub type WindowId = u64;
@@ -133,6 +175,32 @@ impl WorldTree {
             for (&node_id, node) in &window.nodes {
                 if node.name.as_deref() == Some(name) {
                     return Some((window_id, node_id, node));
+                }
+            }
+        }
+        None
+    }
+
+    /// Find a node by name hash across all windows.
+    ///
+    /// Phase 6.1: Uses hash matching since full strings don't fit in IPC payload.
+    /// Names are stored as "__hash_XXXXXXXX" format, so we extract and compare the hash.
+    /// Returns (window_id, node_id, &Node) if found.
+    pub fn find_by_name_hash(&self, target_hash: u32) -> Option<(WindowId, NodeId, &Node)> {
+        for (&window_id, window) in &self.windows {
+            for (&node_id, node) in &window.nodes {
+                if let Some(ref name) = node.name {
+                    // Check if name is in __hash_XXXXXXXX format
+                    if let Some(stored_hash) = parse_hash_name(name) {
+                        if stored_hash == target_hash {
+                            return Some((window_id, node_id, node));
+                        }
+                    } else {
+                        // Fall back to computing hash of actual name
+                        if hash_name(name) == target_hash {
+                            return Some((window_id, node_id, node));
+                        }
+                    }
                 }
             }
         }

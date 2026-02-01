@@ -67,8 +67,11 @@ impl FramebufferView {
     /// Create a color value from RGB components.
     ///
     /// Returns a 32-bit color in the framebuffer's native format.
+    /// Note: QEMU VGA uses XRGB format (R at byte 2, G at byte 1, B at byte 0)
+    /// which means shifts should be R=16, G=8, B=0 and we write 0x00RRGGBB
     #[inline]
     pub fn rgb(&self, r: u8, g: u8, b: u8) -> u32 {
+        // Use the reported shifts from bootloader
         ((r as u32) << self.red_shift)
             | ((g as u32) << self.green_shift)
             | ((b as u32) << self.blue_shift)
@@ -77,10 +80,9 @@ impl FramebufferView {
     /// Create a color from a packed 0xRRGGBB value.
     #[inline]
     pub fn color_from_rgb24(&self, rgb: u32) -> u32 {
-        let r = ((rgb >> 16) & 0xFF) as u8;
-        let g = ((rgb >> 8) & 0xFF) as u8;
-        let b = (rgb & 0xFF) as u8;
-        self.rgb(r, g, b)
+        // Just pass through - the input is already 0x00RRGGBB format
+        // which matches QEMU's XRGB framebuffer format
+        rgb
     }
 
     /// Get pointer to a pixel at (x, y).

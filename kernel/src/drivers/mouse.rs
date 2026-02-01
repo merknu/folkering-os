@@ -5,7 +5,7 @@
 
 use spin::Mutex;
 use x86_64::instructions::port::Port;
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 /// PS/2 data port
 const PS2_DATA_PORT: u16 = 0x60;
@@ -106,9 +106,6 @@ static MOUSE_PACKET: Mutex<MousePacket> = Mutex::new(MousePacket::new());
 static MOUSE_BUFFER: Mutex<MouseBuffer> = Mutex::new(MouseBuffer::new());
 static MOUSE_INIT: AtomicBool = AtomicBool::new(false);
 
-/// Debug counter for mouse interrupts
-static MOUSE_IRQ_COUNT: AtomicU8 = AtomicU8::new(0);
-
 /// Wait for PS/2 controller input buffer to be ready (can write)
 unsafe fn wait_write() {
     for _ in 0..100_000 {
@@ -188,15 +185,13 @@ pub fn init() {
         // Enable data reporting
         let enable_ack = mouse_write(0xF4);
 
-        // Enable IRQ12 on PIC2
-        let mut pic2_data = Port::<u8>::new(0xA1);
-        let mask = pic2_data.read();
-        pic2_data.write(mask & !0x10);  // Clear bit 4 (IRQ12)
+        // Enable IRQ12 (mouse) using centralized PIC module
+        crate::arch::x86_64::pic::enable_irq(12);
 
         crate::serial_str!("[MOUSE] Enable ACK: 0x");
         crate::drivers::serial::write_hex(enable_ack as u64);
         crate::serial_strln!("");
-        crate::serial_strln!("[MOUSE] PS/2 mouse initialized, IRQ12 enabled (vector 44)");
+        crate::serial_strln!("[MOUSE] PS/2 mouse initialized");
 
         MOUSE_INIT.store(true, Ordering::Relaxed);
     }
@@ -210,24 +205,14 @@ pub fn handle_interrupt() {
         data_port.read()
     };
 
-    // Send EOI to both PICs (IRQ12 is on PIC2)
-    unsafe {
-        let mut pic2_cmd = Port::<u8>::new(0xA0);
-        let mut pic1_cmd = Port::<u8>::new(0x20);
-        pic2_cmd.write(0x20);
-        pic1_cmd.write(0x20);
-    }
+    // Send EOI to PIC (IRQ12 is on PIC2, send_eoi handles cascade)
+    crate::arch::x86_64::pic::send_eoi(12);
+
+    // Also send EOI to APIC (needed in virtual wire mode)
+    crate::arch::x86_64::apic::send_eoi();
 
     if !MOUSE_INIT.load(Ordering::Relaxed) {
         return;
-    }
-
-    // Debug: count interrupts
-    let count = MOUSE_IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
-    if count < 10 {
-        crate::serial_str!("[MOUSE] IRQ byte: 0x");
-        crate::drivers::serial::write_hex(byte as u64);
-        crate::serial_strln!("");
     }
 
     // Process byte through packet state machine
@@ -276,21 +261,6 @@ pub fn handle_interrupt() {
             if !x_overflow && !y_overflow {
                 let event = MouseEvent { buttons, dx, dy };
                 MOUSE_BUFFER.lock().push(event);
-
-                // Debug output for first few events
-                static mut EVENT_COUNT: u8 = 0;
-                unsafe {
-                    EVENT_COUNT += 1;
-                    if EVENT_COUNT <= 5 {
-                        crate::serial_str!("[MOUSE] Event: buttons=");
-                        crate::drivers::serial::write_dec(buttons as u32);
-                        crate::serial_str!(", dx=");
-                        crate::drivers::serial::write_dec(dx as u32);
-                        crate::serial_str!(", dy=");
-                        crate::drivers::serial::write_dec(dy as u32);
-                        crate::serial_strln!("");
-                    }
-                }
             }
 
             packet.reset();

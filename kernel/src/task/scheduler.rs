@@ -255,6 +255,20 @@ pub fn enqueue(task_id: TaskId) {
 pub fn yield_cpu() {
     use super::task;
 
+    // Debug: print first few yields
+    static mut YIELD_COUNT: u64 = 0;
+    unsafe {
+        YIELD_COUNT += 1;
+        if YIELD_COUNT <= 5 {
+            let current = task::get_current_task();
+            crate::serial_str!("[YIELD] Task ");
+            crate::drivers::serial::write_dec(current as u32);
+            crate::serial_str!(" yielding (count=");
+            crate::drivers::serial::write_dec(YIELD_COUNT as u32);
+            crate::serial_strln!(")");
+        }
+    }
+
     // Record voluntary yield
     let current_id = task::get_current_task();
     super::statistics::record_voluntary_yield(current_id);
@@ -264,8 +278,19 @@ pub fn yield_cpu() {
 
     // Get next task to run
     let next_id = match schedule_next() {
-        Some(id) => id,
+        Some(id) => {
+            // Debug: show selected task
+            unsafe {
+                if YIELD_COUNT <= 5 {
+                    crate::serial_str!("[YIELD] Selected next task: ");
+                    crate::drivers::serial::write_dec(id as u32);
+                    crate::drivers::serial::write_newline();
+                }
+            }
+            id
+        }
         None => {
+            crate::serial_strln!("[YIELD] No runnable tasks!");
             x86_64::instructions::interrupts::enable();
             return;
         }
@@ -311,6 +336,15 @@ pub fn yield_cpu() {
 
     // Update current context pointer for syscalls
     crate::arch::x86_64::syscall::set_current_context_ptr(target_ctx_ptr as *mut task::Context);
+
+    // Debug: about to switch
+    unsafe {
+        if YIELD_COUNT <= 5 {
+            crate::serial_str!("[YIELD] About to restore_context_only to ctx at ");
+            crate::drivers::serial::write_hex(target_ctx_ptr as u64);
+            crate::drivers::serial::write_newline();
+        }
+    }
 
     // Jump to new task using IRETQ (does not return!)
     unsafe {
@@ -420,6 +454,12 @@ pub fn start() -> ! {
         iterations += 1;
 
         if let Some(task_id) = schedule_next() {
+            // Debug: show which task is selected
+            if iterations < 5 {
+                crate::serial_str!("[SCHED] Switching to task ");
+                crate::drivers::serial::write_dec(task_id as u32);
+                crate::drivers::serial::write_newline();
+            }
             // Perform context switch
             unsafe {
                 super::switch::switch_to(task_id);

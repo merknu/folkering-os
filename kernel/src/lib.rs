@@ -129,11 +129,16 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
         arch::x86_64::apic_init();
         serial_strln!("[APIC] Timer interrupts enabled\n");
 
-        // Initialize keyboard driver (after IDT and PIC setup)
+        // Initialize PIC (8259A) for legacy interrupt support
+        // Must be done before keyboard/mouse drivers
+        serial_strln!("[INIT] Initializing 8259A PIC...");
+        arch::x86_64::pic_init();
+
+        // Initialize keyboard driver (uses IRQ1)
         serial_strln!("[INIT] Initializing PS/2 keyboard driver...");
         drivers::keyboard::init();
 
-        // Initialize mouse driver (IRQ12, vector 44)
+        // Initialize mouse driver (uses IRQ12)
         serial_strln!("[INIT] Initializing PS/2 mouse driver...");
         drivers::mouse::init();
 

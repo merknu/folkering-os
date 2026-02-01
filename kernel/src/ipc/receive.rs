@@ -183,10 +183,14 @@ pub fn ipc_reply(request: &IpcMessage, reply_payload: [u64; 4]) -> Result<(), Er
     reply_msg.sender = current.lock().id;
     reply_msg.msg_id = crate::ipc::next_message_id();
 
-    // Copy reply to sender's buffer
+    // Copy reply to sender's buffer AND set context.rax to the reply value
+    // CRITICAL: When sender resumes from yield, the assembly sets RAX=0.
+    // We need to override this by setting context.rax to the actual reply value.
     {
         let mut sender_lock = sender_task.lock();
         sender_lock.ipc_reply = Some(reply_msg);
+        // Set the return value in sender's context so it resumes with correct RAX
+        sender_lock.context.rax = reply_payload[0];
     }
 
     // Unblock sender (make it runnable)
@@ -345,10 +349,14 @@ pub fn ipc_reply_with_token(token: CallerToken, reply_payload: [u64; 4]) -> Resu
     reply_msg.sender = current.lock().id;
     reply_msg.msg_id = crate::ipc::next_message_id();
 
-    // Copy reply to sender's buffer
+    // Copy reply to sender's buffer AND set context.rax to the reply value
+    // CRITICAL: When sender resumes from yield, the assembly sets RAX=0.
+    // We need to override this by setting context.rax to the actual reply value.
     {
         let mut sender_lock = sender_task.lock();
         sender_lock.ipc_reply = Some(reply_msg);
+        // Set the return value in sender's context so it resumes with correct RAX
+        sender_lock.context.rax = reply_payload[0];
     }
 
     // Unblock sender (make it runnable)

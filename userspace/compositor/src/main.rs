@@ -24,7 +24,7 @@ use compositor::framebuffer::{FramebufferView, colors};
 use libfolk::sys::ipc::{receive, reply, recv_async, reply_with_token, IpcError};
 use libfolk::sys::boot_info::{get_boot_info, FramebufferConfig, BOOT_INFO_VADDR};
 use libfolk::sys::map_physical::{map_framebuffer, MapFlags};
-use libfolk::sys::{yield_cpu, read_mouse};
+use libfolk::sys::{yield_cpu, read_mouse, read_key};
 use libfolk::sys::io::{write_char, write_str};
 use libfolk::{entry, println};
 
@@ -59,6 +59,15 @@ fn print_signed(n: i32) {
         print_dec((-n) as u32);
     } else {
         print_dec(n as u32);
+    }
+}
+
+/// Convert a nibble (0-15) to a hex digit character
+fn hex_digit(n: u8) -> u8 {
+    match n & 0xF {
+        0..=9 => b'0' + n,
+        10..=15 => b'A' + (n - 10),
+        _ => b'?',
     }
 }
 
@@ -195,6 +204,18 @@ fn main() -> ! {
     // Use simple output to avoid stack-heavy formatting
     write_str("[COMPOSITOR] FB info OK\n");
 
+    // Debug: Print shift values to diagnose color issues
+    write_str("[COMPOSITOR] Shifts: R=");
+    write_char(b'0' + fb_config.red_mask_shift / 10);
+    write_char(b'0' + fb_config.red_mask_shift % 10);
+    write_str(" G=");
+    write_char(b'0' + fb_config.green_mask_shift / 10);
+    write_char(b'0' + fb_config.green_mask_shift % 10);
+    write_str(" B=");
+    write_char(b'0' + fb_config.blue_mask_shift / 10);
+    write_char(b'0' + fb_config.blue_mask_shift % 10);
+    write_str("\n");
+
     // Step 3: Calculate framebuffer size
     let fb_size = (fb_config.pitch as u64) * (fb_config.height as u64);
     write_str("[COMPOSITOR] Mapping FB...");
@@ -279,12 +300,49 @@ fn main() -> ! {
     // Track if cursor has been drawn yet (don't draw until first mouse event)
     let mut cursor_drawn = false;
     let mut last_buttons: u8 = 0;
+    let mut cursor_bg_dirty = false;  // Set when screen content changes under cursor
 
     write_str("[COMPOSITOR] Mouse+IPC ready\n");
 
+    // ===== Phase 7.1: Keyboard input display =====
+    // Text input box configuration - positioned below the First Light box
+    let text_box_x: usize = rect_x;  // Same X as First Light box
+    let text_box_y: usize = rect_y + rect_h + 30;  // 30px below First Light box
+    let text_box_w: usize = rect_w;  // Same width as First Light box
+    let text_box_h: usize = 80;
+    const TEXT_PADDING: usize = 8;
+    const MAX_TEXT_LEN: usize = 256;
+    let chars_per_line: usize = (text_box_w - TEXT_PADDING * 2) / 8;
+
+    // Text buffer for typed input - use static to avoid stack corruption issues
+    static mut TEXT_BUFFER: [u8; 256] = [0; 256];
+    static mut TEXT_LEN: usize = 0;
+
+    // Local references for easier use
+    let text_buffer = unsafe { &mut TEXT_BUFFER };
+    let text_len_ptr = unsafe { &mut TEXT_LEN };
+
+    // Draw text input box
+    let text_box_bg = fb.color_from_rgb24(0x1a1a2e);  // Darker background
+    let text_box_border = folk_accent;
+    fb.fill_rect(text_box_x, text_box_y, text_box_w, text_box_h, text_box_bg);
+    fb.draw_rect(text_box_x, text_box_y, text_box_w, text_box_h, text_box_border);
+
+    // Draw label above box
+    fb.draw_string(text_box_x, text_box_y.saturating_sub(20), "Keyboard Test - Type here:", white, folk_dark);
+
+    // Draw cursor indicator
+    fb.draw_string(text_box_x + TEXT_PADDING, text_box_y + TEXT_PADDING, "_", folk_accent, text_box_bg);
+
+    write_str("[COMPOSITOR] Keyboard ready\n");
+
     loop {
+        // Track if we did any work this iteration
+        let mut did_work = false;
+
         // ===== Process mouse input =====
         while let Some(event) = read_mouse() {
+            did_work = true;
             // Determine cursor color based on button state
             let cursor_fill = match (event.left_button(), event.right_button()) {
                 (true, true) => cursor_magenta,   // Both buttons
@@ -310,10 +368,13 @@ fn main() -> ! {
             let new_x = if new_x < 0 { 0 } else if new_x >= fb.width as i32 { fb.width as i32 - 1 } else { new_x };
             let new_y = if new_y < 0 { 0 } else if new_y >= fb.height as i32 { fb.height as i32 - 1 } else { new_y };
 
-            // Redraw if cursor moved OR button state changed
-            if new_x != cursor_x || new_y != cursor_y || event.buttons != last_buttons {
-                // Restore background at old cursor position
-                fb.restore_rect(cursor_x as usize, cursor_y as usize, CURSOR_W, CURSOR_H, &cursor_bg);
+            // Redraw if cursor moved OR button state changed OR background is dirty
+            if new_x != cursor_x || new_y != cursor_y || event.buttons != last_buttons || cursor_bg_dirty {
+                // Only restore background if it's not dirty (stale)
+                if !cursor_bg_dirty {
+                    fb.restore_rect(cursor_x as usize, cursor_y as usize, CURSOR_W, CURSOR_H, &cursor_bg);
+                }
+                cursor_bg_dirty = false;
 
                 // Update position
                 cursor_x = new_x;
@@ -326,18 +387,115 @@ fn main() -> ! {
             }
         }
 
+        // ===== Process keyboard input =====
+        // First, collect all pending keys without redrawing
+        let mut need_redraw = false;
+        while let Some(key) = read_key() {
+            did_work = true;
+
+            match key {
+                // Backspace - delete last character
+                0x08 | 0x7F => {
+                    if *text_len_ptr > 0 {
+                        *text_len_ptr -= 1;
+                        text_buffer[*text_len_ptr] = 0;
+                        need_redraw = true;
+                    }
+                }
+                // Enter - clear the buffer
+                b'\n' | b'\r' => {
+                    *text_len_ptr = 0;
+                    for i in 0..MAX_TEXT_LEN {
+                        text_buffer[i] = 0;
+                    }
+                    need_redraw = true;
+                }
+                // Escape - clear buffer
+                0x1B => {
+                    *text_len_ptr = 0;
+                    for i in 0..MAX_TEXT_LEN {
+                        text_buffer[i] = 0;
+                    }
+                    need_redraw = true;
+                }
+                // Printable ASCII - add to buffer
+                0x20..=0x7E => {
+                    if *text_len_ptr < MAX_TEXT_LEN - 1 {
+                        text_buffer[*text_len_ptr] = key;
+                        *text_len_ptr += 1;
+                        need_redraw = true;
+                    }
+                }
+                // Ignore other keys
+                _ => {}
+            }
+        }
+
+        // Only redraw once after processing all keys
+        if need_redraw {
+            // Clear text area
+            fb.fill_rect(
+                text_box_x + 2,
+                text_box_y + 2,
+                text_box_w - 4,
+                text_box_h - 4,
+                text_box_bg
+            );
+
+            // Calculate max lines that fit in the box (16px per line)
+            let max_lines = (text_box_h - TEXT_PADDING * 2) / 16;
+
+            // Draw text with line wrapping
+            if *text_len_ptr > 0 {
+                let mut char_idx = 0;
+                let mut line = 0;
+
+                while char_idx < *text_len_ptr && line < max_lines {
+                    // Calculate how many chars to draw on this line
+                    let remaining = *text_len_ptr - char_idx;
+                    let line_chars = if remaining > chars_per_line { chars_per_line } else { remaining };
+
+                    // Draw this line
+                    if let Ok(line_str) = core::str::from_utf8(&text_buffer[char_idx..char_idx + line_chars]) {
+                        let line_y = text_box_y + TEXT_PADDING + (line * 16);
+                        fb.draw_string(text_box_x + TEXT_PADDING, line_y, line_str, white, text_box_bg);
+                    }
+
+                    char_idx += line_chars;
+                    line += 1;
+                }
+            }
+
+            // Draw text cursor (blinking underscore)
+            // Calculate cursor position with wrapping
+            let cursor_line = *text_len_ptr / chars_per_line;
+            let cursor_col = *text_len_ptr % chars_per_line;
+            let max_lines = (text_box_h - TEXT_PADDING * 2) / 16;
+
+            if cursor_line < max_lines {
+                let cursor_x = text_box_x + TEXT_PADDING + (cursor_col * 8);
+                let cursor_y = text_box_y + TEXT_PADDING + (cursor_line * 16);
+                fb.draw_string(cursor_x, cursor_y, "_", folk_accent, text_box_bg);
+            }
+
+            // Mark cursor background as dirty - mouse handler will refresh it
+            cursor_bg_dirty = true;
+        }
+
         // ===== Process IPC messages (non-blocking) =====
-        // Only use non-blocking recv to avoid blocking the mouse input loop
         match recv_async() {
             Ok(msg) => {
+                did_work = true;
                 let response = handle_message(&mut compositor, msg.payload0);
                 let _ = reply_with_token(msg.token, response, 0);
             }
-            Err(IpcError::WouldBlock) => {
-                // No messages - yield briefly then continue polling mouse
-                yield_cpu();
-            }
+            Err(IpcError::WouldBlock) => {}
             Err(_) => {}
+        }
+
+        // Only yield CPU if we did no work this iteration
+        if !did_work {
+            yield_cpu();
         }
     }
 }

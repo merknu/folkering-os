@@ -6,7 +6,7 @@
 use crate::syscall::{
     syscall0, syscall1, syscall2, syscall3,
     SYS_IPC_SEND, SYS_IPC_RECEIVE, SYS_IPC_REPLY,
-    SYS_IPC_RECV_ASYNC, SYS_IPC_REPLY_TOKEN,
+    SYS_IPC_RECV_ASYNC, SYS_IPC_REPLY_TOKEN, SYS_IPC_GET_RECV_PAYLOAD, SYS_IPC_GET_RECV_SENDER,
 };
 
 /// Error codes for IPC operations
@@ -167,21 +167,28 @@ pub struct AsyncIpcMessage {
 /// * `Err(WouldBlock)` - No messages available
 /// * `Err(error)` - Other error
 pub fn recv_async() -> Result<AsyncIpcMessage, IpcError> {
-    let ret = unsafe { syscall0(SYS_IPC_RECV_ASYNC) };
+    // First syscall: get the CallerToken (kernel returns raw token value)
+    let token_raw = unsafe { syscall0(SYS_IPC_RECV_ASYNC) };
 
     // Check for error codes
-    if ret >= 0xFFFF_FFFF_FFFF_FFFC {
+    if token_raw >= 0xFFFF_FFFF_FFFF_FFFC {
         return Err(IpcError::WouldBlock);
     }
 
-    // Success: lower 32 bits = sender, upper 32 bits = payload[0]
-    let sender = (ret & 0xFFFF_FFFF) as u32;
-    let payload0 = ret >> 32;
+    // Second syscall: get the full 64-bit payload[0]
+    let payload0 = unsafe { syscall0(SYS_IPC_GET_RECV_PAYLOAD) };
 
-    // Reconstruct token from sender and message context
-    // Note: The kernel stores the original message; we construct a compatible token
-    // For now, use sender as token basis (kernel will verify properly)
-    let token = CallerToken::from_raw(sender as u64);
+    if payload0 == u64::MAX {
+        // Shouldn't happen if recv_async succeeded, but handle it
+        return Err(IpcError::Unknown);
+    }
+
+    // Third syscall: get the sender
+    let sender_ret = unsafe { syscall0(SYS_IPC_GET_RECV_SENDER) };
+    let sender = if sender_ret == u64::MAX { 0 } else { sender_ret as u32 };
+
+    // Use the actual token from kernel (properly encoded with sender_pid + msg_id)
+    let token = CallerToken::from_raw(token_raw);
 
     Ok(AsyncIpcMessage {
         token,
