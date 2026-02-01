@@ -10,6 +10,7 @@ pub mod system;
 pub mod fs;
 pub mod synapse;
 pub mod compositor;
+pub mod shell;
 pub mod boot_info;
 pub mod map_physical;
 
@@ -35,3 +36,10 @@ pub use boot_info::{get_boot_info, boot_info, FolkeringBootInfo, FramebufferConf
 
 // Re-export physical memory mapping
 pub use map_physical::{map_physical, map_framebuffer, MapFlags, MapError};
+
+// Re-export Shell client
+pub use shell::{
+    SHELL_TASK_ID, ShellError, ShellResult,
+    list_files as shell_list_files, cat_file as shell_cat_file,
+    search as shell_search, ps as shell_ps, get_uptime as shell_uptime,
+};

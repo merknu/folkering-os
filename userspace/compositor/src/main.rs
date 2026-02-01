@@ -21,11 +21,14 @@ extern crate alloc;
 
 use compositor::Compositor;
 use compositor::framebuffer::{FramebufferView, colors};
-use libfolk::sys::ipc::{receive, reply, recv_async, reply_with_token, IpcError};
+use libfolk::sys::ipc::{receive, reply, recv_async, reply_with_token, send, IpcError};
 use libfolk::sys::boot_info::{get_boot_info, FramebufferConfig, BOOT_INFO_VADDR};
 use libfolk::sys::map_physical::{map_framebuffer, MapFlags};
-use libfolk::sys::{yield_cpu, read_mouse, read_key};
+use libfolk::sys::{yield_cpu, read_mouse, read_key, uptime, task_list};
 use libfolk::sys::io::{write_char, write_str};
+use libfolk::sys::shell::{
+    SHELL_TASK_ID, SHELL_OP_LIST_FILES, SHELL_OP_PS, SHELL_OP_UPTIME,
+};
 use libfolk::{entry, println};
 
 // ============================================================================
@@ -69,6 +72,79 @@ fn hex_digit(n: u8) -> u8 {
         10..=15 => b'A' + (n - 10),
         _ => b'?',
     }
+}
+
+/// Format a usize as a decimal string into buffer, return slice
+fn format_usize(n: usize, buf: &mut [u8; 16]) -> &str {
+    if n == 0 {
+        buf[0] = b'0';
+        return unsafe { core::str::from_utf8_unchecked(&buf[..1]) };
+    }
+    let mut val = n;
+    let mut i = 0;
+    // Write digits in reverse
+    while val > 0 && i < 16 {
+        buf[15 - i] = b'0' + (val % 10) as u8;
+        val /= 10;
+        i += 1;
+    }
+    // Copy to start
+    for j in 0..i {
+        buf[j] = buf[16 - i + j];
+    }
+    unsafe { core::str::from_utf8_unchecked(&buf[..i]) }
+}
+
+/// Format uptime in ms as "Xm Ys" or "Xs" string
+fn format_uptime(ms: u64, buf: &mut [u8; 32]) -> &str {
+    let secs = ms / 1000;
+    let mins = secs / 60;
+    let remaining_secs = secs % 60;
+
+    let mut i = 0;
+
+    if mins > 0 {
+        // Format minutes
+        let mut m = mins;
+        let mut digits = [0u8; 10];
+        let mut d = 0;
+        while m > 0 && d < 10 {
+            digits[9 - d] = b'0' + (m % 10) as u8;
+            m /= 10;
+            d += 1;
+        }
+        for j in (10 - d)..10 {
+            buf[i] = digits[j];
+            i += 1;
+        }
+        buf[i] = b'm';
+        i += 1;
+        buf[i] = b' ';
+        i += 1;
+    }
+
+    // Format seconds
+    let mut s = remaining_secs;
+    let mut digits = [0u8; 10];
+    let mut d = 0;
+    if s == 0 {
+        buf[i] = b'0';
+        i += 1;
+    } else {
+        while s > 0 && d < 10 {
+            digits[9 - d] = b'0' + (s % 10) as u8;
+            s /= 10;
+            d += 1;
+        }
+        for j in (10 - d)..10 {
+            buf[i] = digits[j];
+            i += 1;
+        }
+    }
+    buf[i] = b's';
+    i += 1;
+
+    unsafe { core::str::from_utf8_unchecked(&buf[..i]) }
 }
 
 // ============================================================================
@@ -512,16 +588,76 @@ fn main() -> ! {
                         // Header
                         fb.draw_string(results_x + 12, results_y + 12, "Results:", folk_accent, results_bg);
 
-                        if cmd_str.starts_with("calc ") {
+                        if cmd_str == "ls" || cmd_str == "files" {
+                            // List files - send to Shell via IPC
+                            fb.draw_string(results_x + 12, results_y + 36, "Files in ramdisk:", white, results_bg);
+                            let ipc_result = unsafe {
+                                libfolk::syscall::syscall3(
+                                    libfolk::syscall::SYS_IPC_SEND,
+                                    SHELL_TASK_ID as u64,
+                                    SHELL_OP_LIST_FILES,
+                                    0
+                                )
+                            };
+                            if ipc_result != u64::MAX {
+                                let count = (ipc_result >> 32) as usize;
+                                // Format count as string
+                                let mut count_buf = [0u8; 16];
+                                let count_str = format_usize(count, &mut count_buf);
+                                fb.draw_string(results_x + 12, results_y + 56, count_str, folk_accent, results_bg);
+                                fb.draw_string(results_x + 12 + count_str.len() * 8 + 8, results_y + 56, "file(s) found", gray, results_bg);
+                            } else {
+                                fb.draw_string(results_x + 12, results_y + 56, "Shell not responding", gray, results_bg);
+                            }
+                        } else if cmd_str == "ps" || cmd_str == "tasks" {
+                            // Process list
+                            fb.draw_string(results_x + 12, results_y + 36, "Running tasks:", white, results_bg);
+                            let ipc_result = unsafe {
+                                libfolk::syscall::syscall3(
+                                    libfolk::syscall::SYS_IPC_SEND,
+                                    SHELL_TASK_ID as u64,
+                                    SHELL_OP_PS,
+                                    0
+                                )
+                            };
+                            if ipc_result != u64::MAX {
+                                let count = ipc_result as usize;
+                                let mut count_buf = [0u8; 16];
+                                let count_str = format_usize(count, &mut count_buf);
+                                fb.draw_string(results_x + 12, results_y + 56, count_str, folk_accent, results_bg);
+                                fb.draw_string(results_x + 12 + count_str.len() * 8 + 8, results_y + 56, "task(s) running", gray, results_bg);
+                            } else {
+                                fb.draw_string(results_x + 12, results_y + 56, "Shell not responding", gray, results_bg);
+                            }
+                        } else if cmd_str == "uptime" {
+                            // System uptime
+                            fb.draw_string(results_x + 12, results_y + 36, "System uptime:", white, results_bg);
+                            let ipc_result = unsafe {
+                                libfolk::syscall::syscall3(
+                                    libfolk::syscall::SYS_IPC_SEND,
+                                    SHELL_TASK_ID as u64,
+                                    SHELL_OP_UPTIME,
+                                    0
+                                )
+                            };
+                            if ipc_result != u64::MAX {
+                                let ms = ipc_result;
+                                let secs = ms / 1000;
+                                let mins = secs / 60;
+                                let mut buf = [0u8; 32];
+                                let time_str = format_uptime(ms, &mut buf);
+                                fb.draw_string(results_x + 12, results_y + 56, time_str, folk_accent, results_bg);
+                            } else {
+                                fb.draw_string(results_x + 12, results_y + 56, "Shell not responding", gray, results_bg);
+                            }
+                        } else if cmd_str.starts_with("calc ") {
                             // Simple calculator
                             fb.draw_string(results_x + 12, results_y + 36, "Calculator:", white, results_bg);
                             fb.draw_string(results_x + 12, results_y + 56, cmd_str, gray, results_bg);
-                            // TODO: Parse and evaluate expression
                             fb.draw_string(results_x + 12, results_y + 80, "(math evaluation coming soon)", dark_gray, results_bg);
-                        } else if cmd_str.starts_with("find ") {
+                        } else if cmd_str.starts_with("find ") || cmd_str.starts_with("search ") {
                             // Search query
                             fb.draw_string(results_x + 12, results_y + 36, "Searching Synapse...", white, results_bg);
-                            // TODO: Send SYN_OP_VECTOR_SEARCH to Synapse
                             fb.draw_string(results_x + 12, results_y + 56, "(vector search coming soon)", dark_gray, results_bg);
                         } else if cmd_str.starts_with("open ") {
                             // Open app/file
@@ -529,11 +665,16 @@ fn main() -> ! {
                             let app_name = &cmd_str[5..];
                             fb.draw_string(results_x + 12, results_y + 56, app_name, folk_accent, results_bg);
                             fb.draw_string(results_x + 12, results_y + 80, "(app launcher coming soon)", dark_gray, results_bg);
+                        } else if cmd_str == "help" {
+                            // Help command
+                            fb.draw_string(results_x + 12, results_y + 36, "Available commands:", white, results_bg);
+                            fb.draw_string(results_x + 12, results_y + 56, "ls, ps, uptime, help", folk_accent, results_bg);
+                            fb.draw_string(results_x + 12, results_y + 80, "find <query>, calc <expr>, open <app>", gray, results_bg);
                         } else {
-                            // Default: treat as search
-                            fb.draw_string(results_x + 12, results_y + 36, "Query:", white, results_bg);
+                            // Default: show help
+                            fb.draw_string(results_x + 12, results_y + 36, "Unknown command:", white, results_bg);
                             fb.draw_string(results_x + 12, results_y + 56, cmd_str, gray, results_bg);
-                            fb.draw_string(results_x + 12, results_y + 80, "Try: find <query>, calc <expr>, open <app>", dark_gray, results_bg);
+                            fb.draw_string(results_x + 12, results_y + 80, "Type 'help' for available commands", dark_gray, results_bg);
                         }
                     }
                 } else {

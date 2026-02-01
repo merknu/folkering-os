@@ -16,6 +16,13 @@ use libfolk::sys::compositor::{
     role, CompError,
 };
 use libfolk::sys::fs::DirEntry;
+use libfolk::sys::ipc::{recv_async, reply_with_token, IpcError};
+use libfolk::sys::shell::{
+    SHELL_OP_LIST_FILES, SHELL_OP_CAT_FILE, SHELL_OP_SEARCH,
+    SHELL_OP_PS, SHELL_OP_UPTIME, SHELL_OP_EXEC,
+    SHELL_STATUS_OK, SHELL_STATUS_NOT_FOUND, SHELL_STATUS_ERROR,
+    hash_name as shell_hash_name,
+};
 
 /// Embedding size in bytes (384 dimensions × 4 bytes)
 const EMBEDDING_SIZE: usize = 1536;
@@ -51,19 +58,99 @@ fn main() -> ! {
     println!("Folkering Shell v0.1.0 (PID: {})", pid);
     println!("Type 'help' for available commands.\n");
 
-    // NOTE: Keyboard input disabled while compositor handles GUI input
-    // Shell commands can still be run via serial console
-    println!("[SHELL] Keyboard disabled (compositor mode)\n");
+    // Shell now operates as IPC service for compositor
+    println!("[SHELL] Running as IPC service (Task {})", pid);
+    println!("[SHELL] Accepting commands from compositor...\n");
 
     print_prompt();
 
     loop {
-        // In compositor mode, shell doesn't poll keyboard - compositor is primary input handler
-        // match read_key() {
-        //     Some(key) => handle_key(key),
-        //     None => yield_cpu(),
-        // }
-        yield_cpu();
+        // Check for IPC messages from compositor
+        match recv_async() {
+            Ok(msg) => {
+                let response = handle_ipc_command(msg.payload0);
+                let _ = reply_with_token(msg.token, response, 0);
+            }
+            Err(IpcError::WouldBlock) => {
+                // No IPC messages, check for keyboard input (serial console)
+                match read_key() {
+                    Some(key) => handle_key(key),
+                    None => yield_cpu(),
+                }
+            }
+            Err(_) => {
+                yield_cpu();
+            }
+        }
+    }
+}
+
+/// Handle IPC command from compositor or other tasks
+fn handle_ipc_command(payload0: u64) -> u64 {
+    let opcode = payload0 & 0xFF;
+
+    match opcode {
+        x if x == SHELL_OP_LIST_FILES => {
+            // List files - return count
+            let mut entries = [DirEntry {
+                id: 0, entry_type: 0, name: [0u8; 32], size: 0
+            }; 16];
+            let count = libfolk::sys::fs::read_dir(&mut entries);
+            // Return count in upper 32 bits
+            (count as u64) << 32
+        }
+
+        x if x == SHELL_OP_CAT_FILE => {
+            // Cat file by name hash
+            let name_hash = ((payload0 >> 8) & 0xFFFFFFFF) as u32;
+            // Find matching file in ramdisk
+            let mut entries = [DirEntry {
+                id: 0, entry_type: 0, name: [0u8; 32], size: 0
+            }; 16];
+            let count = libfolk::sys::fs::read_dir(&mut entries);
+
+            for i in 0..count {
+                let entry_hash = shell_hash_name(entries[i].name_str());
+                if entry_hash == name_hash {
+                    // Found file - read via Synapse shmem
+                    match read_file_shmem(entries[i].name_str()) {
+                        Ok(resp) => {
+                            // Return size in upper 32 bits, shmem handle in lower
+                            return ((resp.size as u64) << 32) | (resp.shmem_handle as u64);
+                        }
+                        Err(_) => return SHELL_STATUS_NOT_FOUND,
+                    }
+                }
+            }
+            SHELL_STATUS_NOT_FOUND
+        }
+
+        x if x == SHELL_OP_SEARCH => {
+            // Keyword search - for now just return file count
+            // Full implementation would use shared memory for results
+            let mut entries = [DirEntry {
+                id: 0, entry_type: 0, name: [0u8; 32], size: 0
+            }; 16];
+            let count = libfolk::sys::fs::read_dir(&mut entries);
+            // Return count (no shmem yet)
+            (count as u64) << 32
+        }
+
+        x if x == SHELL_OP_PS => {
+            // Process list
+            let count = task_list();
+            count as u64
+        }
+
+        x if x == SHELL_OP_UPTIME => {
+            // System uptime
+            uptime()
+        }
+
+        _ => {
+            // Unknown opcode
+            SHELL_STATUS_ERROR
+        }
     }
 }
 
