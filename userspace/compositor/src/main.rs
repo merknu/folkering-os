@@ -237,43 +237,57 @@ fn main() -> ! {
         FramebufferView::new(FRAMEBUFFER_VADDR as *mut u8, fb_config)
     };
 
-    // ===== FIRST LIGHT TEST =====
-    // Fill screen with Folkering blue as proof of life
+    // ===== NEURAL DESKTOP =====
+    // AI-native interface with Omnibar at center
     let folk_blue = fb.color_from_rgb24(colors::FOLK_BLUE);
     let folk_dark = fb.color_from_rgb24(colors::FOLK_DARK);
     let white = fb.color_from_rgb24(colors::WHITE);
     let folk_accent = fb.color_from_rgb24(colors::FOLK_ACCENT);
+    let gray = fb.color_from_rgb24(0x666666);
+    let dark_gray = fb.color_from_rgb24(0x333333);
 
     // Clear to dark background
     fb.clear(folk_dark);
 
-    // Draw a centered rectangle
-    let rect_w = 400;
-    let rect_h = 200;
-    let rect_x = (fb.width.saturating_sub(rect_w)) / 2;
-    let rect_y = (fb.height.saturating_sub(rect_h)) / 2;
-    fb.fill_rect(rect_x, rect_y, rect_w, rect_h, folk_blue);
+    // ===== Title at top =====
+    let title = "FOLKERING OS";
+    let title_x = (fb.width.saturating_sub(title.len() * 8)) / 2;
+    fb.draw_string(title_x, 40, title, folk_accent, folk_dark);
 
-    // Draw border
-    fb.draw_rect(rect_x, rect_y, rect_w, rect_h, folk_accent);
+    let subtitle = "Neural Desktop";
+    let sub_x = (fb.width.saturating_sub(subtitle.len() * 8)) / 2;
+    fb.draw_string(sub_x, 60, subtitle, gray, folk_dark);
 
-    // Draw "First Light" text
-    let title = "Folkering OS - First Light";
-    let title_x = rect_x + (rect_w.saturating_sub(title.len() * 8)) / 2;
-    let title_y = rect_y + 40;
-    fb.draw_string(title_x, title_y, title, white, folk_blue);
+    // ===== Omnibar (centered, near bottom) =====
+    let omnibar_w: usize = 500;
+    let omnibar_h: usize = 40;
+    let omnibar_x = (fb.width.saturating_sub(omnibar_w)) / 2;
+    let omnibar_y = fb.height - 120;
 
-    let subtitle = "Phase 6.2 Complete";
-    let sub_x = rect_x + (rect_w.saturating_sub(subtitle.len() * 8)) / 2;
-    let sub_y = rect_y + 80;
-    fb.draw_string(sub_x, sub_y, subtitle, folk_accent, folk_blue);
+    // Omnibar colors
+    let omnibar_bg = fb.color_from_rgb24(0x1a1a2e);
+    let omnibar_border = folk_accent;
 
-    let info = "Semantic Mirror Active";
-    let info_x = rect_x + (rect_w.saturating_sub(info.len() * 8)) / 2;
-    let info_y = rect_y + 120;
-    fb.draw_string(info_x, info_y, info, white, folk_blue);
+    // Draw the omnibar immediately (visible by default)
+    fb.fill_rect(omnibar_x.saturating_sub(2), omnibar_y.saturating_sub(2), omnibar_w + 4, omnibar_h + 4, dark_gray);
+    fb.fill_rect(omnibar_x, omnibar_y, omnibar_w, omnibar_h, omnibar_bg);
+    fb.draw_rect(omnibar_x, omnibar_y, omnibar_w, omnibar_h, omnibar_border);
+    fb.draw_string(omnibar_x + 12, omnibar_y + 12, "Type here...", gray, omnibar_bg);
+    fb.draw_string(omnibar_x + omnibar_w - 24, omnibar_y + 12, ">", folk_accent, omnibar_bg);
 
-    write_str("[COMPOSITOR] *** FIRST LIGHT ***\n");
+    // Hint text below omnibar
+    let hint = "Type and press Enter | ESC to clear";
+    let hint_x = (fb.width.saturating_sub(hint.len() * 8)) / 2;
+    fb.draw_string(hint_x, omnibar_y + omnibar_h + 16, hint, dark_gray, folk_dark);
+
+    // ===== Results area (above omnibar, initially hidden) =====
+    // We'll draw this when there are search results
+    let results_w: usize = omnibar_w;
+    let results_h: usize = 160;
+    let results_x = omnibar_x;
+    let results_y = omnibar_y - results_h - 10;
+
+    write_str("[COMPOSITOR] *** NEURAL DESKTOP ***\n");
 
     // ===== Continue with normal operation =====
     let mut compositor = Compositor::new();
@@ -304,44 +318,43 @@ fn main() -> ! {
 
     write_str("[COMPOSITOR] Mouse+IPC ready\n");
 
-    // ===== Phase 7.1: Keyboard input display =====
-    // Text input box configuration - positioned below the First Light box
-    let text_box_x: usize = rect_x;  // Same X as First Light box
-    let text_box_y: usize = rect_y + rect_h + 30;  // 30px below First Light box
-    let text_box_w: usize = rect_w;  // Same width as First Light box
-    let text_box_h: usize = 80;
-    const TEXT_PADDING: usize = 8;
+    // ===== Omnibar Input Configuration =====
+    // Use omnibar dimensions for text input
+    let text_box_x: usize = omnibar_x;
+    let text_box_y: usize = omnibar_y;
+    let text_box_w: usize = omnibar_w;
+    let text_box_h: usize = omnibar_h;
+    const TEXT_PADDING: usize = 12;
     const MAX_TEXT_LEN: usize = 256;
-    let chars_per_line: usize = (text_box_w - TEXT_PADDING * 2) / 8;
+    let chars_per_line: usize = (text_box_w - TEXT_PADDING * 2 - 24) / 8;  // -24 for the ">" icon
 
-    // Text buffer for typed input - use static to avoid stack corruption issues
-    static mut TEXT_BUFFER: [u8; 256] = [0; 256];
-    static mut TEXT_LEN: usize = 0;
+    // Text buffer for typed input - use local stack variables
+    // (Previous static mut caused undefined behavior)
+    let mut text_buffer: [u8; 256] = [0; 256];
+    let mut text_len: usize = 0;
+    let mut show_results: bool = false;
+    let mut omnibar_visible: bool = true;  // Start VISIBLE by default
 
-    // Local references for easier use
-    let text_buffer = unsafe { &mut TEXT_BUFFER };
-    let text_len_ptr = unsafe { &mut TEXT_LEN };
+    // Colors for omnibar
+    let text_box_bg = omnibar_bg;
 
-    // Draw text input box
-    let text_box_bg = fb.color_from_rgb24(0x1a1a2e);  // Darker background
-    let text_box_border = folk_accent;
-    fb.fill_rect(text_box_x, text_box_y, text_box_w, text_box_h, text_box_bg);
-    fb.draw_rect(text_box_x, text_box_y, text_box_w, text_box_h, text_box_border);
+    write_str("[COMPOSITOR] Omnibar ready\n");
 
-    // Draw label above box
-    fb.draw_string(text_box_x, text_box_y.saturating_sub(20), "Keyboard Test - Type here:", white, folk_dark);
+    write_str("[COMPOSITOR] Entering main loop...\n");
 
-    // Draw cursor indicator
-    fb.draw_string(text_box_x + TEXT_PADDING, text_box_y + TEXT_PADDING, "_", folk_accent, text_box_bg);
-
-    write_str("[COMPOSITOR] Keyboard ready\n");
-
+    let mut loop_count: u32 = 0;
     loop {
+        if loop_count < 3 {
+            write_str("[LOOP]");
+            loop_count += 1;
+        }
         // Track if we did any work this iteration
         let mut did_work = false;
 
         // ===== Process mouse input =====
+        write_str("M");
         while let Some(event) = read_mouse() {
+            write_str("!");
             did_work = true;
             // Determine cursor color based on button state
             let cursor_fill = match (event.left_button(), event.right_button()) {
@@ -389,93 +402,157 @@ fn main() -> ! {
 
         // ===== Process keyboard input =====
         // First, collect all pending keys without redrawing
+        write_str("K");
         let mut need_redraw = false;
+        let mut execute_command = false;
         while let Some(key) = read_key() {
+            write_str("!");
             did_work = true;
 
             match key {
                 // Backspace - delete last character
                 0x08 | 0x7F => {
-                    if *text_len_ptr > 0 {
-                        *text_len_ptr -= 1;
-                        text_buffer[*text_len_ptr] = 0;
+                    if text_len > 0 {
+                        text_len -= 1;
+                        text_buffer[text_len] = 0;
                         need_redraw = true;
+                        show_results = false;  // Hide results when typing
                     }
                 }
-                // Enter - clear the buffer
+                // Enter - execute command/search
                 b'\n' | b'\r' => {
-                    *text_len_ptr = 0;
-                    for i in 0..MAX_TEXT_LEN {
-                        text_buffer[i] = 0;
-                    }
-                    need_redraw = true;
-                }
-                // Escape - clear buffer
-                0x1B => {
-                    *text_len_ptr = 0;
-                    for i in 0..MAX_TEXT_LEN {
-                        text_buffer[i] = 0;
-                    }
-                    need_redraw = true;
-                }
-                // Printable ASCII - add to buffer
-                0x20..=0x7E => {
-                    if *text_len_ptr < MAX_TEXT_LEN - 1 {
-                        text_buffer[*text_len_ptr] = key;
-                        *text_len_ptr += 1;
+                    if text_len > 0 {
+                        execute_command = true;
+                        show_results = true;
                         need_redraw = true;
                     }
                 }
-                // Ignore other keys
+                // Escape - toggle omnibar visibility / clear buffer
+                0x1B => {
+                    if show_results {
+                        // If results showing, just hide them
+                        show_results = false;
+                        need_redraw = true;
+                    } else if text_len > 0 {
+                        // If text entered, clear it
+                        text_len = 0;
+                        for i in 0..MAX_TEXT_LEN {
+                            text_buffer[i] = 0;
+                        }
+                        need_redraw = true;
+                    } else {
+                        // Toggle omnibar visibility
+                        omnibar_visible = !omnibar_visible;
+                        need_redraw = true;
+                    }
+                }
+                // Printable ASCII - add to buffer (always, since omnibar always visible now)
+                0x20..=0x7E => {
+                    if text_len < MAX_TEXT_LEN - 1 {
+                        text_buffer[text_len] = key;
+                        text_len += 1;
+                        need_redraw = true;
+                        show_results = false;  // Hide results when typing
+                    }
+                }
+                // Ignore other keys (including Windows key for now)
                 _ => {}
             }
         }
 
         // Only redraw once after processing all keys
+        write_str("R");
         if need_redraw {
-            // Clear text area
-            fb.fill_rect(
-                text_box_x + 2,
-                text_box_y + 2,
-                text_box_w - 4,
-                text_box_h - 4,
-                text_box_bg
-            );
+            write_str("!");
+            if omnibar_visible {
+                // ===== Draw Omnibar =====
+                // Outer glow (subtle)
+                fb.fill_rect(text_box_x - 2, text_box_y - 2, text_box_w + 4, text_box_h + 4, dark_gray);
+                // Main box
+                fb.fill_rect(text_box_x, text_box_y, text_box_w, text_box_h, text_box_bg);
+                fb.draw_rect(text_box_x, text_box_y, text_box_w, text_box_h, omnibar_border);
 
-            // Calculate max lines that fit in the box (16px per line)
-            let max_lines = (text_box_h - TEXT_PADDING * 2) / 16;
-
-            // Draw text with line wrapping
-            if *text_len_ptr > 0 {
-                let mut char_idx = 0;
-                let mut line = 0;
-
-                while char_idx < *text_len_ptr && line < max_lines {
-                    // Calculate how many chars to draw on this line
-                    let remaining = *text_len_ptr - char_idx;
-                    let line_chars = if remaining > chars_per_line { chars_per_line } else { remaining };
-
-                    // Draw this line
-                    if let Ok(line_str) = core::str::from_utf8(&text_buffer[char_idx..char_idx + line_chars]) {
-                        let line_y = text_box_y + TEXT_PADDING + (line * 16);
-                        fb.draw_string(text_box_x + TEXT_PADDING, line_y, line_str, white, text_box_bg);
+                // Draw user input text (single line for omnibar)
+                if text_len > 0 {
+                    if let Ok(_input_str) = core::str::from_utf8(&text_buffer[..text_len]) {
+                        // Truncate if too long
+                        let display_len = if text_len > chars_per_line { chars_per_line } else { text_len };
+                        if let Ok(display_str) = core::str::from_utf8(&text_buffer[..display_len]) {
+                            fb.draw_string(text_box_x + TEXT_PADDING, text_box_y + 12, display_str, white, text_box_bg);
+                        }
                     }
-
-                    char_idx += line_chars;
-                    line += 1;
+                } else {
+                    // Show placeholder when empty
+                    fb.draw_string(text_box_x + TEXT_PADDING, text_box_y + 12, "Ask anything...", gray, text_box_bg);
                 }
-            }
 
-            // Draw text cursor (blinking underscore)
-            // Calculate cursor position with wrapping
-            let cursor_line = *text_len_ptr / chars_per_line;
-            let cursor_col = *text_len_ptr % chars_per_line;
-            let max_lines = (text_box_h - TEXT_PADDING * 2) / 16;
+                // Draw cursor after text
+                let cursor_x_pos = text_box_x + TEXT_PADDING + (text_len * 8);
+                if cursor_x_pos < text_box_x + text_box_w - 30 {
+                    fb.draw_string(cursor_x_pos, text_box_y + 12, "_", folk_accent, text_box_bg);
+                }
 
-            if cursor_line < max_lines {
-                let cursor_x = text_box_x + TEXT_PADDING + (cursor_col * 8);
-                let cursor_y = text_box_y + TEXT_PADDING + (cursor_line * 16);
-                fb.draw_string(cursor_x, cursor_y, "_", folk_accent, text_box_bg);
+                // Draw ">" icon on right
+                fb.draw_string(text_box_x + text_box_w - 24, text_box_y + 12, ">", folk_accent, text_box_bg);
+
+                // Context hints below omnibar
+                let hint = "find <query> | calc <expr> | open <app>";
+                let hint_x = (fb.width.saturating_sub(hint.len() * 8)) / 2;
+                fb.draw_string(hint_x, text_box_y + text_box_h + 16, hint, dark_gray, folk_dark);
+
+                // ===== Results Panel =====
+                if show_results && text_len > 0 {
+                    // Draw results box above omnibar
+                    let results_bg = fb.color_from_rgb24(0x252540);
+                    fb.fill_rect(results_x, results_y, results_w, results_h, results_bg);
+                    fb.draw_rect(results_x, results_y, results_w, results_h, folk_accent);
+
+                    // Parse command and show appropriate results
+                    if let Ok(cmd_str) = core::str::from_utf8(&text_buffer[..text_len]) {
+                        // Header
+                        fb.draw_string(results_x + 12, results_y + 12, "Results:", folk_accent, results_bg);
+
+                        if cmd_str.starts_with("calc ") {
+                            // Simple calculator
+                            fb.draw_string(results_x + 12, results_y + 36, "Calculator:", white, results_bg);
+                            fb.draw_string(results_x + 12, results_y + 56, cmd_str, gray, results_bg);
+                            // TODO: Parse and evaluate expression
+                            fb.draw_string(results_x + 12, results_y + 80, "(math evaluation coming soon)", dark_gray, results_bg);
+                        } else if cmd_str.starts_with("find ") {
+                            // Search query
+                            fb.draw_string(results_x + 12, results_y + 36, "Searching Synapse...", white, results_bg);
+                            // TODO: Send SYN_OP_VECTOR_SEARCH to Synapse
+                            fb.draw_string(results_x + 12, results_y + 56, "(vector search coming soon)", dark_gray, results_bg);
+                        } else if cmd_str.starts_with("open ") {
+                            // Open app/file
+                            fb.draw_string(results_x + 12, results_y + 36, "Opening:", white, results_bg);
+                            let app_name = &cmd_str[5..];
+                            fb.draw_string(results_x + 12, results_y + 56, app_name, folk_accent, results_bg);
+                            fb.draw_string(results_x + 12, results_y + 80, "(app launcher coming soon)", dark_gray, results_bg);
+                        } else {
+                            // Default: treat as search
+                            fb.draw_string(results_x + 12, results_y + 36, "Query:", white, results_bg);
+                            fb.draw_string(results_x + 12, results_y + 56, cmd_str, gray, results_bg);
+                            fb.draw_string(results_x + 12, results_y + 80, "Try: find <query>, calc <expr>, open <app>", dark_gray, results_bg);
+                        }
+                    }
+                } else {
+                    // Clear results area when no results to show
+                    fb.fill_rect(results_x, results_y, results_w, results_h, folk_dark);
+                }
+            } else {
+                // ===== Omnibar hidden - clear the area =====
+                // Clear omnibar area
+                fb.fill_rect(text_box_x - 2, text_box_y - 2, text_box_w + 4, text_box_h + 4, folk_dark);
+                // Clear results area
+                fb.fill_rect(results_x, results_y, results_w, results_h, folk_dark);
+                // Clear hint area below omnibar position
+                fb.fill_rect(0, text_box_y + text_box_h + 8, fb.width, 24, folk_dark);
+
+                // Show hint to open omnibar
+                let hint = "Press Windows/Super key to open Omnibar";
+                let hint_x = (fb.width.saturating_sub(hint.len() * 8)) / 2;
+                fb.draw_string(hint_x, fb.height - 50, hint, dark_gray, folk_dark);
             }
 
             // Mark cursor background as dirty - mouse handler will refresh it
@@ -483,6 +560,7 @@ fn main() -> ! {
         }
 
         // ===== Process IPC messages (non-blocking) =====
+        write_str("I");
         match recv_async() {
             Ok(msg) => {
                 did_work = true;
@@ -494,6 +572,7 @@ fn main() -> ! {
         }
 
         // Only yield CPU if we did no work this iteration
+        write_str("Y");
         if !did_work {
             yield_cpu();
         }

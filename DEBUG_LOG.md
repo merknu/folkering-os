@@ -63,6 +63,24 @@ Moved `text_buffer` and `text_len` from stack to static memory:
 
 ---
 
+## Session 2026-02-01 (Omnibar Toggle with Windows Key)
+
+### Feature: Neural Desktop with Toggleable Omnibar
+
+**Implemented:**
+- Extended scancode handling in keyboard driver (0xE0 prefix)
+- Windows/Super key (0xE0 0x5B) now detected and emits key code 0xE5
+- Omnibar starts hidden by default
+- Windows key toggles omnibar visibility
+- Escape closes omnibar and clears input
+- Hint text shown when omnibar is hidden
+
+**Files Changed:**
+- `kernel/src/drivers/keyboard.rs` - Extended scancode support
+- `userspace/compositor/src/main.rs` - Toggleable omnibar
+
+---
+
 ## Session 2026-02-01 (Color Fix)
 
 ### Problem

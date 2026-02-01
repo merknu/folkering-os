@@ -70,6 +70,9 @@ static SHIFT_PRESSED: AtomicBool = AtomicBool::new(false);
 /// Caps lock state
 static CAPS_LOCK: AtomicBool = AtomicBool::new(false);
 
+/// Extended scancode prefix received (0xE0)
+static EXTENDED_PREFIX: AtomicBool = AtomicBool::new(false);
+
 /// US keyboard scancode set 1 to ASCII mapping
 const SCANCODE_TO_ASCII: [u8; 128] = [
     0, 27, b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8',    // 0-9
@@ -118,6 +121,18 @@ const SCANCODE_ESCAPE: u8 = 0x01;
 const SCANCODE_BACKSPACE: u8 = 0x0E;
 const SCANCODE_ENTER: u8 = 0x1C;
 
+/// Extended scancode prefix
+const SCANCODE_EXTENDED: u8 = 0xE0;
+
+/// Extended key scancodes (after 0xE0 prefix)
+const EXT_LEFT_WINDOWS: u8 = 0x5B;
+const EXT_RIGHT_WINDOWS: u8 = 0x5C;
+
+/// Special key codes we emit (outside normal ASCII, userspace can detect these)
+/// These are NOT scancodes - they are our own key codes
+pub const KEY_LEFT_WINDOWS: u8 = 0xE5;
+pub const KEY_RIGHT_WINDOWS: u8 = 0xE6;
+
 /// Initialize keyboard driver
 pub fn init() {
     unsafe {
@@ -139,11 +154,16 @@ pub fn init() {
 
 /// Handle keyboard interrupt (called from IDT handler)
 pub fn handle_interrupt() {
+    crate::serial_str!("[IRQ1]");
+
     // Always read scancode from port 0x60 to clear the keyboard controller
     let scancode = unsafe {
         let mut data_port = Port::<u8>::new(KEYBOARD_DATA_PORT);
         data_port.read()
     };
+    crate::serial_str!("[SC:");
+    crate::drivers::serial::write_hex(scancode as u64);
+    crate::serial_str!("]");
 
     // Send EOI to PIC (IRQ1 is on PIC1)
     crate::arch::x86_64::pic::send_eoi(1);
@@ -155,7 +175,22 @@ pub fn handle_interrupt() {
         return;
     }
 
-    // Handle key release (bit 7 set)
+    // Check if this is the extended prefix (0xE0)
+    // Just ignore extended scancodes for now - they can cause issues
+    if scancode == SCANCODE_EXTENDED {
+        EXTENDED_PREFIX.store(true, Ordering::Relaxed);
+        return;
+    }
+
+    // Check if we're in an extended sequence - just ignore
+    let is_extended = EXTENDED_PREFIX.load(Ordering::Relaxed);
+    if is_extended {
+        EXTENDED_PREFIX.store(false, Ordering::Relaxed);
+        // Ignore extended keys for now
+        return;
+    }
+
+    // Handle key release (bit 7 set) for non-extended keys
     if scancode & 0x80 != 0 {
         let released = scancode & 0x7F;
         if released == SCANCODE_LSHIFT || released == SCANCODE_RSHIFT {
@@ -183,9 +218,9 @@ pub fn handle_interrupt() {
     let caps = CAPS_LOCK.load(Ordering::Relaxed);
 
     let ascii = if shift {
-        unsafe { SCANCODE_TO_ASCII_SHIFT[scancode as usize] }
+        SCANCODE_TO_ASCII_SHIFT[scancode as usize]
     } else {
-        unsafe { SCANCODE_TO_ASCII[scancode as usize] }
+        SCANCODE_TO_ASCII[scancode as usize]
     };
 
     // Apply caps lock (only affects a-z)
@@ -199,6 +234,9 @@ pub fn handle_interrupt() {
 
     // Push to buffer if valid
     if ascii != 0 {
+        crate::serial_str!("[K:");
+        crate::drivers::serial::write_byte(ascii);
+        crate::serial_str!("]");
         KEY_BUFFER.lock().push(ascii);
     }
 }

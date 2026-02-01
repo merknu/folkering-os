@@ -98,5 +98,6 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
 
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
     // Handle keyboard interrupt
+    crate::serial_str!("[IDT33]");
     crate::drivers::keyboard::handle_interrupt();
 }
