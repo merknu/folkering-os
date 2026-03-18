@@ -25,10 +25,11 @@ use compositor::window_manager::{WindowManager, HitZone};
 use libfolk::sys::ipc::{receive, reply, recv_async, reply_with_token, send, IpcError};
 use libfolk::sys::boot_info::{get_boot_info, FramebufferConfig, BOOT_INFO_VADDR};
 use libfolk::sys::map_physical::{map_framebuffer, MapFlags};
-use libfolk::sys::{yield_cpu, read_mouse, read_key, uptime, shmem_map, shmem_unmap, shmem_destroy};
+use libfolk::sys::{yield_cpu, read_mouse, read_key, uptime, shmem_create, shmem_map, shmem_unmap, shmem_destroy, shmem_grant};
 use libfolk::sys::io::{write_char, write_str};
 use libfolk::sys::shell::{
-    SHELL_TASK_ID, SHELL_OP_LIST_FILES, SHELL_OP_CAT_FILE, SHELL_OP_PS, SHELL_OP_UPTIME,
+    SHELL_TASK_ID, SHELL_OP_LIST_FILES, SHELL_OP_CAT_FILE, SHELL_OP_SEARCH,
+    SHELL_OP_PS, SHELL_OP_UPTIME,
     SHELL_STATUS_NOT_FOUND, hash_name as shell_hash_name,
 };
 use libfolk::{entry, println};
@@ -954,8 +955,116 @@ fn main() -> ! {
                         win.push_line("Commands: ls, cat, ps, uptime");
                         win.push_line("find <q>, calc <e>, open <a>");
                         win.push_line("Windows: drag title, click X");
-                    } else if cmd_str.starts_with("find ") {
-                        win.push_line("Vector search: coming soon");
+                    } else if cmd_str.starts_with("find ") || cmd_str.starts_with("search ") {
+                        let query = if cmd_str.starts_with("find ") {
+                            cmd_str[5..].trim()
+                        } else {
+                            cmd_str[7..].trim()
+                        };
+                        if query.is_empty() {
+                            win.push_line("usage: find <query>");
+                        } else {
+                            win.push_line("Searching Synapse...");
+                            // Create shmem with query string
+                            let query_bytes = query.as_bytes();
+                            let query_len = query_bytes.len().min(63);
+                            if let Ok(query_handle) = shmem_create(64) {
+                                // Grant broadly
+                                for tid in 2..=8 {
+                                    let _ = shmem_grant(query_handle, tid);
+                                }
+                                if shmem_map(query_handle, COMPOSITOR_SHMEM_VADDR).is_ok() {
+                                    let buf = unsafe {
+                                        core::slice::from_raw_parts_mut(COMPOSITOR_SHMEM_VADDR as *mut u8, 64)
+                                    };
+                                    buf[..query_len].copy_from_slice(&query_bytes[..query_len]);
+                                    buf[query_len] = 0; // null terminate
+                                    let _ = shmem_unmap(query_handle, COMPOSITOR_SHMEM_VADDR);
+                                }
+
+                                // Send to Shell: SHELL_OP_SEARCH | (query_handle << 8) | (query_len << 40)
+                                let shell_req = SHELL_OP_SEARCH
+                                    | ((query_handle as u64) << 8)
+                                    | ((query_len as u64) << 40);
+                                let ipc_result = unsafe {
+                                    libfolk::syscall::syscall3(
+                                        libfolk::syscall::SYS_IPC_SEND,
+                                        SHELL_TASK_ID as u64, shell_req, 0
+                                    )
+                                };
+
+                                // Cleanup query shmem
+                                let _ = shmem_destroy(query_handle);
+
+                                if ipc_result != u64::MAX && ipc_result != 0 {
+                                    let count = (ipc_result >> 32) as usize;
+                                    let results_handle = (ipc_result & 0xFFFFFFFF) as u32;
+
+                                    if results_handle != 0 && count > 0 {
+                                        win.push_line("");
+                                        let mut match_buf = [0u8; 40];
+                                        let prefix = b"Matches: ";
+                                        match_buf[..prefix.len()].copy_from_slice(prefix);
+                                        let mut num_buf = [0u8; 16];
+                                        let num_str = format_usize(count, &mut num_buf);
+                                        let nlen = num_str.len();
+                                        match_buf[prefix.len()..prefix.len()+nlen]
+                                            .copy_from_slice(num_str.as_bytes());
+                                        if let Ok(s) = core::str::from_utf8(&match_buf[..prefix.len()+nlen]) {
+                                            win.push_line(s);
+                                        }
+
+                                        // Read results from shmem
+                                        if shmem_map(results_handle, COMPOSITOR_SHMEM_VADDR).is_ok() {
+                                            let buf = unsafe {
+                                                core::slice::from_raw_parts(
+                                                    COMPOSITOR_SHMEM_VADDR as *const u8, count * 32
+                                                )
+                                            };
+                                            for i in 0..count.min(10) {
+                                                let offset = i * 32;
+                                                let name_end = buf[offset..offset+24].iter()
+                                                    .position(|&b| b == 0).unwrap_or(24);
+                                                let name = unsafe {
+                                                    core::str::from_utf8_unchecked(
+                                                        &buf[offset..offset+name_end]
+                                                    )
+                                                };
+                                                let size = u32::from_le_bytes([
+                                                    buf[offset+24], buf[offset+25],
+                                                    buf[offset+26], buf[offset+27]
+                                                ]) as usize;
+                                                // Format: "  synapse (30774 bytes)"
+                                                let mut line = [0u8; 64];
+                                                line[0] = b' '; line[1] = b' ';
+                                                let nlen2 = name.len().min(30);
+                                                line[2..2+nlen2].copy_from_slice(&name.as_bytes()[..nlen2]);
+                                                let mut size_buf2 = [0u8; 16];
+                                                let size_str = format_usize(size, &mut size_buf2);
+                                                let slen = size_str.len();
+                                                line[2+nlen2] = b' ';
+                                                line[3+nlen2] = b'(';
+                                                line[4+nlen2..4+nlen2+slen]
+                                                    .copy_from_slice(size_str.as_bytes());
+                                                let suffix = b" bytes)";
+                                                line[4+nlen2+slen..4+nlen2+slen+suffix.len()]
+                                                    .copy_from_slice(suffix);
+                                                let total = 4 + nlen2 + slen + suffix.len();
+                                                if let Ok(s) = core::str::from_utf8(&line[..total]) {
+                                                    win.push_line(s);
+                                                }
+                                            }
+                                            let _ = shmem_unmap(results_handle, COMPOSITOR_SHMEM_VADDR);
+                                            let _ = shmem_destroy(results_handle);
+                                        }
+                                    } else {
+                                        win.push_line("No matches found");
+                                    }
+                                } else {
+                                    win.push_line("No matches found");
+                                }
+                            }
+                        }
                     } else if cmd_str.starts_with("calc ") {
                         win.push_line("Calculator: coming soon");
                     } else {
@@ -1042,9 +1151,9 @@ fn main() -> ! {
                             fb.draw_string(results_x + 12, results_y + 56, cmd_str, gray, results_bg);
                             fb.draw_string(results_x + 12, results_y + 80, "(math evaluation coming soon)", dark_gray, results_bg);
                         } else if cmd_str.starts_with("find ") || cmd_str.starts_with("search ") {
-                            // Search query
-                            fb.draw_string(results_x + 12, results_y + 36, "Searching Synapse...", white, results_bg);
-                            fb.draw_string(results_x + 12, results_y + 56, "(vector search coming soon)", dark_gray, results_bg);
+                            // Search query preview
+                            fb.draw_string(results_x + 12, results_y + 36, "Search Synapse", white, results_bg);
+                            fb.draw_string(results_x + 12, results_y + 56, "Press Enter to search", gray, results_bg);
                         } else if cmd_str.starts_with("open ") {
                             // Open app/file
                             fb.draw_string(results_x + 12, results_y + 36, "Opening:", white, results_bg);

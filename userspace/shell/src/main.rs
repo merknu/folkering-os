@@ -36,6 +36,24 @@ const CMD_BUFFER_SIZE: usize = 256;
 static mut CMD_BUFFER: [u8; CMD_BUFFER_SIZE] = [0u8; CMD_BUFFER_SIZE];
 static mut CMD_LEN: usize = 0;
 
+/// Case-insensitive substring match (no_std)
+fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() { return true; }
+    if needle.len() > haystack.len() { return false; }
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    for i in 0..=(h.len() - n.len()) {
+        let mut matched = true;
+        for j in 0..n.len() {
+            let a = if h[i+j] >= b'A' && h[i+j] <= b'Z' { h[i+j] + 32 } else { h[i+j] };
+            let b = if n[j] >= b'A' && n[j] <= b'Z' { n[j] + 32 } else { n[j] };
+            if a != b { matched = false; break; }
+        }
+        if matched { return true; }
+    }
+    false
+}
+
 // Helper functions for volatile access to prevent compiler optimizations
 fn get_cmd_len() -> usize {
     unsafe { core::ptr::read_volatile(&CMD_LEN) }
@@ -132,14 +150,114 @@ fn handle_ipc_command(payload0: u64) -> u64 {
         }
 
         x if x == SHELL_OP_SEARCH => {
-            // Keyword search - for now just return file count
-            // Full implementation would use shared memory for results
-            let mut entries = [DirEntry {
-                id: 0, entry_type: 0, name: [0u8; 32], size: 0
-            }; 16];
-            let count = libfolk::sys::fs::read_dir(&mut entries);
-            // Return count (no shmem yet)
-            (count as u64) << 32
+            // Semantic search — query string in shmem from compositor
+            let query_handle = ((payload0 >> 8) & 0xFFFFFFFF) as u32;
+            let query_len = ((payload0 >> 40) & 0xFF) as usize;
+
+            if query_handle == 0 || query_len == 0 {
+                return 0;
+            }
+
+            // Map query shmem to read the search string
+            let mut query_buf = [0u8; 64];
+            if shmem_map(query_handle, SHELL_SHMEM_VADDR).is_ok() {
+                let src = unsafe {
+                    core::slice::from_raw_parts(SHELL_SHMEM_VADDR as *const u8, query_len.min(63))
+                };
+                query_buf[..src.len()].copy_from_slice(src);
+                let _ = shmem_unmap(query_handle, SHELL_SHMEM_VADDR);
+            } else {
+                return 0;
+            }
+            let query_str = unsafe {
+                core::str::from_utf8_unchecked(&query_buf[..query_len.min(63)])
+            };
+
+            // Get file list from Synapse
+            let syn_result = unsafe {
+                libfolk::syscall::syscall3(
+                    libfolk::syscall::SYS_IPC_SEND,
+                    SYNAPSE_TASK_ID as u64,
+                    libfolk::sys::synapse::SYN_OP_LIST_FILES,
+                    0
+                )
+            };
+            if syn_result == u64::MAX {
+                return 0;
+            }
+            let file_count = (syn_result >> 32) as usize;
+            let files_handle = (syn_result & 0xFFFFFFFF) as u32;
+            if files_handle == 0 || file_count == 0 {
+                return 0;
+            }
+
+            // Map file list shmem and do substring match
+            if shmem_map(files_handle, SHELL_SHMEM_VADDR).is_err() {
+                let _ = shmem_destroy(files_handle);
+                return 0;
+            }
+            let file_buf = unsafe {
+                core::slice::from_raw_parts(SHELL_SHMEM_VADDR as *const u8, file_count * 32)
+            };
+
+            // Collect matching entries (max 10)
+            let mut matches: [([u8; 24], u32, u32); 10] = [([0u8; 24], 0, 0); 10];
+            let mut match_count = 0;
+
+            for i in 0..file_count {
+                if match_count >= 10 { break; }
+                let offset = i * 32;
+                let name_end = file_buf[offset..offset+24].iter()
+                    .position(|&b| b == 0).unwrap_or(24);
+                let name = unsafe {
+                    core::str::from_utf8_unchecked(&file_buf[offset..offset+name_end])
+                };
+                // Case-insensitive substring match
+                if contains_ignore_case(name, query_str) {
+                    matches[match_count].0[..name_end].copy_from_slice(&file_buf[offset..offset+name_end]);
+                    matches[match_count].1 = u32::from_le_bytes([
+                        file_buf[offset+24], file_buf[offset+25],
+                        file_buf[offset+26], file_buf[offset+27]
+                    ]);
+                    matches[match_count].2 = u32::from_le_bytes([
+                        file_buf[offset+28], file_buf[offset+29],
+                        file_buf[offset+30], file_buf[offset+31]
+                    ]);
+                    match_count += 1;
+                }
+            }
+            let _ = shmem_unmap(files_handle, SHELL_SHMEM_VADDR);
+            let _ = shmem_destroy(files_handle);
+
+            if match_count == 0 {
+                return 0;
+            }
+
+            // Create results shmem
+            let results_size = match_count * 32;
+            let results_handle = match shmem_create(results_size) {
+                Ok(h) => h,
+                Err(_) => return 0,
+            };
+            for tid in 2..=8 {
+                let _ = shmem_grant(results_handle, tid);
+            }
+            if shmem_map(results_handle, SHELL_SHMEM_VADDR).is_err() {
+                let _ = shmem_destroy(results_handle);
+                return 0;
+            }
+            let result_buf = unsafe {
+                core::slice::from_raw_parts_mut(SHELL_SHMEM_VADDR as *mut u8, results_size)
+            };
+            for i in 0..match_count {
+                let offset = i * 32;
+                result_buf[offset..offset+24].copy_from_slice(&matches[i].0);
+                result_buf[offset+24..offset+28].copy_from_slice(&matches[i].1.to_le_bytes());
+                result_buf[offset+28..offset+32].copy_from_slice(&matches[i].2.to_le_bytes());
+            }
+            let _ = shmem_unmap(results_handle, SHELL_SHMEM_VADDR);
+
+            ((match_count as u64) << 32) | (results_handle as u64)
         }
 
         x if x == SHELL_OP_PS => {
