@@ -28,6 +28,7 @@ use crate::syscall::{syscall3, SYS_IPC_SEND};
 // ============================================================================
 
 /// Shell service task ID (spawned at boot as Task 3)
+/// Task layout: 1=Idle, 2=Synapse, 3=Shell, 4=Compositor
 pub const SHELL_TASK_ID: u32 = 3;
 
 // ============================================================================

@@ -53,6 +53,7 @@
 // Graphics modules (Phase 6.2)
 pub mod framebuffer;
 pub mod font;
+pub mod window_manager;
 
 extern crate alloc;
 

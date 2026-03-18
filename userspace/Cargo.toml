@@ -9,6 +9,7 @@ members = [
     "synapse-service",
     "libaccesskit-folk",
     "compositor",
+    "intent-service",
 ]
 resolver = "2"
 

@@ -31,8 +31,7 @@ use crate::syscall::{syscall3, SYS_IPC_SEND};
 
 /// Synapse service task ID (spawned at boot as Task 2)
 ///
-/// Note: Task 1 is the idle/dummy task, Task 2 is IPC receiver (now Synapse),
-/// Shell gets Task 4+
+/// Task layout: 1=Idle, 2=Synapse, 3=Shell, 4=Compositor
 pub const SYNAPSE_TASK_ID: u32 = 2;
 
 // ============================================================================

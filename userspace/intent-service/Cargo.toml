@@ -1,0 +1,12 @@
+[package]
+name = "intent-service"
+version = "0.1.0"
+edition = "2021"
+description = "Intent Service - Semantic Command Router for Folkering OS"
+
+[[bin]]
+name = "intent-service"
+path = "src/main.rs"
+
+[dependencies]
+libfolk = { path = "../libfolk" }

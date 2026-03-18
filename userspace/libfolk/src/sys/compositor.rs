@@ -26,7 +26,7 @@ use crate::syscall::{syscall3, SYS_IPC_SEND};
 /// Compositor service task ID (spawned at boot as Task 4)
 ///
 /// Task layout:
-/// - Task 1: Idle/dummy task
+/// - Task 1: Idle/kernel
 /// - Task 2: Synapse (Data Kernel)
 /// - Task 3: Shell
 /// - Task 4: Compositor (Semantic Mirror)
