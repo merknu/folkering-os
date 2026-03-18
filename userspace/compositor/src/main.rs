@@ -723,14 +723,15 @@ fn main() -> ! {
                         win.push_line(s);
                     }
 
-                    // Built-in commands — direct IPC to Shell + shmem
+                    // Built-in commands — routed through Intent Service (microkernel IPC)
                     if cmd_str == "ls" || cmd_str == "files" {
                         win.push_line("Files in ramdisk:");
-                        // Direct IPC to Shell (fewer context switches)
+                        let intent_req = libfolk::sys::intent::INTENT_OP_SUBMIT
+                            | (SHELL_OP_LIST_FILES << 8);
                         let ipc_result = unsafe {
                             libfolk::syscall::syscall3(
                                 libfolk::syscall::SYS_IPC_SEND,
-                                SHELL_TASK_ID as u64, SHELL_OP_LIST_FILES, 0
+                                libfolk::sys::intent::INTENT_TASK_ID as u64, intent_req, 0
                             )
                         };
                         if ipc_result != u64::MAX {
@@ -802,11 +803,13 @@ fn main() -> ! {
                         }
                     } else if cmd_str == "ps" || cmd_str == "tasks" {
                         win.push_line("Running tasks:");
-                        // Direct IPC to Shell
+                        // Route through Intent Service (4-hop IPC test)
+                        let intent_req = libfolk::sys::intent::INTENT_OP_SUBMIT
+                            | (SHELL_OP_PS << 8);
                         let ipc_result = unsafe {
                             libfolk::syscall::syscall3(
                                 libfolk::syscall::SYS_IPC_SEND,
-                                SHELL_TASK_ID as u64, SHELL_OP_PS, 0
+                                libfolk::sys::intent::INTENT_TASK_ID as u64, intent_req, 0
                             )
                         };
                         if ipc_result != u64::MAX {
@@ -893,13 +896,15 @@ fn main() -> ! {
                         if filename.is_empty() {
                             win.push_line("usage: cat <filename>");
                         } else {
-                            // Hash filename and send directly to Shell
+                            // Hash filename and route through Intent Service
                             let name_hash = shell_hash_name(filename) as u64;
-                            let shell_req = SHELL_OP_CAT_FILE | (name_hash << 8);
+                            let shell_payload = SHELL_OP_CAT_FILE | (name_hash << 8);
+                            let intent_req = libfolk::sys::intent::INTENT_OP_SUBMIT
+                                | (shell_payload << 8);
                             let ipc_result = unsafe {
                                 libfolk::syscall::syscall3(
                                     libfolk::syscall::SYS_IPC_SEND,
-                                    SHELL_TASK_ID as u64, shell_req, 0
+                                    libfolk::sys::intent::INTENT_TASK_ID as u64, intent_req, 0
                                 )
                             };
                             if ipc_result != u64::MAX && ipc_result != SHELL_STATUS_NOT_FOUND {
