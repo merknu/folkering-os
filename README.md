@@ -206,7 +206,7 @@ Four concepts that define the long-term direction:
 
 ## Author
 
-Knut Melvaer
+Knut Ingmar Merødningen
 
 ## License
 
