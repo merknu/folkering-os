@@ -64,6 +64,11 @@ pub struct Window {
     pub dragging: bool,
     pub drag_offset_x: i32,
     pub drag_offset_y: i32,
+    // Interactive terminal input
+    pub interactive: bool,
+    pub input_buf: [u8; 128],
+    pub input_len: usize,
+    pub input_cursor: usize,
 }
 
 impl Window {
@@ -71,6 +76,18 @@ impl Window {
     pub fn total_w(&self) -> usize { self.width as usize + BORDER_W * 2 }
     /// Total pixel height (title bar + content + 2 * BORDER_W)
     pub fn total_h(&self) -> usize { TITLE_BAR_H + self.height as usize + BORDER_W * 2 }
+
+    /// Get the current input as a string
+    pub fn input_str(&self) -> &str {
+        unsafe { core::str::from_utf8_unchecked(&self.input_buf[..self.input_len]) }
+    }
+
+    /// Clear input buffer
+    pub fn clear_input(&mut self) {
+        self.input_len = 0;
+        self.input_cursor = 0;
+        self.input_buf = [0u8; 128];
+    }
 
     /// Append a text line to this window (drops oldest if full)
     pub fn push_line(&mut self, text: &str) {
@@ -130,6 +147,10 @@ impl WindowManager {
             dragging: false,
             drag_offset_x: 0,
             drag_offset_y: 0,
+            interactive: false,
+            input_buf: [0u8; 128],
+            input_len: 0,
+            input_cursor: 0,
         };
         self.windows.push(win);
         self.focused_id = Some(id);
@@ -291,10 +312,44 @@ fn draw_window(fb: &mut FramebufferView, win: &Window, focused: bool) {
         0
     };
 
+    // Reserve space for input prompt in interactive windows
+    let reserved_lines = if win.interactive { 2 } else { 0 };
+    let display_max = max_lines.saturating_sub(reserved_lines);
+
+    let skip = if win.lines.len() > display_max {
+        win.lines.len() - display_max
+    } else {
+        0
+    };
+
     for line in win.lines.iter().skip(skip) {
-        if text_y + 8 > content_y + content_h { break; }
+        if text_y + 8 > content_y + content_h.saturating_sub(if win.interactive { 20 } else { 0 }) {
+            break;
+        }
         draw_str_small(fb, text_x, text_y, line.as_str(), text_fg, win_bg);
         text_y += line_h;
+    }
+
+    // Draw input prompt for interactive windows
+    if win.interactive {
+        let prompt_y = content_y + content_h.saturating_sub(14);
+        let prompt_fg = rgb(fb, 0x00CCFF); // cyan prompt
+        let cursor_fg = rgb(fb, 0xFFFFFF);
+
+        // Draw separator line
+        let sep_y = prompt_y.saturating_sub(3);
+        fb.fill_rect(content_x + 2, sep_y, content_w.saturating_sub(4), 1, rgb(fb, 0x334455));
+
+        // Draw "folk> " prompt + input text
+        draw_str_small(fb, text_x, prompt_y, "folk>", prompt_fg, win_bg);
+        let input_str = win.input_str();
+        draw_str_small(fb, text_x + 48, prompt_y, input_str, cursor_fg, win_bg);
+
+        // Draw cursor
+        let cursor_x = text_x + 48 + win.input_cursor * 8;
+        if cursor_x + 8 <= content_x + content_w && focused {
+            fb.fill_rect(cursor_x, prompt_y, 8, 8, cursor_fg);
+        }
     }
 }
 

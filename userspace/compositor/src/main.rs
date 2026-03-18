@@ -585,6 +585,7 @@ fn main() -> ! {
         // ===== Process keyboard input =====
         // First, collect all pending keys without redrawing
         let mut execute_command = false;
+        let mut win_execute_command: Option<u32> = None; // window id to execute from
         while let Some(key) = read_key() {
             did_work = true;
 
@@ -594,6 +595,63 @@ fn main() -> ! {
             const KEY_HOME: u8 = 0x84;
             const KEY_END: u8 = 0x85;
             const KEY_DELETE: u8 = 0x86;
+
+            // Route keys to focused interactive window when omnibar is hidden
+            if !omnibar_visible {
+                if let Some(focused_id) = wm.focused_id {
+                    if let Some(win) = wm.get_window_mut(focused_id) {
+                        if win.interactive {
+                            match key {
+                                0x08 | 0x7F => {
+                                    if win.input_cursor > 0 {
+                                        let mut i = win.input_cursor - 1;
+                                        while i < win.input_len - 1 {
+                                            win.input_buf[i] = win.input_buf[i + 1];
+                                            i += 1;
+                                        }
+                                        win.input_len -= 1;
+                                        win.input_buf[win.input_len] = 0;
+                                        win.input_cursor -= 1;
+                                        need_redraw = true;
+                                    }
+                                }
+                                b'\n' | b'\r' => {
+                                    if win.input_len > 0 {
+                                        win_execute_command = Some(focused_id);
+                                        need_redraw = true;
+                                    }
+                                }
+                                0x1B => {
+                                    // Escape: toggle omnibar back
+                                    omnibar_visible = true;
+                                    need_redraw = true;
+                                }
+                                0x20..=0x7E => {
+                                    if win.input_len < 126 {
+                                        let mut i = win.input_len;
+                                        while i > win.input_cursor {
+                                            win.input_buf[i] = win.input_buf[i - 1];
+                                            i -= 1;
+                                        }
+                                        win.input_buf[win.input_cursor] = key;
+                                        win.input_len += 1;
+                                        win.input_cursor += 1;
+                                        need_redraw = true;
+                                    }
+                                }
+                                _ => {}
+                            }
+                            continue; // Key consumed by window
+                        }
+                    }
+                }
+                // No interactive window focused — Escape reopens omnibar
+                if key == 0x1B {
+                    omnibar_visible = true;
+                    need_redraw = true;
+                    continue;
+                }
+            }
 
             match key {
                 // Backspace - delete character before cursor
@@ -1070,12 +1128,19 @@ fn main() -> ! {
                                 }
                             }
                         }
+                    } else if cmd_str == "term" || cmd_str == "terminal" {
+                        // Open interactive terminal — make this window interactive
+                        win.interactive = true;
+                        win.push_line("Folkering OS Terminal");
+                        win.push_line("Type commands, Enter to run, Esc for omnibar");
                     } else if cmd_str.starts_with("calc ") {
                         win.push_line("Calculator: coming soon");
                     } else {
                         win.push_line("Sent to shell...");
                     }
-                    win.push_line("---");
+                    if !win.interactive {
+                        win.push_line("---");
+                    }
                 }
 
                 // Clear the omnibar input after executing
@@ -1084,6 +1149,120 @@ fn main() -> ! {
                 for i in 0..MAX_TEXT_LEN { text_buffer[i] = 0; }
                 show_results = false;
                 cursor_bg_dirty = true;
+            }
+        }
+
+        // ===== Execute command from interactive terminal window =====
+        if let Some(win_id) = win_execute_command {
+            if let Some(win) = wm.get_window_mut(win_id) {
+                let cmd_len = win.input_len;
+                let mut cmd_buf = [0u8; 128];
+                cmd_buf[..cmd_len].copy_from_slice(&win.input_buf[..cmd_len]);
+                win.clear_input();
+
+                if let Ok(cmd_str) = core::str::from_utf8(&cmd_buf[..cmd_len]) {
+                    // Echo the command
+                    let mut echo = [0u8; 132];
+                    echo[0] = b'f'; echo[1] = b'o'; echo[2] = b'l';
+                    echo[3] = b'k'; echo[4] = b'>'; echo[5] = b' ';
+                    let elen = cmd_len.min(125);
+                    echo[6..6+elen].copy_from_slice(&cmd_buf[..elen]);
+                    if let Ok(s) = core::str::from_utf8(&echo[..6+elen]) {
+                        win.push_line(s);
+                    }
+
+                    // Execute built-in commands (same as omnibar but output to THIS window)
+                    if cmd_str == "ls" || cmd_str == "files" {
+                        let intent_req = libfolk::sys::intent::INTENT_OP_SUBMIT
+                            | (SHELL_OP_LIST_FILES << 8);
+                        let ipc_result = unsafe {
+                            libfolk::syscall::syscall3(
+                                libfolk::syscall::SYS_IPC_SEND,
+                                libfolk::sys::intent::INTENT_TASK_ID as u64, intent_req, 0
+                            )
+                        };
+                        if ipc_result != u64::MAX {
+                            let count = (ipc_result >> 32) as usize;
+                            let shmem_handle = (ipc_result & 0xFFFFFFFF) as u32;
+                            if shmem_handle != 0 && count > 0 {
+                                if shmem_map(shmem_handle, COMPOSITOR_SHMEM_VADDR).is_ok() {
+                                    let buf = unsafe {
+                                        core::slice::from_raw_parts(COMPOSITOR_SHMEM_VADDR as *const u8, count * 32)
+                                    };
+                                    for i in 0..count {
+                                        let offset = i * 32;
+                                        let name_end = buf[offset..offset+24].iter()
+                                            .position(|&b| b == 0).unwrap_or(24);
+                                        let name = unsafe { core::str::from_utf8_unchecked(&buf[offset..offset+name_end]) };
+                                        let size = u32::from_le_bytes([buf[offset+24], buf[offset+25], buf[offset+26], buf[offset+27]]);
+                                        let mut line = [0u8; 48];
+                                        line[0] = b' '; line[1] = b' ';
+                                        let nlen = name.len().min(30);
+                                        line[2..2+nlen].copy_from_slice(&name.as_bytes()[..nlen]);
+                                        let mut sb = [0u8; 16];
+                                        let ss = format_usize(size as usize, &mut sb);
+                                        let sl = ss.len();
+                                        line[3+nlen..3+nlen+sl].copy_from_slice(ss.as_bytes());
+                                        if let Ok(s) = core::str::from_utf8(&line[..3+nlen+sl]) {
+                                            win.push_line(s);
+                                        }
+                                    }
+                                    let _ = shmem_unmap(shmem_handle, COMPOSITOR_SHMEM_VADDR);
+                                    let _ = shmem_destroy(shmem_handle);
+                                }
+                            }
+                        }
+                    } else if cmd_str == "ps" || cmd_str == "tasks" {
+                        let intent_req = libfolk::sys::intent::INTENT_OP_SUBMIT | (SHELL_OP_PS << 8);
+                        let ipc_result = unsafe {
+                            libfolk::syscall::syscall3(
+                                libfolk::syscall::SYS_IPC_SEND,
+                                libfolk::sys::intent::INTENT_TASK_ID as u64, intent_req, 0
+                            )
+                        };
+                        if ipc_result != u64::MAX {
+                            let count = (ipc_result >> 32) as usize;
+                            let handle = (ipc_result & 0xFFFFFFFF) as u32;
+                            if handle != 0 && count > 0 {
+                                if shmem_map(handle, COMPOSITOR_SHMEM_VADDR).is_ok() {
+                                    let buf = unsafe {
+                                        core::slice::from_raw_parts(COMPOSITOR_SHMEM_VADDR as *const u8, count * 32)
+                                    };
+                                    for i in 0..count {
+                                        let off = i * 32;
+                                        let tid = u32::from_le_bytes([buf[off], buf[off+1], buf[off+2], buf[off+3]]);
+                                        let state = u32::from_le_bytes([buf[off+4], buf[off+5], buf[off+6], buf[off+7]]);
+                                        let ne = buf[off+8..off+24].iter().position(|&b| b == 0).unwrap_or(16);
+                                        let name = unsafe { core::str::from_utf8_unchecked(&buf[off+8..off+8+ne]) };
+                                        let ss = match state { 0=>"Run", 1=>"Run", 2=>"Blk", 3=>"Blk", 4=>"Wait", 5=>"Exit", _=>"?" };
+                                        let mut line = [0u8; 48];
+                                        let mut p = 0;
+                                        let mut tb = [0u8; 16];
+                                        let ts = format_usize(tid as usize, &mut tb);
+                                        line[p..p+ts.len()].copy_from_slice(ts.as_bytes()); p += ts.len();
+                                        line[p] = b' '; p += 1;
+                                        let nl = name.len().min(15);
+                                        line[p..p+nl].copy_from_slice(&name.as_bytes()[..nl]); p += nl;
+                                        line[p] = b' '; p += 1;
+                                        line[p..p+ss.len()].copy_from_slice(ss.as_bytes()); p += ss.len();
+                                        if let Ok(s) = core::str::from_utf8(&line[..p]) { win.push_line(s); }
+                                    }
+                                    let _ = shmem_unmap(handle, COMPOSITOR_SHMEM_VADDR);
+                                    let _ = shmem_destroy(handle);
+                                }
+                            }
+                        }
+                    } else if cmd_str == "uptime" {
+                        let ms = uptime();
+                        let mut buf = [0u8; 32];
+                        let time_str = format_uptime(ms, &mut buf);
+                        win.push_line(time_str);
+                    } else if cmd_str == "help" {
+                        win.push_line("ls ps cat find uptime help");
+                    } else {
+                        win.push_line("Unknown command");
+                    }
+                }
             }
         }
 
