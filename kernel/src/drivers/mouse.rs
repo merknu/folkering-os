@@ -197,6 +197,49 @@ pub fn init() {
     }
 }
 
+/// Initialize PS/2 mouse without enabling PIC IRQ
+/// Use this when IOAPIC handles interrupt routing instead of PIC
+pub fn init_without_pic() {
+    unsafe {
+        crate::serial_strln!("[MOUSE] Initializing PS/2 mouse (IOAPIC mode)...");
+
+        // Enable auxiliary device (mouse) on PS/2 controller
+        send_command(0xA8);
+
+        // Get controller configuration byte
+        send_command(0x20);
+        let config = read_data();
+
+        // Enable mouse interrupt (bit 1) and disable mouse clock inhibit (bit 5)
+        let new_config = (config | 0x02) & !0x20;
+        send_command(0x60);
+        send_data(new_config);
+
+        // Reset mouse
+        let ack = mouse_write(0xFF);
+        if ack == 0xFA {
+            // Wait for self-test result
+            let _test = read_data();  // Should be 0xAA (pass)
+            let _id = read_data();    // Should be 0x00 (standard mouse)
+        }
+
+        // Set defaults
+        mouse_write(0xF6);
+
+        // Enable data reporting
+        let enable_ack = mouse_write(0xF4);
+
+        // Don't enable PIC IRQ - IOAPIC handles it
+
+        crate::serial_str!("[MOUSE] Enable ACK: 0x");
+        crate::drivers::serial::write_hex(enable_ack as u64);
+        crate::serial_strln!("");
+        crate::serial_strln!("[MOUSE] PS/2 mouse initialized (IOAPIC mode)");
+
+        MOUSE_INIT.store(true, Ordering::Relaxed);
+    }
+}
+
 /// Handle mouse interrupt (called from IDT handler)
 pub fn handle_interrupt() {
     // Read byte from mouse
@@ -205,10 +248,7 @@ pub fn handle_interrupt() {
         data_port.read()
     };
 
-    // Send EOI to PIC (IRQ12 is on PIC2, send_eoi handles cascade)
-    crate::arch::x86_64::pic::send_eoi(12);
-
-    // Also send EOI to APIC (needed in virtual wire mode)
+    // Send EOI to Local APIC (IOAPIC routes to Local APIC)
     crate::arch::x86_64::apic::send_eoi();
 
     if !MOUSE_INIT.load(Ordering::Relaxed) {

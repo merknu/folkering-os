@@ -129,18 +129,36 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
         arch::x86_64::apic_init();
         serial_strln!("[APIC] Timer interrupts enabled\n");
 
-        // Initialize PIC (8259A) for legacy interrupt support
-        // Must be done before keyboard/mouse drivers
-        serial_strln!("[INIT] Initializing 8259A PIC...");
-        arch::x86_64::pic_init();
+        // Initialize IOAPIC for device interrupt routing
+        // Must be done after APIC but before keyboard/mouse drivers
+        serial_strln!("[INIT] Initializing I/O APIC...");
+        arch::x86_64::ioapic_init();
 
-        // Initialize keyboard driver (uses IRQ1)
+        // Disable PIC completely - IOAPIC handles all device interrupts now
+        // Mask all PIC interrupts to avoid conflicts with IOAPIC
+        serial_strln!("[INIT] Disabling legacy PIC (using IOAPIC instead)...");
+        unsafe {
+            use x86_64::instructions::port::Port;
+            let mut pic1_data = Port::<u8>::new(0x21);
+            let mut pic2_data = Port::<u8>::new(0xA1);
+            pic1_data.write(0xFF); // Mask all IRQs on PIC1
+            pic2_data.write(0xFF); // Mask all IRQs on PIC2
+        }
+        serial_strln!("[INIT] PIC disabled (all IRQs masked)");
+
+        // Initialize keyboard driver (uses IRQ1 via IOAPIC)
+        // NOTE: keyboard::init() will try to enable PIC IRQ1, but it's masked
         serial_strln!("[INIT] Initializing PS/2 keyboard driver...");
-        drivers::keyboard::init();
+        drivers::keyboard::init_without_pic();
+        // Route keyboard IRQ1 to vector 33 via IOAPIC
+        arch::x86_64::ioapic_enable_irq(1, 33);
 
-        // Initialize mouse driver (uses IRQ12)
+        // Initialize mouse driver (uses IRQ12 via IOAPIC)
+        // NOTE: mouse::init() will try to enable PIC IRQ12, but it's masked
         serial_strln!("[INIT] Initializing PS/2 mouse driver...");
-        drivers::mouse::init();
+        drivers::mouse::init_without_pic();
+        // Route mouse IRQ12 to vector 44 via IOAPIC
+        arch::x86_64::ioapic_enable_irq(12, 44);
 
         // Initialize boot info for userspace handoff
         serial_strln!("[INIT] Initializing boot info page...");
@@ -235,6 +253,10 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
         serial_strln!("[BOOT] Spawning Task 1 (idle)...");
         match task::spawn_raw(&IDLE_LOOP, 0) {
             Ok(task_id) => {
+                // Set task name
+                if let Some(task_arc) = task::task::get_task(task_id) {
+                    task_arc.lock().set_name("idle");
+                }
                 serial_str!("[BOOT] Task 1 (idle) spawned, id=");
                 drivers::serial::write_dec(task_id);
                 serial_strln!("");
@@ -307,6 +329,9 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
                 serial_strln!(" bytes");
                 match task::spawn(synapse_elf, &[]) {
                     Ok(task_id) => {
+                        if let Some(task_arc) = task::task::get_task(task_id) {
+                            task_arc.lock().set_name("synapse");
+                        }
                         serial_str!("[BOOT] Synapse spawned, id=");
                         drivers::serial::write_dec(task_id);
                         serial_strln!("");
@@ -334,9 +359,15 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
                 serial_strln!(" bytes");
                 match task::spawn(shell_elf, &[]) {
                     Ok(task_id) => {
+                        if let Some(task_arc) = task::task::get_task(task_id) {
+                            task_arc.lock().set_name("shell");
+                        }
                         serial_str!("[BOOT] Shell spawned, id=");
                         drivers::serial::write_dec(task_id);
                         serial_strln!("");
+                        // Grant IPC send-to-any so shell can communicate with all tasks
+                        let _ = capability::grant_ipc_send_any(task_id);
+                        serial_strln!("[BOOT] Granted IPC capability to shell");
                     }
                     Err(e) => {
                         serial_str!("[BOOT] Shell spawn FAILED: ");
@@ -369,17 +400,29 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
                     let elf_data = rd.read(entry);
                     match task::spawn(elf_data, &[]) {
                         Ok(task_id) => {
+                            // Set task name from ramdisk entry name
+                            if let Some(task_arc) = task::task::get_task(task_id) {
+                                task_arc.lock().set_name(name);
+                            }
                             serial_str!("[BOOT] Spawned \"");
                             serial_str!(name);
                             serial_str!("\", id=");
                             drivers::serial::write_dec(task_id);
                             serial_strln!("");
 
+                            // Grant IPC send-to-any for all spawned tasks
+                            let _ = capability::grant_ipc_send_any(task_id);
+
                             // Grant framebuffer capability to compositor
                             if is_compositor && fb_addr != 0 {
                                 let fb_size = fb_pitch * fb_height;
                                 // Convert HHDM virtual address to physical address
                                 let fb_phys = virt_to_phys(fb_addr).unwrap_or(fb_addr);
+                                serial_str!("[BOOT] FB cap: phys=");
+                                drivers::serial::write_hex(fb_phys as u64);
+                                serial_str!(" size=");
+                                drivers::serial::write_hex(fb_size as u64);
+                                drivers::serial::write_newline();
                                 if capability::grant_framebuffer(task_id, fb_phys as u64, fb_size as u64).is_ok() {
                                     serial_str!("[BOOT] Granted framebuffer capability to compositor (task ");
                                     drivers::serial::write_dec(task_id);
@@ -430,10 +473,23 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
 
         serial_strln!("[BOOT] All tasks spawned, starting scheduler...\n");
 
+        // TEMPORARY DIAGNOSTIC: wait 3 seconds so TCP serial logger can connect
+        // before the scheduler starts (TCP logger misses early boot output).
+        // Remove after debugging is complete.
+        serial_strln!("[BOOT] Waiting 3s for serial logger to connect...");
+        unsafe { core::arch::asm!("sti"); }
+        arch::x86_64::enable_timer();
+        let wait_start = timer::uptime_ms();
+        while timer::uptime_ms() - wait_start < 3000 {
+            core::hint::spin_loop();
+        }
+        unsafe { core::arch::asm!("cli"); }
+        serial_strln!("[BOOT] Wait done. Boot output above should be visible.");
+
         // Grant IPC capabilities to all userspace tasks
-        // Task 2 = Synapse, Task 3 = Shell, Task 4 = Compositor
+        // Task 2 = Synapse, Task 3 = Shell, Task 4 = Compositor, Task 5 = Intent Service
         serial_strln!("[BOOT] Granting IPC capabilities...");
-        for task_id in 2..=4 {
+        for task_id in 2..=8 {
             if capability::grant_ipc_send_any(task_id).is_ok() {
                 serial_str!("[BOOT] Task ");
                 drivers::serial::write_dec(task_id);
@@ -490,7 +546,7 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
 
         // Spin for a while to let timer fire (busy wait ~50ms)
         serial_strln!("[TIMER-TEST] Waiting for timer interrupts (busy loop)...");
-        for i in 0..5_000_000u64 {
+        for i in 0..100_000u64 {
             // Prevent optimizer from removing this loop
             core::hint::spin_loop();
             if i % 1_000_000 == 0 {

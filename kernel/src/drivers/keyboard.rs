@@ -127,11 +127,25 @@ const SCANCODE_EXTENDED: u8 = 0xE0;
 /// Extended key scancodes (after 0xE0 prefix)
 const EXT_LEFT_WINDOWS: u8 = 0x5B;
 const EXT_RIGHT_WINDOWS: u8 = 0x5C;
+const EXT_ARROW_UP: u8 = 0x48;
+const EXT_ARROW_DOWN: u8 = 0x50;
+const EXT_ARROW_LEFT: u8 = 0x4B;
+const EXT_ARROW_RIGHT: u8 = 0x4D;
+const EXT_HOME: u8 = 0x47;
+const EXT_END: u8 = 0x4F;
+const EXT_DELETE: u8 = 0x53;
 
 /// Special key codes we emit (outside normal ASCII, userspace can detect these)
 /// These are NOT scancodes - they are our own key codes
 pub const KEY_LEFT_WINDOWS: u8 = 0xE5;
 pub const KEY_RIGHT_WINDOWS: u8 = 0xE6;
+pub const KEY_ARROW_UP: u8 = 0x80;
+pub const KEY_ARROW_DOWN: u8 = 0x81;
+pub const KEY_ARROW_LEFT: u8 = 0x82;
+pub const KEY_ARROW_RIGHT: u8 = 0x83;
+pub const KEY_HOME: u8 = 0x84;
+pub const KEY_END: u8 = 0x85;
+pub const KEY_DELETE: u8 = 0x86;
 
 /// Initialize keyboard driver
 pub fn init() {
@@ -152,23 +166,37 @@ pub fn init() {
     KEYBOARD_INIT.store(true, Ordering::Relaxed);
 }
 
+/// Initialize keyboard driver without enabling PIC IRQ
+/// Use this when IOAPIC handles interrupt routing instead of PIC
+pub fn init_without_pic() {
+    if KEYBOARD_INIT.load(Ordering::Relaxed) {
+        return;
+    }
+
+    unsafe {
+        // Clear any pending data in the keyboard buffer
+        let mut status = Port::<u8>::new(KEYBOARD_STATUS_PORT);
+        let mut data = Port::<u8>::new(KEYBOARD_DATA_PORT);
+        while status.read() & 1 != 0 {
+            let _ = data.read();
+        }
+
+        // Don't enable PIC IRQ - IOAPIC handles it
+        crate::drivers::serial::write_str("[KEYBOARD] PS/2 keyboard driver initialized (IOAPIC mode)\n");
+    }
+
+    KEYBOARD_INIT.store(true, Ordering::Relaxed);
+}
+
 /// Handle keyboard interrupt (called from IDT handler)
 pub fn handle_interrupt() {
-    crate::serial_str!("[IRQ1]");
-
     // Always read scancode from port 0x60 to clear the keyboard controller
     let scancode = unsafe {
         let mut data_port = Port::<u8>::new(KEYBOARD_DATA_PORT);
         data_port.read()
     };
-    crate::serial_str!("[SC:");
-    crate::drivers::serial::write_hex(scancode as u64);
-    crate::serial_str!("]");
 
-    // Send EOI to PIC (IRQ1 is on PIC1)
-    crate::arch::x86_64::pic::send_eoi(1);
-
-    // Also send EOI to APIC (needed in virtual wire mode)
+    // Send EOI to Local APIC (IOAPIC routes to Local APIC)
     crate::arch::x86_64::apic::send_eoi();
 
     if !KEYBOARD_INIT.load(Ordering::Relaxed) {
@@ -182,11 +210,31 @@ pub fn handle_interrupt() {
         return;
     }
 
-    // Check if we're in an extended sequence - just ignore
+    // Handle extended scancode sequence (after 0xE0 prefix)
     let is_extended = EXTENDED_PREFIX.load(Ordering::Relaxed);
     if is_extended {
         EXTENDED_PREFIX.store(false, Ordering::Relaxed);
-        // Ignore extended keys for now
+
+        // Ignore key releases in extended mode
+        if scancode & 0x80 != 0 {
+            return;
+        }
+
+        // Map extended scancodes to our key codes
+        let key = match scancode {
+            EXT_ARROW_UP => KEY_ARROW_UP,
+            EXT_ARROW_DOWN => KEY_ARROW_DOWN,
+            EXT_ARROW_LEFT => KEY_ARROW_LEFT,
+            EXT_ARROW_RIGHT => KEY_ARROW_RIGHT,
+            EXT_HOME => KEY_HOME,
+            EXT_END => KEY_END,
+            EXT_DELETE => KEY_DELETE,
+            EXT_LEFT_WINDOWS => KEY_LEFT_WINDOWS,
+            EXT_RIGHT_WINDOWS => KEY_RIGHT_WINDOWS,
+            _ => return, // Unknown extended scancode
+        };
+
+        KEY_BUFFER.lock().push(key);
         return;
     }
 
@@ -234,9 +282,6 @@ pub fn handle_interrupt() {
 
     // Push to buffer if valid
     if ascii != 0 {
-        crate::serial_str!("[K:");
-        crate::drivers::serial::write_byte(ascii);
-        crate::serial_str!("]");
         KEY_BUFFER.lock().push(ascii);
     }
 }

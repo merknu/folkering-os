@@ -7,8 +7,38 @@ use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use spin::Mutex;
+
+/// 512-byte FXSAVE area, must be 16-byte aligned for FXSAVE/FXRSTOR instructions.
+/// Stores x87 FPU + SSE/AVX MXCSR + XMM0–XMM15 state (FXSAVE64 format).
+#[repr(C, align(16))]
+pub struct FxsaveArea(pub [u8; 512]);
+
+impl FxsaveArea {
+    /// Create a valid initial FPU/SSE state:
+    ///   FPU CW  (offset  0) = 0x037F  — all exceptions masked, double precision
+    ///   MXCSR   (offset 24) = 0x1F80  — all SSE exceptions masked, round-nearest
+    pub const fn default_init() -> Self {
+        let mut data = [0u8; 512];
+        // FPU Control Word at bytes 0-1 (little-endian)
+        data[0] = 0x7F;
+        data[1] = 0x03;
+        // MXCSR at bytes 24-27 (little-endian)
+        data[24] = 0x80;
+        data[25] = 0x1F;
+        Self(data)
+    }
+}
+
+/// Raw pointer to the current task's FXSAVE area.
+///
+/// Set by `timer_preempt_handler` on every context switch so that `irq_timer`
+/// assembly can call FXSAVE / FXRSTOR without holding any Rust locks.
+///
+/// Invariant: always points into a live Task's `fxsave_area` field, or is 0
+/// (before the first userspace task starts).
+pub static FXSAVE_CURRENT_PTR: AtomicUsize = AtomicUsize::new(0);
 
 /// Send wrapper for PageTable pointer (we manage synchronization via Task's Mutex)
 pub struct PageTablePtr(*mut PageTable);
@@ -85,9 +115,14 @@ pub struct Task {
     pub kernel_stack_base: Option<SendPtr>,  // Base of kernel stack (for deallocation)
     pub kernel_stack_ptr: Option<SendPtr>,   // Current stack pointer (points to saved InterruptFrame)
 
-    // Legacy context (DEPRECATED - kept for compatibility during transition)
-    #[deprecated(note = "Use kernel_stack_ptr instead - stack-based context is the new approach")]
+    // User-mode context: saved by syscall_entry, used to build IRETQ frame.
+    // MUST NOT be overwritten by switch_context — only syscall_entry/preempt write here.
     pub context: Context,
+
+    // Kernel-mode context: saved/restored by switch_context during task switches.
+    // Holds kernel RSP/RIP/callee-saved regs so switch_context can resume in the
+    // yield path without corrupting the user context above.
+    pub kernel_context: Context,
 
     // IPC fields
     pub recv_queue: MessageQueue,
@@ -110,6 +145,13 @@ pub struct Task {
 
     // Interrupt handling
     pub interrupt_pending: bool,  // Set when Ctrl+C is received
+
+    /// Human-readable task name (e.g. "synapse", "shell", "compositor")
+    pub name: [u8; 16],
+
+    /// FXSAVE/FXRSTOR area — stores x87 + SSE state across context switches.
+    /// 512 bytes, 16-byte aligned (required by FXSAVE64).
+    pub fxsave_area: FxsaveArea,
 }
 
 /// CPU context for task switching
@@ -262,203 +304,92 @@ impl Task {
         let mut buffer = TASK_CREATION_BUFFER.lock();
         unsafe {
             let task_ptr = buffer.as_mut_ptr();
-
-            // DEBUG: Print address of global buffer
-            static mut PRINTED: bool = false;
-            if !PRINTED {
-                crate::serial_str!("[TASK_NEW] TASK_CREATION_BUFFER at "); crate::drivers::serial::write_hex(task_ptr as u64); crate::drivers::serial::write_newline();
-                PRINTED = true;
-            }
             ptr::write_bytes(task_ptr, 0, 1);
 
-            // Write non-zero fields directly to global buffer
+            // Core fields
             ptr::addr_of_mut!((*task_ptr).id).write(id);
             ptr::addr_of_mut!((*task_ptr).state).write(TaskState::Runnable);
             ptr::addr_of_mut!((*task_ptr).page_table).write(page_table_ptr);
-            // page_table_phys will be set by spawn_raw after calling create_task_page_table
             ptr::addr_of_mut!((*task_ptr).page_table_phys).write(0);
 
-            // NEW: Allocate kernel stack and set up InterruptFrame
+            // Allocate kernel stack and write InterruptFrame
             let (stack_base, stack_top) = allocate_kernel_stack();
-            crate::serial_strln!("[TASK_NEW] Step 1: stack allocated");
-
-            // Create initial InterruptFrame for this task
             let user_stack_top = 0x0000_7FFF_FFFF_F000u64;
-            crate::serial_strln!("[TASK_NEW] Step 2: about to create InterruptFrame");
             let initial_frame = InterruptFrame::new_user(entry_point, user_stack_top);
-            crate::serial_strln!("[TASK_NEW] Step 3: InterruptFrame created");
-
-            // Push InterruptFrame to kernel stack (stack grows down)
             let frame_ptr = (stack_top as usize - core::mem::size_of::<InterruptFrame>()) as *mut InterruptFrame;
-            crate::serial_str!("[TASK_NEW] Step 4: frame_ptr="); crate::drivers::serial::write_hex(frame_ptr as u64); crate::drivers::serial::write_newline();
+            ptr::write_volatile(frame_ptr, initial_frame);
 
-            // DEBUG: Try reading from the address first to verify it's accessible
-            crate::serial_strln!("[TASK_NEW] Step 4a: testing read from frame_ptr...");
-            let test_read = ptr::read_volatile(frame_ptr as *const u8);
-            crate::serial_str!("[TASK_NEW] Step 4b: read test OK (val="); crate::drivers::serial::write_dec(test_read as u32); crate::serial_strln!(")");
-
-            // DEBUG: Try writing a single byte first
-            crate::serial_strln!("[TASK_NEW] Step 4c: testing write to frame_ptr...");
-            ptr::write_volatile(frame_ptr as *mut u8, 0xAA);
-            crate::serial_strln!("[TASK_NEW] Step 4d: write test OK");
-
-            // Now write the full InterruptFrame - field by field to debug
-            crate::serial_strln!("[TASK_NEW] Step 4e: writing InterruptFrame fields...");
-
-            // Write each field individually using volatile writes
-            let frame = frame_ptr;
-            ptr::write_volatile(ptr::addr_of_mut!((*frame).r15), initial_frame.r15);
-            crate::serial_strln!("[TASK_NEW] r15 OK");
-            ptr::write_volatile(ptr::addr_of_mut!((*frame).r14), initial_frame.r14);
-            crate::serial_strln!("[TASK_NEW] r14 OK");
-            ptr::write_volatile(ptr::addr_of_mut!((*frame).r13), initial_frame.r13);
-            crate::serial_strln!("[TASK_NEW] r13 OK");
-            ptr::write_volatile(ptr::addr_of_mut!((*frame).r12), initial_frame.r12);
-            crate::serial_strln!("[TASK_NEW] r12 OK");
-            ptr::write_volatile(ptr::addr_of_mut!((*frame).r11), initial_frame.r11);
-            crate::serial_strln!("[TASK_NEW] r11 OK");
-            ptr::write_volatile(ptr::addr_of_mut!((*frame).r10), initial_frame.r10);
-            crate::serial_strln!("[TASK_NEW] r10 OK");
-            ptr::write_volatile(ptr::addr_of_mut!((*frame).r9), initial_frame.r9);
-            crate::serial_strln!("[TASK_NEW] r9 OK");
-            ptr::write_volatile(ptr::addr_of_mut!((*frame).r8), initial_frame.r8);
-            crate::serial_strln!("[TASK_NEW] r8 OK");
-            ptr::write_volatile(ptr::addr_of_mut!((*frame).rbp), initial_frame.rbp);
-            crate::serial_strln!("[TASK_NEW] rbp OK");
-            ptr::write_volatile(ptr::addr_of_mut!((*frame).rdi), initial_frame.rdi);
-            crate::serial_strln!("[TASK_NEW] rdi OK");
-            ptr::write_volatile(ptr::addr_of_mut!((*frame).rsi), initial_frame.rsi);
-            crate::serial_strln!("[TASK_NEW] rsi OK");
-            ptr::write_volatile(ptr::addr_of_mut!((*frame).rdx), initial_frame.rdx);
-            crate::serial_strln!("[TASK_NEW] rdx OK");
-            ptr::write_volatile(ptr::addr_of_mut!((*frame).rcx), initial_frame.rcx);
-            crate::serial_strln!("[TASK_NEW] rcx OK");
-            ptr::write_volatile(ptr::addr_of_mut!((*frame).rbx), initial_frame.rbx);
-            crate::serial_strln!("[TASK_NEW] rbx OK");
-            ptr::write_volatile(ptr::addr_of_mut!((*frame).rax), initial_frame.rax);
-            crate::serial_strln!("[TASK_NEW] rax OK");
-            ptr::write_volatile(ptr::addr_of_mut!((*frame).rip), initial_frame.rip);
-            crate::serial_strln!("[TASK_NEW] rip OK");
-            ptr::write_volatile(ptr::addr_of_mut!((*frame).cs), initial_frame.cs);
-            crate::serial_strln!("[TASK_NEW] cs OK");
-            ptr::write_volatile(ptr::addr_of_mut!((*frame).rflags), initial_frame.rflags);
-            crate::serial_strln!("[TASK_NEW] rflags OK");
-            ptr::write_volatile(ptr::addr_of_mut!((*frame).rsp), initial_frame.rsp);
-            crate::serial_strln!("[TASK_NEW] rsp OK");
-            ptr::write_volatile(ptr::addr_of_mut!((*frame).ss), initial_frame.ss);
-            crate::serial_strln!("[TASK_NEW] ss OK - all fields written!");
-
-            crate::serial_strln!("[TASK_NEW] Step 5: InterruptFrame written to stack");
-
-            // Update kernel stack pointers
+            // Kernel stack pointers
             ptr::addr_of_mut!((*task_ptr).kernel_stack_base).write(Some(SendPtr::new(stack_base)));
-            crate::serial_strln!("[TASK_NEW] Step 6: kernel_stack_base written");
             ptr::addr_of_mut!((*task_ptr).kernel_stack_ptr).write(Some(SendPtr::new(frame_ptr as *mut u8)));
-            crate::serial_strln!("[TASK_NEW] Step 7: kernel_stack_ptr written");
 
-            crate::serial_str!("[TASK_NEW] Task "); crate::drivers::serial::write_dec(id); crate::serial_str!(" kernel stack: base="); crate::drivers::serial::write_hex(stack_base as u64); crate::serial_str!(", frame="); crate::drivers::serial::write_hex(frame_ptr as u64); crate::drivers::serial::write_newline();
-
-            // LEGACY: Also fill old Context for compatibility during transition
-            #[allow(deprecated)]
-            {
-                ptr::addr_of_mut!((*task_ptr).context.rsp).write(user_stack_top);
-                ptr::addr_of_mut!((*task_ptr).context.rbp).write(user_stack_top);
-                ptr::addr_of_mut!((*task_ptr).context.rip).write(entry_point);
-                ptr::addr_of_mut!((*task_ptr).context.rflags).write(0x202);
-                ptr::addr_of_mut!((*task_ptr).context.cs).write(0x23);  // User code (0x20 | RPL=3)
-                ptr::addr_of_mut!((*task_ptr).context.ss).write(0x1B);  // User data (0x18 | RPL=3)
-            }
-
-            // DEBUG: Verify what we just wrote (using bypass functions to avoid toolchain hang)
-            let cs_val = ptr::addr_of!((*task_ptr).context.cs).read();
-            let ss_val = ptr::addr_of!((*task_ptr).context.ss).read();
-            crate::drivers::serial::write_str("[TASK_NEW] Set CS=");
-            crate::drivers::serial::write_hex(cs_val);
-            crate::drivers::serial::write_str(", SS=");
-            crate::drivers::serial::write_hex(ss_val);
+            crate::serial_str!("[TASK_NEW] Task "); crate::drivers::serial::write_dec(id);
+            crate::serial_str!(" entry="); crate::drivers::serial::write_hex(entry_point);
+            crate::serial_str!(" stack="); crate::drivers::serial::write_hex(stack_base as u64);
+            crate::serial_str!(".."); crate::drivers::serial::write_hex(stack_top as u64);
             crate::drivers::serial::write_newline();
 
-            // CRITICAL: Verify CS and SS are NOT swapped!
-            if cs_val != 0x23 || ss_val != 0x1B {
-                crate::drivers::serial::write_str("[TASK_NEW] ERROR: CS/SS values are wrong!\n");
-                crate::drivers::serial::write_str("  Expected CS=0x23, SS=0x1B\n");
-            }
+            // User context (for IRETQ frame)
+            ptr::addr_of_mut!((*task_ptr).context.rsp).write(user_stack_top);
+            ptr::addr_of_mut!((*task_ptr).context.rbp).write(user_stack_top);
+            ptr::addr_of_mut!((*task_ptr).context.rip).write(entry_point);
+            ptr::addr_of_mut!((*task_ptr).context.rflags).write(0x202);
+            ptr::addr_of_mut!((*task_ptr).context.cs).write(0x23);
+            ptr::addr_of_mut!((*task_ptr).context.ss).write(0x1B);
 
-            crate::serial_strln!("[TASK_NEW] Step 8: about to init IPC...");
-            // IPC - Initialize in-place (zero-stack method)
-            // recv_queue was already zeroed by write_bytes above
-            // MessageQueue::init_at_ptr just sets the max_size field
+            // Kernel context (for switch_context)
+            ptr::addr_of_mut!((*task_ptr).kernel_context.cs).write(0x08);
+            ptr::addr_of_mut!((*task_ptr).kernel_context.ss).write(0x10);
+            ptr::addr_of_mut!((*task_ptr).kernel_context.rflags).write(0x202);
+
+            crate::serial_str!("[TASK_NEW] CS=");
+            crate::drivers::serial::write_hex(0x23);
+            crate::serial_str!(", SS=");
+            crate::drivers::serial::write_hex(0x1B);
+            crate::drivers::serial::write_newline();
+
+            // IPC
             MessageQueue::init_at_ptr(ptr::addr_of_mut!((*task_ptr).recv_queue));
-            crate::serial_strln!("[TASK_NEW] Step 8a: recv_queue init OK");
-
             ptr::addr_of_mut!((*task_ptr).ipc_reply).write(None);
-            crate::serial_strln!("[TASK_NEW] Step 8b: ipc_reply OK");
             ptr::addr_of_mut!((*task_ptr).blocked_on).write(None);
-            crate::serial_strln!("[TASK_NEW] Step 8c: blocked_on OK");
 
             // Security
-            crate::serial_strln!("[TASK_NEW] Step 9: about to init security...");
             ptr::addr_of_mut!((*task_ptr).capabilities).write(Vec::new());
-            crate::serial_strln!("[TASK_NEW] Step 9a: capabilities OK");
             ptr::addr_of_mut!((*task_ptr).credentials).write(Credentials {
-                uid: 0,
-                gid: 0,
-                sandbox_level: SandboxLevel::Untrusted,
+                uid: 0, gid: 0, sandbox_level: SandboxLevel::Untrusted,
             });
-            crate::serial_strln!("[TASK_NEW] Step 9b: credentials OK");
 
             // Scheduling
-            crate::serial_strln!("[TASK_NEW] Step 10: about to init scheduling...");
-            crate::serial_str!("[TASK_NEW] Step 10a: priority addr="); crate::drivers::serial::write_hex(ptr::addr_of_mut!((*task_ptr).priority) as u64); crate::drivers::serial::write_newline();
             ptr::addr_of_mut!((*task_ptr).priority).write(PRIORITY_NORMAL);
-            crate::serial_strln!("[TASK_NEW] Step 10a: priority OK");
             ptr::addr_of_mut!((*task_ptr).base_priority).write(PRIORITY_NORMAL);
-            crate::serial_strln!("[TASK_NEW] Step 10b: base_priority OK");
             ptr::addr_of_mut!((*task_ptr).deadline_ms).write(None);
-            crate::serial_strln!("[TASK_NEW] Step 10c: deadline_ms OK");
             ptr::addr_of_mut!((*task_ptr).cpu_time_used_ms).write(0);
-            crate::serial_strln!("[TASK_NEW] Step 10d: cpu_time_used OK");
             ptr::addr_of_mut!((*task_ptr).last_scheduled_ms).write(0);
-            crate::serial_strln!("[TASK_NEW] Step 10e: last_scheduled OK");
 
             // Statistics
-            crate::serial_strln!("[TASK_NEW] Step 11: about to init stats...");
-            crate::serial_strln!("[TASK_NEW] Step 11a: calling uptime_ms()...");
             let current_time = crate::timer::uptime_ms();
-            crate::serial_str!("[TASK_NEW] Step 11b: uptime_ms returned "); crate::drivers::serial::write_dec(current_time as u32); crate::drivers::serial::write_newline();
-
             let stats_ptr = ptr::addr_of_mut!((*task_ptr).stats);
-            crate::serial_str!("[TASK_NEW] Step 11c: stats addr="); crate::drivers::serial::write_hex(stats_ptr as u64); crate::serial_str!(", size="); crate::drivers::serial::write_dec(core::mem::size_of::<TaskStatistics>() as u32); crate::drivers::serial::write_newline();
-
-            // Test read first
-            crate::serial_strln!("[TASK_NEW] Step 11d: testing read from stats...");
-            let test_byte = ptr::read_volatile(stats_ptr as *const u8);
-            crate::serial_str!("[TASK_NEW] Step 11e: read OK (val="); crate::drivers::serial::write_dec(test_byte as u32); crate::serial_strln!(")");
-
-            // Test single byte write
-            crate::serial_strln!("[TASK_NEW] Step 11f: testing single byte write to stats...");
-            ptr::write_volatile(stats_ptr as *mut u8, 0xAA);
-            crate::serial_strln!("[TASK_NEW] Step 11g: single byte OK");
-
-            // Now try zeroing
-            crate::serial_strln!("[TASK_NEW] Step 11h: zeroing stats memory...");
-            for i in 0..core::mem::size_of::<TaskStatistics>() {
-                ptr::write_volatile((stats_ptr as *mut u8).add(i), 0);
-            }
-            crate::serial_strln!("[TASK_NEW] Step 11i: zeroing done");
-
-            // Write created_at_ms
-            crate::serial_strln!("[TASK_NEW] Step 11j: writing created_at_ms...");
+            ptr::write_bytes(stats_ptr as *mut u8, 0, core::mem::size_of::<TaskStatistics>());
             ptr::addr_of_mut!((*stats_ptr).created_at_ms).write(current_time);
-            crate::serial_strln!("[TASK_NEW] Step 11: stats init OK");
 
             // Interrupt handling
             ptr::addr_of_mut!((*task_ptr).interrupt_pending).write(false);
 
-            // Move out of buffer (assume_init returns by value, perfect!)
-            crate::serial_strln!("[TASK_NEW] Step 12: about to return Task...");
+            // Task name (zeroed by default, set via set_name after creation)
+            // Already zeroed by write_bytes above
+
+            // FPU/SSE: valid initial state (MXCSR=0x1F80, FPU CW=0x037F)
+            ptr::addr_of_mut!((*task_ptr).fxsave_area).write(FxsaveArea::default_init());
             buffer.assume_init_read()
         }
+    }
+
+    /// Set the task's human-readable name (max 15 chars, null-terminated)
+    pub fn set_name(&mut self, name: &str) {
+        let bytes = name.as_bytes();
+        let len = bytes.len().min(15);
+        self.name[..len].copy_from_slice(&bytes[..len]);
+        self.name[len] = 0;
     }
 }
 

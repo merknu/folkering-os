@@ -63,6 +63,13 @@ pub fn init() {
 
         crate::drivers::serial::write_str("[APIC] APIC registers mapped successfully\n");
 
+        // Print Local APIC ID for debugging
+        let apic_id_reg = read_apic_reg(apic_virt, APIC_ID);
+        let apic_id = (apic_id_reg >> 24) & 0xFF;
+        crate::drivers::serial::write_str("[APIC] Local APIC ID: ");
+        crate::drivers::serial::write_dec(apic_id);
+        crate::drivers::serial::write_newline();
+
         // 2. Enable APIC by setting spurious interrupt vector
         let spurious = read_apic_reg(apic_virt, APIC_SPURIOUS);
         write_apic_reg(apic_virt, APIC_SPURIOUS, spurious | 0x100 | 0xFF);
@@ -70,15 +77,10 @@ pub fn init() {
         // 2b. Set Task Priority to 0 to accept all interrupts
         write_apic_reg(apic_virt, APIC_TPR, 0);
 
-        // 3. NOTE: Do NOT disable legacy PIC here - keyboard driver needs IRQ1
-        // disable_pic();
-        crate::drivers::serial::write_str("[APIC] Legacy PIC left enabled for keyboard IRQ1\n");
-
-        // 4. Configure LINT0 for virtual wire mode (ExtINT from PIC)
-        // This allows legacy PIC interrupts to be delivered through APIC LINT0
-        // Delivery mode: ExtINT (111b = 0x700), unmasked (bit 16 = 0)
-        write_apic_reg(apic_virt, APIC_LVT_LINT0, 0x700);
-        crate::drivers::serial::write_str("[APIC] LINT0 configured for ExtINT (virtual wire mode)\n");
+        // 3. Mask LINT0 - we use IOAPIC for device interrupts, not virtual wire mode
+        // LINT0 is masked (bit 16 = 1) since IOAPIC handles keyboard/mouse
+        write_apic_reg(apic_virt, APIC_LVT_LINT0, 0x10000);
+        crate::drivers::serial::write_str("[APIC] LINT0 masked (using IOAPIC for device interrupts)\n");
 
         // 5. Configure LINT1 for NMI (standard configuration)
         // Delivery mode: NMI (100b = 0x400), edge triggered

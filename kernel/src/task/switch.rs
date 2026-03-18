@@ -53,15 +53,23 @@ pub unsafe fn switch_to(target_id: TaskId) {
         }
     };
 
-    // Save current task's context pointer (if we have a current task)
-    let current_ctx_ptr = if let Some(ref current_task) = current {
+    // Get kernel_context pointers for switch_context (kernel-level save/restore).
+    // These are separate from the user context, so switch_context won't overwrite
+    // the user state that syscall_entry saved for the IRETQ frame.
+    let current_kctx_ptr = if let Some(ref current_task) = current {
         let current_locked = current_task.lock();
-        &current_locked.context as *const Context as usize
+        &current_locked.kernel_context as *const Context as usize
     } else {
         0 // No current task (first switch from kernel)
     };
 
-    // Get target task's context pointer
+    let target_kctx_ptr = {
+        let target_locked = target.lock();
+        &target_locked.kernel_context as *const Context as usize
+    };
+
+    // Get target's USER context pointer for set_current_context_ptr
+    // (syscall_entry reads this to build IRETQ frames)
     let target_ctx_ptr = {
         let target_locked = target.lock();
         &target_locked.context as *const Context as usize
@@ -80,16 +88,18 @@ pub unsafe fn switch_to(target_id: TaskId) {
     // Update current task pointer
     set_current_task(target_id);
 
-    // Update current context pointer for fast syscall access
+    // Update current context pointer for fast syscall access (points to USER context)
     crate::arch::x86_64::syscall::set_current_context_ptr(target_ctx_ptr as *mut Context);
 
     // Perform actual register switch (assembly)
-    if current_ctx_ptr == 0 {
+    if current_kctx_ptr == 0 {
         // First switch from kernel - just restore new task, don't save
+        // Uses USER context (target_ctx_ptr) for IRETQ to user mode
         restore_context_only(target_ctx_ptr);
     } else {
-        // Normal switch - save current, restore new
-        switch_context(current_ctx_ptr, target_ctx_ptr);
+        // Normal switch - save/restore KERNEL context (not user context!)
+        // User context remains untouched in task.context for IRETQ frame
+        switch_context(current_kctx_ptr, target_kctx_ptr);
     }
 }
 
@@ -149,7 +159,8 @@ extern "C" fn switch_context(_old_ctx: usize, _new_ctx: usize) {
         "pop rax",
         "mov [r10 + 136], rax",   // Save RFLAGS
 
-        // Save segment registers
+        // Save segment registers (zero-extend to 64-bit to avoid garbage in upper bits)
+        "xor eax, eax",
         "mov ax, cs",
         "mov [r10 + 144], rax",   // Save CS
         "mov ax, ss",
@@ -190,12 +201,6 @@ extern "C" fn switch_context(_old_ctx: usize, _new_ctx: usize) {
     );
 }
 
-/// Debug helper: print context before restore (kept as no-op)
-#[inline(never)]
-pub fn debug_context_before_restore(_ctx_ptr: usize) {
-    // Intentionally empty — was debug noise
-}
-
 /// Restore task context without saving (for first switch from kernel to user)
 ///
 /// Uses IRETQ to properly transition from CPL 0 (kernel) to CPL 3 (user).
@@ -209,104 +214,56 @@ pub fn debug_context_before_restore(_ctx_ptr: usize) {
 pub unsafe extern "C" fn restore_context_only(_new_ctx: usize) {
     core::arch::naked_asm!(
         // Argument: RDI = new_ctx pointer
-
-        // Save new_ctx to R11 first (so we can call debug function)
         "mov r11, rdi",           // R11 = new_ctx pointer
-
-        // Call debug function (RDI still has ctx_ptr)
-        // NOTE: R11 is caller-saved, so we must save it across the call!
-        "push r11",
-        "call {debug_fn}",
-        "pop r11",                // Restore R11 after call
-
-        // R11 now has new_ctx pointer again
-        // NOTE: MSR restore removed - caused format! crashes at boot
 
         // Set DS, ES, FS, GS to user data segment (0x1B) before IRETQ
         // These are NOT restored by IRETQ but must be valid for user mode
-        // In 64-bit mode, the base is ignored but the selector must be valid
         "mov ax, 0x1B",           // User data segment selector (0x18 | RPL 3)
         "mov ds, ax",
         "mov es, ax",
         "mov fs, ax",
         "mov gs, ax",
 
-        // Build IRETQ frame on stack (required for CPL 0->3 transition)
-        // IRETQ pops: SS, RSP, RFLAGS, CS, RIP
-        "mov qword ptr [{debug_marker}], 0x1111",   // Marker: starting frame build
+        // FXRSTOR: restore FPU/SSE state for the new task
+        "mov rax, qword ptr [{fxsave_ptr}]",
+        "test rax, rax",
+        "jz 4f",
+        "fxrstor64 [rax]",
+        "4:",
+
+        // Build IRETQ frame (push in reverse: SS, RSP, RFLAGS, CS, RIP)
         "mov rax, [r11 + 152]",   // SS
-        "mov qword ptr [{debug_marker}], 0x2222",   // Marker: loaded SS
         "push rax",
-        "mov qword ptr [{debug_marker}], 0x3333",   // Marker: pushed SS
         "mov rax, [r11 + 0]",     // RSP
         "push rax",
-        "mov qword ptr [{debug_marker}], 0x4444",   // Marker: pushed RSP
         "mov rax, [r11 + 136]",   // RFLAGS
         "push rax",
-        "mov qword ptr [{debug_marker}], 0x5555",   // Marker: pushed RFLAGS
         "mov rax, [r11 + 144]",   // CS
         "push rax",
-        "mov qword ptr [{debug_marker}], 0x6666",   // Marker: pushed CS
         "mov rax, [r11 + 128]",   // RIP
         "push rax",
-        "mov qword ptr [{debug_marker}], 0xDEAD",   // Marker: frame complete
 
         // Restore general-purpose registers
-        "mov rax, [r11 + 16]",    // Restore RAX
-        "mov rbx, [r11 + 24]",    // Restore RBX
-        "mov rcx, [r11 + 32]",    // Restore RCX
-        "mov rdx, [r11 + 40]",    // Restore RDX
-        "mov rsi, [r11 + 48]",    // Restore RSI
-        "mov rdi, [r11 + 56]",    // Restore RDI
-        "mov rbp, [r11 + 8]",     // Restore RBP
-        "mov r8,  [r11 + 64]",    // Restore R8
-        "mov r9,  [r11 + 72]",    // Restore R9
-        "mov r10, [r11 + 80]",    // Restore R10
-        "mov r12, [r11 + 96]",    // Restore R12
-        "mov r13, [r11 + 104]",   // Restore R13
-        "mov r14, [r11 + 112]",   // Restore R14
-        "mov r15, [r11 + 120]",   // Restore R15
+        "mov rax, [r11 + 16]",
+        "mov rbx, [r11 + 24]",
+        "mov rcx, [r11 + 32]",
+        "mov rdx, [r11 + 40]",
+        "mov rsi, [r11 + 48]",
+        "mov rdi, [r11 + 56]",
+        "mov rbp, [r11 + 8]",
+        "mov r8,  [r11 + 64]",
+        "mov r9,  [r11 + 72]",
+        "mov r10, [r11 + 80]",
+        "mov r12, [r11 + 96]",
+        "mov r13, [r11 + 104]",
+        "mov r14, [r11 + 112]",
+        "mov r15, [r11 + 120]",
+        "mov r11, [r11 + 88]",
 
-        // Finally restore R11
-        "mov r11, [r11 + 88]",    // Restore R11
-
-        // Can't use push/pop here - would corrupt IRETQ frame!
-        // IRETQ will pop RIP, CS, RFLAGS, RSP, SS from stack and switch to user mode
         "iretq",
 
-        debug_fn = sym debug_before_iretq_fn,
-        debug_marker = sym crate::arch::x86_64::syscall::DEBUG_MARKER,
+        fxsave_ptr = sym crate::task::task::FXSAVE_CURRENT_PTR,
     );
-}
-
-/// Debug function called before IRETQ (kept as no-op, referenced from asm)
-#[no_mangle]
-extern "C" fn debug_before_iretq_fn(ctx_ptr: usize) {
-    // Debug: print when we're about to IRETQ
-    static mut IRETQ_COUNT: u64 = 0;
-    unsafe {
-        IRETQ_COUNT += 1;
-        if IRETQ_COUNT <= 5 {
-            let ctx = ctx_ptr as *const crate::task::task::Context;
-            crate::serial_str!("[IRETQ] ctx=");
-            crate::drivers::serial::write_hex(ctx_ptr as u64);
-            crate::serial_str!(", RIP=");
-            crate::drivers::serial::write_hex((*ctx).rip);
-            crate::serial_str!(", RSP=");
-            crate::drivers::serial::write_hex((*ctx).rsp);
-            crate::serial_str!(", CS=");
-            crate::drivers::serial::write_hex((*ctx).cs);
-            crate::serial_str!(", SS=");
-            crate::drivers::serial::write_hex((*ctx).ss);
-            crate::drivers::serial::write_newline();
-        }
-    }
-}
-
-/// Debug function for IRETQ frame inspection (kept as no-op)
-#[no_mangle]
-extern "C" fn debug_switch_iretq_frame(_frame_rsp: usize) {
-    // Intentionally empty — was debug noise
 }
 
 /// Initialize a new task's context

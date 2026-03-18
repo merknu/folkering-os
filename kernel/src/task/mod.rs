@@ -9,7 +9,7 @@ pub mod statistics;
 pub mod preempt;
 
 pub use scheduler::{init as scheduler_init, start as scheduler_start, enqueue, yield_cpu};
-pub use task::Task;
+pub use task::{Task, FXSAVE_CURRENT_PTR, FxsaveArea};
 pub use spawn::{spawn, spawn_raw, SpawnError};
 pub use switch::{switch_to, init_context, init_user_context};
 pub use statistics::{

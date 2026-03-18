@@ -2,10 +2,11 @@
 //!
 //! Handles preemptive context switching when the timer interrupt fires.
 
-use super::task::{self, Context, TaskState};
+use super::task::{self, Context, TaskState, FXSAVE_CURRENT_PTR};
 use super::scheduler;
 use super::statistics;
 use crate::timer;
+use core::sync::atomic::Ordering;
 
 /// Saved interrupt context from timer handler
 /// This matches the layout pushed by the timer handler assembly
@@ -100,6 +101,12 @@ pub extern "C" fn timer_preempt_handler(saved_ctx: *const SavedInterruptContext)
         task_locked.context.r15 = saved.r15;
         task_locked.context.rip = saved.rip;
         task_locked.context.rsp = saved.rsp;
+
+        // Store R14/RSP into debug statics while lock is held
+        crate::arch::x86_64::syscall::DEBUG_CONTEXT_R14
+            .store(saved.r14, core::sync::atomic::Ordering::Relaxed);
+        crate::arch::x86_64::syscall::DEBUG_CONTEXT_RSP
+            .store(saved.rsp, core::sync::atomic::Ordering::Relaxed);
         task_locked.context.rflags = saved.rflags;
         task_locked.context.cs = saved.cs;
         task_locked.context.ss = saved.ss;
@@ -118,6 +125,9 @@ pub extern "C" fn timer_preempt_handler(saved_ctx: *const SavedInterruptContext)
     // If same task, just return its context
     if next_id == current_id {
         let task_locked = current_task.lock();
+        // Keep FXSAVE_CURRENT_PTR pointing to this task's area (update in case it was 0)
+        let fxsave_ptr = &task_locked.fxsave_area as *const _ as usize;
+        FXSAVE_CURRENT_PTR.store(fxsave_ptr, Ordering::Release);
         return &task_locked.context as *const Context;
     }
 
@@ -125,21 +135,6 @@ pub extern "C" fn timer_preempt_handler(saved_ctx: *const SavedInterruptContext)
     // Record the preemption for statistics
     statistics::record_preemption(current_id);
     statistics::record_context_switch(next_id);
-
-    // Debug output for first few preemptions
-    static mut PREEMPT_COUNT: u64 = 0;
-    unsafe {
-        PREEMPT_COUNT += 1;
-        if PREEMPT_COUNT <= 5 {
-            crate::serial_str!("[PREEMPT] Task ");
-            crate::drivers::serial::write_dec(current_id);
-            crate::serial_str!(" -> Task ");
-            crate::drivers::serial::write_dec(next_id);
-            crate::serial_str!(" (count=");
-            crate::drivers::serial::write_dec(PREEMPT_COUNT as u32);
-            crate::serial_strln!(")");
-        }
-    }
 
     // Get next task
     let next_task = match task::get_task(next_id) {
@@ -166,11 +161,19 @@ pub extern "C" fn timer_preempt_handler(saved_ctx: *const SavedInterruptContext)
     // Update current task ID
     task::set_current_task(next_id);
 
-    // Update syscall context pointer
-    let next_ctx_ptr = {
+    // Update FXSAVE pointer AND syscall context pointer for next task.
+    // We lock once and extract both raw pointers so the lock can be released.
+    let (next_ctx_ptr, next_fxsave_ptr) = {
         let next_locked = next_task.lock();
-        &next_locked.context as *const Context
+        let ctx = &next_locked.context as *const Context;
+        let fxsave = &next_locked.fxsave_area as *const _ as usize;
+        (ctx, fxsave)
     };
+
+    // FXSAVE_CURRENT_PTR now points to the NEXT task's fxsave area.
+    // irq_timer will call FXRSTOR [ptr] after this function returns.
+    FXSAVE_CURRENT_PTR.store(next_fxsave_ptr, Ordering::Release);
+
     crate::arch::x86_64::syscall::set_current_context_ptr(next_ctx_ptr as *mut Context);
 
     // Return pointer to next task's context
