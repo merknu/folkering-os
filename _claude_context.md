@@ -1,7 +1,33 @@
 # Folkering OS — Claude Context
 
 ## Project Overview
-Rust bare-metal x86-64 hobby OS. Limine bootloader, QEMU for emulation, Docker/WSL build environment.
+Rust bare-metal x86-64 AI-native microkernel OS. Limine bootloader, QEMU for emulation, WSL build.
+
+**Current milestone**: 4.5 (App Weaver + interactive buttons)
+
+## What Works (as of 2026-03-18)
+- Graphical desktop (Neural Desktop) with draggable windows
+- Interactive terminal: `ls`, `ps`, `cat`, `find`, `uptime`, `app`, `help`
+- SQLite VFS via Synapse (custom no_std B-tree reader)
+- App Weaver: Shell builds declarative UI → shmem → Compositor renders
+- Clickable buttons with action_id IPC events back to owner task
+- SYS_MMAP/MUNMAP for dynamic anonymous memory
+- Full microkernel IPC: Compositor → Intent Service → Shell → Synapse
+
+## 5 Userspace Tasks
+| Task | Name | Purpose |
+|------|------|---------|
+| 1 | idle | Idle loop |
+| 2 | synapse | SQLite, file cache, search |
+| 3 | shell | Commands, app builder |
+| 4 | compositor | GUI, windows, widgets |
+| 5 | intent-service | Capability-based IPC routing |
+
+## Critical Lessons (from this session)
+1. **shmem_map MUST use task PML4** — `map_page_in_table(task.page_table_phys, ...)` NOT global MAPPER
+2. **receive() truncates to 32 bits** — use recv_async() for full 64-bit payloads
+3. **B-tree right_pointer: follow exactly once** — check `next_cell == cell_count`
+4. **Avoid IPC deadlocks** — Shell can't send IPC to Compositor while Compositor waits for Shell
 
 ## Build
 - Kernel: `kernel/` → `target/x86_64-folkering/release/kernel` (ELF)
