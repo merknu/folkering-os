@@ -151,16 +151,13 @@ impl<'a, 'db> TableScanner<'a, 'db> {
             } else {
                 // Interior page
                 if next_cell < header.cell_count {
-                    // Move to next cell and descend
+                    // Move to next cell and descend to its left child
                     self.stack[self.depth - 1].1 = next_cell;
 
-                    // Get the child pointer from this cell
                     let cell_offset = self.get_cell_offset(page, &header, header_offset, next_cell)
                         .ok_or(Error::InvalidRecord)?;
                     let cell = &page[cell_offset as usize..];
 
-                    // Interior table cell: [left_child: u32][rowid: varint]...
-                    // We want the left child of the NEXT cell, which is stored in this cell
                     if cell.len() < 4 {
                         return Err(Error::InvalidRecord);
                     }
@@ -168,13 +165,18 @@ impl<'a, 'db> TableScanner<'a, 'db> {
 
                     self.descend_to_leaf(child)?;
                     return Ok(true);
-                } else if let Some(right_ptr) = header.right_pointer {
-                    // No more cells, but there's a right pointer
-                    self.stack[self.depth - 1].1 = next_cell;
-                    self.descend_to_leaf(right_ptr)?;
-                    return Ok(true);
+                } else if next_cell == header.cell_count {
+                    // Just finished last cell's subtree — follow right_pointer ONCE
+                    if let Some(right_ptr) = header.right_pointer {
+                        self.stack[self.depth - 1].1 = next_cell; // now > cell_count on next visit
+                        self.descend_to_leaf(right_ptr)?;
+                        return Ok(true);
+                    }
+                    // No right pointer — interior page done
+                    self.depth -= 1;
+                    continue;
                 } else {
-                    // Interior page exhausted
+                    // next_cell > cell_count — right_pointer already followed, pop
                     self.depth -= 1;
                     continue;
                 }
