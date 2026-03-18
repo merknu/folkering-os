@@ -1257,10 +1257,64 @@ fn main() -> ! {
                         let mut buf = [0u8; 32];
                         let time_str = format_uptime(ms, &mut buf);
                         win.push_line(time_str);
+                    } else if cmd_str.starts_with("cat ") {
+                        let filename = cmd_str[4..].trim();
+                        if filename.is_empty() {
+                            win.push_line("usage: cat <filename>");
+                        } else {
+                            let name_hash = shell_hash_name(filename) as u64;
+                            let shell_payload = SHELL_OP_CAT_FILE | (name_hash << 8);
+                            let intent_req = libfolk::sys::intent::INTENT_OP_SUBMIT
+                                | (shell_payload << 8);
+                            let ipc_result = unsafe {
+                                libfolk::syscall::syscall3(
+                                    libfolk::syscall::SYS_IPC_SEND,
+                                    libfolk::sys::intent::INTENT_TASK_ID as u64, intent_req, 0
+                                )
+                            };
+                            if ipc_result != u64::MAX && ipc_result != SHELL_STATUS_NOT_FOUND {
+                                let size = (ipc_result >> 32) as usize;
+                                let handle = (ipc_result & 0xFFFFFFFF) as u32;
+                                if handle != 0 && size > 0 {
+                                    if shmem_map(handle, COMPOSITOR_SHMEM_VADDR).is_ok() {
+                                        let buf = unsafe {
+                                            core::slice::from_raw_parts(COMPOSITOR_SHMEM_VADDR as *const u8, size)
+                                        };
+                                        let mut start = 0;
+                                        for pos in 0..size {
+                                            if buf[pos] == b'\n' || buf[pos] == 0 {
+                                                if pos > start {
+                                                    if let Ok(line) = core::str::from_utf8(&buf[start..pos]) {
+                                                        win.push_line(line);
+                                                    }
+                                                }
+                                                start = pos + 1;
+                                                if buf[pos] == 0 { break; }
+                                            }
+                                        }
+                                        if start < size {
+                                            let end = buf[start..size].iter().position(|&b| b == 0)
+                                                .map(|p| start + p).unwrap_or(size);
+                                            if end > start {
+                                                if let Ok(line) = core::str::from_utf8(&buf[start..end]) {
+                                                    win.push_line(line);
+                                                }
+                                            }
+                                        }
+                                        let _ = shmem_unmap(handle, COMPOSITOR_SHMEM_VADDR);
+                                        let _ = shmem_destroy(handle);
+                                    }
+                                } else {
+                                    win.push_line("File is empty");
+                                }
+                            } else {
+                                win.push_line("File not found");
+                            }
+                        }
                     } else if cmd_str == "help" {
-                        win.push_line("ls ps cat find uptime help");
+                        win.push_line("ls ps cat find uptime help term");
                     } else {
-                        win.push_line("Unknown command");
+                        win.push_line("Unknown command. Try: help");
                     }
                 }
             }
