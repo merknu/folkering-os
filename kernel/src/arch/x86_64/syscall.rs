@@ -948,8 +948,9 @@ extern "C" fn syscall_handler(
         0x25 => syscall_read_mouse(),
         // Phase 8: Detailed task list via userspace buffer
         0x26 => syscall_task_list_detailed(arg1, arg2),
-        // Phase 9: Anonymous memory mapping (mmap)
+        // Phase 9: Anonymous memory mapping
         0x30 => syscall_mmap(arg1, arg2, arg3),
+        0x31 => syscall_munmap(arg1, arg2),
         _ => {
             crate::drivers::serial::write_str("[HANDLER] Invalid syscall!\n");
             u64::MAX // Return error
@@ -1454,6 +1455,54 @@ fn syscall_mmap(hint_addr: u64, size: u64, flags: u64) -> u64 {
     }
 
     virt_base
+}
+
+/// Unmap anonymous memory previously allocated with SYS_MMAP
+///
+/// # Arguments
+/// - `virt_addr`: virtual address (must be page-aligned, in user mmap range)
+/// - `size`: number of bytes to unmap (rounded up to page boundary)
+///
+/// # Returns
+/// - 0 on success, u64::MAX on failure
+fn syscall_munmap(virt_addr: u64, size: u64) -> u64 {
+    use crate::memory::paging::unmap_page_in_table;
+    use crate::memory::physical::free_pages;
+
+    const PAGE_SIZE: u64 = 4096;
+    const MMAP_BASE: u64 = 0x4000_0000;
+
+    if size == 0 || virt_addr % PAGE_SIZE != 0 || virt_addr < MMAP_BASE {
+        return u64::MAX;
+    }
+
+    let num_pages = ((size + PAGE_SIZE - 1) / PAGE_SIZE) as usize;
+
+    let task_pml4 = crate::task::task::current_task().lock().page_table_phys;
+    if task_pml4 == 0 {
+        return u64::MAX;
+    }
+
+    let mut freed = 0usize;
+    for i in 0..num_pages {
+        let virt = virt_addr + (i as u64 * PAGE_SIZE);
+        match unmap_page_in_table(task_pml4, virt as usize) {
+            Ok(phys_addr) => {
+                // Return physical page to PMM
+                free_pages(phys_addr, 0);
+                freed += 1;
+            }
+            Err(_) => {
+                // Page wasn't mapped — skip silently (like Linux munmap)
+            }
+        }
+    }
+
+    if freed > 0 {
+        crate::serial_println!("[MUNMAP] Freed {} pages at {:#x}", freed, virt_addr);
+    }
+
+    0 // success
 }
 
 fn syscall_spawn(binary_ptr: u64, binary_len: u64) -> u64 {

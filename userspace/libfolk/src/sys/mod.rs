@@ -19,7 +19,7 @@ pub mod intent;
 pub use task::{exit, yield_cpu, get_pid, spawn};
 pub use io::{read_key, read_mouse, write_char, poweroff, check_interrupt, clear_interrupt, MouseEvent};
 pub use ipc::{send, receive, reply};
-pub use memory::{shmem_create, shmem_map, shmem_grant, shmem_unmap, shmem_destroy, mmap, mmap_at, PROT_READ, PROT_WRITE, PROT_EXEC, MmapError};
+pub use memory::{shmem_create, shmem_map, shmem_grant, shmem_unmap, shmem_destroy, mmap, mmap_at, munmap, PROT_READ, PROT_WRITE, PROT_EXEC, MmapError};
 pub use system::{task_list, task_list_detailed, uptime};
 
 // Re-export Synapse protocol

@@ -2,7 +2,7 @@
 //!
 //! Functions for creating and mapping shared memory regions.
 
-use crate::syscall::{syscall1, syscall2, syscall3, SYS_SHMEM_CREATE, SYS_SHMEM_MAP, SYS_SHMEM_GRANT, SYS_SHMEM_UNMAP, SYS_SHMEM_DESTROY, SYS_MMAP};
+use crate::syscall::{syscall1, syscall2, syscall3, SYS_SHMEM_CREATE, SYS_SHMEM_MAP, SYS_SHMEM_GRANT, SYS_SHMEM_UNMAP, SYS_SHMEM_DESTROY, SYS_MMAP, SYS_MUNMAP};
 
 /// Error codes for shared memory operations
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,5 +171,22 @@ pub fn mmap_at(addr: usize, size: usize, flags: u64) -> Result<*mut u8, MmapErro
         Err(MmapError::OutOfMemory)
     } else {
         Ok(ret as *mut u8)
+    }
+}
+
+/// Unmap and free anonymous pages previously allocated with mmap.
+///
+/// # Safety
+/// The caller must ensure `ptr` was returned by `mmap` and the region
+/// is not accessed after munmap returns.
+pub fn munmap(ptr: *mut u8, size: usize) -> Result<(), MmapError> {
+    if ptr.is_null() || size == 0 {
+        return Err(MmapError::InvalidParam);
+    }
+    let ret = unsafe { syscall2(SYS_MUNMAP, ptr as u64, size as u64) };
+    if ret == u64::MAX {
+        Err(MmapError::InvalidParam)
+    } else {
+        Ok(())
     }
 }
