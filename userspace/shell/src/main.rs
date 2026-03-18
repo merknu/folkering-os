@@ -89,110 +89,46 @@ fn handle_ipc_command(payload0: u64) -> u64 {
 
     match opcode {
         x if x == SHELL_OP_LIST_FILES => {
-            // List files - return count + shmem with file entries
-            let mut entries = [DirEntry {
-                id: 0, entry_type: 0, name: [0u8; 32], size: 0
-            }; 16];
-            let count = libfolk::sys::fs::read_dir(&mut entries);
-            if count == 0 {
-                return 0;
-            }
-
-            // Create shmem: 32 bytes per entry [name: [u8;24]][size: u32][type_pad: u32]
-            let shmem_size = count * 32;
-            let handle = match shmem_create(shmem_size) {
-                Ok(h) => h,
-                Err(_) => return (count as u64) << 32, // Fallback: count only
+            // List files via Synapse (reads from SQLite)
+            // Synapse returns (count << 32) | shmem_handle with file entries
+            let result = unsafe {
+                libfolk::syscall::syscall3(
+                    libfolk::syscall::SYS_IPC_SEND,
+                    SYNAPSE_TASK_ID as u64,
+                    libfolk::sys::synapse::SYN_OP_LIST_FILES,
+                    0
+                )
             };
-
-            // Map shmem
-            if shmem_map(handle, SHELL_SHMEM_VADDR).is_err() {
-                let _ = shmem_destroy(handle);
-                return (count as u64) << 32;
-            }
-
-            // Write entries to shmem
-            let buf = unsafe {
-                core::slice::from_raw_parts_mut(SHELL_SHMEM_VADDR as *mut u8, shmem_size)
-            };
-            for i in 0..count {
-                let offset = i * 32;
-                // name: [u8; 24]
-                let name_bytes = entries[i].name_str().as_bytes();
-                let name_len = name_bytes.len().min(24);
-                buf[offset..offset+name_len].copy_from_slice(&name_bytes[..name_len]);
-                // Zero-fill rest of name
-                for j in name_len..24 {
-                    buf[offset + j] = 0;
-                }
-                // size: u32
-                let size_val = entries[i].size as u32;
-                buf[offset+24..offset+28].copy_from_slice(&size_val.to_le_bytes());
-                // type: u32 (0=elf, 1=data)
-                let type_val: u32 = if entries[i].is_elf() { 0 } else { 1 };
-                buf[offset+28..offset+32].copy_from_slice(&type_val.to_le_bytes());
-            }
-
-            // Grant to caller (Intent Service = task 5, but we grant broadly)
-            // The msg.sender is provided by the kernel — grant to all potential callers
-            for task_id in 2..=8 {
-                let _ = shmem_grant(handle, task_id);
-            }
-
-            // Unmap from shell (caller will map it)
-            let _ = shmem_unmap(handle, SHELL_SHMEM_VADDR);
-
-            // Return count in upper 32 bits, shmem handle in lower
-            ((count as u64) << 32) | (handle as u64)
+            // Forward Synapse's response directly to compositor
+            // (Synapse already granted shmem to tasks 2-8)
+            result
         }
 
         x if x == SHELL_OP_CAT_FILE => {
-            // Cat file by name hash — read directly from ramdisk via kernel syscall
+            // Cat file via Synapse (reads BLOB from SQLite, returns shmem)
             let name_hash = ((payload0 >> 8) & 0xFFFFFFFF) as u32;
-            // Find matching file in ramdisk
-            let mut entries = [DirEntry {
-                id: 0, entry_type: 0, name: [0u8; 32], size: 0
-            }; 16];
-            let count = libfolk::sys::fs::read_dir(&mut entries);
 
-            for i in 0..count {
-                let entry_hash = shell_hash_name(entries[i].name_str());
-                if entry_hash == name_hash {
-                    // Found file — read content directly via kernel syscall
-                    let mut file_buf = [0u8; 4096];
-                    let bytes_read = libfolk::sys::fs::read_file(
-                        entries[i].name_str(), &mut file_buf
-                    );
-                    if bytes_read == 0 {
-                        return SHELL_STATUS_NOT_FOUND;
-                    }
+            // Send to Synapse: SYN_OP_READ_FILE_SHMEM | (name_hash << 16)
+            let syn_request = libfolk::sys::synapse::SYN_OP_READ_FILE_SHMEM
+                | ((name_hash as u64) << 16);
+            let result = unsafe {
+                libfolk::syscall::syscall3(
+                    libfolk::syscall::SYS_IPC_SEND,
+                    SYNAPSE_TASK_ID as u64,
+                    syn_request,
+                    0
+                )
+            };
 
-                    // Create shmem and copy file content
-                    let handle = match shmem_create(bytes_read) {
-                        Ok(h) => h,
-                        Err(_) => return SHELL_STATUS_ERROR,
-                    };
-                    if shmem_map(handle, SHELL_SHMEM_VADDR).is_err() {
-                        let _ = shmem_destroy(handle);
-                        return SHELL_STATUS_ERROR;
-                    }
-
-                    let buf = unsafe {
-                        core::slice::from_raw_parts_mut(
-                            SHELL_SHMEM_VADDR as *mut u8, bytes_read
-                        )
-                    };
-                    buf.copy_from_slice(&file_buf[..bytes_read]);
-
-                    for task_id in 2..=8 {
-                        let _ = shmem_grant(handle, task_id);
-                    }
-                    let _ = shmem_unmap(handle, SHELL_SHMEM_VADDR);
-
-                    return ((bytes_read as u64) << 32) | (handle as u64);
-                }
+            // Forward Synapse's response directly to compositor
+            // Synapse returns (size << 32) | shmem_handle, or SYN_STATUS_NOT_FOUND
+            if result == u64::MAX {
+                SHELL_STATUS_ERROR
+            } else if result == libfolk::sys::synapse::SYN_STATUS_NOT_FOUND {
+                SHELL_STATUS_NOT_FOUND
+            } else {
+                result // (size << 32) | shmem_handle
             }
-            SHELL_STATUS_NOT_FOUND
         }
 
         x if x == SHELL_OP_SEARCH => {

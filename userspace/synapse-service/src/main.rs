@@ -20,8 +20,8 @@
 #![no_main]
 
 use libfolk::{entry, println};
-use libfolk::sys::{yield_cpu, get_pid};
-use libfolk::sys::ipc::{receive, reply, IpcMessage};
+use libfolk::sys::{yield_cpu, get_pid, shmem_unmap, shmem_destroy};
+use libfolk::sys::ipc::{recv_async, reply_with_token, AsyncIpcMessage};
 use libfolk::sys::fs::{read_dir, DirEntry, read_file};
 use libfolk::sys::synapse::{
     SYN_OP_PING, SYN_OP_LIST_FILES, SYN_OP_FILE_COUNT, SYN_OP_FILE_BY_INDEX,
@@ -104,6 +104,18 @@ static mut SQLITE_STATE: SqliteState = SqliteState {
 
 static mut BACKEND: Backend = Backend::Fpk;
 
+/// Current IPC caller token (set by main loop before each handle_request)
+static mut CURRENT_TOKEN: Option<libfolk::sys::ipc::CallerToken> = None;
+
+/// Reply to the current IPC request using the stored CallerToken
+fn reply(payload0: u64, payload1: u64) -> Result<(), libfolk::sys::ipc::IpcError> {
+    if let Some(token) = unsafe { CURRENT_TOKEN.take() } {
+        reply_with_token(token, payload0, payload1)
+    } else {
+        Err(libfolk::sys::ipc::IpcError::WouldBlock)
+    }
+}
+
 fn main() -> ! {
     let pid = get_pid();
     println!("[SYNAPSE] Data Kernel starting (PID: {})", pid);
@@ -116,49 +128,12 @@ fn main() -> ! {
         println!("[SYNAPSE] SQLite backend initialized");
         unsafe { BACKEND = Backend::Sqlite; }
 
-        // Count files
-        let file_count = count_sqlite_files();
+        // Pre-cache file entries from SQLite into DIR_CACHE_STATE
+        // This avoids repeated slow table scans during IPC handling
+        refresh_sqlite_cache();
+        let file_count = unsafe { DIR_CACHE_STATE.count };
 
-        // Count embeddings - cap at file_count since we have 1:1 file:embedding
-        let embedding_count = if let Some(db) = get_sqlite_db() {
-            if let Ok(scanner) = db.table_scan("embeddings") {
-                let mut cnt = 0;
-                for result in scanner {
-                    // Only count valid records
-                    if result.is_ok() {
-                        cnt += 1;
-                    }
-                    // Cap at file count (1:1 relationship)
-                    if cnt >= file_count { break; }
-                }
-                cnt
-            } else {
-                0
-            }
-        } else {
-            0
-        };
-
-        if embedding_count > 0 {
-            // Check for quantized index
-            let has_quantized = if let Some(db) = get_sqlite_db() {
-                has_shadow_tables(&db)
-            } else {
-                false
-            };
-
-            if has_quantized {
-                println!("[SYNAPSE] Ready - {} ({} files, {} embeddings)",
-                         DB_FILENAME, file_count, embedding_count);
-                println!("[SYNAPSE] Vector search enabled (quantized BQ+SQ8)");
-            } else {
-                println!("[SYNAPSE] Ready - {} ({} files, {} embeddings)",
-                         DB_FILENAME, file_count, embedding_count);
-                println!("[SYNAPSE] Vector search enabled (brute-force)");
-            }
-        } else {
-            println!("[SYNAPSE] Ready - {} ({} files)", DB_FILENAME, file_count);
-        }
+        println!("[SYNAPSE] Ready - {} ({} files)", DB_FILENAME, file_count);
     } else {
         println!("[SYNAPSE] SQLite not found, using FPK backend");
         unsafe { BACKEND = Backend::Fpk; }
@@ -168,10 +143,12 @@ fn main() -> ! {
 
     println!("[SYNAPSE] Entering service loop...\n");
 
-    // Main service loop
+    // Main service loop — use recv_async for full 64-bit payload
     loop {
-        match receive() {
+        match recv_async() {
             Ok(msg) => {
+                // Store token for reply
+                unsafe { CURRENT_TOKEN = Some(msg.token); }
                 handle_request(msg);
             }
             Err(_) => {
@@ -259,8 +236,46 @@ fn refresh_fpk_cache() {
     }
 }
 
+/// Populate DIR_CACHE_STATE from SQLite files table (called once at init)
+/// This avoids repeated table scans — all handlers use the cached entries.
+fn refresh_sqlite_cache() {
+    if let Some(db) = get_sqlite_db() {
+        if let Ok(scanner) = db.table_scan("files") {
+            let mut count = 0;
+            for result in scanner {
+                if count >= MAX_ENTRIES { break; }
+                if let Ok(record) = result {
+                    if let Some(Value::Text(name)) = record.get(1) {
+                        let name_bytes = name.as_bytes();
+                        let name_len = name_bytes.len().min(32);
+                        unsafe {
+                            let entry = &mut DIR_CACHE_STATE.entries[count];
+                            entry.name = [0u8; 32];
+                            entry.name[..name_len].copy_from_slice(&name_bytes[..name_len]);
+                            entry.id = record.get(0)
+                                .and_then(|v| v.as_int())
+                                .unwrap_or(count as i64) as u16;
+                            entry.size = record.get(3)
+                                .and_then(|v| v.as_int())
+                                .unwrap_or(0) as u64;
+                            entry.entry_type = if record.get(2)
+                                .and_then(|v| v.as_int())
+                                .unwrap_or(1) == KIND_ELF { 0 } else { 1 };
+                            count += 1;
+                        }
+                    }
+                }
+            }
+            unsafe {
+                DIR_CACHE_STATE.count = count;
+                DIR_CACHE_STATE.valid = true;
+            }
+        }
+    }
+}
+
 /// Handle an incoming IPC request
-fn handle_request(msg: IpcMessage) {
+fn handle_request(msg: AsyncIpcMessage) {
     let op = msg.payload0 & 0xFFFF;
 
     match op {
@@ -284,12 +299,12 @@ fn handle_request(msg: IpcMessage) {
 }
 
 /// Handle PING request
-fn handle_ping(_msg: IpcMessage) {
+fn handle_ping(_msg: AsyncIpcMessage) {
     let _ = reply(SYNAPSE_VERSION, 0);
 }
 
 /// Handle FILE_COUNT request
-fn handle_file_count(_msg: IpcMessage) {
+fn handle_file_count(_msg: AsyncIpcMessage) {
     let count = match unsafe { BACKEND } {
         Backend::Sqlite => count_sqlite_files(),
         Backend::Fpk => {
@@ -303,7 +318,7 @@ fn handle_file_count(_msg: IpcMessage) {
 }
 
 /// Handle FILE_BY_INDEX request
-fn handle_file_by_index(msg: IpcMessage) {
+fn handle_file_by_index(msg: AsyncIpcMessage) {
     let index = ((msg.payload0 >> 16) & 0xFFFF) as usize;
 
     match unsafe { BACKEND } {
@@ -347,27 +362,62 @@ fn handle_file_by_index(msg: IpcMessage) {
 }
 
 /// Handle LIST_FILES request
-fn handle_list_files(_msg: IpcMessage) {
-    let count = match unsafe { BACKEND } {
-        Backend::Sqlite => count_sqlite_files(),
-        Backend::Fpk => {
-            if !unsafe { DIR_CACHE_STATE.valid } {
-                refresh_fpk_cache();
-            }
-            unsafe { DIR_CACHE_STATE.count }
-        }
+fn handle_list_files(_msg: AsyncIpcMessage) {
+    // Return file entries via shmem from DIR_CACHE_STATE (works for both backends)
+    // Format: [name: [u8; 24]][size: u32][type: u32] = 32 bytes each
+    if !unsafe { DIR_CACHE_STATE.valid } {
+        let _ = reply(0, 0);
+        return;
+    }
+
+    let count = unsafe { DIR_CACHE_STATE.count };
+    if count == 0 {
+        let _ = reply(0, 0);
+        return;
+    }
+
+    let shmem_size = count * 32;
+    let handle = match shmem_create(shmem_size) {
+        Ok(h) => h,
+        Err(_) => { let _ = reply((count as u64) << 32, 0); return; }
     };
-    let _ = reply(count as u64, 0);
+
+    for tid in 2..=8 {
+        let _ = shmem_grant(handle, tid);
+    }
+
+    if shmem_map(handle, SHMEM_BUFFER_VADDR).is_err() {
+        let _ = shmem_destroy(handle);
+        let _ = reply((count as u64) << 32, 0);
+        return;
+    }
+
+    let buf = unsafe {
+        core::slice::from_raw_parts_mut(SHMEM_BUFFER_VADDR as *mut u8, shmem_size)
+    };
+    for i in 0..count {
+        let offset = i * 32;
+        let entry = unsafe { &DIR_CACHE_STATE.entries[i] };
+        // name: [u8; 24] from entry.name[0..24]
+        buf[offset..offset+24].copy_from_slice(&entry.name[..24]);
+        // size: u32
+        buf[offset+24..offset+28].copy_from_slice(&(entry.size as u32).to_le_bytes());
+        // type: u32 (0=elf, 1=data)
+        buf[offset+28..offset+32].copy_from_slice(&(entry.entry_type as u32).to_le_bytes());
+    }
+
+    let _ = shmem_unmap(handle, SHMEM_BUFFER_VADDR);
+    let _ = reply(((count as u64) << 32) | (handle as u64), 0);
 }
 
 /// Handle FILE_INFO request (by name hash)
-fn handle_file_info(_msg: IpcMessage) {
+fn handle_file_info(_msg: AsyncIpcMessage) {
     // For now, just return not found - need shared memory for string passing
     let _ = reply(SYN_STATUS_NOT_FOUND, 0);
 }
 
 /// Handle READ_FILE request (legacy)
-fn handle_read_file(msg: IpcMessage) {
+fn handle_read_file(msg: AsyncIpcMessage) {
     let file_id = ((msg.payload0 >> 16) & 0xFFFF) as usize;
 
     match unsafe { BACKEND } {
@@ -416,7 +466,7 @@ fn handle_read_file(msg: IpcMessage) {
 }
 
 /// Handle READ_FILE_BY_NAME request
-fn handle_read_file_by_name(msg: IpcMessage) {
+fn handle_read_file_by_name(msg: AsyncIpcMessage) {
     let request_hash = (msg.payload0 >> 16) as u32;
 
     match unsafe { BACKEND } {
@@ -468,7 +518,7 @@ fn handle_read_file_by_name(msg: IpcMessage) {
 }
 
 /// Handle READ_FILE_CHUNK request
-fn handle_read_file_chunk(msg: IpcMessage) {
+fn handle_read_file_chunk(msg: AsyncIpcMessage) {
     let file_id = ((msg.payload0 >> 16) & 0xFFFF) as u16;
     let offset = (msg.payload0 >> 32) as u32;
 
@@ -558,63 +608,65 @@ fn handle_read_file_chunk(msg: IpcMessage) {
 const SHMEM_BUFFER_VADDR: usize = 0x10000000;
 
 /// Handle READ_FILE_SHMEM request (zero-copy file read)
-fn handle_read_file_shmem(msg: IpcMessage) {
+fn handle_read_file_shmem(msg: AsyncIpcMessage) {
     let request_hash = (msg.payload0 >> 16) as u32;
-    let requester_task = msg.sender;
 
     match unsafe { BACKEND } {
         Backend::Sqlite => {
-            // For SQLite, we read the BLOB data directly
-            if let Some(db) = get_sqlite_db() {
-                if let Ok(scanner) = db.table_scan("files") {
-                    for result in scanner {
-                        if let Ok(record) = result {
-                            if let Some(Value::Text(name)) = record.get(1) {
-                                if hash_name(name) == request_hash {
-                                    if let Some(Value::Blob(data)) = record.get(4) {
-                                        let file_size = data.len();
-                                        let buffer_size = ((file_size + 4095) / 4096) * 4096;
-                                        let buffer_size = if buffer_size == 0 { 4096 } else { buffer_size };
+            // Step 1: Find file name from cache (fast, no table scan)
+            let file_name: Option<&str> = unsafe {
+                DIR_CACHE_STATE.entries[..DIR_CACHE_STATE.count]
+                    .iter()
+                    .find(|e| hash_name(e.name_str()) == request_hash)
+                    .map(|e| e.name_str())
+            };
 
-                                        let shmem_handle = match shmem_create(buffer_size) {
-                                            Ok(handle) => handle,
-                                            Err(_) => {
-                                                let _ = reply(SYN_STATUS_ERROR, 0);
-                                                return;
-                                            }
-                                        };
-
-                                        if shmem_grant(shmem_handle, requester_task).is_err() {
-                                            let _ = reply(SYN_STATUS_ERROR, 0);
-                                            return;
-                                        }
-
-                                        if shmem_map(shmem_handle, SHMEM_BUFFER_VADDR).is_err() {
-                                            let _ = reply(SYN_STATUS_ERROR, 0);
-                                            return;
-                                        }
-
-                                        // Copy BLOB data to shared memory
-                                        let buffer_ptr = SHMEM_BUFFER_VADDR as *mut u8;
-                                        unsafe {
-                                            core::ptr::copy_nonoverlapping(
-                                                data.as_ptr(),
-                                                buffer_ptr,
-                                                file_size
-                                            );
-                                        }
-
-                                        let response = ((file_size as u64) << 32) | (shmem_handle as u64);
-                                        let _ = reply(response, 0);
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-                    }
+            let name = match file_name {
+                Some(n) => n,
+                None => {
+                    let _ = reply(SYN_STATUS_NOT_FOUND, 0);
+                    return;
                 }
+            };
+
+            // Step 2: Read file content via kernel syscall (fast, no B-tree scan)
+            let mut file_buf = [0u8; 4096];
+            let bytes_read = read_file(name, &mut file_buf);
+            if bytes_read == 0 {
+                let _ = reply(SYN_STATUS_NOT_FOUND, 0);
+                return;
             }
-            let _ = reply(SYN_STATUS_NOT_FOUND, 0);
+
+            // Step 3: Create shmem and copy content
+            let buffer_size = ((bytes_read + 4095) / 4096) * 4096;
+            let shmem_handle = match shmem_create(buffer_size) {
+                Ok(handle) => handle,
+                Err(_) => {
+                    let _ = reply(SYN_STATUS_ERROR, 0);
+                    return;
+                }
+            };
+
+            for tid in 2..=8 {
+                let _ = shmem_grant(shmem_handle, tid);
+            }
+
+            if shmem_map(shmem_handle, SHMEM_BUFFER_VADDR).is_err() {
+                let _ = reply(SYN_STATUS_ERROR, 0);
+                return;
+            }
+
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    file_buf.as_ptr(),
+                    SHMEM_BUFFER_VADDR as *mut u8,
+                    bytes_read,
+                );
+            }
+
+            let _ = shmem_unmap(shmem_handle, SHMEM_BUFFER_VADDR);
+            let response = ((bytes_read as u64) << 32) | (shmem_handle as u64);
+            let _ = reply(response, 0);
         }
         Backend::Fpk => {
             // FPK implementation (same as before)
@@ -653,9 +705,8 @@ fn handle_read_file_shmem(msg: IpcMessage) {
                 }
             };
 
-            if shmem_grant(shmem_handle, requester_task).is_err() {
-                let _ = reply(SYN_STATUS_ERROR, 0);
-                return;
+            for tid in 2..=8 {
+                let _ = shmem_grant(shmem_handle, tid);
             }
 
             if shmem_map(shmem_handle, SHMEM_BUFFER_VADDR).is_err() {
@@ -683,7 +734,7 @@ fn handle_read_file_shmem(msg: IpcMessage) {
 
 /// Handle SQL_QUERY request
 /// For now, this returns file info for the SQL query type
-fn handle_sql_query(msg: IpcMessage) {
+fn handle_sql_query(msg: AsyncIpcMessage) {
     let query_type = ((msg.payload0 >> 16) & 0xFF) as u8;
 
     // Query types:
@@ -729,7 +780,7 @@ const VECTOR_RESULTS_VADDR: usize = 0x12000000;
 /// Handle VECTOR_SEARCH request
 /// Request format: op | (k << 16) | (shmem_handle << 32)
 /// Reply: (result_count << 32) | shmem_handle_with_results
-fn handle_vector_search(msg: IpcMessage) {
+fn handle_vector_search(msg: AsyncIpcMessage) {
     let k = ((msg.payload0 >> 16) & 0xFF) as usize;
     let query_shmem = (msg.payload0 >> 32) as u32;
     let requester_task = msg.sender;
@@ -849,7 +900,7 @@ fn handle_vector_search(msg: IpcMessage) {
 /// Handle GET_EMBEDDING request
 /// Request format: op | (file_id << 16)
 /// Reply: (size << 32) | shmem_handle
-fn handle_get_embedding(msg: IpcMessage) {
+fn handle_get_embedding(msg: AsyncIpcMessage) {
     let file_id = ((msg.payload0 >> 16) & 0xFFFF) as u32;
     let requester_task = msg.sender;
 
@@ -912,7 +963,7 @@ fn handle_get_embedding(msg: IpcMessage) {
 }
 
 /// Handle EMBEDDING_COUNT request
-fn handle_embedding_count(_msg: IpcMessage) {
+fn handle_embedding_count(_msg: AsyncIpcMessage) {
     // Only SQLite backend has embeddings
     if unsafe { BACKEND } != Backend::Sqlite {
         let _ = reply(0, 0);
