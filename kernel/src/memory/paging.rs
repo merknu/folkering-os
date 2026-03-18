@@ -120,6 +120,22 @@ pub fn unmap_page(virt_addr: usize) -> Result<usize, MapError> {
     Ok(frame.start_address().as_u64() as usize)
 }
 
+/// Unmap a page from a specific task's page table
+pub fn unmap_page_in_table(pml4_phys: u64, virt_addr: usize) -> Result<usize, MapError> {
+    let pml4_virt = crate::phys_to_virt(pml4_phys as usize);
+    let hhdm = crate::HHDM_OFFSET.load(core::sync::atomic::Ordering::Relaxed);
+    let phys_mem_offset = VirtAddr::new(hhdm as u64);
+
+    let pml4 = unsafe { &mut *(pml4_virt as *mut PageTable) };
+    let mut mapper = unsafe { OffsetPageTable::new(pml4, phys_mem_offset) };
+
+    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(virt_addr as u64));
+    let (frame, flush) = mapper.unmap(page).map_err(|_| MapError::UnmapFailed)?;
+    flush.flush();
+
+    Ok(frame.start_address().as_u64() as usize)
+}
+
 /// Translate virtual address to physical address
 ///
 /// # Arguments
@@ -256,6 +272,39 @@ pub fn flush_tlb_all() {
     unsafe {
         Cr3::write(frame, flags);
     }
+}
+
+/// Virtual address of the kernel stack guard page (0 = not installed).
+///
+/// Set by `map_guard_page`. The `#PF` handler can compare CR2 against
+/// [STACK_GUARD_BASE, STACK_GUARD_BASE + 4096) to detect stack overflows.
+pub static STACK_GUARD_BASE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Map (or record) a non-present guard page at `virt_addr`.
+///
+/// Any access to this virtual address will trigger `#PF` immediately, turning
+/// silent kernel stack overflow into a clean fault that the panic screen can show.
+///
+/// If the page is currently mapped (e.g. it is part of the BSS range), it is
+/// unmapped to create the guard hole. If it was already unmapped, it is already
+/// a guard by virtue of being non-present.
+pub fn map_guard_page(virt_addr: VirtAddr) {
+    let addr = virt_addr.as_u64() as usize;
+    STACK_GUARD_BASE.store(addr, core::sync::atomic::Ordering::Relaxed);
+    // Best-effort: unmap the page if it happens to be currently mapped.
+    // Ignore errors — if the page was not mapped it is already a guard.
+    let _ = unmap_page(addr);
+    crate::serial_str!("[GUARD] Stack guard page installed at ");
+    crate::drivers::serial::write_hex(addr as u64);
+    crate::drivers::serial::write_newline();
+}
+
+/// Returns `true` if `cr2` falls inside the installed stack guard page.
+#[inline]
+pub fn is_stack_guard_fault(cr2: u64) -> bool {
+    let guard = STACK_GUARD_BASE.load(core::sync::atomic::Ordering::Relaxed);
+    guard != 0 && (cr2 as usize).wrapping_sub(guard) < 4096
 }
 
 /// Page mapping errors

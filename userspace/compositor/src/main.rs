@@ -21,58 +21,20 @@ extern crate alloc;
 
 use compositor::Compositor;
 use compositor::framebuffer::{FramebufferView, colors};
+use compositor::window_manager::{WindowManager, HitZone};
 use libfolk::sys::ipc::{receive, reply, recv_async, reply_with_token, send, IpcError};
 use libfolk::sys::boot_info::{get_boot_info, FramebufferConfig, BOOT_INFO_VADDR};
 use libfolk::sys::map_physical::{map_framebuffer, MapFlags};
-use libfolk::sys::{yield_cpu, read_mouse, read_key, uptime, task_list};
+use libfolk::sys::{yield_cpu, read_mouse, read_key, uptime, shmem_map, shmem_unmap, shmem_destroy};
 use libfolk::sys::io::{write_char, write_str};
 use libfolk::sys::shell::{
-    SHELL_TASK_ID, SHELL_OP_LIST_FILES, SHELL_OP_PS, SHELL_OP_UPTIME,
+    SHELL_TASK_ID, SHELL_OP_LIST_FILES, SHELL_OP_CAT_FILE, SHELL_OP_PS, SHELL_OP_UPTIME,
+    SHELL_STATUS_NOT_FOUND, hash_name as shell_hash_name,
 };
 use libfolk::{entry, println};
 
-// ============================================================================
-// Debug printing helpers
-// ============================================================================
-
-/// Print a u32 as decimal
-fn print_dec(n: u32) {
-    if n == 0 {
-        write_char(b'0');
-        return;
-    }
-    let mut buf = [0u8; 10];
-    let mut i = 0;
-    let mut val = n;
-    while val > 0 {
-        buf[i] = b'0' + (val % 10) as u8;
-        val /= 10;
-        i += 1;
-    }
-    while i > 0 {
-        i -= 1;
-        write_char(buf[i]);
-    }
-}
-
-/// Print a signed i32
-fn print_signed(n: i32) {
-    if n < 0 {
-        write_char(b'-');
-        print_dec((-n) as u32);
-    } else {
-        print_dec(n as u32);
-    }
-}
-
-/// Convert a nibble (0-15) to a hex digit character
-fn hex_digit(n: u8) -> u8 {
-    match n & 0xF {
-        0..=9 => b'0' + n,
-        10..=15 => b'A' + (n - 10),
-        _ => b'?',
-    }
-}
+/// Virtual address for mapping shared memory received from shell
+const COMPOSITOR_SHMEM_VADDR: usize = 0x30000000;
 
 /// Format a usize as a decimal string into buffer, return slice
 fn format_usize(n: usize, buf: &mut [u8; 16]) -> &str {
@@ -235,16 +197,15 @@ fn run_ipc_loop() -> ! {
 /// Framebuffer virtual address for mapping (4GB mark in userspace)
 const FRAMEBUFFER_VADDR: u64 = 0x0000_0001_0000_0000;
 
+
 fn main() -> ! {
     println!("[COMPOSITOR] Starting Semantic Mirror compositor service...");
 
     // ===== Phase 6.2: First Light - Graphics Initialization =====
 
     // Step 1: Read boot info from fixed address
-    write_str("<<<1>>>");  // DEBUG marker 1
     let boot_info = match get_boot_info() {
         Some(info) => {
-            write_str("<<<2>>>");  // DEBUG marker 2 - got boot info
             info
         }
         None => {
@@ -252,7 +213,6 @@ fn main() -> ! {
             run_ipc_loop();
         }
     };
-    write_str("<<<3>>>");  // DEBUG marker 3 - after match
 
     // Step 2: Print framebuffer info using simple hex output
     write_str("W:");
@@ -385,7 +345,10 @@ fn main() -> ! {
     const CURSOR_H: usize = 16;
 
     // Buffer to save pixels behind cursor (12x16 = 192 pixels)
-    let mut cursor_bg: [u32; CURSOR_W * CURSOR_H] = [0; CURSOR_W * CURSOR_H];
+    // Using repr(align(16)) to ensure proper alignment for potential SSE operations
+    #[repr(C, align(16))]
+    struct AlignedCursorBuffer([u32; 192]);
+    let mut cursor_bg = AlignedCursorBuffer([0; 192]);
 
     // Track if cursor has been drawn yet (don't draw until first mouse event)
     let mut cursor_drawn = false;
@@ -408,8 +371,24 @@ fn main() -> ! {
     // (Previous static mut caused undefined behavior)
     let mut text_buffer: [u8; 256] = [0; 256];
     let mut text_len: usize = 0;
+    let mut cursor_pos: usize = 0;  // Cursor position within text (0..=text_len)
     let mut show_results: bool = false;
     let mut omnibar_visible: bool = true;  // Start VISIBLE by default
+
+    // Blinking caret state (toggles every ~500ms using uptime syscall)
+    let mut caret_visible: bool = true;
+    let mut last_caret_flip_ms: u64 = 0;
+    const CARET_BLINK_MS: u64 = 500;
+
+    // Mouse click tracking (detect left-button press edge)
+    let mut prev_left_button: bool = false;
+
+    // ===== Window Manager (Milestone 2.1) =====
+    let mut wm = WindowManager::new();
+    // Track which window (if any) is being dragged
+    let mut dragging_window_id: Option<u32> = None;
+    let mut drag_last_x: i32 = 0;
+    let mut drag_last_y: i32 = 0;
 
     // Colors for omnibar
     let text_box_bg = omnibar_bg;
@@ -418,20 +397,46 @@ fn main() -> ! {
 
     write_str("[COMPOSITOR] Entering main loop...\n");
 
-    let mut loop_count: u32 = 0;
-    loop {
-        if loop_count < 3 {
-            write_str("[LOOP]");
-            loop_count += 1;
+    // ===== BOOT-TIME TEST WINDOW =====
+    // Diagnose compositing pipeline: if this window appears, compositing works.
+    // If it does NOT appear, the draw_window path has a bug.
+    {
+        let test_id = wm.create_terminal("Boot Test", 100, 80, 400, 150);
+        if let Some(win) = wm.get_window_mut(test_id) {
+            win.push_line("Folkering OS v0.8");
+            win.push_line("Window Manager: OK");
+            win.push_line("Type commands in omnibar");
         }
+        // Draw immediately (before first event)
+        wm.composite(&mut fb);
+        write_str("[WM] Boot test window drawn\n");
+        // Pixel probe: verify compositor actually painted non-black pixels
+        let probe = fb.get_pixel(300, 155); // center of test window
+        if probe != 0 {
+            write_str("[FB_PROBE] PASS: compositor drew non-black pixels\n");
+        } else {
+            write_str("[FB_PROBE] FAIL: pixel at (300,155) is black - compositing broken\n");
+        }
+    }
+
+    loop {
         // Track if we did any work this iteration
         let mut did_work = false;
+        // Consolidated redraw flag — any subsystem can set this
+        let mut need_redraw = false;
 
         // ===== Process mouse input =====
-        write_str("M");
         while let Some(event) = read_mouse() {
-            write_str("!");
             did_work = true;
+
+            // Sanity check cursor position (can get corrupted by kernel register save/restore bugs)
+            if cursor_x < 0 || cursor_x >= fb.width as i32 || cursor_y < 0 || cursor_y >= fb.height as i32 {
+                cursor_x = (fb.width / 2) as i32;
+                cursor_y = (fb.height / 2) as i32;
+                cursor_bg_dirty = true;
+                cursor_drawn = false;
+            }
+
             // Determine cursor color based on button state
             let cursor_fill = match (event.left_button(), event.right_button()) {
                 (true, true) => cursor_magenta,   // Both buttons
@@ -442,7 +447,7 @@ fn main() -> ! {
 
             // First mouse event: draw cursor at center, ignore accumulated delta
             if !cursor_drawn {
-                fb.save_rect(cursor_x as usize, cursor_y as usize, CURSOR_W, CURSOR_H, &mut cursor_bg);
+                fb.save_rect(cursor_x as usize, cursor_y as usize, CURSOR_W, CURSOR_H, &mut cursor_bg.0);
                 fb.draw_cursor(cursor_x as usize, cursor_y as usize, cursor_fill, cursor_outline);
                 cursor_drawn = true;
                 last_buttons = event.buttons;
@@ -457,11 +462,98 @@ fn main() -> ! {
             let new_x = if new_x < 0 { 0 } else if new_x >= fb.width as i32 { fb.width as i32 - 1 } else { new_x };
             let new_y = if new_y < 0 { 0 } else if new_y >= fb.height as i32 { fb.height as i32 - 1 } else { new_y };
 
+            // ===== Milestone 1.4 + 2.2: Mouse Click Hit-Testing + Window Dragging =====
+            let left_now = event.left_button();
+            let left_pressed = left_now && !prev_left_button;  // rising edge
+            let left_released = !left_now && prev_left_button; // falling edge
+            prev_left_button = left_now;
+
+            // Window drag: continue drag if in progress
+            if left_now {
+                if let Some(drag_id) = dragging_window_id {
+                    let dx = new_x - drag_last_x;
+                    let dy = new_y - drag_last_y;
+                    drag_last_x = new_x;
+                    drag_last_y = new_y;
+                    if dx != 0 || dy != 0 {
+                        if let Some(win) = wm.get_window_mut(drag_id) {
+                            win.x = win.x.saturating_add(dx);
+                            win.y = win.y.saturating_add(dy);
+                            // Clamp to screen
+                            if win.x < 0 { win.x = 0; }
+                            if win.y < 0 { win.y = 0; }
+                        }
+                        need_redraw = true;
+                        cursor_bg_dirty = true;
+                    }
+                }
+            }
+
+            // Release drag
+            if left_released {
+                dragging_window_id = None;
+            }
+
+            if left_pressed {
+                let cx = new_x;
+                let cy = new_y;
+
+                // Hit-test windows first (topmost)
+                let mut handled = false;
+                if let Some((win_id, zone)) = wm.hit_test(cx, cy) {
+                    match zone {
+                        HitZone::CloseButton => {
+                            wm.close_window(win_id);
+                            need_redraw = true;
+                            cursor_bg_dirty = true;
+                            handled = true;
+                        }
+                        HitZone::TitleBar => {
+                            wm.focus(win_id);
+                            dragging_window_id = Some(win_id);
+                            drag_last_x = new_x;
+                            drag_last_y = new_y;
+                            need_redraw = true;
+                            handled = true;
+                        }
+                        HitZone::Content => {
+                            wm.focus(win_id);
+                            need_redraw = true;
+                            handled = true;
+                        }
+                    }
+                }
+
+                if !handled {
+                    let cx = cx as usize;
+                    let cy = cy as usize;
+
+                    // Hit-test: click inside the omnibar
+                    if cx >= text_box_x && cx < text_box_x + text_box_w
+                        && cy >= text_box_y && cy < text_box_y + text_box_h
+                    {
+                        if show_results {
+                            show_results = false;
+                            need_redraw = true;
+                        }
+                    }
+
+                    // Hit-test: click in results panel items
+                    if show_results
+                        && cx >= results_x && cx < results_x + results_w
+                        && cy >= results_y && cy < results_y + results_h
+                    {
+                        show_results = false;
+                        need_redraw = true;
+                    }
+                }
+            }
+
             // Redraw if cursor moved OR button state changed OR background is dirty
             if new_x != cursor_x || new_y != cursor_y || event.buttons != last_buttons || cursor_bg_dirty {
                 // Only restore background if it's not dirty (stale)
                 if !cursor_bg_dirty {
-                    fb.restore_rect(cursor_x as usize, cursor_y as usize, CURSOR_W, CURSOR_H, &cursor_bg);
+                    fb.restore_rect(cursor_x as usize, cursor_y as usize, CURSOR_W, CURSOR_H, &cursor_bg.0);
                 }
                 cursor_bg_dirty = false;
 
@@ -471,28 +563,91 @@ fn main() -> ! {
                 last_buttons = event.buttons;
 
                 // Save background at new position, then draw cursor
-                fb.save_rect(cursor_x as usize, cursor_y as usize, CURSOR_W, CURSOR_H, &mut cursor_bg);
+                fb.save_rect(cursor_x as usize, cursor_y as usize, CURSOR_W, CURSOR_H, &mut cursor_bg.0);
                 fb.draw_cursor(cursor_x as usize, cursor_y as usize, cursor_fill, cursor_outline);
             }
         }
 
+
+        // ===== Blink caret =====
+        // Toggle caret every CARET_BLINK_MS; force redraw when it flips
+        {
+            let now = uptime();
+            if now.saturating_sub(last_caret_flip_ms) >= CARET_BLINK_MS {
+                caret_visible = !caret_visible;
+                last_caret_flip_ms = now;
+                if omnibar_visible { need_redraw = true; }
+            }
+        }
+
+
         // ===== Process keyboard input =====
         // First, collect all pending keys without redrawing
-        write_str("K");
-        let mut need_redraw = false;
         let mut execute_command = false;
         while let Some(key) = read_key() {
-            write_str("!");
             did_work = true;
 
+            // Arrow key codes from kernel keyboard driver
+            const KEY_ARROW_LEFT: u8 = 0x82;
+            const KEY_ARROW_RIGHT: u8 = 0x83;
+            const KEY_HOME: u8 = 0x84;
+            const KEY_END: u8 = 0x85;
+            const KEY_DELETE: u8 = 0x86;
+
             match key {
-                // Backspace - delete last character
+                // Backspace - delete character before cursor
                 0x08 | 0x7F => {
-                    if text_len > 0 {
+                    if cursor_pos > 0 {
+                        // Shift characters left to fill gap
+                        let mut i = cursor_pos - 1;
+                        while i < text_len - 1 {
+                            text_buffer[i] = text_buffer[i + 1];
+                            i += 1;
+                        }
+                        text_len -= 1;
+                        text_buffer[text_len] = 0;
+                        cursor_pos -= 1;
+                        need_redraw = true;
+                        show_results = false;
+                    }
+                }
+                // Delete key - delete character at cursor
+                KEY_DELETE => {
+                    if cursor_pos < text_len {
+                        let mut i = cursor_pos;
+                        while i < text_len - 1 {
+                            text_buffer[i] = text_buffer[i + 1];
+                            i += 1;
+                        }
                         text_len -= 1;
                         text_buffer[text_len] = 0;
                         need_redraw = true;
-                        show_results = false;  // Hide results when typing
+                        show_results = false;
+                    }
+                }
+                // Arrow keys - move cursor
+                KEY_ARROW_LEFT => {
+                    if cursor_pos > 0 {
+                        cursor_pos -= 1;
+                        need_redraw = true;
+                    }
+                }
+                KEY_ARROW_RIGHT => {
+                    if cursor_pos < text_len {
+                        cursor_pos += 1;
+                        need_redraw = true;
+                    }
+                }
+                KEY_HOME => {
+                    if cursor_pos != 0 {
+                        cursor_pos = 0;
+                        need_redraw = true;
+                    }
+                }
+                KEY_END => {
+                    if cursor_pos != text_len {
+                        cursor_pos = text_len;
+                        need_redraw = true;
                     }
                 }
                 // Enter - execute command/search
@@ -506,44 +661,324 @@ fn main() -> ! {
                 // Escape - toggle omnibar visibility / clear buffer
                 0x1B => {
                     if show_results {
-                        // If results showing, just hide them
                         show_results = false;
                         need_redraw = true;
                     } else if text_len > 0 {
-                        // If text entered, clear it
                         text_len = 0;
+                        cursor_pos = 0;
                         for i in 0..MAX_TEXT_LEN {
                             text_buffer[i] = 0;
                         }
                         need_redraw = true;
                     } else {
-                        // Toggle omnibar visibility
                         omnibar_visible = !omnibar_visible;
                         need_redraw = true;
                     }
                 }
-                // Printable ASCII - add to buffer (always, since omnibar always visible now)
+                // Printable ASCII - insert at cursor position
                 0x20..=0x7E => {
                     if text_len < MAX_TEXT_LEN - 1 {
-                        text_buffer[text_len] = key;
+                        // Shift characters right to make room
+                        let mut i = text_len;
+                        while i > cursor_pos {
+                            text_buffer[i] = text_buffer[i - 1];
+                            i -= 1;
+                        }
+                        text_buffer[cursor_pos] = key;
                         text_len += 1;
+                        cursor_pos += 1;
                         need_redraw = true;
-                        show_results = false;  // Hide results when typing
+                        show_results = false;
                     }
                 }
-                // Ignore other keys (including Windows key for now)
+                // Ignore other keys (arrow up/down, windows key, etc.)
                 _ => {}
             }
         }
 
+        // ===== Milestone 2.3: Create terminal window on Enter =====
+        if execute_command && text_len > 0 {
+            if let Ok(cmd_str) = core::str::from_utf8(&text_buffer[..text_len]) {
+                write_str("[WM] Creating window for: ");
+                write_str(cmd_str);
+                write_str("\n");
+
+                // Spawn a terminal window at a cascade position
+                let win_count = wm.windows.len() as i32;
+                let wx = 80 + win_count * 24;
+                let wy = 60 + win_count * 24;
+                let win_id = wm.create_terminal(cmd_str, wx, wy, 480, 200);
+
+                if let Some(win) = wm.get_window_mut(win_id) {
+                    // Execute the command and populate the window
+                    win.push_line("> ");  // we'll append cmd below
+                    // Title is already the command, show it as first line too
+                    let mut title_line = [0u8; 130];
+                    title_line[0] = b'>';
+                    title_line[1] = b' ';
+                    let tlen = cmd_str.len().min(126);
+                    title_line[2..2+tlen].copy_from_slice(&cmd_str.as_bytes()[..tlen]);
+                    if let Ok(s) = core::str::from_utf8(&title_line[..2+tlen]) {
+                        win.push_line(s);
+                    }
+
+                    // Built-in commands — direct IPC to Shell + shmem
+                    if cmd_str == "ls" || cmd_str == "files" {
+                        win.push_line("Files in ramdisk:");
+                        // Direct IPC to Shell (fewer context switches)
+                        let ipc_result = unsafe {
+                            libfolk::syscall::syscall3(
+                                libfolk::syscall::SYS_IPC_SEND,
+                                SHELL_TASK_ID as u64, SHELL_OP_LIST_FILES, 0
+                            )
+                        };
+                        if ipc_result != u64::MAX {
+                            let count = (ipc_result >> 32) as usize;
+                            let shmem_handle = (ipc_result & 0xFFFFFFFF) as u32;
+
+                            if shmem_handle != 0 && count > 0 {
+                                // Map shmem from shell
+                                if shmem_map(shmem_handle, COMPOSITOR_SHMEM_VADDR).is_ok() {
+                                    let buf = unsafe {
+                                        core::slice::from_raw_parts(COMPOSITOR_SHMEM_VADDR as *const u8, count * 32)
+                                    };
+                                    for i in 0..count {
+                                        let offset = i * 32;
+                                        // name: [u8; 24]
+                                        let name_end = buf[offset..offset+24].iter()
+                                            .position(|&b| b == 0).unwrap_or(24);
+                                        let name = unsafe {
+                                            core::str::from_utf8_unchecked(&buf[offset..offset+name_end])
+                                        };
+                                        // size: u32 at offset+24
+                                        let size = u32::from_le_bytes([
+                                            buf[offset+24], buf[offset+25],
+                                            buf[offset+26], buf[offset+27]
+                                        ]) as usize;
+                                        // type: u32 at offset+28 (0=ELF, 1=data)
+                                        let kind = u32::from_le_bytes([
+                                            buf[offset+28], buf[offset+29],
+                                            buf[offset+30], buf[offset+31]
+                                        ]);
+                                        let kind_str = if kind == 0 { "ELF " } else { "DATA" };
+
+                                        // Format: "  ELF   12345 filename"
+                                        let mut line = [0u8; 64];
+                                        line[0] = b' '; line[1] = b' ';
+                                        line[2..6].copy_from_slice(kind_str.as_bytes());
+                                        line[6] = b' ';
+                                        let mut size_buf = [0u8; 16];
+                                        let size_str = format_usize(size, &mut size_buf);
+                                        let slen = size_str.len();
+                                        let pad = 8usize.saturating_sub(slen);
+                                        for j in 0..pad { line[7 + j] = b' '; }
+                                        line[7+pad..7+pad+slen].copy_from_slice(size_str.as_bytes());
+                                        line[7+pad+slen] = b' ';
+                                        let nlen = name.len().min(40);
+                                        line[8+pad+slen..8+pad+slen+nlen].copy_from_slice(&name.as_bytes()[..nlen]);
+                                        let total = 8 + pad + slen + nlen;
+                                        if let Ok(s) = core::str::from_utf8(&line[..total]) {
+                                            win.push_line(s);
+                                        }
+                                    }
+                                    let _ = shmem_unmap(shmem_handle, COMPOSITOR_SHMEM_VADDR);
+                                    let _ = shmem_destroy(shmem_handle);
+                                }
+                            }
+                            let mut count_buf = [0u8; 16];
+                            let count_str = format_usize(count, &mut count_buf);
+                            let suffix = b" file(s)";
+                            let mut line_buf = [0u8; 32];
+                            let clen = count_str.len().min(16);
+                            let slen2 = suffix.len();
+                            line_buf[..clen].copy_from_slice(&count_str.as_bytes()[..clen]);
+                            line_buf[clen..clen+slen2].copy_from_slice(suffix);
+                            if let Ok(s) = core::str::from_utf8(&line_buf[..clen+slen2]) {
+                                win.push_line(s);
+                            }
+                        } else {
+                            win.push_line("Shell not responding");
+                        }
+                    } else if cmd_str == "ps" || cmd_str == "tasks" {
+                        win.push_line("Running tasks:");
+                        // Direct IPC to Shell
+                        let ipc_result = unsafe {
+                            libfolk::syscall::syscall3(
+                                libfolk::syscall::SYS_IPC_SEND,
+                                SHELL_TASK_ID as u64, SHELL_OP_PS, 0
+                            )
+                        };
+                        if ipc_result != u64::MAX {
+                            let count = (ipc_result >> 32) as usize;
+                            let shmem_handle = (ipc_result & 0xFFFFFFFF) as u32;
+
+                            if shmem_handle != 0 && count > 0 {
+                                if shmem_map(shmem_handle, COMPOSITOR_SHMEM_VADDR).is_ok() {
+                                    let buf = unsafe {
+                                        core::slice::from_raw_parts(COMPOSITOR_SHMEM_VADDR as *const u8, count * 32)
+                                    };
+                                    for i in 0..count {
+                                        let offset = i * 32;
+                                        let tid = u32::from_le_bytes([
+                                            buf[offset], buf[offset+1],
+                                            buf[offset+2], buf[offset+3]
+                                        ]);
+                                        let state = u32::from_le_bytes([
+                                            buf[offset+4], buf[offset+5],
+                                            buf[offset+6], buf[offset+7]
+                                        ]);
+                                        let name_end = buf[offset+8..offset+24].iter()
+                                            .position(|&b| b == 0).unwrap_or(16);
+                                        let name = unsafe {
+                                            core::str::from_utf8_unchecked(&buf[offset+8..offset+8+name_end])
+                                        };
+                                        let state_str = match state {
+                                            0 => "Runnable",
+                                            1 => "Running",
+                                            2 => "Blocked",
+                                            3 => "Blocked",
+                                            4 => "Waiting",
+                                            5 => "Exited",
+                                            _ => "Unknown",
+                                        };
+                                        // Format: "  Task 2: synapse (Blocked)"
+                                        let mut line = [0u8; 64];
+                                        let mut pos = 0usize;
+                                        let prefix = b"  Task ";
+                                        line[..prefix.len()].copy_from_slice(prefix);
+                                        pos += prefix.len();
+                                        let mut tid_buf2 = [0u8; 16];
+                                        let tid_str = format_usize(tid as usize, &mut tid_buf2);
+                                        let tlen = tid_str.len();
+                                        line[pos..pos+tlen].copy_from_slice(tid_str.as_bytes());
+                                        pos += tlen;
+                                        line[pos] = b':'; pos += 1;
+                                        line[pos] = b' '; pos += 1;
+                                        let nlen = name.len().min(15);
+                                        if nlen > 0 {
+                                            line[pos..pos+nlen].copy_from_slice(&name.as_bytes()[..nlen]);
+                                            pos += nlen;
+                                        } else {
+                                            let unk = b"<unnamed>";
+                                            line[pos..pos+unk.len()].copy_from_slice(unk);
+                                            pos += unk.len();
+                                        }
+                                        line[pos] = b' '; pos += 1;
+                                        line[pos] = b'('; pos += 1;
+                                        let slen = state_str.len();
+                                        line[pos..pos+slen].copy_from_slice(state_str.as_bytes());
+                                        pos += slen;
+                                        line[pos] = b')'; pos += 1;
+                                        if let Ok(s) = core::str::from_utf8(&line[..pos]) {
+                                            win.push_line(s);
+                                        }
+                                    }
+                                    let _ = shmem_unmap(shmem_handle, COMPOSITOR_SHMEM_VADDR);
+                                    let _ = shmem_destroy(shmem_handle);
+                                }
+                            } else {
+                                // Fallback: count only
+                                let mut count_buf = [0u8; 16];
+                                let count_str = format_usize(count, &mut count_buf);
+                                win.push_line(count_str);
+                                win.push_line("task(s) — no details available");
+                            }
+                        } else {
+                            win.push_line("Shell not responding");
+                        }
+                    } else if cmd_str.starts_with("cat ") {
+                        // cat <filename> — route through Intent Service → Shell → Synapse
+                        let filename = cmd_str[4..].trim();
+                        if filename.is_empty() {
+                            win.push_line("usage: cat <filename>");
+                        } else {
+                            // Hash filename and send directly to Shell
+                            let name_hash = shell_hash_name(filename) as u64;
+                            let shell_req = SHELL_OP_CAT_FILE | (name_hash << 8);
+                            let ipc_result = unsafe {
+                                libfolk::syscall::syscall3(
+                                    libfolk::syscall::SYS_IPC_SEND,
+                                    SHELL_TASK_ID as u64, shell_req, 0
+                                )
+                            };
+                            if ipc_result != u64::MAX && ipc_result != SHELL_STATUS_NOT_FOUND {
+                                let size = (ipc_result >> 32) as usize;
+                                let shmem_handle = (ipc_result & 0xFFFFFFFF) as u32;
+
+                                if shmem_handle != 0 && size > 0 {
+                                    if shmem_map(shmem_handle, COMPOSITOR_SHMEM_VADDR).is_ok() {
+                                        let buf = unsafe {
+                                            core::slice::from_raw_parts(COMPOSITOR_SHMEM_VADDR as *const u8, size)
+                                        };
+                                        // Display file contents line by line
+                                        let mut line_start = 0;
+                                        for pos in 0..size {
+                                            if buf[pos] == b'\n' || buf[pos] == 0 {
+                                                if pos > line_start {
+                                                    if let Ok(line) = core::str::from_utf8(&buf[line_start..pos]) {
+                                                        win.push_line(line);
+                                                    }
+                                                }
+                                                line_start = pos + 1;
+                                                if buf[pos] == 0 { break; }
+                                            }
+                                        }
+                                        // Handle last line without newline
+                                        if line_start < size {
+                                            let end = buf[line_start..size]
+                                                .iter().position(|&b| b == 0)
+                                                .map(|p| line_start + p)
+                                                .unwrap_or(size);
+                                            if end > line_start {
+                                                if let Ok(line) = core::str::from_utf8(&buf[line_start..end]) {
+                                                    win.push_line(line);
+                                                }
+                                            }
+                                        }
+                                        let _ = shmem_unmap(shmem_handle, COMPOSITOR_SHMEM_VADDR);
+                                        let _ = shmem_destroy(shmem_handle);
+                                    }
+                                } else {
+                                    win.push_line("File is empty");
+                                }
+                            } else {
+                                win.push_line("File not found");
+                            }
+                        }
+                    } else if cmd_str == "uptime" {
+                        let ms = uptime();
+                        let mut buf = [0u8; 32];
+                        let time_str = format_uptime(ms, &mut buf);
+                        win.push_line(time_str);
+                    } else if cmd_str == "help" {
+                        win.push_line("Commands: ls, cat, ps, uptime");
+                        win.push_line("find <q>, calc <e>, open <a>");
+                        win.push_line("Windows: drag title, click X");
+                    } else if cmd_str.starts_with("find ") {
+                        win.push_line("Vector search: coming soon");
+                    } else if cmd_str.starts_with("calc ") {
+                        win.push_line("Calculator: coming soon");
+                    } else {
+                        win.push_line("Sent to shell...");
+                    }
+                    win.push_line("---");
+                }
+
+                // Clear the omnibar input after executing
+                text_len = 0;
+                cursor_pos = 0;
+                for i in 0..MAX_TEXT_LEN { text_buffer[i] = 0; }
+                show_results = false;
+                cursor_bg_dirty = true;
+            }
+        }
+
         // Only redraw once after processing all keys
-        write_str("R");
         if need_redraw {
-            write_str("!");
             if omnibar_visible {
                 // ===== Draw Omnibar =====
                 // Outer glow (subtle)
-                fb.fill_rect(text_box_x - 2, text_box_y - 2, text_box_w + 4, text_box_h + 4, dark_gray);
+                fb.fill_rect(text_box_x.saturating_sub(2), text_box_y.saturating_sub(2), text_box_w + 4, text_box_h + 4, dark_gray);
                 // Main box
                 fb.fill_rect(text_box_x, text_box_y, text_box_w, text_box_h, text_box_bg);
                 fb.draw_rect(text_box_x, text_box_y, text_box_w, text_box_h, omnibar_border);
@@ -562,10 +997,11 @@ fn main() -> ! {
                     fb.draw_string(text_box_x + TEXT_PADDING, text_box_y + 12, "Ask anything...", gray, text_box_bg);
                 }
 
-                // Draw cursor after text
-                let cursor_x_pos = text_box_x + TEXT_PADDING + (text_len * 8);
-                if cursor_x_pos < text_box_x + text_box_w - 30 {
-                    fb.draw_string(cursor_x_pos, text_box_y + 12, "_", folk_accent, text_box_bg);
+                // Draw blinking text caret at cursor position
+                let caret_x_pos = text_box_x + TEXT_PADDING + (cursor_pos.min(chars_per_line) * 8);
+                if caret_x_pos < text_box_x + text_box_w - 30 {
+                    let caret_char = if caret_visible { "|" } else { " " };
+                    fb.draw_string(caret_x_pos, text_box_y + 10, caret_char, folk_accent, text_box_bg);
                 }
 
                 // Draw ">" icon on right
@@ -589,67 +1025,17 @@ fn main() -> ! {
                         fb.draw_string(results_x + 12, results_y + 12, "Results:", folk_accent, results_bg);
 
                         if cmd_str == "ls" || cmd_str == "files" {
-                            // List files - send to Shell via IPC
-                            fb.draw_string(results_x + 12, results_y + 36, "Files in ramdisk:", white, results_bg);
-                            let ipc_result = unsafe {
-                                libfolk::syscall::syscall3(
-                                    libfolk::syscall::SYS_IPC_SEND,
-                                    SHELL_TASK_ID as u64,
-                                    SHELL_OP_LIST_FILES,
-                                    0
-                                )
-                            };
-                            if ipc_result != u64::MAX {
-                                let count = (ipc_result >> 32) as usize;
-                                // Format count as string
-                                let mut count_buf = [0u8; 16];
-                                let count_str = format_usize(count, &mut count_buf);
-                                fb.draw_string(results_x + 12, results_y + 56, count_str, folk_accent, results_bg);
-                                fb.draw_string(results_x + 12 + count_str.len() * 8 + 8, results_y + 56, "file(s) found", gray, results_bg);
-                            } else {
-                                fb.draw_string(results_x + 12, results_y + 56, "Shell not responding", gray, results_bg);
-                            }
+                            // Preview: no IPC — results shown in window on Enter
+                            fb.draw_string(results_x + 12, results_y + 36, "List files in ramdisk", white, results_bg);
+                            fb.draw_string(results_x + 12, results_y + 56, "Press Enter to run", gray, results_bg);
                         } else if cmd_str == "ps" || cmd_str == "tasks" {
-                            // Process list
-                            fb.draw_string(results_x + 12, results_y + 36, "Running tasks:", white, results_bg);
-                            let ipc_result = unsafe {
-                                libfolk::syscall::syscall3(
-                                    libfolk::syscall::SYS_IPC_SEND,
-                                    SHELL_TASK_ID as u64,
-                                    SHELL_OP_PS,
-                                    0
-                                )
-                            };
-                            if ipc_result != u64::MAX {
-                                let count = ipc_result as usize;
-                                let mut count_buf = [0u8; 16];
-                                let count_str = format_usize(count, &mut count_buf);
-                                fb.draw_string(results_x + 12, results_y + 56, count_str, folk_accent, results_bg);
-                                fb.draw_string(results_x + 12 + count_str.len() * 8 + 8, results_y + 56, "task(s) running", gray, results_bg);
-                            } else {
-                                fb.draw_string(results_x + 12, results_y + 56, "Shell not responding", gray, results_bg);
-                            }
+                            // Preview: no IPC — results shown in window on Enter
+                            fb.draw_string(results_x + 12, results_y + 36, "Show running tasks", white, results_bg);
+                            fb.draw_string(results_x + 12, results_y + 56, "Press Enter to run", gray, results_bg);
                         } else if cmd_str == "uptime" {
-                            // System uptime
-                            fb.draw_string(results_x + 12, results_y + 36, "System uptime:", white, results_bg);
-                            let ipc_result = unsafe {
-                                libfolk::syscall::syscall3(
-                                    libfolk::syscall::SYS_IPC_SEND,
-                                    SHELL_TASK_ID as u64,
-                                    SHELL_OP_UPTIME,
-                                    0
-                                )
-                            };
-                            if ipc_result != u64::MAX {
-                                let ms = ipc_result;
-                                let secs = ms / 1000;
-                                let mins = secs / 60;
-                                let mut buf = [0u8; 32];
-                                let time_str = format_uptime(ms, &mut buf);
-                                fb.draw_string(results_x + 12, results_y + 56, time_str, folk_accent, results_bg);
-                            } else {
-                                fb.draw_string(results_x + 12, results_y + 56, "Shell not responding", gray, results_bg);
-                            }
+                            // Preview: no IPC — results shown in window on Enter
+                            fb.draw_string(results_x + 12, results_y + 36, "System uptime", white, results_bg);
+                            fb.draw_string(results_x + 12, results_y + 56, "Press Enter to run", gray, results_bg);
                         } else if cmd_str.starts_with("calc ") {
                             // Simple calculator
                             fb.draw_string(results_x + 12, results_y + 36, "Calculator:", white, results_bg);
@@ -668,13 +1054,13 @@ fn main() -> ! {
                         } else if cmd_str == "help" {
                             // Help command
                             fb.draw_string(results_x + 12, results_y + 36, "Available commands:", white, results_bg);
-                            fb.draw_string(results_x + 12, results_y + 56, "ls, ps, uptime, help", folk_accent, results_bg);
+                            fb.draw_string(results_x + 12, results_y + 56, "ls, cat <f>, ps, uptime, help", folk_accent, results_bg);
                             fb.draw_string(results_x + 12, results_y + 80, "find <query>, calc <expr>, open <app>", gray, results_bg);
                         } else {
-                            // Default: show help
-                            fb.draw_string(results_x + 12, results_y + 36, "Unknown command:", white, results_bg);
-                            fb.draw_string(results_x + 12, results_y + 56, cmd_str, gray, results_bg);
-                            fb.draw_string(results_x + 12, results_y + 80, "Type 'help' for available commands", dark_gray, results_bg);
+                            // Unknown command — preview only (no IPC from results panel)
+                            fb.draw_string(results_x + 12, results_y + 36, "Command:", white, results_bg);
+                            fb.draw_string(results_x + 12, results_y + 56, cmd_str, folk_accent, results_bg);
+                            fb.draw_string(results_x + 12, results_y + 80, "Press Enter to run", dark_gray, results_bg);
                         }
                     }
                 } else {
@@ -696,12 +1082,17 @@ fn main() -> ! {
                 fb.draw_string(hint_x, fb.height - 50, hint, dark_gray, folk_dark);
             }
 
+            // ===== Composite Windows (Milestone 2.1) =====
+            // Draw all managed windows on top of the desktop/omnibar
+            if wm.has_visible() {
+                wm.composite(&mut fb);
+            }
+
             // Mark cursor background as dirty - mouse handler will refresh it
             cursor_bg_dirty = true;
         }
 
         // ===== Process IPC messages (non-blocking) =====
-        write_str("I");
         match recv_async() {
             Ok(msg) => {
                 did_work = true;
@@ -713,7 +1104,6 @@ fn main() -> ! {
         }
 
         // Only yield CPU if we did no work this iteration
-        write_str("Y");
         if !did_work {
             yield_cpu();
         }

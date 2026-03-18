@@ -114,6 +114,16 @@ impl IdtEntry {
         self.type_attr = 0x8E; // Present, DPL=0, Interrupt Gate
         self.reserved = 0;
     }
+
+    fn set_handler_addr(&mut self, addr: u64) {
+        self.offset_low = (addr & 0xFFFF) as u16;
+        self.offset_mid = ((addr >> 16) & 0xFFFF) as u16;
+        self.offset_high = ((addr >> 32) & 0xFFFFFFFF) as u32;
+        self.selector = 0x08; // Kernel code segment
+        self.ist = 0;
+        self.type_attr = 0x8E; // Present, DPL=0, Interrupt Gate
+        self.reserved = 0;
+    }
 }
 
 /// IDT Descriptor for LIDT instruction
@@ -196,6 +206,37 @@ make_exception_handler!(exc_sx, 30, "\n[#SX] Security Exception (Vector 30)!");
 make_exception_handler!(exc_reserved31, 31, "\n[RESERVED] Vector 31!");
 // IRQ handlers
 
+/// Heartbeat print from kernel-mode timer path.
+/// Fires every 500 kernel ticks (~5 seconds) to confirm kernel is alive.
+/// Presence of [HB] lines = all tasks have crashed (timer fires only in kernel mode).
+/// Absence of [HB] lines + presence of [IRQ_CTX] lines = tasks running normally.
+#[no_mangle]
+pub extern "C" fn kernel_timer_heartbeat() {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static HB_TICKS: AtomicU64 = AtomicU64::new(0);
+    let tick = HB_TICKS.fetch_add(1, Ordering::Relaxed);
+    if tick % 500 == 0 {
+        folkering_kernel::serial_str!("[HB] kernel_ticks=");
+        folkering_kernel::drivers::serial::write_dec(tick as u32);
+        folkering_kernel::serial_str!(" uptime_ms=");
+        folkering_kernel::drivers::serial::write_dec(folkering_kernel::timer::uptime_ms() as u32);
+        folkering_kernel::serial_str!(" debug_marker=");
+        folkering_kernel::drivers::serial::write_hex(
+            folkering_kernel::arch::x86_64::syscall::DEBUG_MARKER
+                .load(core::sync::atomic::Ordering::Relaxed)
+        );
+        folkering_kernel::drivers::serial::write_newline();
+    }
+}
+
+/// Debug helper: called from irq_timer asm after timer_preempt_handler returns.
+/// Writes a single 'U' byte DIRECTLY to UART 0x3F8 on every call — bypasses mutex.
+/// If UART works: serial log fills with 'U'. If not: UART itself is broken.
+#[no_mangle]
+pub unsafe extern "C" fn debug_after_preempt_handler(_ctx: u64) {
+    // No-op in production — enable for debugging context switch issues
+}
+
 /// Timer interrupt handler (Vector 32) - PREEMPTIVE VERSION
 ///
 /// This handler is called ~100 times per second (10ms interval).
@@ -244,6 +285,9 @@ extern "C" fn irq_timer() {
         // Send EOI to APIC
         "call {eoi_fn}",
 
+        // Periodic heartbeat print (every 500 ticks) so serial logger can detect kernel-only mode
+        "call {heartbeat_fn}",
+
         // Restore registers
         "pop r11",
         "pop r10",
@@ -279,13 +323,23 @@ extern "C" fn irq_timer() {
         "push r14",
         "push r15",
 
+        // FXSAVE: save x87 FPU + XMM0-15 + MXCSR for the preempted task.
+        // FXSAVE_CURRENT_PTR is set by timer_preempt_handler to the current task's
+        // fxsave_area before returning, so before the call it still points at the
+        // task being preempted.
+        "mov rax, qword ptr [rip + {fxsave_ptr}]",
+        "test rax, rax",
+        "jz 2f",              // skip if pointer is NULL (no task yet)
+        "fxsave64 [rax]",     // save FPU/SSE state to current task's fxsave_area
+        "2:",
+
         // Align stack to 16 bytes before call (15 pushes = 120 bytes, need 8 more)
         "sub rsp, 8",
 
         // Pass pointer to saved context as first argument
         "lea rdi, [rsp + 8]",
 
-        // Call preemption handler - returns pointer to Context to restore
+        // Call preemption handler - returns pointer to Context to restore.
         "call {preempt_fn}",
 
         // RAX now contains pointer to Context structure to restore from
@@ -294,6 +348,22 @@ extern "C" fn irq_timer() {
 
         // Move returned context pointer to R11
         "mov r11, rax",
+
+        // Debug: print CS and RIP we are about to iretq to.
+        // r11 is caller-saved so debug_ctx_fn may clobber it — push/pop to preserve.
+        "push r11",
+        "mov rdi, r11",
+        "call {debug_ctx_fn}",
+        "pop r11",
+
+        // FXRSTOR: restore FPU/SSE state for the task we are switching TO.
+        // timer_preempt_handler has already updated FXSAVE_CURRENT_PTR to point
+        // at the new task's fxsave_area, so we restore from there.
+        "mov rax, qword ptr [rip + {fxsave_ptr}]",
+        "test rax, rax",
+        "jz 3f",
+        "fxrstor64 [rax]",    // restore XMM state for the incoming task
+        "3:",
 
         // Discard our saved registers (we'll restore from context)
         "add rsp, 120",  // Skip all 15 pushed registers
@@ -334,7 +404,10 @@ extern "C" fn irq_timer() {
 
         tick_fn = sym folkering_kernel::timer::tick,
         eoi_fn = sym folkering_kernel::arch::x86_64::apic::send_eoi,
+        heartbeat_fn = sym kernel_timer_heartbeat,
         preempt_fn = sym folkering_kernel::task::preempt::timer_preempt_handler,
+        fxsave_ptr = sym folkering_kernel::task::task::FXSAVE_CURRENT_PTR,
+        debug_ctx_fn = sym debug_after_preempt_handler,
     );
 }
 /// Keyboard interrupt handler (Vector 33 / IRQ1)
@@ -428,60 +501,81 @@ make_exception_handler!(vec_254, 254, "\n[VEC254] Vector 254!");
 #[unsafe(naked)]
 extern "C" fn gp_handler() {
     core::arch::naked_asm!(
-        // Save registers we'll use
+        // Save registers we'll use (rdi/rsi first so we can print their original values)
+        "push rdi",
+        "push rsi",
         "push rax",
         "push rbx",
         "push rcx",
         "push rdx",
+        // Stack after 6 pushes: [rsp+0]=rdx,[rsp+8]=rcx,[rsp+16]=rbx,[rsp+24]=rax,
+        //   [rsp+32]=rsi,[rsp+40]=rdi,[rsp+48]=error_code,[rsp+56]=rip,
+        //   [rsp+64]=cs,[rsp+72]=rflags,[rsp+80]=user_rsp,[rsp+88]=ss
 
         // Print #GP header
         "mov rdi, {gp_msg}",
         "call {serial_write_fn}",
 
-        // Print error code (at rsp+32 due to 4 pushes)
+        // Print error code (at rsp+48 due to 6 pushes)
         "mov rdi, {err_msg}",
         "call {serial_write_fn}",
-        "mov rdi, [rsp + 32]",  // error_code
+        "mov rdi, [rsp + 48]",  // error_code
         "call {write_hex_fn}",
         "mov rdi, {newline}",
         "call {serial_write_fn}",
 
-        // Print RIP (at rsp+40)
+        // Print RIP (at rsp+56)
         "mov rdi, {rip_msg}",
         "call {serial_write_fn}",
-        "mov rdi, [rsp + 40]",  // rip
+        "mov rdi, [rsp + 56]",  // rip
         "call {write_hex_fn}",
         "mov rdi, {newline}",
         "call {serial_write_fn}",
 
-        // Print CS (at rsp+48)
+        // Print CS (at rsp+64)
         "mov rdi, {cs_msg}",
         "call {serial_write_fn}",
-        "mov rdi, [rsp + 48]",  // cs
+        "mov rdi, [rsp + 64]",  // cs
         "call {write_hex_fn}",
         "mov rdi, {newline}",
         "call {serial_write_fn}",
 
-        // Print RFLAGS (at rsp+56)
+        // Print RFLAGS (at rsp+72)
         "mov rdi, {rflags_msg}",
         "call {serial_write_fn}",
-        "mov rdi, [rsp + 56]",  // rflags
+        "mov rdi, [rsp + 72]",  // rflags
         "call {write_hex_fn}",
         "mov rdi, {newline}",
         "call {serial_write_fn}",
 
-        // Print RSP (at rsp+64)
+        // Print RSP (at rsp+80)
         "mov rdi, {rsp_msg}",
         "call {serial_write_fn}",
-        "mov rdi, [rsp + 64]",  // rsp
+        "mov rdi, [rsp + 80]",  // rsp
         "call {write_hex_fn}",
         "mov rdi, {newline}",
         "call {serial_write_fn}",
 
-        // Print SS (at rsp+72)
+        // Print SS (at rsp+88)
         "mov rdi, {ss_msg}",
         "call {serial_write_fn}",
-        "mov rdi, [rsp + 72]",  // ss
+        "mov rdi, [rsp + 88]",  // ss
+        "call {write_hex_fn}",
+        "mov rdi, {newline}",
+        "call {serial_write_fn}",
+
+        // Print original RDI (at rsp+40) - likely 'self' pointer in fill_rect
+        "mov rdi, {saved_rdi_msg}",
+        "call {serial_write_fn}",
+        "mov rdi, [rsp + 40]",  // original RDI
+        "call {write_hex_fn}",
+        "mov rdi, {newline}",
+        "call {serial_write_fn}",
+
+        // Print original RSI (at rsp+32) - likely 'x' arg in fill_rect
+        "mov rdi, {saved_rsi_msg}",
+        "call {serial_write_fn}",
+        "mov rdi, [rsp + 32]",  // original RSI
         "call {write_hex_fn}",
         "mov rdi, {newline}",
         "call {serial_write_fn}",
@@ -522,8 +616,34 @@ extern "C" fn gp_handler() {
         "mov rdi, {newline}",
         "call {serial_write_fn}",
 
-        // Halt
+        // Print Context.r14 value from last syscall/yield restore (KEY DIAGNOSTIC)
+        "mov rdi, {ctx_r14_msg}",
+        "call {serial_write_fn}",
+        "call {get_ctx_r14_fn}",
+        "mov rdi, rax",
+        "call {write_hex_fn}",
+        "mov rdi, {newline}",
+        "call {serial_write_fn}",
+
+        // Print Context.rsp value (user RSP stored in Context)
+        "mov rdi, {ctx_rsp_msg}",
+        "call {serial_write_fn}",
+        "call {get_ctx_rsp_fn}",
+        "mov rdi, rax",
+        "call {write_hex_fn}",
+        "mov rdi, {newline}",
+        "call {serial_write_fn}",
+
+        // Draw panic screen (rdi=msg, rsi=rip, rdx=cs, rcx=err_code, r8=0 for CR2)
         "cli",
+        "mov rdi, {gp_panic_msg}",
+        "mov rsi, [rsp + 56]",  // rip
+        "mov rdx, [rsp + 64]",  // cs
+        "mov rcx, [rsp + 48]",  // error_code
+        "xor r8, r8",           // cr2 = 0 for #GP
+        "call {panic_screen_fn}",
+
+        // Halt
         "2:",
         "hlt",
         "jmp 2b",
@@ -539,6 +659,8 @@ extern "C" fn gp_handler() {
         dbg_rip_msg = sym DBG_RIP_MSG,
         dbg_rsp_msg = sym DBG_RSP_MSG,
         dbg_rflags_msg = sym DBG_RFLAGS_MSG,
+        saved_rdi_msg = sym SAVED_RDI_MSG,
+        saved_rsi_msg = sym SAVED_RSI_MSG,
         newline = sym NEWLINE,
         serial_write_fn = sym serial_write_cstr,
         write_hex_fn = sym write_hex_from_reg,
@@ -546,7 +668,45 @@ extern "C" fn gp_handler() {
         get_dbg_rip_fn = sym get_debug_rip_wrapper,
         get_dbg_rsp_fn = sym get_debug_rsp_wrapper,
         get_dbg_rflags_fn = sym get_debug_rflags_wrapper,
+        ctx_r14_msg = sym CTX_R14_MSG,
+        ctx_rsp_msg = sym CTX_RSP_MSG,
+        get_ctx_r14_fn = sym get_debug_context_r14_local,
+        get_ctx_rsp_fn = sym get_debug_context_rsp_local,
+        gp_panic_msg = sym GP_PANIC_MSG,
+        panic_screen_fn = sym panic_screen_wrapper,
     );
+}
+
+#[link_section = ".rodata"]
+static GP_PANIC_MSG: &str = "#GP - General Protection Fault\0";
+
+/// Wrapper for panic_screen callable from naked asm
+/// ABI: rdi=msg_ptr, rsi=rip, rdx=cs, rcx=err_code, r8=cr2
+#[no_mangle]
+unsafe extern "C" fn panic_screen_wrapper(msg_ptr: *const u8, rip: u64, cs: u64, err: u64, cr2: u64) {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static IN_PANIC: AtomicBool = AtomicBool::new(false);
+
+    // Prevent recursive panic (e.g., #PF during panic screen drawing)
+    if IN_PANIC.swap(true, Ordering::SeqCst) {
+        // Already in panic handler — just print to serial and halt
+        folkering_kernel::serial_println!("[PANIC] RECURSIVE FAULT during panic handler!");
+        folkering_kernel::serial_println!("  RIP={:#x} CS={:#x} ERR={:#x} CR2={:#x}", rip, cs, err, cr2);
+        loop { core::arch::asm!("cli; hlt"); }
+    }
+
+    // Switch to kernel page table (PML4) to ensure HHDM framebuffer mapping is accessible
+    // The current CR3 might point to a user task's page table after a context switch
+    let kernel_cr3: u64;
+    core::arch::asm!("mov {}, cr3", out(reg) kernel_cr3);
+    // If CR3 points to a user task PML4, the HHDM might still be mapped
+    // (kernel PML4 entries are shared). But just in case, we proceed carefully.
+
+    // Convert C-string pointer to &str
+    let mut len = 0;
+    while *msg_ptr.add(len) != 0 { len += 1; }
+    let msg = core::str::from_utf8_unchecked(core::slice::from_raw_parts(msg_ptr, len));
+    panic_screen(msg, rip, cs, err, cr2);
 }
 
 /// #PF (Page Fault) handler - vector 14
@@ -625,12 +785,60 @@ extern "C" fn pf_handler() {
         "mov rdi, {newline}",
         "call {serial_write_fn}",
 
+        // Dump ALL callee-saved registers to serial for debugging
+        // The 4 pushes (rax,rbx,rcx,rdx) are on stack but we still have
+        // the original values of rsi,rdi,rbp,r8-r15 in their registers!
+        // (The serial_write/hex functions are caller-saved convention)
+        // So let's save them NOW and call a Rust dump function
+        "push rsi",
+        "push rdi",
+        "push rbp",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        // Stack: [r15 r14 r13 r12 r11 r10 r9 r8 rbp rdi rsi | rdx rcx rbx rax | err rip cs rflags rsp ss]
+        // Offsets from rsp: rsi=+80, rdi=+72, rbp=+64, ...
+        // But rdi/rsi/etc were already clobbered by the serial calls above.
+        // Let's just pass cr2, rip, and the error code from the interrupt frame
+        "mov rdi, cr2",              // arg1: faulting address
+        "mov rsi, [rsp + 128]",      // arg2: rip (11 pushes × 8 = 88, + err at 88, rip at 96... let me calculate)
+        // 11 new pushes (88) + 4 old pushes (32) = 120 bytes above error_code
+        // error_code at [rsp + 120], rip at [rsp + 128], cs at [rsp + 136]
+        "mov rdx, [rsp + 136]",      // arg3: cs
+        "mov rcx, [rsp + 120]",      // arg4: error code
+        "call {dump_pf_fn}",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rbp",
+        "pop rdi",
+        "pop rsi",
+
+        // Draw panic screen
+        "mov rdi, {pf_panic_msg}",  // panic message string
+        "mov rsi, [rsp + 40]",      // rip (offset 40 after 4 pushes + error_code)
+        "mov rdx, [rsp + 48]",      // cs
+        "mov rcx, [rsp + 32]",      // error_code
+        "mov r8, cr2",              // cr2 = faulting address
+        "call {panic_screen_fn}",
+
         // Halt
         "cli",
         "2:",
         "hlt",
         "jmp 2b",
 
+        dump_pf_fn = sym dump_pf_context,
         pf_msg = sym PF_MSG,
         cr2_msg = sym CR2_MSG,
         err_msg = sym ERR_MSG,
@@ -645,8 +853,37 @@ extern "C" fn pf_handler() {
         get_marker_fn = sym get_debug_marker_wrapper,
         get_retval_fn = sym get_debug_return_val_wrapper,
         get_handler_result_fn = sym get_debug_handler_result_wrapper,
+        pf_panic_msg = sym PF_PANIC_MSG,
+        panic_screen_fn = sym panic_screen_wrapper,
     );
 }
+
+/// Dump full register state during #PF for debugging context corruption
+#[no_mangle]
+unsafe extern "C" fn dump_pf_context(cr2: u64, rip: u64, cs: u64, err: u64) {
+    // Which task was running?
+    let task_id = folkering_kernel::task::task::get_current_task();
+    folkering_kernel::serial_println!("[PF_DUMP] Task {} at RIP={:#x} CR2={:#x} ERR={:#x} CS={:#x}",
+        task_id, rip, cr2, err, cs);
+
+    // If this is compositor (task 4), dump its saved Context for comparison
+    if let Some(task_arc) = folkering_kernel::task::task::get_task(task_id) {
+        let task_locked = task_arc.lock();
+        let ctx = &task_locked.context;
+        folkering_kernel::serial_println!("[PF_DUMP] Saved Context for task {}:", task_id);
+        folkering_kernel::serial_println!("  ctx.RIP={:#x} ctx.RAX={:#x} ctx.RSP={:#x}",
+            ctx.rip, ctx.rax, ctx.rsp);
+        folkering_kernel::serial_println!("  ctx.RBX={:#x} ctx.RBP={:#x} ctx.RCX={:#x} ctx.RDX={:#x}",
+            ctx.rbx, ctx.rbp, ctx.rcx, ctx.rdx);
+        folkering_kernel::serial_println!("  ctx.R12={:#x} ctx.R13={:#x} ctx.R14={:#x} ctx.R15={:#x}",
+            ctx.r12, ctx.r13, ctx.r14, ctx.r15);
+        folkering_kernel::serial_println!("  ctx.RDI={:#x} ctx.RSI={:#x} ctx.CS={:#x} ctx.SS={:#x}",
+            ctx.rdi, ctx.rsi, ctx.cs, ctx.ss);
+    }
+}
+
+#[link_section = ".rodata"]
+static PF_PANIC_MSG: &str = "#PF - Page Fault\0";
 
 // Static strings for exception handlers
 #[link_section = ".rodata"]
@@ -681,6 +918,20 @@ static DBG_RSP_MSG: &[u8] = b"  syscall DEBUG_RSP (CS): \0";
 static DBG_RFLAGS_MSG: &[u8] = b"  syscall DEBUG_RFLAGS (SS): \0";
 #[link_section = ".rodata"]
 static NEWLINE: &[u8] = b"\n\0";
+#[link_section = ".rodata"]
+static SAVED_RDI_MSG: &[u8] = b"  RDI (self/arg0): \0";
+#[link_section = ".rodata"]
+static SAVED_RSI_MSG: &[u8] = b"  RSI (x/arg1): \0";
+#[link_section = ".rodata"]
+static CTX_R14_MSG: &[u8] = b"  Context.r14 (before restore): \0";
+#[link_section = ".rodata"]
+static CTX_RSP_MSG: &[u8] = b"  Context.rsp (user RSP in ctx): \0";
+#[link_section = ".rodata"]
+static NEXT_CTX_PTR_MSG: &[u8] = b"  [PREEMPT] next_ctx_ptr: \0";
+#[link_section = ".rodata"]
+static NEXT_CTX_CS_MSG: &[u8] = b"  [PREEMPT] next_ctx.cs: \0";
+#[link_section = ".rodata"]
+static NEXT_CTX_RIP_MSG: &[u8] = b"  [PREEMPT] next_ctx.rip: \0";
 
 /// Write C-string (null-terminated) to serial
 #[no_mangle]
@@ -731,6 +982,36 @@ unsafe extern "C" fn get_debug_rflags_wrapper() -> u64 {
 #[no_mangle]
 unsafe extern "C" fn get_debug_return_val_wrapper() -> u64 {
     folkering_kernel::arch::x86_64::syscall::get_debug_return_val()
+}
+
+/// Wrapper to get Context.r14 value read just before R14 was restored (KEY DIAGNOSTIC)
+#[no_mangle]
+unsafe extern "C" fn get_debug_context_r14_local() -> u64 {
+    folkering_kernel::arch::x86_64::syscall::get_debug_context_r14()
+}
+
+/// Wrapper to get Context.rsp value read alongside Context.r14
+#[no_mangle]
+unsafe extern "C" fn get_debug_context_rsp_local() -> u64 {
+    folkering_kernel::arch::x86_64::syscall::get_debug_context_rsp()
+}
+
+/// Wrapper to get Context pointer returned by timer_preempt_handler
+#[no_mangle]
+unsafe extern "C" fn get_debug_next_ctx_ptr_local() -> u64 {
+    folkering_kernel::arch::x86_64::syscall::get_debug_next_ctx_ptr()
+}
+
+/// Wrapper to get context.cs captured by timer_preempt_handler before returning
+#[no_mangle]
+unsafe extern "C" fn get_debug_next_ctx_cs_local() -> u64 {
+    folkering_kernel::arch::x86_64::syscall::get_debug_next_ctx_cs()
+}
+
+/// Wrapper to get context.rip captured by timer_preempt_handler before returning
+#[no_mangle]
+unsafe extern "C" fn get_debug_next_ctx_rip_local() -> u64 {
+    folkering_kernel::arch::x86_64::syscall::get_debug_next_ctx_rip()
 }
 
 /// Wrapper to get handler result (what Rust returned)
@@ -798,6 +1079,240 @@ unsafe fn write_hex_byte(byte: u8) {
         in("al") low,
         options(nostack)
     );
+}
+
+// ============================================================================
+// Kernel Panic Screen (BSOD replacement)
+// ============================================================================
+
+/// Minimal 8×8 bitmap font — printable ASCII 0x20..=0x7E.
+/// Each char is 8 bytes (one byte per row, MSB = leftmost pixel).
+static PANIC_FONT: [[u8; 8]; 95] = [
+    [0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00], // ' '
+    [0x18,0x3C,0x3C,0x18,0x18,0x00,0x18,0x00], // '!'
+    [0x36,0x36,0x00,0x00,0x00,0x00,0x00,0x00], // '"'
+    [0x36,0x36,0x7F,0x36,0x7F,0x36,0x36,0x00], // '#'
+    [0x0C,0x3E,0x03,0x1E,0x30,0x1F,0x0C,0x00], // '$'
+    [0x00,0x63,0x33,0x18,0x0C,0x66,0x63,0x00], // '%'
+    [0x1C,0x36,0x1C,0x6E,0x3B,0x33,0x6E,0x00], // '&'
+    [0x06,0x06,0x03,0x00,0x00,0x00,0x00,0x00], // '\''
+    [0x18,0x0C,0x06,0x06,0x06,0x0C,0x18,0x00], // '('
+    [0x06,0x0C,0x18,0x18,0x18,0x0C,0x06,0x00], // ')'
+    [0x00,0x66,0x3C,0xFF,0x3C,0x66,0x00,0x00], // '*'
+    [0x00,0x0C,0x0C,0x3F,0x0C,0x0C,0x00,0x00], // '+'
+    [0x00,0x00,0x00,0x00,0x00,0x0C,0x0C,0x06], // ','
+    [0x00,0x00,0x00,0x3F,0x00,0x00,0x00,0x00], // '-'
+    [0x00,0x00,0x00,0x00,0x00,0x0C,0x0C,0x00], // '.'
+    [0x60,0x30,0x18,0x0C,0x06,0x03,0x01,0x00], // '/'
+    [0x3E,0x63,0x73,0x7B,0x6F,0x67,0x3E,0x00], // '0'
+    [0x0C,0x0E,0x0C,0x0C,0x0C,0x0C,0x3F,0x00], // '1'
+    [0x1E,0x33,0x30,0x1C,0x06,0x33,0x3F,0x00], // '2'
+    [0x1E,0x33,0x30,0x1C,0x30,0x33,0x1E,0x00], // '3'
+    [0x38,0x3C,0x36,0x33,0x7F,0x30,0x78,0x00], // '4'
+    [0x3F,0x03,0x1F,0x30,0x30,0x33,0x1E,0x00], // '5'
+    [0x1C,0x06,0x03,0x1F,0x33,0x33,0x1E,0x00], // '6'
+    [0x3F,0x33,0x30,0x18,0x0C,0x0C,0x0C,0x00], // '7'
+    [0x1E,0x33,0x33,0x1E,0x33,0x33,0x1E,0x00], // '8'
+    [0x1E,0x33,0x33,0x3E,0x30,0x18,0x0E,0x00], // '9'
+    [0x00,0x0C,0x0C,0x00,0x00,0x0C,0x0C,0x00], // ':'
+    [0x00,0x0C,0x0C,0x00,0x00,0x0C,0x0C,0x06], // ';'
+    [0x18,0x0C,0x06,0x03,0x06,0x0C,0x18,0x00], // '<'
+    [0x00,0x00,0x3F,0x00,0x00,0x3F,0x00,0x00], // '='
+    [0x06,0x0C,0x18,0x30,0x18,0x0C,0x06,0x00], // '>'
+    [0x1E,0x33,0x30,0x18,0x0C,0x00,0x0C,0x00], // '?'
+    [0x3E,0x63,0x7B,0x7B,0x7B,0x03,0x1E,0x00], // '@'
+    [0x0C,0x1E,0x33,0x33,0x3F,0x33,0x33,0x00], // 'A'
+    [0x3F,0x66,0x66,0x3E,0x66,0x66,0x3F,0x00], // 'B'
+    [0x3C,0x66,0x03,0x03,0x03,0x66,0x3C,0x00], // 'C'
+    [0x1F,0x36,0x66,0x66,0x66,0x36,0x1F,0x00], // 'D'
+    [0x7F,0x46,0x16,0x1E,0x16,0x46,0x7F,0x00], // 'E'
+    [0x7F,0x46,0x16,0x1E,0x16,0x06,0x0F,0x00], // 'F'
+    [0x3C,0x66,0x03,0x03,0x73,0x66,0x7C,0x00], // 'G'
+    [0x33,0x33,0x33,0x3F,0x33,0x33,0x33,0x00], // 'H'
+    [0x1E,0x0C,0x0C,0x0C,0x0C,0x0C,0x1E,0x00], // 'I'
+    [0x78,0x30,0x30,0x30,0x33,0x33,0x1E,0x00], // 'J'
+    [0x67,0x66,0x36,0x1E,0x36,0x66,0x67,0x00], // 'K'
+    [0x0F,0x06,0x06,0x06,0x46,0x66,0x7F,0x00], // 'L'
+    [0x63,0x77,0x7F,0x7F,0x6B,0x63,0x63,0x00], // 'M'
+    [0x63,0x67,0x6F,0x7B,0x73,0x63,0x63,0x00], // 'N'
+    [0x1C,0x36,0x63,0x63,0x63,0x36,0x1C,0x00], // 'O'
+    [0x3F,0x66,0x66,0x3E,0x06,0x06,0x0F,0x00], // 'P'
+    [0x1E,0x33,0x33,0x33,0x3B,0x1E,0x38,0x00], // 'Q'
+    [0x3F,0x66,0x66,0x3E,0x36,0x66,0x67,0x00], // 'R'
+    [0x1E,0x33,0x07,0x0E,0x38,0x33,0x1E,0x00], // 'S'
+    [0x3F,0x2D,0x0C,0x0C,0x0C,0x0C,0x1E,0x00], // 'T'
+    [0x33,0x33,0x33,0x33,0x33,0x33,0x3F,0x00], // 'U'
+    [0x33,0x33,0x33,0x33,0x33,0x1E,0x0C,0x00], // 'V'
+    [0x63,0x63,0x63,0x6B,0x7F,0x77,0x63,0x00], // 'W'
+    [0x63,0x63,0x36,0x1C,0x1C,0x36,0x63,0x00], // 'X'
+    [0x33,0x33,0x33,0x1E,0x0C,0x0C,0x1E,0x00], // 'Y'
+    [0x7F,0x63,0x31,0x18,0x4C,0x66,0x7F,0x00], // 'Z'
+    [0x1E,0x06,0x06,0x06,0x06,0x06,0x1E,0x00], // '['
+    [0x03,0x06,0x0C,0x18,0x30,0x60,0x40,0x00], // '\'
+    [0x1E,0x18,0x18,0x18,0x18,0x18,0x1E,0x00], // ']'
+    [0x08,0x1C,0x36,0x63,0x00,0x00,0x00,0x00], // '^'
+    [0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xFF], // '_'
+    [0x0C,0x0C,0x18,0x00,0x00,0x00,0x00,0x00], // '`'
+    [0x00,0x00,0x1E,0x30,0x3E,0x33,0x6E,0x00], // 'a'
+    [0x07,0x06,0x06,0x3E,0x66,0x66,0x3B,0x00], // 'b'
+    [0x00,0x00,0x1E,0x33,0x03,0x33,0x1E,0x00], // 'c'
+    [0x38,0x30,0x30,0x3e,0x33,0x33,0x6E,0x00], // 'd'
+    [0x00,0x00,0x1E,0x33,0x3f,0x03,0x1E,0x00], // 'e'
+    [0x1C,0x36,0x06,0x0f,0x06,0x06,0x0F,0x00], // 'f'
+    [0x00,0x00,0x6E,0x33,0x33,0x3E,0x30,0x1F], // 'g'
+    [0x07,0x06,0x36,0x6E,0x66,0x66,0x67,0x00], // 'h'
+    [0x0C,0x00,0x0E,0x0C,0x0C,0x0C,0x1E,0x00], // 'i'
+    [0x30,0x00,0x30,0x30,0x30,0x33,0x33,0x1E], // 'j'
+    [0x07,0x06,0x66,0x36,0x1E,0x36,0x67,0x00], // 'k'
+    [0x0E,0x0C,0x0C,0x0C,0x0C,0x0C,0x1E,0x00], // 'l'
+    [0x00,0x00,0x33,0x7F,0x7F,0x6B,0x63,0x00], // 'm'
+    [0x00,0x00,0x1F,0x33,0x33,0x33,0x33,0x00], // 'n'
+    [0x00,0x00,0x1E,0x33,0x33,0x33,0x1E,0x00], // 'o'
+    [0x00,0x00,0x3B,0x66,0x66,0x3E,0x06,0x0F], // 'p'
+    [0x00,0x00,0x6E,0x33,0x33,0x3E,0x30,0x78], // 'q'
+    [0x00,0x00,0x3B,0x6E,0x66,0x06,0x0F,0x00], // 'r'
+    [0x00,0x00,0x3E,0x03,0x1E,0x30,0x1F,0x00], // 's'
+    [0x08,0x0C,0x3E,0x0C,0x0C,0x2C,0x18,0x00], // 't'
+    [0x00,0x00,0x33,0x33,0x33,0x33,0x6E,0x00], // 'u'
+    [0x00,0x00,0x33,0x33,0x33,0x1E,0x0C,0x00], // 'v'
+    [0x00,0x00,0x63,0x6B,0x7F,0x7F,0x36,0x00], // 'w'
+    [0x00,0x00,0x63,0x36,0x1C,0x36,0x63,0x00], // 'x'
+    [0x00,0x00,0x33,0x33,0x33,0x3E,0x30,0x1F], // 'y'
+    [0x00,0x00,0x3F,0x19,0x0C,0x26,0x3F,0x00], // 'z'
+    [0x38,0x0C,0x0C,0x07,0x0C,0x0C,0x38,0x00], // '{'
+    [0x18,0x18,0x18,0x00,0x18,0x18,0x18,0x00], // '|'
+    [0x07,0x0C,0x0C,0x38,0x0C,0x0C,0x07,0x00], // '}'
+    [0x6E,0x3B,0x00,0x00,0x00,0x00,0x00,0x00], // '~'
+];
+
+/// Draw a single character directly into the framebuffer.
+/// `fb_ptr` is the virtual (HHDM-mapped) linear framebuffer address.
+/// `pitch` is bytes per row, `fg`/`bg` are packed 32-bit pixel values.
+unsafe fn panic_draw_char(
+    fb_ptr: *mut u32,
+    pitch: usize,   // in bytes
+    x: usize, y: usize,
+    ch: u8, fg: u32, bg: u32,
+    width: usize, height: usize,
+) {
+    if ch < 0x20 || ch > 0x7E { return; }
+    let glyph = &PANIC_FONT[(ch - 0x20) as usize];
+    for row in 0..8 {
+        let py = y + row;
+        if py >= height { break; }
+        for col in 0..8 {
+            let px = x + col;
+            if px >= width { continue; }
+            let bit = (glyph[row] >> (7 - col)) & 1;
+            let color = if bit != 0 { fg } else { bg };
+            // pitch is in bytes, fb_ptr is *mut u32 (4 bytes each)
+            let pixel_ptr = fb_ptr.add(py * (pitch / 4) + px);
+            core::ptr::write_volatile(pixel_ptr, color);
+        }
+    }
+}
+
+/// Write a string to the framebuffer at (x, y) using the 8x8 panic font.
+unsafe fn panic_draw_str(
+    fb_ptr: *mut u32, pitch: usize,
+    x: usize, y: usize,
+    s: &str, fg: u32, bg: u32,
+    width: usize, height: usize,
+) -> usize {  // returns new X position
+    let mut cx = x;
+    for byte in s.bytes() {
+        panic_draw_char(fb_ptr, pitch, cx, y, byte, fg, bg, width, height);
+        cx += 8;
+        if cx + 8 > width { break; }
+    }
+    cx
+}
+
+/// Write a hex number to framebuffer.
+unsafe fn panic_draw_hex(
+    fb_ptr: *mut u32, pitch: usize,
+    x: usize, y: usize,
+    mut val: u64, fg: u32, bg: u32,
+    width: usize, height: usize,
+) -> usize {
+    let hex = b"0123456789ABCDEF";
+    let mut buf = [0u8; 18]; // "0x" + 16 hex digits
+    buf[0] = b'0';
+    buf[1] = b'x';
+    for i in 0..16 {
+        buf[17 - i] = hex[(val & 0xF) as usize];
+        val >>= 4;
+    }
+    let s = core::str::from_utf8_unchecked(&buf);
+    panic_draw_str(fb_ptr, pitch, x, y, s, fg, bg, width, height)
+}
+
+/// Kernel panic screen — draws directly to VRAM, bypassing compositor.
+///
+/// Shows a dark red background with white text describing the fault.
+/// `msg`  — short description (e.g., "#GP" or "#PF")
+/// `rip`  — faulting RIP
+/// `cs`   — code segment at fault
+/// `err`  — error code (0 for exceptions without error codes)
+/// `cr2`  — CR2 register (faulting address for #PF; 0 otherwise)
+pub unsafe fn panic_screen(msg: &str, rip: u64, cs: u64, err: u64, cr2: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+
+    let fb_phys = FRAMEBUFFER_INFO.load(Relaxed);
+    let fb_w    = FRAMEBUFFER_WIDTH.load(Relaxed);
+    let fb_h    = FRAMEBUFFER_HEIGHT.load(Relaxed);
+    let pitch   = FRAMEBUFFER_PITCH.load(Relaxed);
+
+    if fb_phys == 0 || fb_w == 0 { return; }
+
+    // Map to HHDM virtual address via phys_to_virt (framebuffer is mapped at kernel init)
+    let fb_virt = folkering_kernel::phys_to_virt(fb_phys) as *mut u32;
+
+    // Background: dark red (#8B0000)
+    let bg: u32 = 0x008B_0000;
+    let fg: u32 = 0x00FF_FFFF;   // white
+    let yellow: u32 = 0x00FF_FF00;
+
+    // Fill entire screen with dark red
+    let total_pixels = (pitch / 4) * fb_h;
+    for i in 0..total_pixels {
+        core::ptr::write_volatile(fb_virt.add(i), bg);
+    }
+
+    let mut y = 20usize;
+    let x0 = 20usize;
+
+    // Title
+    panic_draw_str(fb_virt, pitch, x0, y, "*** FOLKERING OS KERNEL PANIC ***", yellow, bg, fb_w, fb_h);
+    y += 16;
+    panic_draw_str(fb_virt, pitch, x0, y, msg, fg, bg, fb_w, fb_h);
+    y += 20;
+
+    // Register dump
+    let nx = panic_draw_str(fb_virt, pitch, x0, y, "RIP: ", fg, bg, fb_w, fb_h);
+    panic_draw_hex(fb_virt, pitch, nx, y, rip, yellow, bg, fb_w, fb_h);
+    y += 12;
+
+    let nx = panic_draw_str(fb_virt, pitch, x0, y, "CS:  ", fg, bg, fb_w, fb_h);
+    panic_draw_hex(fb_virt, pitch, nx, y, cs, yellow, bg, fb_w, fb_h);
+    y += 12;
+
+    let nx = panic_draw_str(fb_virt, pitch, x0, y, "ERR: ", fg, bg, fb_w, fb_h);
+    panic_draw_hex(fb_virt, pitch, nx, y, err, yellow, bg, fb_w, fb_h);
+    y += 12;
+
+    if cr2 != 0 {
+        let nx = panic_draw_str(fb_virt, pitch, x0, y, "CR2: ", fg, bg, fb_w, fb_h);
+        panic_draw_hex(fb_virt, pitch, nx, y, cr2, yellow, bg, fb_w, fb_h);
+        y += 12;
+    }
+
+    let marker = folkering_kernel::arch::x86_64::syscall::get_debug_marker();
+    let nx = panic_draw_str(fb_virt, pitch, x0, y, "MARKER: ", fg, bg, fb_w, fb_h);
+    panic_draw_hex(fb_virt, pitch, nx, y, marker, yellow, bg, fb_w, fb_h);
+    y += 20;
+
+    panic_draw_str(fb_virt, pitch, x0, y, "System halted. Check serial log for details.", fg, bg, fb_w, fb_h);
 }
 
 /// Initialize IDT with generic exception handlers
@@ -896,7 +1411,23 @@ unsafe fn init_idt() {
     IDT[30].set_handler(core::mem::transmute(exc_sx as *const ())); // #SX
     IDT[31].set_handler(core::mem::transmute(exc_reserved31 as *const ()));
     // IRQ handlers (32+)
-    IDT[32].set_handler(core::mem::transmute(irq_timer as *const ())); // Timer
+    // IMPORTANT: Use `sym irq_timer` in inline asm to get the TRUE machine code
+    // address of the naked function. Rust function pointers for naked functions
+    // may point 28 bytes into the function body (past the RPL check), causing
+    // the kernel-mode path to be entered instead of the userspace-path prologue.
+    let irq_timer_addr: u64;
+    core::arch::asm!(
+        "lea {0}, [rip + {timer}]",
+        out(reg) irq_timer_addr,
+        timer = sym irq_timer,
+        options(nostack, readonly)
+    );
+    serial_write("[IDT] irq_timer sym addr: ");
+    write_hex(irq_timer_addr);
+    serial_write(", fn ptr: ");
+    write_hex(irq_timer as *const () as u64);
+    serial_write("\n");
+    IDT[32].set_handler_addr(irq_timer_addr); // Timer
 
     // DEBUG: Print IDT[32] raw bytes to verify format
     serial_write("[IDT] IDT[32] raw bytes: ");

@@ -6,7 +6,7 @@
 #![no_main]
 
 use libfolk::{entry, print, println};
-use libfolk::sys::{read_key, yield_cpu, get_pid, exit, task_list, uptime, shmem_map, shmem_create, shmem_grant, shmem_unmap, shmem_destroy, poweroff, check_interrupt, clear_interrupt};
+use libfolk::sys::{yield_cpu, get_pid, exit, task_list, uptime, shmem_map, shmem_create, shmem_grant, shmem_unmap, shmem_destroy, poweroff, check_interrupt, clear_interrupt};
 use libfolk::sys::synapse::{
     read_file_shmem, file_count, embedding_count,
     vector_search, get_embedding, SYNAPSE_TASK_ID,
@@ -58,29 +58,27 @@ fn main() -> ! {
     println!("Folkering Shell v0.1.0 (PID: {})", pid);
     println!("Type 'help' for available commands.\n");
 
-    // Shell now operates as IPC service for compositor
-    println!("[SHELL] Running as IPC service (Task {})", pid);
-    println!("[SHELL] Accepting commands from compositor...\n");
-
+    println!("[SHELL] Running (Task {})", pid);
     print_prompt();
 
     loop {
-        // Check for IPC messages from compositor
-        match recv_async() {
-            Ok(msg) => {
-                let response = handle_ipc_command(msg.payload0);
-                let _ = reply_with_token(msg.token, response, 0);
-            }
-            Err(IpcError::WouldBlock) => {
-                // No IPC messages, check for keyboard input (serial console)
-                match read_key() {
-                    Some(key) => handle_key(key),
-                    None => yield_cpu(),
+        // Process all pending async IPC messages before yielding.
+        // The compositor sends commands here (ls, ps, uptime, exec, etc.)
+        let mut did_work = false;
+        loop {
+            match recv_async() {
+                Ok(msg) => {
+                    did_work = true;
+                    let response = handle_ipc_command(msg.payload0);
+                    let _ = reply_with_token(msg.token, response, 0);
                 }
+                Err(IpcError::WouldBlock) => break,
+                Err(_) => break,
             }
-            Err(_) => {
-                yield_cpu();
-            }
+        }
+
+        if !did_work {
+            yield_cpu();
         }
     }
 }
@@ -91,17 +89,65 @@ fn handle_ipc_command(payload0: u64) -> u64 {
 
     match opcode {
         x if x == SHELL_OP_LIST_FILES => {
-            // List files - return count
+            // List files - return count + shmem with file entries
             let mut entries = [DirEntry {
                 id: 0, entry_type: 0, name: [0u8; 32], size: 0
             }; 16];
             let count = libfolk::sys::fs::read_dir(&mut entries);
-            // Return count in upper 32 bits
-            (count as u64) << 32
+            if count == 0 {
+                return 0;
+            }
+
+            // Create shmem: 32 bytes per entry [name: [u8;24]][size: u32][type_pad: u32]
+            let shmem_size = count * 32;
+            let handle = match shmem_create(shmem_size) {
+                Ok(h) => h,
+                Err(_) => return (count as u64) << 32, // Fallback: count only
+            };
+
+            // Map shmem
+            if shmem_map(handle, SHELL_SHMEM_VADDR).is_err() {
+                let _ = shmem_destroy(handle);
+                return (count as u64) << 32;
+            }
+
+            // Write entries to shmem
+            let buf = unsafe {
+                core::slice::from_raw_parts_mut(SHELL_SHMEM_VADDR as *mut u8, shmem_size)
+            };
+            for i in 0..count {
+                let offset = i * 32;
+                // name: [u8; 24]
+                let name_bytes = entries[i].name_str().as_bytes();
+                let name_len = name_bytes.len().min(24);
+                buf[offset..offset+name_len].copy_from_slice(&name_bytes[..name_len]);
+                // Zero-fill rest of name
+                for j in name_len..24 {
+                    buf[offset + j] = 0;
+                }
+                // size: u32
+                let size_val = entries[i].size as u32;
+                buf[offset+24..offset+28].copy_from_slice(&size_val.to_le_bytes());
+                // type: u32 (0=elf, 1=data)
+                let type_val: u32 = if entries[i].is_elf() { 0 } else { 1 };
+                buf[offset+28..offset+32].copy_from_slice(&type_val.to_le_bytes());
+            }
+
+            // Grant to caller (Intent Service = task 5, but we grant broadly)
+            // The msg.sender is provided by the kernel — grant to all potential callers
+            for task_id in 2..=8 {
+                let _ = shmem_grant(handle, task_id);
+            }
+
+            // Unmap from shell (caller will map it)
+            let _ = shmem_unmap(handle, SHELL_SHMEM_VADDR);
+
+            // Return count in upper 32 bits, shmem handle in lower
+            ((count as u64) << 32) | (handle as u64)
         }
 
         x if x == SHELL_OP_CAT_FILE => {
-            // Cat file by name hash
+            // Cat file by name hash — read directly from ramdisk via kernel syscall
             let name_hash = ((payload0 >> 8) & 0xFFFFFFFF) as u32;
             // Find matching file in ramdisk
             let mut entries = [DirEntry {
@@ -112,14 +158,38 @@ fn handle_ipc_command(payload0: u64) -> u64 {
             for i in 0..count {
                 let entry_hash = shell_hash_name(entries[i].name_str());
                 if entry_hash == name_hash {
-                    // Found file - read via Synapse shmem
-                    match read_file_shmem(entries[i].name_str()) {
-                        Ok(resp) => {
-                            // Return size in upper 32 bits, shmem handle in lower
-                            return ((resp.size as u64) << 32) | (resp.shmem_handle as u64);
-                        }
-                        Err(_) => return SHELL_STATUS_NOT_FOUND,
+                    // Found file — read content directly via kernel syscall
+                    let mut file_buf = [0u8; 4096];
+                    let bytes_read = libfolk::sys::fs::read_file(
+                        entries[i].name_str(), &mut file_buf
+                    );
+                    if bytes_read == 0 {
+                        return SHELL_STATUS_NOT_FOUND;
                     }
+
+                    // Create shmem and copy file content
+                    let handle = match shmem_create(bytes_read) {
+                        Ok(h) => h,
+                        Err(_) => return SHELL_STATUS_ERROR,
+                    };
+                    if shmem_map(handle, SHELL_SHMEM_VADDR).is_err() {
+                        let _ = shmem_destroy(handle);
+                        return SHELL_STATUS_ERROR;
+                    }
+
+                    let buf = unsafe {
+                        core::slice::from_raw_parts_mut(
+                            SHELL_SHMEM_VADDR as *mut u8, bytes_read
+                        )
+                    };
+                    buf.copy_from_slice(&file_buf[..bytes_read]);
+
+                    for task_id in 2..=8 {
+                        let _ = shmem_grant(handle, task_id);
+                    }
+                    let _ = shmem_unmap(handle, SHELL_SHMEM_VADDR);
+
+                    return ((bytes_read as u64) << 32) | (handle as u64);
                 }
             }
             SHELL_STATUS_NOT_FOUND
@@ -137,14 +207,54 @@ fn handle_ipc_command(payload0: u64) -> u64 {
         }
 
         x if x == SHELL_OP_PS => {
-            // Process list
-            let count = task_list();
-            count as u64
+            // Process list - return count + shmem with task details
+            // Format per task (32 bytes): [task_id: u32][state: u32][name: [u8; 16]][cpu_time_ms: u64]
+            let mut task_buf = [0u8; 512]; // max 16 tasks × 32 bytes
+            let count = libfolk::sys::system::task_list_detailed(&mut task_buf) as usize;
+            if count == 0 {
+                return 0;
+            }
+
+            let shmem_size = count * 32;
+            let handle = match shmem_create(shmem_size) {
+                Ok(h) => h,
+                Err(_) => return (count as u64) << 32,
+            };
+
+            if shmem_map(handle, SHELL_SHMEM_VADDR).is_err() {
+                let _ = shmem_destroy(handle);
+                return (count as u64) << 32;
+            }
+
+            // Copy task data to shmem
+            let buf = unsafe {
+                core::slice::from_raw_parts_mut(SHELL_SHMEM_VADDR as *mut u8, shmem_size)
+            };
+            buf.copy_from_slice(&task_buf[..shmem_size]);
+
+            // Grant to potential callers
+            for task_id in 2..=8 {
+                let _ = shmem_grant(handle, task_id);
+            }
+
+            let _ = shmem_unmap(handle, SHELL_SHMEM_VADDR);
+
+            // Return count in upper 32 bits, shmem handle in lower
+            ((count as u64) << 32) | (handle as u64)
         }
 
         x if x == SHELL_OP_UPTIME => {
             // System uptime
             uptime()
+        }
+
+        x if x == SHELL_OP_EXEC => {
+            // Execute a command sent as a hash in the payload.
+            // High 32 bits: command identifier hash
+            // Low  8  bits: opcode (0x85)
+            // For now we return status OK — compositor renders output itself
+            // for common commands; full shmem text output is a future milestone.
+            SHELL_STATUS_OK
         }
 
         _ => {
