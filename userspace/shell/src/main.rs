@@ -304,12 +304,49 @@ fn handle_ipc_command(payload0: u64) -> u64 {
         }
 
         x if x == SHELL_OP_EXEC => {
-            // Execute a command sent as a hash in the payload.
-            // High 32 bits: command identifier hash
-            // Low  8  bits: opcode (0x85)
-            // For now we return status OK — compositor renders output itself
-            // for common commands; full shmem text output is a future milestone.
-            SHELL_STATUS_OK
+            // Execute a command identified by hash
+            let cmd_hash = ((payload0 >> 8) & 0xFFFFFFFF) as u32;
+
+            // Check if this is the "ui_test" command
+            let ui_test_hash = shell_hash_name("ui_test");
+            if cmd_hash == ui_test_hash {
+                // Build a test UI widget tree using UiWriter
+                let mut ui_buf = [0u8; 512];
+                let mut w = libfolk::ui::UiWriter::new(&mut ui_buf);
+                w.header("Folkering App", 280, 160);
+                w.vstack_begin(6, 5);     // 5 children
+                  w.label("Hello from Shell!", 0x00CCFF);
+                  w.spacer(4);
+                  w.label("This UI was built by", 0xCCCCCC);
+                  w.label("Shell and sent via IPC", 0xCCCCCC);
+                  w.hstack_begin(8, 2);   // 2 buttons
+                    w.button("OK", 1, 0x226644, 0xFFFFFF);
+                    w.button("Cancel", 2, 0x664422, 0xFFFFFF);
+                let ui_len = w.len();
+
+                // Allocate shmem and write the UI buffer
+                let handle = match shmem_create(ui_len) {
+                    Ok(h) => h,
+                    Err(_) => return SHELL_STATUS_ERROR,
+                };
+                for tid in 2..=8 { let _ = shmem_grant(handle, tid); }
+                if shmem_map(handle, SHELL_SHMEM_VADDR).is_err() {
+                    let _ = shmem_destroy(handle);
+                    return SHELL_STATUS_ERROR;
+                }
+                let dst = unsafe {
+                    core::slice::from_raw_parts_mut(SHELL_SHMEM_VADDR as *mut u8, ui_len)
+                };
+                dst.copy_from_slice(&ui_buf[..ui_len]);
+                let _ = shmem_unmap(handle, SHELL_SHMEM_VADDR);
+
+                // Return shmem handle to caller (compositor)
+                // Compositor will parse the UI schema and create the window
+                // Magic: 0x5549 ("UI") in upper 16 bits marks this as a UI shmem response
+                (0x5549_u64 << 48) | (ui_len as u64) << 32 | (handle as u64)
+            } else {
+                SHELL_STATUS_OK
+            }
         }
 
         _ => {

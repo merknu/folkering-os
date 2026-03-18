@@ -29,7 +29,7 @@ use libfolk::sys::{yield_cpu, read_mouse, read_key, uptime, shmem_create, shmem_
 use libfolk::sys::io::{write_char, write_str};
 use libfolk::sys::shell::{
     SHELL_TASK_ID, SHELL_OP_LIST_FILES, SHELL_OP_CAT_FILE, SHELL_OP_SEARCH,
-    SHELL_OP_PS, SHELL_OP_UPTIME,
+    SHELL_OP_PS, SHELL_OP_UPTIME, SHELL_OP_EXEC,
     SHELL_STATUS_NOT_FOUND, hash_name as shell_hash_name,
 };
 use libfolk::{entry, println};
@@ -161,6 +161,7 @@ static ALLOCATOR: BumpAllocator = BumpAllocator {
 const MSG_CREATE_WINDOW: u64 = 0x01;
 const MSG_UPDATE: u64 = 0x02;
 const MSG_CLOSE: u64 = 0x03;
+const MSG_CREATE_UI_WINDOW: u64 = 0x06;
 const MSG_QUERY_NAME: u64 = 0x10;
 const MSG_QUERY_FOCUS: u64 = 0x11;
 
@@ -1395,11 +1396,79 @@ fn main() -> ! {
                                 }
                             }
                         }
+                    } else if cmd_str == "ui_test" || cmd_str == "app" {
+                        // Route to Shell via Intent Service — Shell builds UI shmem
+                        let name_hash = shell_hash_name("ui_test") as u64;
+                        let shell_payload = SHELL_OP_EXEC | (name_hash << 8);
+                        let intent_req = libfolk::sys::intent::INTENT_OP_SUBMIT
+                            | (shell_payload << 8);
+                        let ipc_result = unsafe {
+                            libfolk::syscall::syscall3(
+                                libfolk::syscall::SYS_IPC_SEND,
+                                libfolk::sys::intent::INTENT_TASK_ID as u64, intent_req, 0
+                            )
+                        };
+                        // Check for UI shmem response: magic 0x5549 in upper 16 bits
+                        let magic = (ipc_result >> 48) as u16;
+                        if magic == 0x5549 {
+                            let ui_handle = (ipc_result & 0xFFFFFFFF) as u32;
+                            win.push_line("App received from Shell!");
+                            // Signal: create UI window after win borrow released
+                            // Store handle in input_buf temporarily
+                            win.input_buf[0..4].copy_from_slice(&ui_handle.to_le_bytes());
+                            win.input_buf[4] = 0xAA; // marker
+                        } else {
+                            win.push_line("App launch failed");
+                        }
                     } else if cmd_str == "help" {
-                        win.push_line("ls ps cat find uptime help term");
+                        win.push_line("ls ps cat find uptime app help");
                     } else {
                         win.push_line("Unknown command. Try: help");
                     }
+                }
+            }
+        }
+
+        // ===== Deferred UI window creation from Shell IPC =====
+        if let Some(wid) = win_execute_command {
+            let should_create = if let Some(w) = wm.get_window_mut(wid) {
+                w.input_buf[4] == 0xAA // marker from app command
+            } else {
+                false
+            };
+            if should_create {
+                let ui_handle = if let Some(w) = wm.get_window_mut(wid) {
+                    w.input_buf[4] = 0; // clear marker
+                    u32::from_le_bytes([w.input_buf[0], w.input_buf[1], w.input_buf[2], w.input_buf[3]])
+                } else { 0 };
+
+                if ui_handle != 0 {
+                    if shmem_map(ui_handle, COMPOSITOR_SHMEM_VADDR).is_ok() {
+                        let buf = unsafe {
+                            core::slice::from_raw_parts(COMPOSITOR_SHMEM_VADDR as *const u8, 4096)
+                        };
+                        if let Some(header) = libfolk::ui::parse_header(buf) {
+                            let wc = wm.windows.len() as i32;
+                            let app_id = wm.create_terminal(
+                                header.title,
+                                120 + wc * 30, 100 + wc * 30,
+                                header.width as u32, header.height as u32,
+                            );
+                            if let Some(app_win) = wm.get_window_mut(app_id) {
+                                app_win.kind = compositor::window_manager::WindowKind::App;
+                                let (root, _) = parse_widget_tree(header.widget_data);
+                                if let Some(widget) = root {
+                                    app_win.widgets.push(widget);
+                                }
+                            }
+                            write_str("[WM] Created UI window: ");
+                            write_str(header.title);
+                            write_str("\n");
+                            need_redraw = true;
+                        }
+                        let _ = shmem_unmap(ui_handle, COMPOSITOR_SHMEM_VADDR);
+                    }
+                    let _ = shmem_destroy(ui_handle);
                 }
             }
         }
@@ -1527,8 +1596,58 @@ fn main() -> ! {
         match recv_async() {
             Ok(msg) => {
                 did_work = true;
-                let response = handle_message(&mut compositor, msg.payload0);
-                let _ = reply_with_token(msg.token, response, 0);
+                let opcode = msg.payload0 & 0xFF;
+
+                if opcode == MSG_CREATE_UI_WINDOW {
+                    // Create UI window from shmem widget description
+                    let shmem_handle = ((msg.payload0 >> 8) & 0xFFFFFFFF) as u32;
+                    let mut response = u64::MAX;
+
+                    if shmem_handle != 0 {
+                        if shmem_map(shmem_handle, COMPOSITOR_SHMEM_VADDR).is_ok() {
+                            // Read shmem to get UI description size (max 4KB)
+                            let buf = unsafe {
+                                core::slice::from_raw_parts(COMPOSITOR_SHMEM_VADDR as *const u8, 4096)
+                            };
+
+                            if let Some(header) = libfolk::ui::parse_header(buf) {
+                                // Create App window
+                                let win_count = wm.windows.len() as i32;
+                                let wx = 100 + win_count * 30;
+                                let wy = 80 + win_count * 30;
+                                let win_id = wm.create_terminal(
+                                    header.title,
+                                    wx, wy,
+                                    header.width as u32,
+                                    header.height as u32,
+                                );
+
+                                if let Some(win) = wm.get_window_mut(win_id) {
+                                    win.kind = compositor::window_manager::WindowKind::App;
+
+                                    // Parse widget tree recursively
+                                    let (root_widget, _) = parse_widget_tree(header.widget_data);
+                                    if let Some(widget) = root_widget {
+                                        win.widgets.push(widget);
+                                    }
+                                }
+
+                                write_str("[WM] Created UI window: ");
+                                write_str(header.title);
+                                write_str("\n");
+                                response = win_id as u64;
+                            }
+
+                            let _ = shmem_unmap(shmem_handle, COMPOSITOR_SHMEM_VADDR);
+                            let _ = shmem_destroy(shmem_handle);
+                        }
+                    }
+                    let _ = reply_with_token(msg.token, response, 0);
+                    need_redraw = true;
+                } else {
+                    let response = handle_message(&mut compositor, msg.payload0);
+                    let _ = reply_with_token(msg.token, response, 0);
+                }
             }
             Err(IpcError::WouldBlock) => {}
             Err(_) => {}
@@ -1538,6 +1657,47 @@ fn main() -> ! {
         if !did_work {
             yield_cpu();
         }
+    }
+}
+
+/// Recursively parse widget tree from wire format into UiWidget
+fn parse_widget_tree(data: &[u8]) -> (Option<compositor::window_manager::UiWidget>, usize) {
+    use compositor::window_manager::UiWidget;
+    use libfolk::ui::{parse_widget, ParsedWidget as PW};
+
+    match parse_widget(data) {
+        Some((PW::Label { text, color }, consumed)) => {
+            (Some(UiWidget::label(text, color)), consumed)
+        }
+        Some((PW::Button { label, action_id, bg, fg }, consumed)) => {
+            (Some(UiWidget::button(label, action_id, bg, fg)), consumed)
+        }
+        Some((PW::Spacer { height }, consumed)) => {
+            (Some(UiWidget::Spacer { height }), consumed)
+        }
+        Some((PW::VStackBegin { spacing, child_count }, mut consumed)) => {
+            let mut children = alloc::vec::Vec::new();
+            for _ in 0..child_count {
+                let (child, child_consumed) = parse_widget_tree(&data[consumed..]);
+                if let Some(c) = child {
+                    children.push(c);
+                }
+                consumed += child_consumed;
+            }
+            (Some(UiWidget::VStack { children, spacing }), consumed)
+        }
+        Some((PW::HStackBegin { spacing, child_count }, mut consumed)) => {
+            let mut children = alloc::vec::Vec::new();
+            for _ in 0..child_count {
+                let (child, child_consumed) = parse_widget_tree(&data[consumed..]);
+                if let Some(c) = child {
+                    children.push(c);
+                }
+                consumed += child_consumed;
+            }
+            (Some(UiWidget::HStack { children, spacing }), consumed)
+        }
+        _ => (None, 0),
     }
 }
 

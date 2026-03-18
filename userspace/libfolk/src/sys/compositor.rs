@@ -51,6 +51,11 @@ pub const COMP_OP_UPDATE: u64 = 0x02;
 /// Reply: 0 on success
 pub const COMP_OP_CLOSE: u64 = 0x03;
 
+/// Create a UI window from serialized widget tree in shmem
+/// Request: op | (shmem_handle << 8)
+/// Reply: window_id on success, u64::MAX on failure
+pub const COMP_OP_CREATE_UI_WINDOW: u64 = 0x06;
+
 /// Query: find node by name hash
 /// Request: [OP, name_hash]
 /// Reply: (window_id << 32) | node_id, or u64::MAX if not found
