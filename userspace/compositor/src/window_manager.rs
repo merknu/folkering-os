@@ -43,11 +43,65 @@ impl TextLine {
     }
 }
 
+// ===== UI Widget System (Milestone 4: Native UI Schema) =====
+
+/// Widget types for AI-generated app UIs.
+/// Apps describe their UI declaratively; the compositor renders it.
+#[derive(Clone)]
+pub enum UiWidget {
+    /// Text label — static display text
+    Label {
+        text: [u8; 64],
+        text_len: usize,
+        color: u32,      // RGB24
+    },
+    /// Clickable button with label and action ID
+    Button {
+        label: [u8; 32],
+        label_len: usize,
+        action_id: u32,   // sent back to app on click
+        bg_color: u32,
+        fg_color: u32,
+    },
+    /// Vertical stack — children laid out top-to-bottom
+    VStack {
+        children: Vec<UiWidget>,
+        spacing: u16,
+    },
+    /// Horizontal stack — children laid out left-to-right
+    HStack {
+        children: Vec<UiWidget>,
+        spacing: u16,
+    },
+    /// Spacer — flexible empty space
+    Spacer {
+        height: u16,
+    },
+}
+
+impl UiWidget {
+    pub fn label(text: &str, color: u32) -> Self {
+        let mut buf = [0u8; 64];
+        let len = text.len().min(63);
+        buf[..len].copy_from_slice(&text.as_bytes()[..len]);
+        UiWidget::Label { text: buf, text_len: len, color }
+    }
+
+    pub fn button(label: &str, action_id: u32, bg: u32, fg: u32) -> Self {
+        let mut buf = [0u8; 32];
+        let len = label.len().min(31);
+        buf[..len].copy_from_slice(&label.as_bytes()[..len]);
+        UiWidget::Button { label: buf, label_len: len, action_id, bg_color: bg, fg_color: fg }
+    }
+}
+
 // ===== Window =====
 
 pub enum WindowKind {
     /// Text-only terminal-style window
     Terminal,
+    /// Widget-based UI window (for AI-generated apps)
+    App,
 }
 
 pub struct Window {
@@ -59,6 +113,7 @@ pub struct Window {
     pub width: u32,   // content width (inside border)
     pub height: u32,  // content height (inside border, below title bar)
     pub lines: Vec<TextLine>,
+    pub widgets: Vec<UiWidget>,   // Milestone 4: declarative UI widgets
     pub kind: WindowKind,
     pub visible: bool,
     pub dragging: bool,
@@ -142,6 +197,7 @@ impl WindowManager {
             x, y,
             width, height,
             lines: Vec::new(),
+            widgets: Vec::new(),
             kind: WindowKind::Terminal,
             visible: true,
             dragging: false,
@@ -350,6 +406,78 @@ fn draw_window(fb: &mut FramebufferView, win: &Window, focused: bool) {
         if cursor_x + 8 <= content_x + content_w && focused {
             fb.fill_rect(cursor_x, prompt_y, 8, 8, cursor_fg);
         }
+    }
+
+    // Draw widgets for App windows (Milestone 4)
+    if !win.widgets.is_empty() {
+        let mut wy_cursor = if win.lines.is_empty() { content_y + 6 } else { text_y + 4 };
+        draw_widgets(fb, &win.widgets, content_x + 6, wy_cursor, content_w.saturating_sub(12), win_bg);
+    }
+}
+
+/// Recursively render UI widgets
+fn draw_widgets(fb: &mut FramebufferView, widgets: &[UiWidget], x: usize, mut y: usize, max_w: usize, bg: u32) {
+    for widget in widgets {
+        match widget {
+            UiWidget::Label { text, text_len, color } => {
+                let s = unsafe { core::str::from_utf8_unchecked(&text[..*text_len]) };
+                draw_str_small(fb, x, y, s, rgb(fb, *color), bg);
+                y += 12;
+            }
+            UiWidget::Button { label, label_len, bg_color, fg_color, .. } => {
+                let s = unsafe { core::str::from_utf8_unchecked(&label[..*label_len]) };
+                let btn_w = (*label_len * 8 + 16).min(max_w);
+                let btn_h = 16;
+                let btn_bg = rgb(fb, *bg_color);
+                let btn_fg = rgb(fb, *fg_color);
+                fb.fill_rect(x, y, btn_w, btn_h, btn_bg);
+                fb.draw_rect(x, y, btn_w, btn_h, btn_fg);
+                draw_str_small(fb, x + 8, y + 4, s, btn_fg, btn_bg);
+                y += btn_h + 4;
+            }
+            UiWidget::VStack { children, spacing } => {
+                for child in children {
+                    draw_widgets(fb, core::slice::from_ref(child), x, y, max_w, bg);
+                    y += widget_height(child) + *spacing as usize;
+                }
+            }
+            UiWidget::HStack { children, spacing } => {
+                let mut hx = x;
+                for child in children {
+                    draw_widgets(fb, core::slice::from_ref(child), hx, y, max_w, bg);
+                    hx += widget_width(child) + *spacing as usize;
+                }
+                y += children.iter().map(widget_height).max().unwrap_or(12);
+            }
+            UiWidget::Spacer { height } => {
+                y += *height as usize;
+            }
+        }
+    }
+}
+
+/// Estimate widget height for layout
+fn widget_height(w: &UiWidget) -> usize {
+    match w {
+        UiWidget::Label { .. } => 12,
+        UiWidget::Button { .. } => 20,
+        UiWidget::Spacer { height } => *height as usize,
+        UiWidget::VStack { children, spacing } => {
+            children.iter().map(|c| widget_height(c) + *spacing as usize).sum::<usize>()
+        }
+        UiWidget::HStack { children, .. } => {
+            children.iter().map(widget_height).max().unwrap_or(0)
+        }
+    }
+}
+
+/// Estimate widget width for layout
+fn widget_width(w: &UiWidget) -> usize {
+    match w {
+        UiWidget::Label { text_len, .. } => *text_len * 8,
+        UiWidget::Button { label_len, .. } => *label_len * 8 + 16,
+        UiWidget::Spacer { .. } => 0,
+        _ => 100, // default
     }
 }
 
