@@ -21,7 +21,7 @@ extern crate alloc;
 
 use compositor::Compositor;
 use compositor::framebuffer::{FramebufferView, colors};
-use compositor::window_manager::{WindowManager, HitZone};
+use compositor::window_manager::{WindowManager, HitZone, BORDER_W, TITLE_BAR_H};
 use libfolk::sys::ipc::{receive, reply, recv_async, reply_with_token, send, IpcError};
 use libfolk::sys::boot_info::{get_boot_info, FramebufferConfig, BOOT_INFO_VADDR};
 use libfolk::sys::map_physical::{map_framebuffer, MapFlags};
@@ -520,6 +520,40 @@ fn main() -> ! {
                         }
                         HitZone::Content => {
                             wm.focus(win_id);
+                            // Check if App window button was clicked
+                            if let Some(win) = wm.get_window(win_id) {
+                                if matches!(win.kind, compositor::window_manager::WindowKind::App)
+                                    && !win.widgets.is_empty()
+                                {
+                                    let content_x = win.x as usize + BORDER_W + 6;
+                                    let content_y = win.y as usize + BORDER_W + TITLE_BAR_H + 6;
+                                    let owner = win.owner_task;
+
+                                    if let Some(action_id) = compositor::window_manager::hit_test_widgets(
+                                        &win.widgets, content_x, content_y, cx as usize, cy as usize
+                                    ) {
+                                        // Send action event to owner task via IPC
+                                        if owner != 0 {
+                                            let event_payload = 0xAC10_u64  // "ACTION" marker
+                                                | ((action_id as u64) << 16)
+                                                | ((win_id as u64) << 48);
+                                            unsafe {
+                                                libfolk::syscall::syscall3(
+                                                    libfolk::syscall::SYS_IPC_SEND,
+                                                    owner as u64,
+                                                    event_payload,
+                                                    0
+                                                );
+                                            }
+                                            write_str("[UI] Button clicked: action=");
+                                            libfolk::sys::io::write_char(
+                                                b'0' + (action_id % 10) as u8
+                                            );
+                                            write_str("\n");
+                                        }
+                                    }
+                                }
+                            }
                             need_redraw = true;
                             handled = true;
                         }
@@ -1456,6 +1490,7 @@ fn main() -> ! {
                             );
                             if let Some(app_win) = wm.get_window_mut(app_id) {
                                 app_win.kind = compositor::window_manager::WindowKind::App;
+                                app_win.owner_task = libfolk::sys::shell::SHELL_TASK_ID;
                                 let (root, _) = parse_widget_tree(header.widget_data);
                                 if let Some(widget) = root {
                                     app_win.widgets.push(widget);
@@ -1624,6 +1659,7 @@ fn main() -> ! {
 
                                 if let Some(win) = wm.get_window_mut(win_id) {
                                     win.kind = compositor::window_manager::WindowKind::App;
+                                    win.owner_task = msg.sender;
 
                                     // Parse widget tree recursively
                                     let (root_widget, _) = parse_widget_tree(header.widget_data);

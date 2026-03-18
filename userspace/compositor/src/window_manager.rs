@@ -119,6 +119,8 @@ pub struct Window {
     pub dragging: bool,
     pub drag_offset_x: i32,
     pub drag_offset_y: i32,
+    // Owner task ID (for sending events back via IPC)
+    pub owner_task: u32,
     // Interactive terminal input
     pub interactive: bool,
     pub input_buf: [u8; 128],
@@ -199,6 +201,7 @@ impl WindowManager {
             lines: Vec::new(),
             widgets: Vec::new(),
             kind: WindowKind::Terminal,
+            owner_task: 0,
             visible: true,
             dragging: false,
             drag_offset_x: 0,
@@ -218,6 +221,10 @@ impl WindowManager {
         if self.focused_id == Some(id) {
             self.focused_id = self.windows.last().map(|w| w.id);
         }
+    }
+
+    pub fn get_window(&self, id: u32) -> Option<&Window> {
+        self.windows.iter().find(|w| w.id == id)
     }
 
     pub fn get_window_mut(&mut self, id: u32) -> Option<&mut Window> {
@@ -479,6 +486,50 @@ fn widget_width(w: &UiWidget) -> usize {
         UiWidget::Spacer { .. } => 0,
         _ => 100, // default
     }
+}
+
+/// Hit-test widgets to find clicked button's action_id.
+/// Returns Some(action_id) if a Button was clicked at (click_x, click_y).
+/// Coordinates are absolute screen coordinates.
+pub fn hit_test_widgets(widgets: &[UiWidget], mut x: usize, mut y: usize, click_x: usize, click_y: usize) -> Option<u32> {
+    for widget in widgets {
+        match widget {
+            UiWidget::Label { text_len, .. } => {
+                y += 12;
+            }
+            UiWidget::Button { label_len, action_id, .. } => {
+                let btn_w = *label_len * 8 + 16;
+                let btn_h = 16;
+                if click_x >= x && click_x < x + btn_w
+                    && click_y >= y && click_y < y + btn_h {
+                    return Some(*action_id);
+                }
+                y += btn_h + 4;
+            }
+            UiWidget::VStack { children, spacing } => {
+                for child in children {
+                    if let Some(id) = hit_test_widgets(core::slice::from_ref(child), x, y, click_x, click_y) {
+                        return Some(id);
+                    }
+                    y += widget_height(child) + *spacing as usize;
+                }
+            }
+            UiWidget::HStack { children, spacing } => {
+                let mut hx = x;
+                for child in children {
+                    if let Some(id) = hit_test_widgets(core::slice::from_ref(child), hx, y, click_x, click_y) {
+                        return Some(id);
+                    }
+                    hx += widget_width(child) + *spacing as usize;
+                }
+                y += children.iter().map(widget_height).max().unwrap_or(0);
+            }
+            UiWidget::Spacer { height } => {
+                y += *height as usize;
+            }
+        }
+    }
+    None
 }
 
 /// Draw a string using the 8×8 upper half of the 8×16 font (compact for window text).

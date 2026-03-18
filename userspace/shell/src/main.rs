@@ -104,6 +104,15 @@ fn main() -> ! {
 
 /// Handle IPC command from compositor or other tasks
 fn handle_ipc_command(payload0: u64) -> u64 {
+    // Check for UI action event (button click from compositor)
+    let marker = (payload0 & 0xFFFF) as u16;
+    if marker == 0xAC10 {
+        let action_id = ((payload0 >> 16) & 0xFFFFFFFF) as u32;
+        let win_id = (payload0 >> 48) as u16;
+        println!("[SHELL] App button clicked: action_id={} win_id={}", action_id, win_id);
+        return SHELL_STATUS_OK;
+    }
+
     let opcode = payload0 & 0xFF;
 
     match opcode {
