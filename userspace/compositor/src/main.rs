@@ -1311,6 +1311,90 @@ fn main() -> ! {
                                 win.push_line("File not found");
                             }
                         }
+                    } else if cmd_str.starts_with("find ") || cmd_str.starts_with("search ") {
+                        let query = if cmd_str.starts_with("find ") {
+                            cmd_str[5..].trim()
+                        } else {
+                            cmd_str[7..].trim()
+                        };
+                        if query.is_empty() {
+                            win.push_line("usage: find <query>");
+                        } else {
+                            // Create shmem with query string
+                            let qb = query.as_bytes();
+                            let qlen = qb.len().min(63);
+                            if let Ok(qh) = shmem_create(64) {
+                                for tid in 2..=8 { let _ = shmem_grant(qh, tid); }
+                                if shmem_map(qh, COMPOSITOR_SHMEM_VADDR).is_ok() {
+                                    let buf = unsafe {
+                                        core::slice::from_raw_parts_mut(COMPOSITOR_SHMEM_VADDR as *mut u8, 64)
+                                    };
+                                    buf[..qlen].copy_from_slice(&qb[..qlen]);
+                                    buf[qlen] = 0;
+                                    let _ = shmem_unmap(qh, COMPOSITOR_SHMEM_VADDR);
+                                }
+                                let shell_req = SHELL_OP_SEARCH
+                                    | ((qh as u64) << 8)
+                                    | ((qlen as u64) << 40);
+                                let ipc_result = unsafe {
+                                    libfolk::syscall::syscall3(
+                                        libfolk::syscall::SYS_IPC_SEND,
+                                        SHELL_TASK_ID as u64, shell_req, 0
+                                    )
+                                };
+                                let _ = shmem_destroy(qh);
+
+                                if ipc_result != u64::MAX && ipc_result != 0 {
+                                    let count = (ipc_result >> 32) as usize;
+                                    let rh = (ipc_result & 0xFFFFFFFF) as u32;
+                                    if rh != 0 && count > 0 {
+                                        let mut mb = [0u8; 24];
+                                        let prefix = b"Matches: ";
+                                        mb[..prefix.len()].copy_from_slice(prefix);
+                                        let mut nb = [0u8; 16];
+                                        let ns = format_usize(count, &mut nb);
+                                        let nl = ns.len();
+                                        mb[prefix.len()..prefix.len()+nl].copy_from_slice(ns.as_bytes());
+                                        if let Ok(s) = core::str::from_utf8(&mb[..prefix.len()+nl]) {
+                                            win.push_line(s);
+                                        }
+                                        if shmem_map(rh, COMPOSITOR_SHMEM_VADDR).is_ok() {
+                                            let buf = unsafe {
+                                                core::slice::from_raw_parts(COMPOSITOR_SHMEM_VADDR as *const u8, count * 32)
+                                            };
+                                            for i in 0..count.min(10) {
+                                                let off = i * 32;
+                                                let ne = buf[off..off+24].iter()
+                                                    .position(|&b| b == 0).unwrap_or(24);
+                                                let name = unsafe {
+                                                    core::str::from_utf8_unchecked(&buf[off..off+ne])
+                                                };
+                                                let size = u32::from_le_bytes([
+                                                    buf[off+24], buf[off+25], buf[off+26], buf[off+27]
+                                                ]);
+                                                let mut line = [0u8; 48];
+                                                line[0] = b' '; line[1] = b' ';
+                                                let nnl = name.len().min(24);
+                                                line[2..2+nnl].copy_from_slice(&name.as_bytes()[..nnl]);
+                                                let mut sb = [0u8; 16];
+                                                let ss = format_usize(size as usize, &mut sb);
+                                                let sl = ss.len();
+                                                line[3+nnl..3+nnl+sl].copy_from_slice(ss.as_bytes());
+                                                if let Ok(s) = core::str::from_utf8(&line[..3+nnl+sl]) {
+                                                    win.push_line(s);
+                                                }
+                                            }
+                                            let _ = shmem_unmap(rh, COMPOSITOR_SHMEM_VADDR);
+                                            let _ = shmem_destroy(rh);
+                                        }
+                                    } else {
+                                        win.push_line("No matches");
+                                    }
+                                } else {
+                                    win.push_line("No matches");
+                                }
+                            }
+                        }
                     } else if cmd_str == "help" {
                         win.push_line("ls ps cat find uptime help term");
                     } else {
