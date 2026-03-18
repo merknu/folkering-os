@@ -44,8 +44,8 @@ entry!(main);
 /// Maximum cached directory entries (for FPK fallback)
 const MAX_ENTRIES: usize = 16;
 
-/// Maximum SQLite database size (128KB for initrd with embeddings)
-const MAX_DB_SIZE: usize = 131072;
+/// Maximum SQLite database size (256KB — must fit files.db with all ELFs + data)
+const MAX_DB_SIZE: usize = 262144;
 
 /// SQLite database filename
 const DB_FILENAME: &str = "files.db";
@@ -226,7 +226,15 @@ fn count_sqlite_files() -> usize {
             Err(_) => return 0,
         };
 
-        scanner.filter(|r| r.is_ok()).count()
+        let mut count = 0;
+        for result in scanner {
+            match result {
+                Ok(_) => count += 1,
+                Err(_) => break,
+            }
+            if count > 1000 { break; } // Safety cap
+        }
+        count
     }
 }
 
