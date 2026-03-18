@@ -46,6 +46,9 @@ pub const SYS_READ_MOUSE: u64 = 0x25;    // 37 - Read mouse event (packed button
 // Phase 8: Detailed task list
 pub const SYS_TASK_LIST_DETAILED: u64 = 0x26; // 38 - Fill shmem with task details
 
+// Phase 9: Anonymous memory mapping
+pub const SYS_MMAP: u64 = 0x30; // 48 - Map anonymous pages into task address space
+
 /// Execute a syscall with no arguments
 #[inline(always)]
 pub unsafe fn syscall0(nr: u64) -> u64 {

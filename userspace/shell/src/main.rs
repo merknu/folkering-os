@@ -77,6 +77,30 @@ fn main() -> ! {
     println!("Type 'help' for available commands.\n");
 
     println!("[SHELL] Running (Task {})", pid);
+
+    // Test SYS_MMAP: allocate 2 pages (8KB) of anonymous memory
+    {
+        use libfolk::sys::{mmap, PROT_READ, PROT_WRITE};
+        match mmap(8192, PROT_READ | PROT_WRITE) {
+            Ok(ptr) => {
+                // Write and read back to verify no #PF
+                unsafe {
+                    core::ptr::write_volatile(ptr, 0x42);
+                    core::ptr::write_volatile(ptr.add(4095), 0xAB);
+                    core::ptr::write_volatile(ptr.add(4096), 0xCD); // second page
+                    let v0 = core::ptr::read_volatile(ptr);
+                    let v1 = core::ptr::read_volatile(ptr.add(4095));
+                    let v2 = core::ptr::read_volatile(ptr.add(4096));
+                    println!("[MMAP_TEST] OK: ptr={:p} v0=0x{:02x} v1=0x{:02x} v2=0x{:02x}",
+                        ptr, v0, v1, v2);
+                }
+            }
+            Err(e) => {
+                println!("[MMAP_TEST] FAILED: {:?}", e);
+            }
+        }
+    }
+
     print_prompt();
 
     loop {

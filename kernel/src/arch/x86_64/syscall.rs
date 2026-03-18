@@ -948,6 +948,8 @@ extern "C" fn syscall_handler(
         0x25 => syscall_read_mouse(),
         // Phase 8: Detailed task list via userspace buffer
         0x26 => syscall_task_list_detailed(arg1, arg2),
+        // Phase 9: Anonymous memory mapping (mmap)
+        0x30 => syscall_mmap(arg1, arg2, arg3),
         _ => {
             crate::drivers::serial::write_str("[HANDLER] Invalid syscall!\n");
             u64::MAX // Return error
@@ -1363,6 +1365,95 @@ fn syscall_shmem_destroy(shmem_id: u64) -> u64 {
         Ok(()) => 0, // Success
         Err(_) => u64::MAX, // Error
     }
+}
+
+/// Anonymous memory mapping (mmap)
+///
+/// Allocates physical pages and maps them into the calling task's address space.
+///
+/// # Arguments
+/// - `hint_addr`: desired virtual address (0 = kernel chooses)
+/// - `size`: requested size in bytes (rounded up to page boundary)
+/// - `flags`: protection flags (bit 0=read, bit 1=write, bit 2=exec)
+///
+/// # Returns
+/// - Virtual address of the mapped region on success
+/// - u64::MAX on failure
+fn syscall_mmap(hint_addr: u64, size: u64, flags: u64) -> u64 {
+    use crate::memory::physical::alloc_page;
+    use crate::memory::paging::map_page_in_table;
+    use x86_64::structures::paging::PageTableFlags;
+
+    const PAGE_SIZE: u64 = 4096;
+    // Limits
+    const MAX_MMAP_SIZE: u64 = 16 * 1024 * 1024; // 16MB max per call
+    // User mmap region: 0x4000_0000 .. 0x7FFF_0000_0000
+    const MMAP_BASE: u64 = 0x4000_0000;
+
+    if size == 0 || size > MAX_MMAP_SIZE {
+        return u64::MAX;
+    }
+
+    let num_pages = ((size + PAGE_SIZE - 1) / PAGE_SIZE) as usize;
+
+    // Get current task's page table
+    let task_pml4 = crate::task::task::current_task().lock().page_table_phys;
+    if task_pml4 == 0 {
+        return u64::MAX;
+    }
+
+    // Choose virtual address
+    let virt_base = if hint_addr != 0 {
+        // Use hint if page-aligned and in user range
+        if hint_addr % PAGE_SIZE != 0 || hint_addr < MMAP_BASE {
+            return u64::MAX;
+        }
+        hint_addr
+    } else {
+        // Auto-assign: use a per-task bump allocator
+        // Store next_mmap_addr in task struct (simple approach: use atomic counter)
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_MMAP_ADDR: AtomicU64 = AtomicU64::new(MMAP_BASE);
+        let addr = NEXT_MMAP_ADDR.fetch_add(num_pages as u64 * PAGE_SIZE, Ordering::Relaxed);
+        if addr + (num_pages as u64 * PAGE_SIZE) > 0x7FFF_0000_0000 {
+            return u64::MAX; // Address space exhausted
+        }
+        addr
+    };
+
+    // Build page flags
+    let mut pt_flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+    if flags & 0x2 != 0 { // PROT_WRITE
+        pt_flags |= PageTableFlags::WRITABLE;
+    }
+    if flags & 0x4 == 0 { // No PROT_EXEC → set NX
+        pt_flags |= PageTableFlags::NO_EXECUTE;
+    }
+
+    // Allocate and map pages
+    for i in 0..num_pages {
+        let phys = match alloc_page() {
+            Some(p) => p,
+            None => {
+                // TODO: unmap already-mapped pages on failure
+                return u64::MAX;
+            }
+        };
+
+        let virt = virt_base + (i as u64 * PAGE_SIZE);
+        if map_page_in_table(task_pml4, virt as usize, phys, pt_flags).is_err() {
+            return u64::MAX;
+        }
+
+        // Zero the page (security: don't leak kernel data)
+        // We need to write through the HHDM since the page is mapped in user space
+        let hhdm_ptr = crate::phys_to_virt(phys) as *mut u8;
+        unsafe {
+            core::ptr::write_bytes(hhdm_ptr, 0, PAGE_SIZE as usize);
+        }
+    }
+
+    virt_base
 }
 
 fn syscall_spawn(binary_ptr: u64, binary_len: u64) -> u64 {

@@ -2,7 +2,7 @@
 //!
 //! Functions for creating and mapping shared memory regions.
 
-use crate::syscall::{syscall1, syscall2, SYS_SHMEM_CREATE, SYS_SHMEM_MAP, SYS_SHMEM_GRANT, SYS_SHMEM_UNMAP, SYS_SHMEM_DESTROY};
+use crate::syscall::{syscall1, syscall2, syscall3, SYS_SHMEM_CREATE, SYS_SHMEM_MAP, SYS_SHMEM_GRANT, SYS_SHMEM_UNMAP, SYS_SHMEM_DESTROY, SYS_MMAP};
 
 /// Error codes for shared memory operations
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,5 +113,63 @@ pub fn shmem_destroy(shmem_id: u32) -> Result<(), ShmemError> {
         Err(ShmemError::Unknown)
     } else {
         Ok(())
+    }
+}
+
+// ===== Anonymous Memory Mapping (mmap) =====
+
+/// Protection flags for mmap
+pub const PROT_READ: u64 = 0x1;
+pub const PROT_WRITE: u64 = 0x2;
+pub const PROT_EXEC: u64 = 0x4;
+
+/// Error type for mmap operations
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MmapError {
+    /// Invalid size or flags
+    InvalidParam,
+    /// Out of physical memory
+    OutOfMemory,
+    /// Address space exhausted
+    NoSpace,
+}
+
+/// Map anonymous (zero-filled) pages into the current task's address space.
+///
+/// # Arguments
+/// * `size` - Number of bytes to allocate (rounded up to 4KB page boundary)
+/// * `flags` - Protection flags (PROT_READ | PROT_WRITE | PROT_EXEC)
+///
+/// # Returns
+/// * `Ok(ptr)` - Pointer to the start of the mapped region
+/// * `Err(...)` - Allocation failed
+///
+/// # Example
+/// ```no_run
+/// let ptr = mmap(8192, PROT_READ | PROT_WRITE)?;
+/// unsafe { *ptr = 42; }
+/// ```
+pub fn mmap(size: usize, flags: u64) -> Result<*mut u8, MmapError> {
+    if size == 0 {
+        return Err(MmapError::InvalidParam);
+    }
+    let ret = unsafe { syscall3(SYS_MMAP, 0, size as u64, flags) };
+    if ret == u64::MAX {
+        Err(MmapError::OutOfMemory)
+    } else {
+        Ok(ret as *mut u8)
+    }
+}
+
+/// Map anonymous pages at a specific virtual address.
+pub fn mmap_at(addr: usize, size: usize, flags: u64) -> Result<*mut u8, MmapError> {
+    if size == 0 || addr == 0 {
+        return Err(MmapError::InvalidParam);
+    }
+    let ret = unsafe { syscall3(SYS_MMAP, addr as u64, size as u64, flags) };
+    if ret == u64::MAX {
+        Err(MmapError::OutOfMemory)
+    } else {
+        Ok(ret as *mut u8)
     }
 }
