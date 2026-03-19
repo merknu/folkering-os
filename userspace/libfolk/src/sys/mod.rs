@@ -14,6 +14,7 @@ pub mod shell;
 pub mod boot_info;
 pub mod map_physical;
 pub mod intent;
+pub mod block;
 
 // Re-export commonly used functions at the sys level
 pub use task::{exit, yield_cpu, get_pid, spawn};
@@ -49,3 +50,6 @@ pub use shell::{
     list_files as shell_list_files, cat_file as shell_cat_file,
     search as shell_search, ps as shell_ps, get_uptime as shell_uptime,
 };
+
+// Re-export Block device
+pub use block::{block_read, block_write, read_sector, write_sector, BlockError, SECTOR_SIZE, DATA_START_SECTOR};

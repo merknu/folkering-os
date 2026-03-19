@@ -23,6 +23,9 @@ lazy_static! {
         // Mouse interrupt (vector 44 = IRQ12)
         idt[44].set_handler_fn(mouse_interrupt_handler);
 
+        // VirtIO block device interrupt (vector 45)
+        idt[45].set_handler_fn(virtio_blk_interrupt_handler);
+
         idt
     };
 }
@@ -117,4 +120,9 @@ extern "x86-interrupt" fn mouse_interrupt_handler(_stack_frame: InterruptStackFr
     // Handle mouse interrupt (IRQ12)
     crate::serial_str!("[M44]");
     crate::drivers::mouse::handle_interrupt();
+}
+
+extern "x86-interrupt" fn virtio_blk_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    // Handle VirtIO block device interrupt
+    crate::drivers::virtio_blk::irq_handler();
 }

@@ -33,6 +33,7 @@ use libfolk::sys::shell::{
     SHELL_STATUS_NOT_FOUND, hash_name as shell_hash_name,
 };
 use libfolk::{entry, println};
+// write_file is used inline as libfolk::sys::synapse::write_file
 
 /// Virtual address for mapping shared memory received from shell
 const COMPOSITOR_SHMEM_VADDR: usize = 0x30000000;
@@ -342,15 +343,15 @@ fn main() -> ! {
     let cursor_magenta = fb.color_from_rgb24(colors::MAGENTA); // Both buttons
     let cursor_outline = fb.color_from_rgb24(colors::BLACK);
 
-    // Cursor size (must match draw_cursor dimensions)
-    const CURSOR_W: usize = 12;
-    const CURSOR_H: usize = 16;
+    // Cursor dimensions (from framebuffer::FramebufferView)
+    use compositor::framebuffer::FramebufferView;
+    const CURSOR_W: usize = FramebufferView::CURSOR_W;
+    const CURSOR_H: usize = FramebufferView::CURSOR_H;
 
-    // Buffer to save pixels behind cursor (12x16 = 192 pixels)
-    // Using repr(align(16)) to ensure proper alignment for potential SSE operations
+    // Buffer to save pixels behind cursor (16x24 = 384 pixels)
     #[repr(C, align(16))]
-    struct AlignedCursorBuffer([u32; 192]);
-    let mut cursor_bg = AlignedCursorBuffer([0; 192]);
+    struct AlignedCursorBuffer([u32; CURSOR_W * CURSOR_H]);
+    let mut cursor_bg = AlignedCursorBuffer([0; CURSOR_W * CURSOR_H]);
 
     // Track if cursor has been drawn yet (don't draw until first mouse event)
     let mut cursor_drawn = false;
@@ -428,10 +429,22 @@ fn main() -> ! {
         let mut need_redraw = false;
 
         // ===== Process mouse input =====
+        // Accumulate all pending mouse events, then draw cursor ONCE
+        let mut accumulated_dx: i32 = 0;
+        let mut accumulated_dy: i32 = 0;
+        let mut latest_buttons: u8 = last_buttons;
+        let mut had_mouse_events = false;
+
         while let Some(event) = read_mouse() {
             did_work = true;
+            had_mouse_events = true;
+            accumulated_dx += event.dx as i32;
+            accumulated_dy -= event.dy as i32; // Invert Y (mouse up = negative dy in PS/2)
+            latest_buttons = event.buttons;
+        }
 
-            // Sanity check cursor position (can get corrupted by kernel register save/restore bugs)
+        if had_mouse_events {
+            // Sanity check cursor position
             if cursor_x < 0 || cursor_x >= fb.width as i32 || cursor_y < 0 || cursor_y >= fb.height as i32 {
                 cursor_x = (fb.width / 2) as i32;
                 cursor_y = (fb.height / 2) as i32;
@@ -440,32 +453,31 @@ fn main() -> ! {
             }
 
             // Determine cursor color based on button state
-            let cursor_fill = match (event.left_button(), event.right_button()) {
-                (true, true) => cursor_magenta,   // Both buttons
-                (true, false) => cursor_red,      // Left only
-                (false, true) => cursor_blue,     // Right only
-                (false, false) => cursor_white,   // No buttons
+            let cursor_fill = match (latest_buttons & 1 != 0, latest_buttons & 2 != 0) {
+                (true, true) => cursor_magenta,
+                (true, false) => cursor_red,
+                (false, true) => cursor_blue,
+                (false, false) => cursor_white,
             };
 
-            // First mouse event: draw cursor at center, ignore accumulated delta
+            // First mouse event ever: draw cursor at center
             if !cursor_drawn {
                 fb.save_rect(cursor_x as usize, cursor_y as usize, CURSOR_W, CURSOR_H, &mut cursor_bg.0);
                 fb.draw_cursor(cursor_x as usize, cursor_y as usize, cursor_fill, cursor_outline);
                 cursor_drawn = true;
-                last_buttons = event.buttons;
-                continue;
+                last_buttons = latest_buttons;
             }
 
-            // Calculate new position from delta
-            let new_x = cursor_x.saturating_add(event.dx as i32);
-            let new_y = cursor_y.saturating_sub(event.dy as i32);
+            // Calculate new position from accumulated delta
+            let new_x = cursor_x.saturating_add(accumulated_dx);
+            let new_y = cursor_y.saturating_add(accumulated_dy);
 
             // Clamp to screen bounds
             let new_x = if new_x < 0 { 0 } else if new_x >= fb.width as i32 { fb.width as i32 - 1 } else { new_x };
             let new_y = if new_y < 0 { 0 } else if new_y >= fb.height as i32 { fb.height as i32 - 1 } else { new_y };
 
             // ===== Milestone 1.4 + 2.2: Mouse Click Hit-Testing + Window Dragging =====
-            let left_now = event.left_button();
+            let left_now = latest_buttons & 1 != 0;
             let left_pressed = left_now && !prev_left_button;  // rising edge
             let left_released = !left_now && prev_left_button; // falling edge
             prev_left_button = left_now;
@@ -585,9 +597,9 @@ fn main() -> ! {
                 }
             }
 
-            // Redraw if cursor moved OR button state changed OR background is dirty
-            if new_x != cursor_x || new_y != cursor_y || event.buttons != last_buttons || cursor_bg_dirty {
-                // Only restore background if it's not dirty (stale)
+            // Redraw cursor if it moved, button state changed, or background is dirty
+            if new_x != cursor_x || new_y != cursor_y || latest_buttons != last_buttons || cursor_bg_dirty {
+                // Erase old cursor by restoring saved background
                 if !cursor_bg_dirty {
                     fb.restore_rect(cursor_x as usize, cursor_y as usize, CURSOR_W, CURSOR_H, &cursor_bg.0);
                 }
@@ -596,13 +608,13 @@ fn main() -> ! {
                 // Update position
                 cursor_x = new_x;
                 cursor_y = new_y;
-                last_buttons = event.buttons;
+                last_buttons = latest_buttons;
 
-                // Save background at new position, then draw cursor
+                // Save background at new position, then draw cursor on top
                 fb.save_rect(cursor_x as usize, cursor_y as usize, CURSOR_W, CURSOR_H, &mut cursor_bg.0);
                 fb.draw_cursor(cursor_x as usize, cursor_y as usize, cursor_fill, cursor_outline);
             }
-        }
+        } // end if had_mouse_events
 
 
         // ===== Blink caret =====
@@ -1170,6 +1182,34 @@ fn main() -> ! {
                         win.push_line("Type commands, Enter to run, Esc for omnibar");
                     } else if cmd_str.starts_with("calc ") {
                         win.push_line("Calculator: coming soon");
+                    } else if cmd_str.starts_with("save ") {
+                        // VFS write: save <filename> <content>
+                        let args = &cmd_str[5..];
+                        let mut parts = args.splitn(2, ' ');
+                        if let (Some(filename), Some(content)) = (parts.next(), parts.next()) {
+                            match libfolk::sys::synapse::write_file(filename, content.as_bytes()) {
+                                Ok(()) => {
+                                    win.push_line("Saved to SQLite!");
+                                    // Show filename and size
+                                    let mut line = [0u8; 64];
+                                    let prefix = b"  ";
+                                    line[0..2].copy_from_slice(prefix);
+                                    let nlen = filename.len().min(30);
+                                    line[2..2+nlen].copy_from_slice(&filename.as_bytes()[..nlen]);
+                                    let suffix = b" written";
+                                    let slen = suffix.len();
+                                    line[2+nlen..2+nlen+slen].copy_from_slice(suffix);
+                                    if let Ok(s) = core::str::from_utf8(&line[..2+nlen+slen]) {
+                                        win.push_line(s);
+                                    }
+                                }
+                                Err(_) => {
+                                    win.push_line("Save failed!");
+                                }
+                            }
+                        } else {
+                            win.push_line("Usage: save <filename> <text>");
+                        }
                     } else {
                         win.push_line("Sent to shell...");
                     }
@@ -1623,8 +1663,19 @@ fn main() -> ! {
                 wm.composite(&mut fb);
             }
 
-            // Mark cursor background as dirty - mouse handler will refresh it
-            cursor_bg_dirty = true;
+            // After full redraw: re-save cursor background and redraw cursor on top
+            // This ensures cursor is always the topmost element
+            if cursor_drawn {
+                let cursor_fill = match (last_buttons & 1 != 0, last_buttons & 2 != 0) {
+                    (true, true) => cursor_magenta,
+                    (true, false) => cursor_red,
+                    (false, true) => cursor_blue,
+                    (false, false) => cursor_white,
+                };
+                fb.save_rect(cursor_x as usize, cursor_y as usize, CURSOR_W, CURSOR_H, &mut cursor_bg.0);
+                fb.draw_cursor(cursor_x as usize, cursor_y as usize, cursor_fill, cursor_outline);
+                cursor_bg_dirty = false;
+            }
         }
 
         // ===== Process IPC messages (non-blocking) =====

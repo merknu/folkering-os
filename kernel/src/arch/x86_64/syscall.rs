@@ -951,6 +951,9 @@ extern "C" fn syscall_handler(
         // Phase 9: Anonymous memory mapping
         0x30 => syscall_mmap(arg1, arg2, arg3),
         0x31 => syscall_munmap(arg1, arg2),
+        // Milestone 5: Block device I/O
+        0x40 => syscall_block_read(arg1, arg2, arg3),
+        0x41 => syscall_block_write(arg1, arg2, arg3),
         _ => {
             crate::drivers::serial::write_str("[HANDLER] Invalid syscall!\n");
             u64::MAX // Return error
@@ -1503,6 +1506,77 @@ fn syscall_munmap(virt_addr: u64, size: u64) -> u64 {
     }
 
     0 // success
+}
+
+// ── Block Device Syscalls (Milestone 5) ──────────────────────────────────────
+
+fn syscall_block_read(sector: u64, buf_ptr: u64, count: u64) -> u64 {
+    use crate::drivers::virtio_blk;
+
+    if !virtio_blk::is_initialized() {
+        return u64::MAX; // No block device
+    }
+
+    if buf_ptr == 0 || count == 0 || count > 128 {
+        return u64::MAX; // EINVAL (max 64KB per call)
+    }
+
+    let buf_len = (count as usize) * virtio_blk::SECTOR_SIZE;
+
+    // Validate userspace pointer (must be in lower half)
+    if buf_ptr >= 0x0000_8000_0000_0000 {
+        return u64::MAX; // EFAULT
+    }
+
+    // Read sectors into a kernel buffer first, then copy to userspace
+    // This avoids issues with page table contexts during DMA
+    for i in 0..(count as usize) {
+        let mut sector_buf = [0u8; 512];
+        match virtio_blk::block_read(sector + i as u64, &mut sector_buf) {
+            Ok(()) => {
+                // Copy to userspace buffer
+                let dst = (buf_ptr as usize + i * 512) as *mut u8;
+                unsafe {
+                    core::ptr::copy_nonoverlapping(sector_buf.as_ptr(), dst, 512);
+                }
+            }
+            Err(_) => return u64::MAX,
+        }
+    }
+    0
+}
+
+fn syscall_block_write(sector: u64, buf_ptr: u64, count: u64) -> u64 {
+    use crate::drivers::virtio_blk;
+
+    if !virtio_blk::is_initialized() {
+        return u64::MAX; // No block device
+    }
+
+    if buf_ptr == 0 || count == 0 || count > 128 {
+        return u64::MAX; // EINVAL
+    }
+
+    let buf_len = (count as usize) * virtio_blk::SECTOR_SIZE;
+
+    // Validate userspace pointer
+    if buf_ptr >= 0x0000_8000_0000_0000 {
+        return u64::MAX; // EFAULT
+    }
+
+    let current_task = crate::task::task::get_current_task();
+
+    // Write journal entry before actual write (crash recovery)
+    let _ = virtio_blk::write_journal_entry(current_task, 1, sector, count);
+
+    let buf = unsafe {
+        core::slice::from_raw_parts(buf_ptr as *const u8, buf_len)
+    };
+
+    match virtio_blk::write_sectors(sector, buf, count as usize) {
+        Ok(()) => 0,
+        Err(_) => u64::MAX,
+    }
 }
 
 fn syscall_spawn(binary_ptr: u64, binary_len: u64) -> u64 {

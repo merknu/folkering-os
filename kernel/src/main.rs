@@ -487,6 +487,34 @@ extern "C" fn irq_mouse() {
     );
 }
 
+/// VirtIO block device interrupt handler (vector 45)
+#[unsafe(naked)]
+extern "C" fn irq_virtio_blk() {
+    core::arch::naked_asm!(
+        "push rax",
+        "push rcx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "call {handler}",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop rcx",
+        "pop rax",
+        "iretq",
+        handler = sym folkering_kernel::drivers::virtio_blk::irq_handler,
+    );
+}
+
 make_exception_handler!(irq_34, 34, "\n[IRQ2] Cascade (Vector 34)!");
 make_exception_handler!(irq_35, 35, "\n[IRQ3] COM2 (Vector 35)!");
 make_exception_handler!(irq_36, 36, "\n[IRQ4] COM1 (Vector 36)!");
@@ -1452,6 +1480,8 @@ unsafe fn init_idt() {
     IDT[36].set_handler(core::mem::transmute(irq_36 as *const ()));
     // IRQ12 = Mouse (on PIC2, vector 32+12=44)
     IDT[44].set_handler(core::mem::transmute(irq_mouse as *const ()));
+    // VirtIO block device (vector 45, routed via IOAPIC from PCI IRQ)
+    IDT[45].set_handler(core::mem::transmute(irq_virtio_blk as *const ()));
     // Special vectors
     IDT[128].set_handler(core::mem::transmute(vec_128 as *const ())); // INT 0x80
     IDT[254].set_handler(core::mem::transmute(vec_254 as *const ()));

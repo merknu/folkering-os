@@ -106,8 +106,11 @@ pub const SYN_OP_GET_EMBEDDING: u64 = 0x0021;
 /// Reply: [count, 0, 0, 0]
 pub const SYN_OP_EMBEDDING_COUNT: u64 = 0x0022;
 
-// Future operations
-// pub const SYN_OP_WRITE_FILE: u64 = 0x0030;  // Write (when we have writable FS)
+/// Write file via shared memory
+/// Request: op | (shmem_handle << 16) | (total_size << 32)
+///   shmem contains: [name_len: u16 LE][name: bytes][content: bytes]
+/// Reply: 0 = success, SYN_STATUS_ERROR = failure
+pub const SYN_OP_WRITE_FILE: u64 = 0x0030;
 
 // ============================================================================
 // Status Codes
@@ -478,6 +481,63 @@ pub fn get_embedding(file_id: u32) -> SynapseResult<EmbeddingResponse> {
     }
 
     Ok(EmbeddingResponse { size, shmem_handle })
+}
+
+/// Write a file to the VFS via Synapse (SQLite cell insert + disk flush)
+///
+/// Creates a shared memory buffer with `[name_len: u16 LE][name][content]`,
+/// sends it to Synapse via IPC, and waits for the synchronous reply.
+pub fn write_file(name: &str, content: &[u8]) -> SynapseResult<()> {
+    use crate::sys::{shmem_create, shmem_map, shmem_grant, shmem_unmap, shmem_destroy};
+
+    let name_bytes = name.as_bytes();
+    let total_size = 2 + name_bytes.len() + content.len();
+
+    // Create shmem (page-aligned)
+    let shmem_size = ((total_size + 4095) / 4096) * 4096;
+    let shmem_size = if shmem_size == 0 { 4096 } else { shmem_size };
+    let handle = shmem_create(shmem_size).map_err(|_| SynapseError::IpcFailed)?;
+
+    // Grant to Synapse
+    let _ = shmem_grant(handle, SYNAPSE_TASK_ID);
+
+    // Map in shell address space
+    const WRITE_SHMEM_VADDR: usize = 0x20000000;
+    if shmem_map(handle, WRITE_SHMEM_VADDR).is_err() {
+        let _ = shmem_destroy(handle);
+        return Err(SynapseError::IpcFailed);
+    }
+
+    // Write protocol: [name_len: u16 LE][name bytes][content bytes]
+    unsafe {
+        let ptr = WRITE_SHMEM_VADDR as *mut u8;
+        let name_len = name_bytes.len() as u16;
+        core::ptr::copy_nonoverlapping(name_len.to_le_bytes().as_ptr(), ptr, 2);
+        core::ptr::copy_nonoverlapping(name_bytes.as_ptr(), ptr.add(2), name_bytes.len());
+        core::ptr::copy_nonoverlapping(content.as_ptr(), ptr.add(2 + name_bytes.len()), content.len());
+    }
+
+    let _ = shmem_unmap(handle, WRITE_SHMEM_VADDR);
+
+    // IPC: op | (shmem_handle << 16) | (total_size << 32)
+    let request = SYN_OP_WRITE_FILE
+        | ((handle as u64) << 16)
+        | ((total_size as u64) << 32);
+
+    let ret = unsafe {
+        syscall3(SYS_IPC_SEND, SYNAPSE_TASK_ID as u64, request, 0)
+    };
+
+    let _ = shmem_destroy(handle);
+
+    if ret == u64::MAX {
+        return Err(SynapseError::ServiceUnavailable);
+    }
+    if ret != 0 {
+        return Err(SynapseError::IpcFailed);
+    }
+
+    Ok(())
 }
 
 /// Get the count of embeddings in the database

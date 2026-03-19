@@ -25,8 +25,11 @@ use libfolk::sys::boot_info::FramebufferConfig;
 /// This struct provides a safe interface to the mapped framebuffer memory.
 /// All drawing operations are optimized for Write-Combining access patterns.
 pub struct FramebufferView {
-    /// Pointer to framebuffer memory
+    /// Pointer to framebuffer memory (Write-Combining — writes fast, reads unreliable)
     buffer: *mut u8,
+    /// Pointer to shadow buffer in normal RAM (reads are reliable)
+    /// Used for cursor save/restore to avoid WC read artifacts
+    shadow: *mut u8,
     /// Width in pixels
     pub width: usize,
     /// Height in pixels
@@ -52,8 +55,29 @@ impl FramebufferView {
     /// - The memory must remain valid for the lifetime of this struct
     /// - Only one FramebufferView should exist at a time (no aliasing)
     pub unsafe fn new(buffer: *mut u8, config: &FramebufferConfig) -> Self {
+        // Allocate shadow buffer in normal RAM via mmap
+        let fb_size = (config.pitch as usize) * (config.height as usize);
+        let shadow = match libfolk::sys::mmap(fb_size, libfolk::sys::PROT_READ | libfolk::sys::PROT_WRITE) {
+            Ok(ptr) => {
+                libfolk::sys::io::write_str("[COMPOSITOR] Shadow buffer allocated (");
+                // Print size in KB
+                let kb = fb_size / 1024;
+                if kb >= 1000 { libfolk::sys::io::write_char(b'0' + ((kb / 1000) % 10) as u8); }
+                if kb >= 100 { libfolk::sys::io::write_char(b'0' + ((kb / 100) % 10) as u8); }
+                if kb >= 10 { libfolk::sys::io::write_char(b'0' + ((kb / 10) % 10) as u8); }
+                libfolk::sys::io::write_char(b'0' + (kb % 10) as u8);
+                libfolk::sys::io::write_str("KB)\n");
+                ptr as *mut u8
+            }
+            Err(_) => {
+                libfolk::sys::io::write_str("[COMPOSITOR] WARNING: Shadow buffer alloc FAILED\n");
+                core::ptr::null_mut()
+            }
+        };
+
         Self {
             buffer,
+            shadow,
             width: config.width as usize,
             height: config.height as usize,
             pitch: config.pitch as usize,
@@ -94,9 +118,33 @@ impl FramebufferView {
         }
     }
 
-    /// Set a single pixel.
+    /// Get shadow buffer pixel pointer (normal RAM — reliable reads)
+    #[inline]
+    fn shadow_ptr(&self, x: usize, y: usize) -> *mut u32 {
+        debug_assert!(x < self.width && y < self.height);
+        unsafe {
+            self.shadow.add(y * self.pitch + x * self.bpp) as *mut u32
+        }
+    }
+
+    /// Set a single pixel. Writes to BOTH framebuffer (WC) and shadow buffer (RAM).
+    /// Use for all scene content (background, windows, UI).
     #[inline]
     pub fn set_pixel(&mut self, x: usize, y: usize, color: u32) {
+        if x < self.width && y < self.height {
+            unsafe {
+                core::ptr::write_volatile(self.pixel_ptr(x, y), color);
+                if !self.shadow.is_null() {
+                    core::ptr::write(self.shadow_ptr(x, y), color);
+                }
+            }
+        }
+    }
+
+    /// Set a pixel in framebuffer ONLY (not shadow).
+    /// Use for cursor overlay — cursor should not be saved in shadow buffer.
+    #[inline]
+    fn set_pixel_overlay(&mut self, x: usize, y: usize, color: u32) {
         if x < self.width && y < self.height {
             unsafe {
                 core::ptr::write_volatile(self.pixel_ptr(x, y), color);
@@ -114,12 +162,23 @@ impl FramebufferView {
         let start_y = y.min(self.height);
 
         for row in start_y..end_y {
-            let row_start = unsafe { self.buffer.add(row * self.pitch + start_x * self.bpp) };
+            let offset = row * self.pitch + start_x * self.bpp;
+            let row_start = unsafe { self.buffer.add(offset) };
             let pixels = (end_x - start_x) as isize;
 
             for i in 0..pixels {
                 unsafe {
                     core::ptr::write_volatile(row_start.add(i as usize * self.bpp) as *mut u32, color);
+                }
+            }
+
+            // Mirror to shadow buffer
+            if !self.shadow.is_null() {
+                let shadow_row = unsafe { self.shadow.add(offset) };
+                for i in 0..pixels {
+                    unsafe {
+                        core::ptr::write(shadow_row.add(i as usize * self.bpp) as *mut u32, color);
+                    }
                 }
             }
         }
@@ -215,50 +274,71 @@ impl FramebufferView {
     ///
     /// Draws a simple arrow cursor (16x16 pixels).
     /// The hotspot is at the top-left corner (0,0) of the cursor.
+    /// Cursor dimensions (must match CURSOR_BITMAP below)
+    pub const CURSOR_W: usize = 16;
+    pub const CURSOR_H: usize = 24;
+
+    /// Draw a tall triangle mouse cursor at (x, y).
+    /// 1 = outline (black), 2 = fill (color), 0 = transparent.
+    /// The hot-spot is at (0, 0) — top-left corner of the bitmap.
     pub fn draw_cursor(&mut self, x: usize, y: usize, color: u32, outline: u32) {
-        // Simple arrow cursor bitmap (16 pixels tall)
-        // 1 = filled, 2 = outline, 0 = transparent
-        const CURSOR: [[u8; 12]; 16] = [
-            [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            [1, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            [1, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0],
-            [1, 2, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0],
-            [1, 2, 2, 2, 2, 1, 0, 0, 0, 0, 0, 0],
-            [1, 2, 2, 2, 2, 2, 1, 0, 0, 0, 0, 0],
-            [1, 2, 2, 2, 2, 2, 2, 1, 0, 0, 0, 0],
-            [1, 2, 2, 2, 2, 2, 2, 2, 1, 0, 0, 0],
-            [1, 2, 2, 2, 2, 2, 2, 2, 2, 1, 0, 0],
-            [1, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 0],
-            [1, 2, 2, 1, 2, 2, 1, 0, 0, 0, 0, 0],
-            [1, 2, 1, 0, 1, 2, 2, 1, 0, 0, 0, 0],
-            [1, 1, 0, 0, 1, 2, 2, 1, 0, 0, 0, 0],
-            [1, 0, 0, 0, 0, 1, 2, 2, 1, 0, 0, 0],
-            [0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0],
+        // Tall triangle cursor (16 wide × 24 tall)
+        // Designed to be clearly visible on any background
+        #[rustfmt::skip]
+        const CURSOR_BITMAP: [[u8; 16]; 24] = [
+            [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+            [1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+            [1,2,1,0,0,0,0,0,0,0,0,0,0,0,0,0],
+            [1,2,2,1,0,0,0,0,0,0,0,0,0,0,0,0],
+            [1,2,2,1,0,0,0,0,0,0,0,0,0,0,0,0],
+            [1,2,2,2,1,0,0,0,0,0,0,0,0,0,0,0],
+            [1,2,2,2,1,0,0,0,0,0,0,0,0,0,0,0],
+            [1,2,2,2,2,1,0,0,0,0,0,0,0,0,0,0],
+            [1,2,2,2,2,1,0,0,0,0,0,0,0,0,0,0],
+            [1,2,2,2,2,2,1,0,0,0,0,0,0,0,0,0],
+            [1,2,2,2,2,2,1,0,0,0,0,0,0,0,0,0],
+            [1,2,2,2,2,2,2,1,0,0,0,0,0,0,0,0],
+            [1,2,2,2,2,2,2,1,0,0,0,0,0,0,0,0],
+            [1,2,2,2,2,2,2,2,1,0,0,0,0,0,0,0],
+            [1,2,2,2,2,2,2,2,1,0,0,0,0,0,0,0],
+            [1,2,2,2,2,2,2,2,2,1,0,0,0,0,0,0],
+            [1,2,2,2,2,2,2,2,2,1,0,0,0,0,0,0],
+            [1,2,2,2,2,2,2,2,2,2,1,0,0,0,0,0],
+            [1,2,2,2,2,1,1,1,1,1,1,0,0,0,0,0],
+            [1,2,2,2,1,0,0,0,0,0,0,0,0,0,0,0],
+            [1,2,2,1,0,0,0,0,0,0,0,0,0,0,0,0],
+            [1,2,1,0,0,0,0,0,0,0,0,0,0,0,0,0],
+            [1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+            [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
         ];
 
-        for (dy, row) in CURSOR.iter().enumerate() {
+        for (dy, row) in CURSOR_BITMAP.iter().enumerate() {
             for (dx, &pixel) in row.iter().enumerate() {
+                if pixel == 0 { continue; }
                 let px = x.wrapping_add(dx);
                 let py = y.wrapping_add(dy);
                 if px < self.width && py < self.height {
+                    // Use overlay-only write — cursor must NOT go into shadow buffer
                     match pixel {
-                        1 => self.set_pixel(px, py, outline),
-                        2 => self.set_pixel(px, py, color),
-                        _ => {} // transparent
+                        1 => self.set_pixel_overlay(px, py, outline),
+                        _ => self.set_pixel_overlay(px, py, color),
                     }
                 }
             }
         }
     }
 
-    /// Read a single pixel value (for cursor save/restore).
-    /// Note: This is slow on Write-Combining memory, use sparingly.
+    /// Read a single pixel value from shadow buffer (reliable).
+    /// Falls back to WC framebuffer read if no shadow buffer.
     #[inline]
     pub fn get_pixel(&self, x: usize, y: usize) -> u32 {
         if x < self.width && y < self.height {
             unsafe {
-                core::ptr::read_volatile(self.pixel_ptr(x, y))
+                if !self.shadow.is_null() {
+                    core::ptr::read(self.shadow_ptr(x, y))
+                } else {
+                    core::ptr::read_volatile(self.pixel_ptr(x, y))
+                }
             }
         } else {
             0
@@ -266,9 +346,7 @@ impl FramebufferView {
     }
 
     /// Save a rectangular region of pixels to a buffer.
-    ///
-    /// Used for cursor background save/restore.
-    /// Buffer must be at least w * h elements.
+    /// Reads from shadow buffer (normal RAM) for reliable cursor save/restore.
     pub fn save_rect(&self, x: usize, y: usize, w: usize, h: usize, buf: &mut [u32]) {
         let mut idx = 0;
         for dy in 0..h {
@@ -282,8 +360,7 @@ impl FramebufferView {
     }
 
     /// Restore a rectangular region of pixels from a buffer.
-    ///
-    /// Used for cursor background save/restore.
+    /// Writes to FB only — shadow buffer already has the correct scene content.
     pub fn restore_rect(&mut self, x: usize, y: usize, w: usize, h: usize, buf: &[u32]) {
         let mut idx = 0;
         for dy in 0..h {
@@ -291,7 +368,7 @@ impl FramebufferView {
                 let px = x.wrapping_add(dx);
                 let py = y.wrapping_add(dy);
                 if px < self.width && py < self.height {
-                    self.set_pixel(px, py, buf[idx]);
+                    self.set_pixel_overlay(px, py, buf[idx]);
                 }
                 idx += 1;
             }

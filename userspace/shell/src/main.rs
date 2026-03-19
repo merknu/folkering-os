@@ -8,9 +8,10 @@
 
 use libfolk::{entry, print, println};
 use libfolk::sys::{yield_cpu, get_pid, exit, task_list, uptime, shmem_map, shmem_create, shmem_grant, shmem_unmap, shmem_destroy, poweroff, check_interrupt, clear_interrupt};
+use libfolk::sys::block::{self, SECTOR_SIZE, DATA_START_SECTOR};
 use libfolk::sys::synapse::{
     read_file_shmem, file_count, embedding_count,
-    vector_search, get_embedding, SYNAPSE_TASK_ID,
+    vector_search, get_embedding, write_file, SYNAPSE_TASK_ID,
 };
 use libfolk::sys::compositor::{
     create_window, update_node, find_node_by_hash, hash_name as comp_hash_name,
@@ -455,6 +456,8 @@ fn execute_command() {
         "clear" => cmd_clear(),
         "exit" => cmd_exit(),
         "poweroff" | "shutdown" => cmd_poweroff(),
+        "save" => cmd_save(parts),
+        "load" => cmd_load(),
         _ => {
             println!("Unknown command: {}", command);
             println!("Type 'help' for available commands.");
@@ -477,8 +480,78 @@ fn cmd_help() {
     println!("  uptime            - Show system uptime");
     println!("  pid               - Show current process ID");
     println!("  clear             - Clear the screen");
+    println!("  save <file> <text> - Save text file to VFS (SQLite)");
+    println!("  load              - Load text from persistent storage");
     println!("  exit              - Exit the shell");
     println!("  poweroff          - Shut down the system");
+}
+
+/// User data sector for legacy load command
+const USER_DATA_SECTOR: u64 = DATA_START_SECTOR + 200;
+
+fn cmd_save(mut parts: core::str::SplitWhitespace) {
+    let filename = match parts.next() {
+        Some(f) => f,
+        None => {
+            println!("Usage: save <filename> <text>");
+            return;
+        }
+    };
+
+    // Collect remaining args as file content
+    let mut buf = [0u8; 4096];
+    let mut pos = 0usize;
+    let mut first = true;
+    for word in parts {
+        if !first && pos < buf.len() {
+            buf[pos] = b' ';
+            pos += 1;
+        }
+        first = false;
+        let bytes = word.as_bytes();
+        let copy_len = bytes.len().min(buf.len() - pos);
+        if copy_len == 0 { break; }
+        buf[pos..pos + copy_len].copy_from_slice(&bytes[..copy_len]);
+        pos += copy_len;
+    }
+
+    if pos == 0 {
+        println!("Usage: save <filename> <text>");
+        return;
+    }
+
+    match write_file(filename, &buf[..pos]) {
+        Ok(()) => {
+            println!("[VFS] Saved '{}' ({} bytes) to SQLite", filename, pos);
+        }
+        Err(e) => {
+            println!("[VFS] Write failed: {:?}", e);
+        }
+    }
+}
+
+fn cmd_load() {
+    let mut buf = [0u8; SECTOR_SIZE];
+    match block::read_sector(USER_DATA_SECTOR, &mut buf) {
+        Ok(()) => {
+            // Read length from first 4 bytes
+            let text_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+            if text_len == 0 || text_len > SECTOR_SIZE - 4 {
+                println!("[STORAGE] No saved data (or corrupted)");
+                return;
+            }
+            // Print the text
+            if let Ok(text) = core::str::from_utf8(&buf[4..4 + text_len]) {
+                println!("{}", text);
+                println!("[STORAGE] Loaded {} bytes from sector {}", text_len, USER_DATA_SECTOR);
+            } else {
+                println!("[STORAGE] Data is not valid UTF-8");
+            }
+        }
+        Err(e) => {
+            println!("[STORAGE] Read failed: {:?}", e);
+        }
+    }
 }
 
 fn cmd_poweroff() {

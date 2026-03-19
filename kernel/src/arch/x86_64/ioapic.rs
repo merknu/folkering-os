@@ -77,12 +77,12 @@ unsafe fn write_ioapic(reg: u32, value: u32) {
 ///
 /// High 32 bits:
 /// - Bits 24-31: Destination (APIC ID in physical mode)
-fn make_redirection_entry(vector: u8, dest_apic: u8, masked: bool) -> u64 {
+fn make_redirection_entry(vector: u8, dest_apic: u8, masked: bool, level_triggered: bool) -> u64 {
     let low: u32 = (vector as u32)          // Vector
         | (0 << 8)                          // Delivery Mode: Fixed
         | (0 << 11)                         // Destination Mode: Physical
-        | (0 << 13)                         // Pin Polarity: Active High
-        | (0 << 15)                         // Trigger Mode: Edge
+        | (if level_triggered { 1 << 13 } else { 0 })  // Pin Polarity: Active Low for level
+        | (if level_triggered { 1 << 15 } else { 0 })  // Trigger Mode: Level for PCI
         | (if masked { 1 << 16 } else { 0 }); // Mask
 
     let high: u32 = (dest_apic as u32) << 24;
@@ -90,9 +90,19 @@ fn make_redirection_entry(vector: u8, dest_apic: u8, masked: bool) -> u64 {
     ((high as u64) << 32) | (low as u64)
 }
 
-/// Set IOAPIC redirection entry for an IRQ
+/// Set IOAPIC redirection entry for an IRQ (edge-triggered, for ISA devices like keyboard/mouse)
 unsafe fn set_irq_route(irq: u8, vector: u8, dest_apic: u8, enabled: bool) {
-    let entry = make_redirection_entry(vector, dest_apic, !enabled);
+    let entry = make_redirection_entry(vector, dest_apic, !enabled, false);
+    let reg_low = IOREDTBL_BASE + (irq as u32) * 2;
+    let reg_high = reg_low + 1;
+
+    write_ioapic(reg_low, entry as u32);
+    write_ioapic(reg_high, (entry >> 32) as u32);
+}
+
+/// Set IOAPIC redirection entry with level-triggered, active-low (for PCI devices)
+unsafe fn set_irq_route_level(irq: u8, vector: u8, dest_apic: u8, enabled: bool) {
+    let entry = make_redirection_entry(vector, dest_apic, !enabled, true);
     let reg_low = IOREDTBL_BASE + (irq as u32) * 2;
     let reg_high = reg_low + 1;
 
@@ -192,6 +202,36 @@ pub fn enable_irq(irq: u8, vector: u8) {
         crate::serial_str!(" -> Vector ");
         crate::drivers::serial::write_dec(vector as u32);
         crate::serial_str!(" (low=0x");
+        crate::drivers::serial::write_hex(entry_low as u64);
+        crate::serial_str!(", high=0x");
+        crate::drivers::serial::write_hex(entry_high as u64);
+        crate::serial_str!(")\n");
+    }
+}
+
+/// Enable a PCI IRQ on the IOAPIC (level-triggered, active-low)
+///
+/// PCI interrupts are level-triggered and active-low per the PCI specification.
+/// This is different from ISA interrupts (edge-triggered, active-high).
+pub fn enable_irq_level(irq: u8, vector: u8) {
+    if !IOAPIC_INIT.load(Ordering::Relaxed) {
+        crate::serial_strln!("[IOAPIC] ERROR: IOAPIC not initialized!");
+        return;
+    }
+
+    unsafe {
+        set_irq_route_level(irq, vector, 0, true);
+
+        let reg_low = IOREDTBL_BASE + (irq as u32) * 2;
+        let reg_high = reg_low + 1;
+        let entry_low = read_ioapic(reg_low);
+        let entry_high = read_ioapic(reg_high);
+
+        crate::serial_str!("[IOAPIC] Enabled IRQ");
+        crate::drivers::serial::write_dec(irq as u32);
+        crate::serial_str!(" -> Vector ");
+        crate::drivers::serial::write_dec(vector as u32);
+        crate::serial_str!(" [level,active-low] (low=0x");
         crate::drivers::serial::write_hex(entry_low as u64);
         crate::serial_str!(", high=0x");
         crate::drivers::serial::write_hex(entry_high as u64);

@@ -146,6 +146,26 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
         }
         serial_strln!("[INIT] PIC disabled (all IRQs masked)");
 
+        // Initialize PCI bus enumeration
+        serial_strln!("[INIT] Enumerating PCI bus...");
+        drivers::pci::init();
+
+        // Initialize VirtIO block device (if present)
+        serial_strln!("[INIT] Looking for VirtIO block device...");
+        match drivers::virtio_blk::init() {
+            Ok(()) => {
+                serial_strln!("[INIT] VirtIO block device ready");
+                // Initialize disk layout (format if needed, run self-test)
+                match drivers::virtio_blk::init_disk() {
+                    Ok(()) => { serial_strln!("[INIT] Disk initialized"); }
+                    Err(_) => { serial_strln!("[INIT] WARNING: Disk initialization failed"); }
+                }
+            }
+            Err(_) => {
+                serial_strln!("[INIT] No VirtIO block device (running without persistent storage)");
+            }
+        }
+
         // Initialize keyboard driver (uses IRQ1 via IOAPIC)
         // NOTE: keyboard::init() will try to enable PIC IRQ1, but it's masked
         serial_strln!("[INIT] Initializing PS/2 keyboard driver...");

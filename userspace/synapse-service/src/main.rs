@@ -23,16 +23,18 @@ use libfolk::{entry, println};
 use libfolk::sys::{yield_cpu, get_pid, shmem_unmap, shmem_destroy};
 use libfolk::sys::ipc::{recv_async, reply_with_token, AsyncIpcMessage};
 use libfolk::sys::fs::{read_dir, DirEntry, read_file};
+use libfolk::sys::block;
 use libfolk::sys::synapse::{
     SYN_OP_PING, SYN_OP_LIST_FILES, SYN_OP_FILE_COUNT, SYN_OP_FILE_BY_INDEX,
     SYN_OP_FILE_INFO, SYN_OP_READ_FILE, SYN_OP_READ_FILE_BY_NAME, SYN_OP_READ_FILE_CHUNK,
     SYN_OP_READ_FILE_SHMEM, SYN_OP_SQL_QUERY,
     SYN_OP_VECTOR_SEARCH, SYN_OP_GET_EMBEDDING, SYN_OP_EMBEDDING_COUNT,
+    SYN_OP_WRITE_FILE,
     SYN_STATUS_NOT_FOUND, SYN_STATUS_INVALID, SYN_STATUS_ERROR,
     SYNAPSE_VERSION, hash_name,
 };
 use libfolk::sys::{shmem_create, shmem_map, shmem_grant};
-use libsqlite::{SqliteDb, Value};
+use libsqlite::{SqliteDb, Value, encode_varint};
 use libsqlite::vector::{
     Embedding, SearchResult, search_similar_auto,
     get_embedding_by_file_id, count_embeddings, EMBEDDING_SIZE
@@ -123,17 +125,21 @@ fn main() -> ! {
              (SYNAPSE_VERSION >> 16) as u16,
              (SYNAPSE_VERSION & 0xFFFF) as u16);
 
-    // Try to load SQLite database first, fall back to FPK
-    if try_load_sqlite() {
-        println!("[SYNAPSE] SQLite backend initialized");
+    // Try to load SQLite database:
+    // 1. VirtIO disk (persistent) — preferred
+    // 2. Ramdisk FPK (volatile) — fallback
+    if try_load_sqlite_from_disk() {
+        println!("[SYNAPSE] SQLite loaded from VirtIO disk (persistent!)");
         unsafe { BACKEND = Backend::Sqlite; }
-
-        // Pre-cache file entries from SQLite into DIR_CACHE_STATE
-        // This avoids repeated slow table scans during IPC handling
         refresh_sqlite_cache();
         let file_count = unsafe { DIR_CACHE_STATE.count };
-
-        println!("[SYNAPSE] Ready - {} ({} files)", DB_FILENAME, file_count);
+        println!("[SYNAPSE] Ready - {} ({} files, VirtIO)", DB_FILENAME, file_count);
+    } else if try_load_sqlite() {
+        println!("[SYNAPSE] SQLite loaded from ramdisk (volatile)");
+        unsafe { BACKEND = Backend::Sqlite; }
+        refresh_sqlite_cache();
+        let file_count = unsafe { DIR_CACHE_STATE.count };
+        println!("[SYNAPSE] Ready - {} ({} files, ramdisk)", DB_FILENAME, file_count);
     } else {
         println!("[SYNAPSE] SQLite not found, using FPK backend");
         unsafe { BACKEND = Backend::Fpk; }
@@ -183,6 +189,90 @@ fn try_load_sqlite() -> bool {
         SQLITE_STATE.valid = true;
         true
     }
+}
+
+/// Try to load SQLite database from VirtIO block device
+///
+/// Reads the FOLKDISK header to find synapse_db_sector/size, then reads
+/// the database directly from disk sectors into SQLITE_STATE.
+fn try_load_sqlite_from_disk() -> bool {
+    // Read sector 0 (disk header)
+    let mut header_buf = [0u8; block::SECTOR_SIZE];
+    match block::read_sector(0, &mut header_buf) {
+        Ok(()) => {}
+        Err(e) => {
+            println!("[SYNAPSE] VirtIO header read failed: {:?}", e);
+            return false;
+        }
+    }
+
+    // Check FOLKDISK magic
+    if &header_buf[0..8] != b"FOLKDISK" {
+        return false;
+    }
+
+    // Parse header fields (little-endian):
+    // DiskHeader layout: magic(8) + version(4) + pad(4) + journal_start(8) +
+    //   journal_size(8) + data_start(8) + data_size(8) + synapse_db_sector(8) + synapse_db_size(8)
+    // offset 48: synapse_db_sector (u64)
+    // offset 56: synapse_db_size (u64, in sectors)
+    let db_sector = u64::from_le_bytes([
+        header_buf[48], header_buf[49], header_buf[50], header_buf[51],
+        header_buf[52], header_buf[53], header_buf[54], header_buf[55],
+    ]);
+    let db_sectors = u64::from_le_bytes([
+        header_buf[56], header_buf[57], header_buf[58], header_buf[59],
+        header_buf[60], header_buf[61], header_buf[62], header_buf[63],
+    ]);
+
+    println!("[SYNAPSE] VirtIO header: db_sector={}, db_sectors={}", db_sector, db_sectors);
+
+    if db_sector == 0 || db_sectors == 0 {
+        println!("[SYNAPSE] VirtIO: no DB location in header");
+        return false; // No database on disk
+    }
+
+    let db_bytes = (db_sectors as usize) * block::SECTOR_SIZE;
+    if db_bytes > MAX_DB_SIZE {
+        println!("[SYNAPSE] VirtIO DB too large: {} bytes (max {})", db_bytes, MAX_DB_SIZE);
+        return false;
+    }
+
+    // Read database sectors into SQLITE_STATE (chunked, max 64 sectors per syscall)
+    unsafe {
+        let chunk_size = 64usize; // sectors per syscall (must be <= 128)
+        let mut sectors_remaining = db_sectors as usize;
+        let mut current_sector = db_sector;
+        let mut buf_offset = 0usize;
+
+        while sectors_remaining > 0 {
+            let this_chunk = sectors_remaining.min(chunk_size);
+            let chunk_bytes = this_chunk * block::SECTOR_SIZE;
+            let buf = &mut SQLITE_STATE.data[buf_offset..buf_offset + chunk_bytes];
+
+            if block::block_read(current_sector, buf, this_chunk).is_err() {
+                println!("[SYNAPSE] VirtIO DB read failed at sector {}", current_sector);
+                return false;
+            }
+
+            current_sector += this_chunk as u64;
+            buf_offset += chunk_bytes;
+            sectors_remaining -= this_chunk;
+        }
+
+        // Verify SQLite magic
+        if db_bytes < 100 || &SQLITE_STATE.data[0..16] != b"SQLite format 3\0" {
+            println!("[SYNAPSE] VirtIO DB not valid SQLite");
+            return false;
+        }
+
+        SQLITE_STATE.size = db_bytes;
+        SQLITE_STATE.valid = true;
+    }
+
+    println!("[SYNAPSE] Loaded {} sectors ({} KB) from VirtIO sector {}",
+             db_sectors, db_bytes / 1024, db_sector);
+    true
 }
 
 /// Count files in SQLite database
@@ -289,6 +379,7 @@ fn handle_request(msg: AsyncIpcMessage) {
         SYN_OP_READ_FILE_CHUNK => handle_read_file_chunk(msg),
         SYN_OP_READ_FILE_SHMEM => handle_read_file_shmem(msg),
         SYN_OP_SQL_QUERY => handle_sql_query(msg),
+        SYN_OP_WRITE_FILE => handle_write_file(msg),
         SYN_OP_VECTOR_SEARCH => handle_vector_search(msg),
         SYN_OP_GET_EMBEDDING => handle_get_embedding(msg),
         SYN_OP_EMBEDDING_COUNT => handle_embedding_count(msg),
@@ -629,9 +720,15 @@ fn handle_read_file_shmem(msg: AsyncIpcMessage) {
                 }
             };
 
-            // Step 2: Read file content via kernel syscall (fast, no B-tree scan)
+            // Step 2: Read file content — try ramdisk first, fallback to SQLite BLOB
             let mut file_buf = [0u8; 4096];
             let bytes_read = read_file(name, &mut file_buf);
+            // If ramdisk has nothing, read BLOB from SQLite directly
+            let bytes_read = if bytes_read == 0 {
+                read_sqlite_blob(name, &mut file_buf)
+            } else {
+                bytes_read
+            };
             if bytes_read == 0 {
                 let _ = reply(SYN_STATUS_NOT_FOUND, 0);
                 return;
@@ -980,4 +1077,476 @@ fn handle_embedding_count(_msg: AsyncIpcMessage) {
 
     let count = count_embeddings(&db).unwrap_or(0);
     let _ = reply(count as u64, 0);
+}
+
+// ============================================================================
+// VFS Write Handler (Milestone 7)
+// ============================================================================
+
+/// Virtual address for write shmem mapping in Synapse
+const WRITE_SHMEM_VADDR: usize = 0x13000000;
+
+/// Handle WRITE_FILE request
+/// Protocol: op | (shmem_handle << 16) | (total_size << 32)
+/// Shmem format: [name_len: u16 LE][name bytes][content bytes]
+fn handle_write_file(msg: AsyncIpcMessage) {
+    if unsafe { BACKEND } != Backend::Sqlite {
+        println!("[SYNAPSE] write_file: SQLite backend required");
+        let _ = reply(SYN_STATUS_ERROR, 0);
+        return;
+    }
+
+    let shmem_handle = ((msg.payload0 >> 16) & 0xFFFF) as u32;
+    let total_size = (msg.payload0 >> 32) as usize;
+
+    if shmem_handle == 0 || total_size < 3 {
+        let _ = reply(SYN_STATUS_ERROR, 0);
+        return;
+    }
+
+    // Map the shmem
+    if shmem_map(shmem_handle, WRITE_SHMEM_VADDR).is_err() {
+        println!("[SYNAPSE] write_file: failed to map shmem {}", shmem_handle);
+        let _ = reply(SYN_STATUS_ERROR, 0);
+        return;
+    }
+
+    let shmem_slice = unsafe {
+        core::slice::from_raw_parts(WRITE_SHMEM_VADDR as *const u8, total_size)
+    };
+
+    // Parse: [name_len: u16 LE][name][content]
+    let name_len = u16::from_le_bytes([shmem_slice[0], shmem_slice[1]]) as usize;
+    if name_len == 0 || 2 + name_len > total_size {
+        let _ = shmem_unmap(shmem_handle, WRITE_SHMEM_VADDR);
+        let _ = reply(SYN_STATUS_ERROR, 0);
+        return;
+    }
+
+    let name_bytes = &shmem_slice[2..2 + name_len];
+    let content = &shmem_slice[2 + name_len..total_size];
+
+    // Validate UTF-8
+    let name = match core::str::from_utf8(name_bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            let _ = shmem_unmap(shmem_handle, WRITE_SHMEM_VADDR);
+            let _ = reply(SYN_STATUS_ERROR, 0);
+            return;
+        }
+    };
+
+    // Check for duplicate in DIR_CACHE_STATE
+    let name_hash = hash_name(name);
+    let duplicate = unsafe {
+        DIR_CACHE_STATE.entries[..DIR_CACHE_STATE.count]
+            .iter()
+            .any(|e| hash_name(e.name_str()) == name_hash)
+    };
+    if duplicate {
+        println!("[SYNAPSE] write_file: '{}' already exists", name);
+        let _ = shmem_unmap(shmem_handle, WRITE_SHMEM_VADDR);
+        let _ = reply(SYN_STATUS_ERROR, 0);
+        return;
+    }
+
+    // Copy content to a local buffer (we need it after unmapping shmem)
+    let mut content_buf = [0u8; 4096];
+    let content_len = content.len().min(content_buf.len());
+    content_buf[..content_len].copy_from_slice(&content[..content_len]);
+
+    // Copy name to local buffer
+    let mut name_buf = [0u8; 32];
+    let nl = name_len.min(32);
+    name_buf[..nl].copy_from_slice(&name_bytes[..nl]);
+
+    let _ = shmem_unmap(shmem_handle, WRITE_SHMEM_VADDR);
+
+    // Determine next rowid by scanning existing records
+    let next_rowid = find_max_rowid() + 1;
+
+    // Insert cell into SQLite B-tree
+    let name_str = unsafe { core::str::from_utf8_unchecked(&name_buf[..nl]) };
+    if !sqlite_insert_file(next_rowid, name_str, &content_buf[..content_len]) {
+        println!("[SYNAPSE] write_file: cell insert failed");
+        let _ = reply(SYN_STATUS_ERROR, 0);
+        return;
+    }
+
+    // Update DIR_CACHE_STATE for immediate visibility
+    update_dir_cache(next_rowid, &name_buf[..nl], content_len);
+
+    // Flush to VirtIO disk
+    if !flush_sqlite_to_disk() {
+        println!("[SYNAPSE] write_file: disk flush failed (data in memory only)");
+    }
+
+    println!("[SYNAPSE] Wrote '{}' ({} bytes, rowid={})", name_str, content_len, next_rowid);
+    let _ = reply(0, 0); // Success
+}
+
+/// Find the maximum rowid in the files table
+fn find_max_rowid() -> i64 {
+    if let Some(db) = get_sqlite_db() {
+        if let Ok(scanner) = db.table_scan("files") {
+            let mut max_id: i64 = 0;
+            for result in scanner {
+                if let Ok(record) = result {
+                    if record.rowid > max_id {
+                        max_id = record.rowid;
+                    }
+                }
+            }
+            return max_id;
+        }
+    }
+    0
+}
+
+/// Pick the smallest SQLite integer type code for a value
+fn pick_integer_type(val: u64) -> u64 {
+    if val == 0 { return 8; }  // type 8 = integer constant 0
+    if val == 1 { return 9; }  // type 9 = integer constant 1
+    if val <= 0xFF { return 1; }          // 1-byte int
+    if val <= 0xFFFF { return 2; }        // 2-byte int
+    if val <= 0xFFFFFF { return 3; }      // 3-byte int
+    if val <= 0xFFFFFFFF { return 4; }    // 4-byte int
+    if val <= 0xFFFFFFFFFF { return 5; }  // 6-byte int (type 5 = 6 bytes)
+    6  // 8-byte int
+}
+
+/// Get byte count for an integer type code
+fn integer_type_size(type_code: u64) -> usize {
+    match type_code {
+        0 => 0,  // NULL
+        1 => 1,
+        2 => 2,
+        3 => 3,
+        4 => 4,
+        5 => 6,
+        6 => 8,
+        8 | 9 => 0,  // Constants 0 and 1
+        _ => 0,
+    }
+}
+
+/// Encode an integer value in big-endian format for the given type code
+/// Returns the number of bytes written
+fn encode_integer_value(val: u64, type_code: u64, buf: &mut [u8]) -> usize {
+    let size = integer_type_size(type_code);
+    match size {
+        0 => 0,
+        1 => { buf[0] = val as u8; 1 }
+        2 => { buf[0..2].copy_from_slice(&(val as u16).to_be_bytes()); 2 }
+        3 => {
+            let bytes = (val as u32).to_be_bytes();
+            buf[0..3].copy_from_slice(&bytes[1..4]);
+            3
+        }
+        4 => { buf[0..4].copy_from_slice(&(val as u32).to_be_bytes()); 4 }
+        6 => {
+            let bytes = val.to_be_bytes();
+            buf[0..6].copy_from_slice(&bytes[2..8]);
+            6
+        }
+        8 => { buf[0..8].copy_from_slice(&val.to_be_bytes()); 8 }
+        _ => 0,
+    }
+}
+
+/// Insert a file record as a new cell in the SQLite B-tree leaf page
+///
+/// Cell format: [payload_size: varint][rowid: varint][record]
+/// Record: [header_size: varint][name_type][kind_type][size_type][data_type][embed_type][name_bytes][size_bytes][data_bytes]
+///
+/// For INTEGER PRIMARY KEY, the id is stored as the cell rowid, not in the record body.
+/// Record body columns: name(TEXT), kind(INT), size(INT), data(BLOB), embedding(NULL)
+fn sqlite_insert_file(rowid: i64, name: &str, content: &[u8]) -> bool {
+    unsafe {
+        if !SQLITE_STATE.valid {
+            return false;
+        }
+
+        let db_data = &SQLITE_STATE.data[..SQLITE_STATE.size];
+        let db = match SqliteDb::open(db_data) {
+            Ok(db) => db,
+            Err(_) => return false,
+        };
+
+        let root_page = match db.find_table_root("files") {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+
+        let page_size = db.page_size() as usize;
+
+        // Traverse B-tree to find the rightmost leaf page
+        // Interior pages (type 0x05) have a right-pointer; follow it to get the last leaf
+        let mut current_page = root_page;
+        for _ in 0..10 {
+            // Safety depth limit
+            let page_off = (current_page as usize - 1) * page_size;
+            let hdr_off = if current_page == 1 { 100 } else { 0 };
+            let page_type = SQLITE_STATE.data[page_off + hdr_off];
+
+            if page_type == 0x0d {
+                break; // Found leaf page
+            } else if page_type == 0x05 {
+                // Interior page: right-pointer is at header offset + 8 (BE u32)
+                let rp_offset = page_off + hdr_off + 8;
+                let right_child = u32::from_be_bytes([
+                    SQLITE_STATE.data[rp_offset],
+                    SQLITE_STATE.data[rp_offset + 1],
+                    SQLITE_STATE.data[rp_offset + 2],
+                    SQLITE_STATE.data[rp_offset + 3],
+                ]);
+                current_page = right_child;
+            } else {
+                println!("[SYNAPSE] insert: unexpected page type 0x{:02x}", page_type);
+                return false;
+            }
+        }
+
+        let leaf_page = current_page;
+        let page_offset = (leaf_page as usize - 1) * page_size;
+        let header_offset = if leaf_page == 1 { 100 } else { 0 };
+
+        // Verify it's actually a leaf
+        if SQLITE_STATE.data[page_offset + header_offset] != 0x0d {
+            println!("[SYNAPSE] insert: traversal failed, not a leaf (0x{:02x})",
+                     SQLITE_STATE.data[page_offset + header_offset]);
+            return false;
+        }
+
+        let hdr = page_offset + header_offset;
+
+        // Read page header fields (all big-endian)
+        // Offset 0: page type (1 byte) — already validated
+        // Offset 3: cell count (2 bytes)
+        // Offset 5: cell content start (2 bytes), 0 means 65536
+        let cell_count = u16::from_be_bytes([
+            SQLITE_STATE.data[hdr + 3],
+            SQLITE_STATE.data[hdr + 4],
+        ]) as usize;
+
+        let cell_content_start = {
+            let raw = u16::from_be_bytes([
+                SQLITE_STATE.data[hdr + 5],
+                SQLITE_STATE.data[hdr + 6],
+            ]);
+            if raw == 0 { page_size } else { raw as usize }
+        };
+
+        // Build the record body
+        let name_bytes = name.as_bytes();
+
+        // Type codes for record columns (must match existing rows from folk-pack):
+        // id: NULL (type 0) — INTEGER PRIMARY KEY stored as rowid, record body has NULL placeholder
+        // name: TEXT → 13 + len*2
+        // kind: INT constant 1 (DATA file) → type 9
+        // size: smallest int type for content.len()
+        // data: BLOB → 12 + len*2
+        // embedding: NULL → type 0 (reserved for future vector storage)
+        let id_type: u64 = 0; // NULL placeholder for INTEGER PRIMARY KEY
+        let name_type = 13 + (name_bytes.len() as u64) * 2;
+        let kind_type: u64 = 9; // constant 1
+        let size_type = pick_integer_type(content.len() as u64);
+        let data_type = 12 + (content.len() as u64) * 2;
+        let embed_type: u64 = 0; // NULL
+
+        // Build header: [header_size: varint][id_type][name_type][kind_type][size_type][data_type][embed_type]
+        let mut hdr_buf = [0u8; 32];
+        let mut hdr_pos = 0usize;
+
+        // Reserve space for header_size varint (fill later)
+        let hdr_size_pos = 0;
+        hdr_pos += 1; // Placeholder — header size is usually 1 byte for small headers
+
+        hdr_pos += encode_varint(id_type, &mut hdr_buf[hdr_pos..]);
+        hdr_pos += encode_varint(name_type, &mut hdr_buf[hdr_pos..]);
+        hdr_pos += encode_varint(kind_type, &mut hdr_buf[hdr_pos..]);
+        hdr_pos += encode_varint(size_type, &mut hdr_buf[hdr_pos..]);
+        hdr_pos += encode_varint(data_type, &mut hdr_buf[hdr_pos..]);
+        hdr_pos += encode_varint(embed_type, &mut hdr_buf[hdr_pos..]);
+
+        // Header size includes itself
+        let header_size = hdr_pos;
+        // For small headers (< 128), header_size fits in 1 byte
+        if header_size > 127 {
+            println!("[SYNAPSE] insert: header too large");
+            return false;
+        }
+        hdr_buf[hdr_size_pos] = header_size as u8;
+
+        // Record body size = header + name + size_int + data + (id=0 bytes, kind=0 bytes, embed=0 bytes)
+        let size_int_size = integer_type_size(size_type);
+        let record_body_size = header_size + name_bytes.len() + size_int_size + content.len();
+
+        // Build the full cell: [payload_size: varint][rowid: varint][record body]
+        let mut cell_buf = [0u8; 8192];
+        let mut cell_pos = 0usize;
+
+        cell_pos += encode_varint(record_body_size as u64, &mut cell_buf[cell_pos..]);
+        cell_pos += encode_varint(rowid as u64, &mut cell_buf[cell_pos..]);
+
+        // Copy record header
+        cell_buf[cell_pos..cell_pos + header_size].copy_from_slice(&hdr_buf[..header_size]);
+        cell_pos += header_size;
+
+        // Column values (in order): id, name, kind, size, data, embedding
+        // id: NULL — 0 bytes (INTEGER PRIMARY KEY placeholder)
+        // name (TEXT)
+        cell_buf[cell_pos..cell_pos + name_bytes.len()].copy_from_slice(name_bytes);
+        cell_pos += name_bytes.len();
+
+        // kind: type 9 = constant 1, zero value bytes
+        // (no bytes to write)
+
+        // size: integer value
+        let mut int_buf = [0u8; 8];
+        let int_len = encode_integer_value(content.len() as u64, size_type, &mut int_buf);
+        cell_buf[cell_pos..cell_pos + int_len].copy_from_slice(&int_buf[..int_len]);
+        cell_pos += int_len;
+
+        // data (BLOB)
+        cell_buf[cell_pos..cell_pos + content.len()].copy_from_slice(content);
+        cell_pos += content.len();
+
+        // embedding: NULL, zero bytes
+
+        let cell_len = cell_pos;
+
+        // Check free space
+        // Pointer array ends at: header_offset + 8 + cell_count * 2
+        let pointer_array_end = header_offset + 8 + cell_count * 2;
+        let free_space = cell_content_start - pointer_array_end;
+        if cell_len + 2 > free_space {
+            println!("[SYNAPSE] insert: no space (need {}, have {})", cell_len + 2, free_space);
+            return false;
+        }
+
+        // Write cell at cell_content_start - cell_len
+        let new_cell_offset = cell_content_start - cell_len;
+        SQLITE_STATE.data[page_offset + new_cell_offset..page_offset + new_cell_offset + cell_len]
+            .copy_from_slice(&cell_buf[..cell_len]);
+
+        // Write cell pointer (BE u16) at end of pointer array
+        let ptr_offset = page_offset + header_offset + 8 + cell_count * 2;
+        let cell_ptr = (new_cell_offset as u16).to_be_bytes();
+        SQLITE_STATE.data[ptr_offset] = cell_ptr[0];
+        SQLITE_STATE.data[ptr_offset + 1] = cell_ptr[1];
+
+        // Update page header: cell_count += 1
+        let new_count = (cell_count + 1) as u16;
+        let count_bytes = new_count.to_be_bytes();
+        SQLITE_STATE.data[hdr + 3] = count_bytes[0];
+        SQLITE_STATE.data[hdr + 4] = count_bytes[1];
+
+        // Update page header: cell_content_start = new_cell_offset
+        let start_bytes = (new_cell_offset as u16).to_be_bytes();
+        SQLITE_STATE.data[hdr + 5] = start_bytes[0];
+        SQLITE_STATE.data[hdr + 6] = start_bytes[1];
+
+        // Increment DB change counter at file offset 24 (BE u32)
+        let change_counter = u32::from_be_bytes([
+            SQLITE_STATE.data[24], SQLITE_STATE.data[25],
+            SQLITE_STATE.data[26], SQLITE_STATE.data[27],
+        ]);
+        let new_counter = change_counter.wrapping_add(1);
+        let counter_bytes = new_counter.to_be_bytes();
+        SQLITE_STATE.data[24] = counter_bytes[0];
+        SQLITE_STATE.data[25] = counter_bytes[1];
+        SQLITE_STATE.data[26] = counter_bytes[2];
+        SQLITE_STATE.data[27] = counter_bytes[3];
+
+        true
+    }
+}
+
+/// Read a file's BLOB data directly from SQLite into buf. Returns bytes read.
+fn read_sqlite_blob(name: &str, buf: &mut [u8]) -> usize {
+    if let Some(db) = get_sqlite_db() {
+        if let Ok(scanner) = db.table_scan("files") {
+            for result in scanner {
+                if let Ok(record) = result {
+                    if let Some(Value::Text(rec_name)) = record.get(1) {
+                        if rec_name == name {
+                            if let Some(Value::Blob(data)) = record.get(4) {
+                                let copy_len = data.len().min(buf.len());
+                                buf[..copy_len].copy_from_slice(&data[..copy_len]);
+                                return copy_len;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    0
+}
+
+/// Update DIR_CACHE_STATE with the newly inserted file
+fn update_dir_cache(rowid: i64, name_bytes: &[u8], size: usize) {
+    unsafe {
+        let count = DIR_CACHE_STATE.count;
+        if count >= MAX_ENTRIES {
+            return;
+        }
+        let entry = &mut DIR_CACHE_STATE.entries[count];
+        entry.id = rowid as u16;
+        entry.name = [0u8; 32];
+        let nl = name_bytes.len().min(32);
+        entry.name[..nl].copy_from_slice(&name_bytes[..nl]);
+        entry.size = size as u64;
+        entry.entry_type = 1; // DATA type
+        DIR_CACHE_STATE.count = count + 1;
+    }
+}
+
+/// Flush SQLITE_STATE.data back to VirtIO disk
+fn flush_sqlite_to_disk() -> bool {
+    // Read FOLKDISK header to find synapse_db_sector
+    let mut header_buf = [0u8; block::SECTOR_SIZE];
+    if block::read_sector(0, &mut header_buf).is_err() {
+        return false;
+    }
+
+    if &header_buf[0..8] != b"FOLKDISK" {
+        return false;
+    }
+
+    let db_sector = u64::from_le_bytes([
+        header_buf[48], header_buf[49], header_buf[50], header_buf[51],
+        header_buf[52], header_buf[53], header_buf[54], header_buf[55],
+    ]);
+
+    if db_sector == 0 {
+        return false;
+    }
+
+    unsafe {
+        let db_size = SQLITE_STATE.size;
+        let total_sectors = (db_size + block::SECTOR_SIZE - 1) / block::SECTOR_SIZE;
+        let chunk_size = 64usize;
+        let mut sectors_remaining = total_sectors;
+        let mut current_sector = db_sector;
+        let mut buf_offset = 0usize;
+
+        while sectors_remaining > 0 {
+            let this_chunk = sectors_remaining.min(chunk_size);
+            let chunk_bytes = this_chunk * block::SECTOR_SIZE;
+            let buf = &SQLITE_STATE.data[buf_offset..buf_offset + chunk_bytes];
+
+            if block::block_write(current_sector, buf, this_chunk).is_err() {
+                println!("[SYNAPSE] flush: write failed at sector {}", current_sector);
+                return false;
+            }
+
+            current_sector += this_chunk as u64;
+            buf_offset += chunk_bytes;
+            sectors_remaining -= this_chunk;
+        }
+    }
+
+    true
 }

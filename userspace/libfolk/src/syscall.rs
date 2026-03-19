@@ -50,6 +50,10 @@ pub const SYS_TASK_LIST_DETAILED: u64 = 0x26; // 38 - Fill shmem with task detai
 pub const SYS_MMAP: u64 = 0x30;   // 48 - Map anonymous pages into task address space
 pub const SYS_MUNMAP: u64 = 0x31; // 49 - Unmap and free anonymous pages
 
+// Milestone 5: Block device I/O
+pub const SYS_BLOCK_READ: u64 = 0x40;   // 64 - Read sectors from block device
+pub const SYS_BLOCK_WRITE: u64 = 0x41;  // 65 - Write sectors to block device
+
 /// Execute a syscall with no arguments
 #[inline(always)]
 pub unsafe fn syscall0(nr: u64) -> u64 {
