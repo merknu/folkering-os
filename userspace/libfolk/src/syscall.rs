@@ -54,6 +54,17 @@ pub const SYS_MUNMAP: u64 = 0x31; // 49 - Unmap and free anonymous pages
 pub const SYS_BLOCK_READ: u64 = 0x40;   // 64 - Read sectors from block device
 pub const SYS_BLOCK_WRITE: u64 = 0x41;  // 65 - Write sectors to block device
 
+// Milestone 26-27: Network
+pub const SYS_PING: u64 = 0x50;         // 80 - Send ICMP echo request
+pub const SYS_NET_LOOKUP: u64 = 0x51;   // 81 - DNS resolve (blocking)
+
+// Milestone 28: Entropy & RTC
+pub const SYS_GET_TIME: u64 = 0x52;     // 82 - Unix timestamp
+pub const SYS_GET_RANDOM: u64 = 0x53;   // 83 - Fill buffer with random bytes
+
+// Milestone 30: HTTPS
+pub const SYS_HTTPS_TEST: u64 = 0x54;   // 84 - Test HTTPS GET to Google
+
 /// Execute a syscall with no arguments
 #[inline(always)]
 pub unsafe fn syscall0(nr: u64) -> u64 {

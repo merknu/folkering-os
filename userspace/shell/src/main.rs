@@ -5,6 +5,7 @@
 #![no_std]
 #![no_main]
 
+mod wasm;
 
 use libfolk::{entry, print, println};
 use libfolk::sys::{yield_cpu, get_pid, exit, task_list, uptime, shmem_map, shmem_create, shmem_grant, shmem_unmap, shmem_destroy, poweroff, check_interrupt, clear_interrupt};
@@ -21,7 +22,8 @@ use libfolk::sys::fs::DirEntry;
 use libfolk::sys::ipc::{recv_async, reply_with_token, IpcError};
 use libfolk::sys::shell::{
     SHELL_OP_LIST_FILES, SHELL_OP_CAT_FILE, SHELL_OP_SEARCH,
-    SHELL_OP_PS, SHELL_OP_UPTIME, SHELL_OP_EXEC,
+    SHELL_OP_PS, SHELL_OP_UPTIME, SHELL_OP_EXEC, SHELL_OP_OPEN_APP,
+    SHELL_OP_INJECT_STATE,
     SHELL_STATUS_OK, SHELL_STATUS_NOT_FOUND, SHELL_STATUS_ERROR,
     hash_name as shell_hash_name,
 };
@@ -103,15 +105,461 @@ fn main() -> ! {
     }
 }
 
+// ============================================================================
+// Per-Instance Application State (Milestone 10: App Loader)
+// ============================================================================
+
+/// Maximum number of simultaneously open app instances
+const MAX_APP_INSTANCES: usize = 8;
+
+/// Per-instance application state — indexed by Compositor win_id.
+/// Enables multiple calculators open simultaneously with independent state.
+#[derive(Copy, Clone)]
+struct AppState {
+    win_id: u32,        // Compositor window ID (0 = slot unused)
+    app_type: u8,       // 0=calculator, 1=greeter, 2=folkpad
+    display: i64,       // Current display value (calc) or unused (greeter)
+    accumulator: i64,   // Stored accumulator (calc) or unused
+    operator: u8,       // 0=none, 1=+, 2=-, 3=*, 4=/
+    fresh_digit: bool,  // True = next digit starts a new number
+    // Greeter state: last submitted name
+    greet_name: [u8; 32],
+    greet_name_len: usize,
+    // Folkpad state (app_type == 2)
+    pad_lines: [[u8; 64]; 10],   // max 10 lines, 64 chars each
+    pad_line_lens: [usize; 10],
+    pad_line_count: usize,
+    pad_saved: bool,
+}
+
+impl AppState {
+    const fn empty() -> Self {
+        Self { win_id: 0, app_type: 0, display: 0, accumulator: 0, operator: 0, fresh_digit: true, greet_name: [0; 32], greet_name_len: 0, pad_lines: [[0; 64]; 10], pad_line_lens: [0; 10], pad_line_count: 0, pad_saved: false }
+    }
+
+    fn new_calculator(win_id: u32) -> Self {
+        Self { win_id, app_type: 0, ..Self::empty() }
+    }
+
+    fn new_greeter(win_id: u32) -> Self {
+        Self { win_id, app_type: 1, ..Self::empty() }
+    }
+
+    fn new_folkpad(win_id: u32) -> Self {
+        Self { win_id, app_type: 2, ..Self::empty() }
+    }
+}
+
+/// Fixed-size app state registry (no alloc needed)
+static mut APP_STATES: [AppState; MAX_APP_INSTANCES] = [AppState::empty(); MAX_APP_INSTANCES];
+
+/// Find or create an AppState for a given win_id
+fn get_app_state(win_id: u32) -> Option<&'static mut AppState> {
+    unsafe {
+        // First, look for existing entry
+        for state in APP_STATES.iter_mut() {
+            if state.win_id == win_id {
+                return Some(state);
+            }
+        }
+        // Not found — allocate a new slot
+        for state in APP_STATES.iter_mut() {
+            if state.win_id == 0 {
+                *state = AppState::new_calculator(win_id);
+                return Some(state);
+            }
+        }
+        None // All slots full
+    }
+}
+
+/// Format i64 as decimal ASCII string. Returns number of bytes written.
+fn format_i64(val: i64, buf: &mut [u8; 24]) -> usize {
+    if val == 0 {
+        buf[0] = b'0';
+        return 1;
+    }
+
+    let negative = val < 0;
+    let mut abs_val = if negative { (val as i128).wrapping_neg() as u64 } else { val as u64 };
+
+    // Write digits in reverse
+    let mut tmp = [0u8; 20];
+    let mut i = 0;
+    while abs_val > 0 && i < 20 {
+        tmp[i] = b'0' + (abs_val % 10) as u8;
+        abs_val /= 10;
+        i += 1;
+    }
+
+    let mut pos = 0;
+    if negative {
+        buf[0] = b'-';
+        pos = 1;
+    }
+
+    // Reverse into output buffer
+    for j in (0..i).rev() {
+        buf[pos] = tmp[j];
+        pos += 1;
+    }
+    pos
+}
+
+/// Build greeting demo UI with TextInput
+fn build_greeting_ui(name: &str) -> u64 {
+    let mut ui_buf = [0u8; 512];
+    let mut w = libfolk::ui::UiWriter::new(&mut ui_buf);
+
+    w.header("Greeter", 220, 120);
+    if name.is_empty() {
+        w.vstack_begin(6, 3);
+          w.label("Type your name:", 0xFFFFFF);
+          w.text_input("Name...", 100, 32);
+          w.button("Greet", 101, 0x226644, 0xFFFFFF);
+    } else {
+        // Build "Hello, <name>!" label
+        let mut hello = [0u8; 64];
+        let prefix = b"Hello, ";
+        let suffix = b"!";
+        let nlen = name.len().min(50);
+        hello[..prefix.len()].copy_from_slice(prefix);
+        hello[prefix.len()..prefix.len()+nlen].copy_from_slice(&name.as_bytes()[..nlen]);
+        hello[prefix.len()+nlen..prefix.len()+nlen+suffix.len()].copy_from_slice(suffix);
+        let total = prefix.len() + nlen + suffix.len();
+        let hello_str = unsafe { core::str::from_utf8_unchecked(&hello[..total]) };
+
+        w.vstack_begin(6, 3);
+          w.label(hello_str, 0x00FF88);
+          w.text_input("Name...", 100, 32);
+          w.button("Greet", 101, 0x226644, 0xFFFFFF);
+    }
+
+    let ui_len = w.len();
+
+    let handle = match shmem_create(ui_len) {
+        Ok(h) => h,
+        Err(_) => return SHELL_STATUS_ERROR,
+    };
+    for tid in 2..=8 { let _ = shmem_grant(handle, tid); }
+    if shmem_map(handle, SHELL_SHMEM_VADDR).is_err() {
+        let _ = shmem_destroy(handle);
+        return SHELL_STATUS_ERROR;
+    }
+    let dst = unsafe {
+        core::slice::from_raw_parts_mut(SHELL_SHMEM_VADDR as *mut u8, ui_len)
+    };
+    dst.copy_from_slice(&ui_buf[..ui_len]);
+    let _ = shmem_unmap(handle, SHELL_SHMEM_VADDR);
+
+    (0x5549_u64 << 48) | ((ui_len as u64) << 32) | (handle as u64)
+}
+
+/// Build Folkpad UI with lines, text input, and Save/Load/Clear buttons.
+fn build_folkpad_ui(state: &AppState) -> u64 {
+    let mut ui_buf = [0u8; 1024];
+    let mut w = libfolk::ui::UiWriter::new(&mut ui_buf);
+
+    let child_count = (4 + state.pad_line_count).min(255) as u8;
+    w.header("Folkpad", 280, 200);
+    w.vstack_begin(4, child_count);
+
+    // Title
+    if state.pad_saved {
+        w.label("Folkpad - Saved!", 0x00FF88);
+    } else {
+        w.label("Folkpad - Simple Notes", 0x00CCFF);
+    }
+
+    // Existing lines as labels
+    for i in 0..state.pad_line_count {
+        let s = core::str::from_utf8(&state.pad_lines[i][..state.pad_line_lens[i]])
+            .unwrap_or("<invalid>");
+        w.label(s, 0xCCCCCC);
+    }
+
+    // TextInput + buttons
+    w.text_input("Type a line...", 200, 60);
+    w.hstack_begin(8, 3);
+      w.button("Save", 201, 0x226644, 0xFFFFFF);
+      w.button("Load", 203, 0x224466, 0xFFFFFF);
+      w.button("Clear", 202, 0x664422, 0xFFFFFF);
+
+    // Shmem allocation (same pattern as build_calc_ui)
+    let ui_len = w.len();
+    let handle = match shmem_create(ui_len) {
+        Ok(h) => h,
+        Err(_) => return SHELL_STATUS_ERROR,
+    };
+    for tid in 2..=8 { let _ = shmem_grant(handle, tid); }
+    if shmem_map(handle, SHELL_SHMEM_VADDR).is_err() {
+        let _ = shmem_destroy(handle);
+        return SHELL_STATUS_ERROR;
+    }
+    let dst = unsafe {
+        core::slice::from_raw_parts_mut(SHELL_SHMEM_VADDR as *mut u8, ui_len)
+    };
+    dst.copy_from_slice(&ui_buf[..ui_len]);
+    let _ = shmem_unmap(handle, SHELL_SHMEM_VADDR);
+
+    (0x5549_u64 << 48) | ((ui_len as u64) << 32) | (handle as u64)
+}
+
+/// Build calculator UI and return shmem handle encoded as UI response.
+/// Returns (0x5549 << 48) | (ui_len << 32) | shmem_handle on success.
+fn build_calc_ui(display_value: i64) -> u64 {
+    // Format the display value
+    let mut display_buf = [0u8; 24];
+    let display_len = format_i64(display_value, &mut display_buf);
+    let display_str = unsafe { core::str::from_utf8_unchecked(&display_buf[..display_len]) };
+
+    // Build FKUI widget tree
+    let mut ui_buf = [0u8; 1024];
+    let mut w = libfolk::ui::UiWriter::new(&mut ui_buf);
+
+    w.header("Calculator", 200, 260);
+    w.vstack_begin(4, 6); // 6 children: display, spacer, 4 button rows
+      w.label(display_str, 0xFFFFFF);
+      w.spacer(4);
+      w.hstack_begin(4, 4);
+        w.button("7", 7, 0x334455, 0xFFFFFF);
+        w.button("8", 8, 0x334455, 0xFFFFFF);
+        w.button("9", 9, 0x334455, 0xFFFFFF);
+        w.button("/", 13, 0x554433, 0xFFFFFF);
+      w.hstack_begin(4, 4);
+        w.button("4", 4, 0x334455, 0xFFFFFF);
+        w.button("5", 5, 0x334455, 0xFFFFFF);
+        w.button("6", 6, 0x334455, 0xFFFFFF);
+        w.button("*", 12, 0x554433, 0xFFFFFF);
+      w.hstack_begin(4, 4);
+        w.button("1", 1, 0x334455, 0xFFFFFF);
+        w.button("2", 2, 0x334455, 0xFFFFFF);
+        w.button("3", 3, 0x334455, 0xFFFFFF);
+        w.button("-", 11, 0x554433, 0xFFFFFF);
+      w.hstack_begin(4, 4);
+        w.button("0", 0, 0x334455, 0xFFFFFF);
+        w.button("C", 15, 0x664422, 0xFFFFFF);
+        w.button("=", 14, 0x226644, 0xFFFFFF);
+        w.button("+", 10, 0x554433, 0xFFFFFF);
+
+    let ui_len = w.len();
+
+    // Allocate shmem and copy UI buffer
+    let handle = match shmem_create(ui_len) {
+        Ok(h) => h,
+        Err(_) => return SHELL_STATUS_ERROR,
+    };
+    for tid in 2..=8 { let _ = shmem_grant(handle, tid); }
+    if shmem_map(handle, SHELL_SHMEM_VADDR).is_err() {
+        let _ = shmem_destroy(handle);
+        return SHELL_STATUS_ERROR;
+    }
+    let dst = unsafe {
+        core::slice::from_raw_parts_mut(SHELL_SHMEM_VADDR as *mut u8, ui_len)
+    };
+    dst.copy_from_slice(&ui_buf[..ui_len]);
+    let _ = shmem_unmap(handle, SHELL_SHMEM_VADDR);
+
+    (0x5549_u64 << 48) | ((ui_len as u64) << 32) | (handle as u64)
+}
+
 /// Handle IPC command from compositor or other tasks
 fn handle_ipc_command(payload0: u64) -> u64 {
-    // Check for UI action event (button click from compositor)
+    // Check for text submit event (TextInput Enter from compositor)
     let marker = (payload0 & 0xFFFF) as u16;
+    if marker == 0xAC11 {
+        let action_id = ((payload0 >> 16) & 0xFFFF) as u32;
+        let text_handle = ((payload0 >> 32) & 0xFFFF) as u32;
+        let win_id = (payload0 >> 48) as u16;
+
+        // Read text from shmem
+        let mut text = [0u8; 64];
+        let mut text_len = 0usize;
+        if shmem_map(text_handle, SHELL_SHMEM_VADDR).is_ok() {
+            let src = unsafe { core::slice::from_raw_parts(SHELL_SHMEM_VADDR as *const u8, 66) };
+            text_len = u16::from_le_bytes([src[0], src[1]]) as usize;
+            text_len = text_len.min(63);
+            text[..text_len].copy_from_slice(&src[2..2+text_len]);
+            let _ = shmem_unmap(text_handle, SHELL_SHMEM_VADDR);
+        }
+
+        let text_str = unsafe { core::str::from_utf8_unchecked(&text[..text_len]) };
+
+        if let Some(state) = get_app_state(win_id as u32) {
+            // Infer app_type from action_id if this is a fresh slot (app_type==0 and not calc)
+            if state.app_type == 0 && action_id >= 200 {
+                state.app_type = 2; // folkpad
+            } else if state.app_type == 0 && action_id >= 100 {
+                state.app_type = 1; // greeter
+            }
+
+            if state.app_type == 2 {
+                // Folkpad: add line
+                if state.pad_line_count < 10 && text_len > 0 {
+                    let len = text_len.min(64);
+                    state.pad_lines[state.pad_line_count][..len].copy_from_slice(&text[..len]);
+                    state.pad_line_lens[state.pad_line_count] = len;
+                    state.pad_line_count += 1;
+                    state.pad_saved = false;
+                }
+                return build_folkpad_ui(state);
+            }
+            // Greeter: store name
+            let nlen = text_len.min(31);
+            state.greet_name[..nlen].copy_from_slice(&text[..nlen]);
+            state.greet_name_len = nlen;
+        }
+
+        return build_greeting_ui(text_str);
+    }
+
+    // Check for UI action event (button click from compositor)
     if marker == 0xAC10 {
         let action_id = ((payload0 >> 16) & 0xFFFFFFFF) as u32;
         let win_id = (payload0 >> 48) as u16;
-        println!("[SHELL] App button clicked: action_id={} win_id={}", action_id, win_id);
-        return SHELL_STATUS_OK;
+
+        // Lookup or create per-instance state for this window
+        let state = match get_app_state(win_id as u32) {
+            Some(s) => s,
+            None => return SHELL_STATUS_ERROR, // All slots full
+        };
+
+        // M14: One-time WASM load from VFS
+        if !wasm::is_loaded() {
+            if let Ok(resp) = read_file_shmem("calc.wasm") {
+                if resp.size > 0 {
+                    if shmem_map(resp.shmem_handle, SHELL_SHMEM_VADDR).is_ok() {
+                        let wasm_data = unsafe {
+                            core::slice::from_raw_parts(
+                                SHELL_SHMEM_VADDR as *const u8, resp.size as usize
+                            )
+                        };
+                        if wasm::parse(wasm_data) {
+                            println!("[Shell] WASM loaded: calc.wasm ({} bytes)", resp.size);
+                        }
+                        let _ = shmem_unmap(resp.shmem_handle, SHELL_SHMEM_VADDR);
+                    }
+                    let _ = shmem_destroy(resp.shmem_handle);
+                }
+            }
+        }
+
+        // Folkpad app: action_ids 200-299
+        if action_id >= 200 && action_id < 300 {
+            state.app_type = 2;
+            match action_id {
+                201 => {
+                    // Save: concatenate lines with \n, write to VFS
+                    let mut content = [0u8; 700];
+                    let mut pos = 0;
+                    for i in 0..state.pad_line_count {
+                        if i > 0 && pos < content.len() { content[pos] = b'\n'; pos += 1; }
+                        let len = state.pad_line_lens[i].min(content.len() - pos);
+                        content[pos..pos+len].copy_from_slice(&state.pad_lines[i][..len]);
+                        pos += len;
+                    }
+                    let _ = write_file("note.txt", &content[..pos]);
+                    state.pad_saved = true;
+                }
+                202 => { state.pad_line_count = 0; state.pad_saved = false; }
+                203 => {
+                    // Load: read note.txt from VFS, split on \n
+                    state.pad_line_count = 0;
+                    state.pad_saved = false;
+                    if let Ok(resp) = read_file_shmem("note.txt") {
+                        if shmem_map(resp.shmem_handle, SHELL_SHMEM_VADDR).is_ok() {
+                            let src = unsafe {
+                                core::slice::from_raw_parts(SHELL_SHMEM_VADDR as *const u8, resp.size as usize)
+                            };
+                            let mut line_start = 0;
+                            let total = resp.size as usize;
+                            for p in 0..total {
+                                if src[p] == b'\n' || p == total - 1 {
+                                    let end = if src[p] == b'\n' { p } else { p + 1 };
+                                    if end > line_start && state.pad_line_count < 10 {
+                                        let len = (end - line_start).min(64);
+                                        state.pad_lines[state.pad_line_count][..len]
+                                            .copy_from_slice(&src[line_start..line_start+len]);
+                                        state.pad_line_lens[state.pad_line_count] = len;
+                                        state.pad_line_count += 1;
+                                    }
+                                    line_start = p + 1;
+                                }
+                            }
+                            let _ = shmem_unmap(resp.shmem_handle, SHELL_SHMEM_VADDR);
+                        }
+                        let _ = shmem_destroy(resp.shmem_handle);
+                    }
+                }
+                _ => {}
+            }
+            return build_folkpad_ui(state);
+        }
+
+        // Greeter app: action_ids 100+ belong to greeter
+        if action_id >= 100 {
+            state.app_type = 1;
+            let name_str = unsafe { core::str::from_utf8_unchecked(&state.greet_name[..state.greet_name_len]) };
+            return build_greeting_ui(name_str);
+        }
+
+        // Try WASM first, fallback to hardcoded logic
+        let wasm_ok = wasm::call_handle_event(state, action_id);
+
+        if !wasm_ok {
+            // Fallback: hardcoded calculator logic
+            match action_id {
+                0..=9 => {
+                    if state.fresh_digit {
+                        state.display = action_id as i64;
+                        state.fresh_digit = false;
+                    } else {
+                        state.display = state.display.saturating_mul(10).saturating_add(action_id as i64);
+                    }
+                }
+                10 => { // +
+                    state.accumulator = state.display;
+                    state.operator = 1;
+                    state.fresh_digit = true;
+                }
+                11 => { // -
+                    state.accumulator = state.display;
+                    state.operator = 2;
+                    state.fresh_digit = true;
+                }
+                12 => { // *
+                    state.accumulator = state.display;
+                    state.operator = 3;
+                    state.fresh_digit = true;
+                }
+                13 => { // /
+                    state.accumulator = state.display;
+                    state.operator = 4;
+                    state.fresh_digit = true;
+                }
+                14 => { // =
+                    state.display = match state.operator {
+                        1 => state.accumulator.saturating_add(state.display),
+                        2 => state.accumulator.saturating_sub(state.display),
+                        3 => state.accumulator.saturating_mul(state.display),
+                        4 => if state.display != 0 { state.accumulator / state.display } else { 0 },
+                        _ => state.display,
+                    };
+                    state.operator = 0;
+                    state.fresh_digit = true;
+                }
+                15 => { // C (clear)
+                    state.display = 0;
+                    state.accumulator = 0;
+                    state.operator = 0;
+                    state.fresh_digit = true;
+                }
+                _ => return SHELL_STATUS_OK,
+            }
+        }
+
+        let display_val = state.display;
+        return build_calc_ui(display_val);
     }
 
     let opcode = payload0 & 0xFF;
@@ -354,9 +802,65 @@ fn handle_ipc_command(payload0: u64) -> u64 {
                 // Compositor will parse the UI schema and create the window
                 // Magic: 0x5549 ("UI") in upper 16 bits marks this as a UI shmem response
                 (0x5549_u64 << 48) | (ui_len as u64) << 32 | (handle as u64)
+            } else if cmd_hash == shell_hash_name("poweroff") || cmd_hash == shell_hash_name("shutdown") {
+                // M12: Save app states and shut down
+                cmd_poweroff();
+                SHELL_STATUS_OK // unreachable, poweroff doesn't return
             } else {
                 SHELL_STATUS_OK
             }
+        }
+
+        x if x == SHELL_OP_OPEN_APP => {
+            // Open an application by name hash
+            let cmd_hash = ((payload0 >> 8) & 0xFFFFFFFF) as u32;
+            let calc_hash = shell_hash_name("calc");
+            let greet_hash = shell_hash_name("greet");
+
+            let folkpad_hash = shell_hash_name("folkpad");
+
+            if cmd_hash == calc_hash {
+                build_calc_ui(0)
+            } else if cmd_hash == greet_hash {
+                // Pre-create greeter state so 0xAC10/0xAC11 knows this is a greeter
+                // win_id will be set by compositor; use 0 as placeholder, state will be matched by win_id later
+                build_greeting_ui("")
+            } else if cmd_hash == folkpad_hash {
+                build_folkpad_ui(&AppState::new_folkpad(0))
+            } else {
+                SHELL_STATUS_ERROR
+            }
+        }
+
+        x if x == SHELL_OP_INJECT_STATE => {
+            // Restore saved app state from shmem (M12: boot recovery)
+            let inject_handle = ((payload0 >> 16) & 0xFFFF) as u32;
+            if inject_handle == 0 {
+                return SHELL_STATUS_ERROR;
+            }
+            if shmem_map(inject_handle, SHELL_SHMEM_VADDR).is_err() {
+                return SHELL_STATUS_ERROR;
+            }
+            let buf = unsafe {
+                core::slice::from_raw_parts(SHELL_SHMEM_VADDR as *const u8, APP_STATE_ENTRY_SIZE)
+            };
+            let win_id = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+            let display = i64::from_le_bytes([buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11]]);
+            let accumulator = i64::from_le_bytes([buf[12], buf[13], buf[14], buf[15], buf[16], buf[17], buf[18], buf[19]]);
+            let operator = buf[20];
+            let fresh_digit = buf[21] != 0;
+            let _ = shmem_unmap(inject_handle, SHELL_SHMEM_VADDR);
+
+            // Populate APP_STATES with restored state
+            if let Some(state) = get_app_state(win_id) {
+                state.display = display;
+                state.accumulator = accumulator;
+                state.operator = operator;
+                state.fresh_digit = fresh_digit;
+            }
+
+            // Build UI with restored display value
+            build_calc_ui(display)
         }
 
         _ => {
@@ -456,6 +960,11 @@ fn execute_command() {
         "clear" => cmd_clear(),
         "exit" => cmd_exit(),
         "poweroff" | "shutdown" => cmd_poweroff(),
+        "ping" => cmd_ping(parts),
+        "resolve" | "nslookup" => cmd_resolve(parts),
+        "time" | "date" => cmd_time(),
+        "random" | "rand" => cmd_random(),
+        "https" => cmd_https_test(),
         "save" => cmd_save(parts),
         "load" => cmd_load(),
         _ => {
@@ -480,6 +989,11 @@ fn cmd_help() {
     println!("  uptime            - Show system uptime");
     println!("  pid               - Show current process ID");
     println!("  clear             - Clear the screen");
+    println!("  ping <ip|host>    - Ping IP or hostname (DNS resolves automatically)");
+    println!("  resolve <host>    - DNS lookup (e.g. resolve google.com)");
+    println!("  time              - Show current date/time (RTC)");
+    println!("  random            - Generate random numbers (RDRAND)");
+    println!("  https             - Test HTTPS GET to Google (TLS 1.3)");
     println!("  save <file> <text> - Save text file to VFS (SQLite)");
     println!("  load              - Load text from persistent storage");
     println!("  exit              - Exit the shell");
@@ -554,7 +1068,43 @@ fn cmd_load() {
     }
 }
 
+/// Serialize all active app states and write to VFS for persistence across reboots.
+/// Binary format: [count: u8][entries...] where each entry is 22 bytes:
+///   win_id(4) + display(8) + accumulator(8) + operator(1) + fresh_digit(1)
+const APP_STATE_ENTRY_SIZE: usize = 22;
+
+fn save_all_app_states() {
+    let mut buf = [0u8; 1 + MAX_APP_INSTANCES * APP_STATE_ENTRY_SIZE]; // 177 bytes
+    let mut count: u8 = 0;
+    let mut pos = 1;
+
+    unsafe {
+        for state in APP_STATES.iter() {
+            if state.win_id != 0 {
+                buf[pos..pos+4].copy_from_slice(&state.win_id.to_le_bytes());
+                buf[pos+4..pos+12].copy_from_slice(&state.display.to_le_bytes());
+                buf[pos+12..pos+20].copy_from_slice(&state.accumulator.to_le_bytes());
+                buf[pos+20] = state.operator;
+                buf[pos+21] = state.fresh_digit as u8;
+                pos += APP_STATE_ENTRY_SIZE;
+                count += 1;
+            }
+        }
+    }
+    buf[0] = count;
+
+    if count > 0 {
+        match write_file("app_states.dat", &buf[..pos]) {
+            Ok(()) => println!("[SHELL] Saved {} app state(s)", count),
+            Err(_) => println!("[SHELL] Failed to save app states"),
+        }
+    } else {
+        println!("[SHELL] No app states to save");
+    }
+}
+
 fn cmd_poweroff() {
+    save_all_app_states();
     println!("Shutting down...");
     poweroff();
 }
@@ -1506,6 +2056,153 @@ fn cmd_echo<'a>(mut args: impl Iterator<Item = &'a str>) {
 fn cmd_ps() {
     let count = task_list();
     println!("\n{} task(s) total", count);
+}
+
+fn cmd_ping<'a>(mut args: impl Iterator<Item = &'a str>) {
+    let target = match args.next() {
+        Some(s) => s,
+        None => {
+            println!("usage: ping <ip or hostname>");
+            return;
+        }
+    };
+
+    // Try to parse as IP address first
+    let octets = match parse_ipv4(target) {
+        Some(o) => o,
+        None => {
+            // Not an IP — treat as hostname, do DNS lookup
+            println!("Resolving {}...", target);
+            match libfolk::sys::dns::lookup(target) {
+                Some(o) => {
+                    println!("{} -> {}.{}.{}.{}", target, o.0, o.1, o.2, o.3);
+                    [o.0, o.1, o.2, o.3]
+                }
+                None => {
+                    println!("ping: could not resolve {}", target);
+                    return;
+                }
+            }
+        }
+    };
+
+    println!("PING {}.{}.{}.{} ...", octets[0], octets[1], octets[2], octets[3]);
+    libfolk::sys::ping::ping(octets[0], octets[1], octets[2], octets[3]);
+    println!("(check serial log for reply)");
+}
+
+fn cmd_resolve<'a>(mut args: impl Iterator<Item = &'a str>) {
+    let hostname = match args.next() {
+        Some(s) => s,
+        None => {
+            println!("usage: resolve <hostname>");
+            return;
+        }
+    };
+
+    println!("Resolving {}...", hostname);
+    match libfolk::sys::dns::lookup(hostname) {
+        Some((a, b, c, d)) => {
+            println!("{} -> {}.{}.{}.{}", hostname, a, b, c, d);
+        }
+        None => {
+            println!("resolve: failed to resolve {}", hostname);
+        }
+    }
+}
+
+/// Try to parse "a.b.c.d" as IPv4. Returns None if not a valid IP.
+fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
+    let mut octets = [0u8; 4];
+    let mut idx = 0;
+    for part in s.split('.') {
+        if idx >= 4 {
+            return None;
+        }
+        let mut val: u16 = 0;
+        if part.is_empty() {
+            return None;
+        }
+        for &b in part.as_bytes() {
+            if b < b'0' || b > b'9' {
+                return None;
+            }
+            val = val * 10 + (b - b'0') as u16;
+            if val > 255 {
+                return None;
+            }
+        }
+        octets[idx] = val as u8;
+        idx += 1;
+    }
+    if idx == 4 { Some(octets) } else { None }
+}
+
+fn cmd_https_test() {
+    println!("Testing HTTPS connection to Google...");
+    println!("(output on serial log)");
+    let result = unsafe {
+        libfolk::syscall::syscall0(libfolk::syscall::SYS_HTTPS_TEST)
+    };
+    if result == 0 {
+        println!("HTTPS test completed successfully!");
+    } else {
+        println!("HTTPS test failed (check serial log)");
+    }
+}
+
+fn cmd_time() {
+    let ts = libfolk::sys::time::unix_timestamp();
+    // Decode unix timestamp to human-readable
+    let secs_per_day: u64 = 86400;
+    let secs_per_hour: u64 = 3600;
+    let secs_per_min: u64 = 60;
+    let days_in_month: [u64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+    let mut remaining = ts;
+    let mut year: u64 = 1970;
+    loop {
+        let days_in_year = if (year % 400 == 0) || (year % 4 == 0 && year % 100 != 0) { 366 } else { 365 };
+        if remaining < days_in_year * secs_per_day {
+            break;
+        }
+        remaining -= days_in_year * secs_per_day;
+        year += 1;
+    }
+    let is_leap = (year % 400 == 0) || (year % 4 == 0 && year % 100 != 0);
+    let mut month: u64 = 1;
+    for m in 0..12 {
+        let mut d = days_in_month[m];
+        if m == 1 && is_leap { d += 1; }
+        if remaining < d * secs_per_day { break; }
+        remaining -= d * secs_per_day;
+        month += 1;
+    }
+    let day = remaining / secs_per_day + 1;
+    remaining %= secs_per_day;
+    let hour = remaining / secs_per_hour;
+    remaining %= secs_per_hour;
+    let min = remaining / secs_per_min;
+    let sec = remaining % secs_per_min;
+
+    println!("{}-{:02}-{:02} {:02}:{:02}:{:02} UTC", year, month, day, hour, min, sec);
+    println!("Unix timestamp: {}", ts);
+}
+
+fn cmd_random() {
+    println!("Random values (RDRAND/RDTSC):");
+    for i in 0..4 {
+        let val = libfolk::sys::random::random_u64();
+        // Print as hex manually since we don't have {:x}
+        print!("  [{}] 0x", i);
+        // Simple hex print
+        for shift in (0..16).rev() {
+            let nibble = ((val >> (shift * 4)) & 0xF) as u8;
+            let c = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
+            print!("{}", c as char);
+        }
+        println!();
+    }
 }
 
 fn cmd_uptime() {

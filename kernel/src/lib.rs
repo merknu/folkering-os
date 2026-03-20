@@ -51,6 +51,10 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
 
         serial_strln!("\n[KERNEL_MAIN] kernel_main_with_boot_info() started!");
 
+        // Initialize hardware RNG and RTC early (needed for TLS later)
+        drivers::rng::init();
+        drivers::cmos::init();
+
         serial_strln!("\n==============================================");
         serial_strln!("   Folkering OS v0.1.0 - Microkernel        ");
         serial_strln!("==============================================\n");
@@ -164,6 +168,16 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
             Err(_) => {
                 serial_strln!("[INIT] No VirtIO block device (running without persistent storage)");
             }
+        }
+
+        // Initialize VirtIO network device
+        serial_strln!("[INIT] Looking for VirtIO network device...");
+        match drivers::virtio_net::init() {
+            Ok(()) => {
+                serial_strln!("[INIT] VirtIO network device ready");
+                net::init();
+            }
+            Err(_) => { serial_strln!("[INIT] No VirtIO network device (running without networking)"); }
         }
 
         // Initialize keyboard driver (uses IRQ1 via IOAPIC)
@@ -625,6 +639,7 @@ pub mod drivers;
 pub mod fs;
 pub mod ipc;
 pub mod memory;
+pub mod net;
 pub mod panic;
 pub mod task;
 pub mod timer;

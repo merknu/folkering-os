@@ -954,6 +954,14 @@ extern "C" fn syscall_handler(
         // Milestone 5: Block device I/O
         0x40 => syscall_block_read(arg1, arg2, arg3),
         0x41 => syscall_block_write(arg1, arg2, arg3),
+        // Milestone 26-27: Network
+        0x50 => syscall_ping(arg1),
+        0x51 => syscall_dns_lookup(arg1, arg2),
+        // Milestone 28: Entropy & RTC
+        0x52 => syscall_get_time(),
+        0x53 => syscall_get_random(arg1, arg2),
+        // Milestone 30: HTTPS
+        0x54 => syscall_https_test(),
         _ => {
             crate::drivers::serial::write_str("[HANDLER] Invalid syscall!\n");
             u64::MAX // Return error
@@ -1574,6 +1582,73 @@ fn syscall_block_write(sector: u64, buf_ptr: u64, count: u64) -> u64 {
     };
 
     match virtio_blk::write_sectors(sector, buf, count as usize) {
+        Ok(()) => 0,
+        Err(_) => u64::MAX,
+    }
+}
+
+// ── Network Ping Syscall (Milestone 26) ──────────────────────────────────────
+
+/// Send an ICMP echo request to an IPv4 address
+/// arg1: packed IPv4 address (a | b<<8 | c<<16 | d<<24)
+/// Returns: 0 on success
+fn syscall_ping(ip_packed: u64) -> u64 {
+    let a = (ip_packed & 0xFF) as u8;
+    let b = ((ip_packed >> 8) & 0xFF) as u8;
+    let c = ((ip_packed >> 16) & 0xFF) as u8;
+    let d = ((ip_packed >> 24) & 0xFF) as u8;
+    crate::net::send_ping(a, b, c, d);
+    0
+}
+
+/// Resolve a domain name to an IPv4 address (blocking).
+/// arg1: pointer to domain name string (null-terminated or with length)
+/// arg2: length of domain name
+/// Returns: packed IPv4 (a | b<<8 | c<<16 | d<<24) on success, 0 on failure
+fn syscall_dns_lookup(name_ptr: u64, name_len: u64) -> u64 {
+    if name_ptr == 0 || name_len == 0 || name_len > 255 {
+        return 0;
+    }
+
+    // Read domain name from userspace
+    let name_bytes = unsafe {
+        core::slice::from_raw_parts(name_ptr as *const u8, name_len as usize)
+    };
+
+    let name = match core::str::from_utf8(name_bytes) {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+
+    crate::net::dns_lookup(name)
+}
+
+// ── Milestone 28: Entropy & RTC Syscalls ─────────────────────────────────────
+
+/// Get current Unix timestamp (seconds since 1970-01-01 UTC)
+fn syscall_get_time() -> u64 {
+    crate::drivers::cmos::unix_timestamp()
+}
+
+/// Fill a userspace buffer with random bytes
+/// arg1: buffer pointer, arg2: buffer length
+/// Returns: 0 on success, u64::MAX on error
+fn syscall_get_random(buf_ptr: u64, buf_len: u64) -> u64 {
+    if buf_ptr == 0 || buf_len == 0 || buf_len > 4096 {
+        return u64::MAX;
+    }
+    let buf = unsafe {
+        core::slice::from_raw_parts_mut(buf_ptr as *mut u8, buf_len as usize)
+    };
+    crate::drivers::rng::fill_bytes(buf);
+    0
+}
+
+/// Test HTTPS connection to a hardcoded Google IP
+fn syscall_https_test() -> u64 {
+    // Google IP (hardcoded to bypass DNS)
+    let ip = [142, 250, 74, 142];
+    match crate::net::tls::https_get(ip, "www.google.com", "/") {
         Ok(()) => 0,
         Err(_) => u64::MAX,
     }

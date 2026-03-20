@@ -15,6 +15,10 @@ pub mod boot_info;
 pub mod map_physical;
 pub mod intent;
 pub mod block;
+pub mod dns;
+pub mod ping;
+pub mod random;
+pub mod time;
 
 // Re-export commonly used functions at the sys level
 pub use task::{exit, yield_cpu, get_pid, spawn};
