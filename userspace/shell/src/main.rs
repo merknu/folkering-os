@@ -965,6 +965,8 @@ fn execute_command() {
         "time" | "date" => cmd_time(),
         "random" | "rand" => cmd_random(),
         "https" => cmd_https_test(),
+        "fetch" => cmd_fetch(parts),
+        "clone" => cmd_clone(parts),
         "save" => cmd_save(parts),
         "load" => cmd_load(),
         _ => {
@@ -994,6 +996,8 @@ fn cmd_help() {
     println!("  time              - Show current date/time (RTC)");
     println!("  random            - Generate random numbers (RDRAND)");
     println!("  https             - Test HTTPS GET to Google (TLS 1.3)");
+    println!("  fetch <user> <repo> - Fetch GitHub repo info via API");
+    println!("  clone <user> <repo> - Download repo to VFS (SQLite)");
     println!("  save <file> <text> - Save text file to VFS (SQLite)");
     println!("  load              - Load text from persistent storage");
     println!("  exit              - Exit the shell");
@@ -2136,6 +2140,122 @@ fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
         idx += 1;
     }
     if idx == 4 { Some(octets) } else { None }
+}
+
+fn cmd_clone<'a>(mut args: impl Iterator<Item = &'a str>) {
+    let user = match args.next() {
+        Some(s) => s,
+        None => {
+            println!("usage: clone <user> <repo>");
+            return;
+        }
+    };
+    let repo = match args.next() {
+        Some(s) => s,
+        None => {
+            println!("usage: clone <user> <repo>");
+            return;
+        }
+    };
+
+    println!("Cloning {}/{}...", user, repo);
+
+    // Step 1: Download from GitHub via kernel (TLS → shmem)
+    let result = unsafe {
+        libfolk::syscall::syscall4(
+            libfolk::syscall::SYS_GITHUB_CLONE,
+            user.as_ptr() as u64,
+            user.len() as u64,
+            repo.as_ptr() as u64,
+            repo.len() as u64,
+        )
+    };
+
+    if result == u64::MAX {
+        println!("Clone failed (check serial log)");
+        return;
+    }
+
+    let data_size = (result >> 32) as usize;
+    let shmem_handle = (result & 0xFFFFFFFF) as u32;
+
+    println!("Downloaded {} bytes", data_size);
+
+    // Step 2: Map shmem to read the data
+    if shmem_map(shmem_handle, SHELL_SHMEM_VADDR).is_err() {
+        println!("Failed to map download buffer");
+        let _ = shmem_destroy(shmem_handle);
+        return;
+    }
+
+    let data = unsafe {
+        core::slice::from_raw_parts(SHELL_SHMEM_VADDR as *const u8, data_size)
+    };
+
+    // Step 3: Build filename: "{user}_{repo}.json"
+    let mut filename = [0u8; 64];
+    let mut flen = 0;
+    for &b in user.as_bytes() {
+        if flen < 60 { filename[flen] = b; flen += 1; }
+    }
+    if flen < 60 { filename[flen] = b'_'; flen += 1; }
+    for &b in repo.as_bytes() {
+        if flen < 58 { filename[flen] = b; flen += 1; }
+    }
+    let suffix = b".json";
+    for &b in suffix {
+        if flen < 63 { filename[flen] = b; flen += 1; }
+    }
+    let fname = unsafe { core::str::from_utf8_unchecked(&filename[..flen]) };
+
+    // Step 4: Write to Synapse VFS (SQLite on VirtIO disk)
+    let _ = shmem_unmap(shmem_handle, SHELL_SHMEM_VADDR);
+
+    match libfolk::sys::synapse::write_file(fname, data) {
+        Ok(()) => {
+            println!("[VFS] Saved '{}' ({} bytes) to SQLite", fname, data_size);
+            println!("Clone complete! Use 'cat {}' to view.", fname);
+        }
+        Err(e) => {
+            println!("VFS write failed: {:?}", e);
+        }
+    }
+
+    let _ = shmem_destroy(shmem_handle);
+}
+
+fn cmd_fetch<'a>(mut args: impl Iterator<Item = &'a str>) {
+    let user = match args.next() {
+        Some(s) => s,
+        None => {
+            println!("usage: fetch <user> <repo>");
+            return;
+        }
+    };
+    let repo = match args.next() {
+        Some(s) => s,
+        None => {
+            println!("usage: fetch <user> <repo>");
+            return;
+        }
+    };
+
+    println!("Fetching {}/{}...", user, repo);
+    println!("(results on serial log)");
+    let result = unsafe {
+        libfolk::syscall::syscall4(
+            libfolk::syscall::SYS_GITHUB_FETCH,
+            user.as_ptr() as u64,
+            user.len() as u64,
+            repo.as_ptr() as u64,
+            repo.len() as u64,
+        )
+    };
+    if result == 0 {
+        println!("Fetch completed!");
+    } else {
+        println!("Fetch failed (check serial log)");
+    }
 }
 
 fn cmd_https_test() {

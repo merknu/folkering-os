@@ -62,8 +62,10 @@ pub const SYS_NET_LOOKUP: u64 = 0x51;   // 81 - DNS resolve (blocking)
 pub const SYS_GET_TIME: u64 = 0x52;     // 82 - Unix timestamp
 pub const SYS_GET_RANDOM: u64 = 0x53;   // 83 - Fill buffer with random bytes
 
-// Milestone 30: HTTPS
+// Milestone 30-32: HTTPS, GitHub & Clone
 pub const SYS_HTTPS_TEST: u64 = 0x54;   // 84 - Test HTTPS GET to Google
+pub const SYS_GITHUB_FETCH: u64 = 0x55; // 85 - Fetch GitHub repo info
+pub const SYS_GITHUB_CLONE: u64 = 0x56; // 86 - Clone repo JSON to shmem
 
 /// Execute a syscall with no arguments
 #[inline(always)]

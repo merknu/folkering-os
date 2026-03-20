@@ -4,6 +4,8 @@
 //! supplies raw Ethernet frames; this module wraps it as a smoltcp Device
 //! and runs the TCP/IP stack. Supports ICMP echo (ping), DNS resolution, and TLS 1.3.
 
+pub mod github;
+pub mod json;
 pub mod tls;
 
 extern crate alloc;

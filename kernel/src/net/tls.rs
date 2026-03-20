@@ -134,6 +134,98 @@ impl Write for TcpStream<'_> {
 
 // ── Public API ──────────────────────────────────────────────────────────────
 
+/// Perform an HTTPS request with a raw pre-built HTTP request.
+/// Returns the full HTTP response (headers + body) as a Vec<u8>.
+pub fn https_get_raw(ip: [u8; 4], host: &str, request: &[u8]) -> Result<alloc::vec::Vec<u8>, &'static str> {
+    // Take the network lock
+    let mut guard = NET_STATE.lock();
+    let state = guard.as_mut().ok_or("no network")?;
+    if !state.has_ip {
+        return Err("no IP address");
+    }
+
+    // Create TCP socket
+    let tcp_rx = smoltcp::socket::tcp::SocketBuffer::new(vec![0u8; 8192]);
+    let tcp_tx = smoltcp::socket::tcp::SocketBuffer::new(vec![0u8; 4096]);
+    let tcp_socket = smoltcp::socket::tcp::Socket::new(tcp_rx, tcp_tx);
+    let tcp_handle = state.sockets.add(tcp_socket);
+
+    let remote_addr = smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(ip[0], ip[1], ip[2], ip[3]));
+
+    {
+        let socket = state.sockets.get_mut::<smoltcp::socket::tcp::Socket>(tcp_handle);
+        socket.connect(state.iface.context(), (remote_addr, 443u16), 49153)
+            .map_err(|_| "TCP connect failed")?;
+    }
+
+    // Wait for TCP connect
+    let start = crate::timer::uptime_ms();
+    loop {
+        let now = Instant::from_millis(crate::timer::uptime_ms() as i64);
+        let mut device = FolkeringDevice;
+        state.iface.poll(now, &mut device, &mut state.sockets);
+
+        let socket = state.sockets.get_mut::<smoltcp::socket::tcp::Socket>(tcp_handle);
+        if socket.may_send() { break; }
+        if !socket.is_active() {
+            state.sockets.remove(tcp_handle);
+            return Err("TCP refused");
+        }
+        if crate::timer::uptime_ms() - start > 10_000 {
+            state.sockets.remove(tcp_handle);
+            return Err("TCP timeout");
+        }
+        for _ in 0..1000 { core::hint::spin_loop(); }
+    }
+
+    // TLS handshake
+    let mut tls_read_buf = vec![0u8; 16640];
+    let mut tls_write_buf = vec![0u8; 4096];
+    let config = TlsConfig::new().with_server_name(host);
+
+    let stream = TcpStream { state, handle: tcp_handle };
+    let mut tls: TlsConnection<'_, TcpStream<'_>, Aes128GcmSha256> =
+        TlsConnection::new(stream, &mut tls_read_buf, &mut tls_write_buf);
+
+    let rng = KernelRng;
+    let provider = UnsecureProvider::new::<Aes128GcmSha256>(rng);
+    tls.open(TlsContext::new(&config, provider))
+        .map_err(|_| "TLS handshake failed")?;
+
+    // Send request
+    let mut written = 0;
+    while written < request.len() {
+        match tls.write(&request[written..]) {
+            Ok(n) => written += n,
+            Err(_) => break,
+        }
+    }
+    let _ = tls.flush();
+
+    // Read response
+    let mut response = alloc::vec::Vec::new();
+    let mut buf = [0u8; 1024];
+    loop {
+        match tls.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                response.extend_from_slice(&buf[..n]);
+                if response.len() > 65536 { break; } // Cap at 64KB
+            }
+            Err(_) => break,
+        }
+    }
+
+    // Cleanup
+    let stream = match tls.close() {
+        Ok(s) => s,
+        Err((s, _)) => s,
+    };
+    stream.state.sockets.remove(tcp_handle);
+
+    Ok(response)
+}
+
 /// Perform an HTTPS GET request to a hardcoded IP.
 /// Logs the result to serial. Blocking — call from syscall context only.
 ///

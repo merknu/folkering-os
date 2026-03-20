@@ -960,8 +960,10 @@ extern "C" fn syscall_handler(
         // Milestone 28: Entropy & RTC
         0x52 => syscall_get_time(),
         0x53 => syscall_get_random(arg1, arg2),
-        // Milestone 30: HTTPS
+        // Milestone 30-32: HTTPS, GitHub & Clone
         0x54 => syscall_https_test(),
+        0x55 => syscall_github_fetch(arg1, arg2, arg3, arg4),
+        0x56 => syscall_github_clone(arg1, arg2, arg3, arg4),
         _ => {
             crate::drivers::serial::write_str("[HANDLER] Invalid syscall!\n");
             u64::MAX // Return error
@@ -1642,6 +1644,118 @@ fn syscall_get_random(buf_ptr: u64, buf_len: u64) -> u64 {
     };
     crate::drivers::rng::fill_bytes(buf);
     0
+}
+
+/// Fetch GitHub repo info: arg1=user_ptr, arg2=user_len, arg3=repo_ptr, arg4=repo_len
+/// Prints results to serial. Returns 0 on success.
+fn syscall_github_fetch(user_ptr: u64, user_len: u64, repo_ptr: u64, repo_len: u64) -> u64 {
+    if user_ptr == 0 || user_len == 0 || user_len > 64 || repo_ptr == 0 || repo_len == 0 || repo_len > 64 {
+        return u64::MAX;
+    }
+    let user = unsafe { core::slice::from_raw_parts(user_ptr as *const u8, user_len as usize) };
+    let repo = unsafe { core::slice::from_raw_parts(repo_ptr as *const u8, repo_len as usize) };
+    let user_str = match core::str::from_utf8(user) {
+        Ok(s) => s,
+        Err(_) => return u64::MAX,
+    };
+    let repo_str = match core::str::from_utf8(repo) {
+        Ok(s) => s,
+        Err(_) => return u64::MAX,
+    };
+
+    match crate::net::github::fetch_repo_info(user_str, repo_str) {
+        Ok(info) => {
+            crate::net::github::print_repo_info(&info);
+            0
+        }
+        Err(e) => {
+            crate::drivers::serial::write_str("[GITHUB] Error: ");
+            crate::drivers::serial::write_str(e);
+            crate::drivers::serial::write_newline();
+            u64::MAX
+        }
+    }
+}
+
+/// Clone a GitHub repo: download JSON, store in shmem for shell to write to VFS.
+/// arg1=user_ptr, arg2=user_len, arg3=repo_ptr, arg4=repo_len
+/// Returns: (size << 32) | shmem_handle on success, u64::MAX on error.
+fn syscall_github_clone(user_ptr: u64, user_len: u64, repo_ptr: u64, repo_len: u64) -> u64 {
+    if user_ptr == 0 || user_len == 0 || user_len > 64 || repo_ptr == 0 || repo_len == 0 || repo_len > 64 {
+        return u64::MAX;
+    }
+    let user = unsafe { core::slice::from_raw_parts(user_ptr as *const u8, user_len as usize) };
+    let repo = unsafe { core::slice::from_raw_parts(repo_ptr as *const u8, repo_len as usize) };
+    let user_str = match core::str::from_utf8(user) {
+        Ok(s) => s,
+        Err(_) => return u64::MAX,
+    };
+    let repo_str = match core::str::from_utf8(repo) {
+        Ok(s) => s,
+        Err(_) => return u64::MAX,
+    };
+
+    // Download repo JSON from GitHub
+    let data = match crate::net::github::clone_repo(user_str, repo_str) {
+        Ok(d) => d,
+        Err(e) => {
+            crate::drivers::serial::write_str("[CLONE] Error: ");
+            crate::drivers::serial::write_str(e);
+            crate::drivers::serial::write_newline();
+            return u64::MAX;
+        }
+    };
+
+    if data.is_empty() {
+        return u64::MAX;
+    }
+
+    let size = data.len();
+    let shmem_size = ((size + 4095) / 4096) * 4096;
+    let shmem_size = if shmem_size == 0 { 4096 } else { shmem_size };
+
+    // Create shmem region
+    use crate::ipc::shared_memory::{shmem_create, shmem_grant, ShmemPerms, SHMEM_TABLE};
+    let id = match shmem_create(shmem_size, ShmemPerms::ReadWrite) {
+        Ok(id) => id,
+        Err(_) => return u64::MAX,
+    };
+
+    // Grant to userspace tasks
+    for tid in 2..=8u32 {
+        let _ = shmem_grant(id, tid);
+    }
+
+    // Write data directly to shmem physical pages via HHDM
+    {
+        let table = SHMEM_TABLE.lock();
+        if let Some(shmem) = table.get(&id.get()) {
+            let mut offset = 0;
+            for &phys_page in &shmem.phys_pages {
+                let virt = crate::phys_to_virt(phys_page);
+                let chunk = (size - offset).min(4096);
+                if chunk == 0 { break; }
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        data.as_ptr().add(offset),
+                        virt as *mut u8,
+                        chunk,
+                    );
+                }
+                offset += chunk;
+            }
+        }
+    }
+
+    let handle = id.get();
+
+    crate::serial_str!("[CLONE] Data in shmem handle=");
+    crate::drivers::serial::write_dec(handle);
+    crate::serial_str!(", size=");
+    crate::drivers::serial::write_dec(size as u32);
+    crate::serial_strln!(" bytes");
+
+    ((size as u64) << 32) | (handle as u64)
 }
 
 /// Test HTTPS connection to a hardcoded Google IP
