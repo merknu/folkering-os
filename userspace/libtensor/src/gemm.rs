@@ -234,7 +234,6 @@ pub fn gemm_f32_x_q4(
     _arena: &BumpArena,
 ) {
     // Direct f32 × dequant(Q4_0) — no Q8_0 quantization of activations.
-    // Eliminates Q8_0 roundtrip precision loss that accumulates across 30 layers.
     let n_blocks = k / 32;
     let q4_row_bytes = n_blocks * Q4_0_BLOCK_SIZE;
 

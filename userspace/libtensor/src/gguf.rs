@@ -513,12 +513,8 @@ impl<'a> GgufModel<'a> {
         }
 
         // Align to data start (GGUF alignment, typically 32 bytes)
-        let pre_align = cursor.pos;
         cursor.align(32);
         let data_start = cursor.pos;
-        // DEBUG: log for data_start verification
-        // Correct data_start for SmolLM2-135M is 1786080
-        libfolk::println!("[GGUF] pre_align={} data_start={} (diff={})", pre_align, data_start, data_start - pre_align);
 
         // Create zero-copy tensor slices
         let mut tensors = Vec::with_capacity(tensor_count);

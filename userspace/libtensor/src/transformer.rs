@@ -144,20 +144,6 @@ pub fn forward<'a>(
     // Dequantize the embedding row for token_id from Q4_0
     embed_token(token_id as usize, config.vocab_size, dim, weights.token_embed, x);
 
-    // DEBUG: Check embedding for NaN
-    {
-        let mut nan = 0u32;
-        let mut zero = 0u32;
-        for i in 0..dim {
-            if x[i].is_nan() { nan += 1; }
-            if x[i] == 0.0 { zero += 1; }
-        }
-        if nan > 0 || pos == 0 {
-            libfolk::println!("[FWD] tok={} pos={} embed: NaN={} Zero={}/{} x[0]={:.6} x[1]={:.6}",
-                token_id, pos, nan, zero, dim, x[0], x[1]);
-        }
-    }
-
     // === Transformer layers ===
     for layer in 0..config.n_layers {
         let lw = &weights.layers[layer];
@@ -166,29 +152,12 @@ pub fn forward<'a>(
         // 1. RMSNorm
         ops::rmsnorm_into(x, lw.attn_norm, xb, config.rms_norm_eps);
 
-        // DEBUG: Check RMSNorm output for layers 0-1, token 0
-        if pos == 0 && layer <= 1 {
-            let mut nan = 0u32;
-            let mut sum_sq = 0.0f32;
-            for i in 0..dim {
-                if xb[i].is_nan() { nan += 1; }
-                sum_sq += xb[i] * xb[i];
-            }
-            let rms = ops::fast_sqrt(sum_sq / dim as f32);
-            libfolk::println!("[FWD] L0 RMSNorm: NaN={} rms={:.6} xb[0]={:.6} xb[1]={:.6}", nan, rms, xb[0], xb[1]);
-        }
-
         // 2. Q/K/V projections (f32 activations × Q4_0 weights)
+        // Zero output buffers — GEMM uses += accumulation
+        for i in 0..n_heads * head_dim { q[i] = 0.0; }
+        for i in 0..kv_dim { k[i] = 0.0; v[i] = 0.0; }
         gemm::gemm_f32_x_q4(q, xb, lw.wq, 1, dim, n_heads * head_dim,
             FuseOp::None, yield_cfg.gemm_yield, arena);
-
-        // DEBUG: Check Q projection output for layers 0-1, token 0
-        if pos == 0 && layer <= 1 {
-            let mut nan = 0u32;
-            for i in 0..n_heads*head_dim { if q[i].is_nan() { nan += 1; } }
-            libfolk::println!("[FWD] L0 Q-proj: NaN={} q[0]={:.6} q[1]={:.6} q[63]={:.6}",
-                nan, q[0], q[1], q[63]);
-        }
         gemm::gemm_f32_x_q4(k, xb, lw.wk, 1, dim, kv_dim,
             FuseOp::None, yield_cfg.gemm_yield, arena);
         gemm::gemm_f32_x_q4(v, xb, lw.wv, 1, dim, kv_dim,
@@ -276,16 +245,6 @@ pub fn forward<'a>(
 
         // 5. Residual connection
         for i in 0..dim { x[i] += xb[i]; }
-
-        // DEBUG: Check for NaN after each layer (only for first token)
-        if pos == 0 && layer < 3 {
-            let mut nan = 0u32;
-            for i in 0..dim {
-                if x[i].is_nan() { nan += 1; }
-            }
-            libfolk::println!("[FWD] layer {} done: NaN={}/{} x[0]={:.6} x[1]={:.6}",
-                layer, nan, dim, x[0], x[1]);
-        }
     }
 
     // === Final norm + LM head ===
