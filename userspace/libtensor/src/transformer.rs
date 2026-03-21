@@ -144,6 +144,20 @@ pub fn forward<'a>(
     // Dequantize the embedding row for token_id from Q4_0
     embed_token(token_id as usize, config.vocab_size, dim, weights.token_embed, x);
 
+    // DEBUG: Check embedding for NaN
+    {
+        let mut nan = 0u32;
+        let mut zero = 0u32;
+        for i in 0..dim {
+            if x[i].is_nan() { nan += 1; }
+            if x[i] == 0.0 { zero += 1; }
+        }
+        if nan > 0 || pos == 0 {
+            libfolk::println!("[FWD] tok={} pos={} embed: NaN={} Zero={}/{} x[0]={:.6} x[1]={:.6}",
+                token_id, pos, nan, zero, dim, x[0], x[1]);
+        }
+    }
+
     // === Transformer layers ===
     for layer in 0..config.n_layers {
         let lw = &weights.layers[layer];
@@ -242,6 +256,16 @@ pub fn forward<'a>(
 
         // 5. Residual connection
         for i in 0..dim { x[i] += xb[i]; }
+
+        // DEBUG: Check for NaN after each layer (only for first token)
+        if pos == 0 && layer < 2 {
+            let mut nan = 0u32;
+            for i in 0..dim {
+                if x[i].is_nan() { nan += 1; }
+            }
+            libfolk::println!("[FWD] layer {} done: NaN={}/{} x[0]={:.6} x[1]={:.6}",
+                layer, nan, dim, x[0], x[1]);
+        }
     }
 
     // === Final norm + LM head ===

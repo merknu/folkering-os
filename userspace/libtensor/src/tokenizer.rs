@@ -6,14 +6,95 @@
 //! Key design decisions:
 //! - Scans vocab strings directly in GGUF mmap'd data (zero-copy)
 //! - Builds offset table in arena for O(1) token→string lookup
-//! - Converts ASCII space to ▁ (U+2581) before matching (ULTRA 29)
+//! - Uses GPT-2 byte encoding: raw bytes → Unicode chars for matching
 //! - Falls back to byte tokens <0xHH> for unmatched bytes
 
 use crate::arena::BumpArena;
 
-/// UTF-8 encoding of ▁ (U+2581, LOWER ONE EIGHTH BLOCK)
-/// Used as space prefix in LLaMA/SmolLM BPE vocabularies
-const SPIECE_UNDERLINE: [u8; 3] = [0xE2, 0x96, 0x81];
+// ============================================================================
+// GPT-2 Byte Encoding
+// ============================================================================
+//
+// SmolLM2 (and GPT-2 family) tokenizers use a byte-to-unicode mapping:
+// - Printable ASCII (33-126): unchanged (1-byte UTF-8)
+// - Latin-1 supplement (161-172, 174-255): unchanged (2-byte UTF-8)
+// - All other bytes (0-32, 127-160, 173): mapped to U+0100..U+0143
+//
+// Key examples:
+//   Space (0x20) → Ġ (U+0120, \xC4\xA0)
+//   Newline (0x0A) → Ċ (U+010A, \xC4\x8A)
+//   Tab (0x09) → ĉ (U+0109, \xC4\x89)
+
+/// Check if a byte is in the GPT-2 "printable" set (maps to itself).
+#[inline]
+fn is_gpt2_printable(b: u8) -> bool {
+    (b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174)
+}
+
+/// Encode a single raw byte to its GPT-2 UTF-8 representation.
+/// Returns (utf8_bytes, length) where length is 1 or 2.
+#[inline]
+fn gpt2_encode_byte(b: u8) -> ([u8; 2], usize) {
+    if is_gpt2_printable(b) {
+        if b < 128 {
+            // Printable ASCII: 1-byte UTF-8
+            return ([b, 0], 1);
+        } else {
+            // Latin-1 supplement: 2-byte UTF-8 encoding of codepoint = b
+            return ([0xC0 | (b >> 6), 0x80 | (b & 0x3F)], 2);
+        }
+    }
+    // Non-printable: compute index among non-printable bytes
+    let n: u16 = if b <= 32 {
+        b as u16
+    } else if b == 127 {
+        33
+    } else if b <= 160 {
+        34 + (b as u16 - 128)
+    } else {
+        // b == 173
+        34 + 33
+    };
+    let codepoint = 256 + n;
+    // 2-byte UTF-8 encoding: codepoints 256-323 → \xC4\x80..\xC5\x03
+    let utf8 = [0xC0 | ((codepoint >> 6) as u8), 0x80 | ((codepoint & 0x3F) as u8)];
+    (utf8, 2)
+}
+
+/// Decode a GPT-2 UTF-8 character back to a raw byte.
+/// Returns (raw_byte, bytes_consumed).
+#[inline]
+fn gpt2_decode_char(utf8: &[u8]) -> (u8, usize) {
+    if utf8.is_empty() {
+        return (0, 0);
+    }
+    if utf8[0] < 128 {
+        // ASCII: in GPT-2 printable set, maps to itself
+        return (utf8[0], 1);
+    }
+    if utf8.len() >= 2 && (utf8[0] & 0xE0) == 0xC0 {
+        let codepoint = ((utf8[0] as u16 & 0x1F) << 6) | (utf8[1] as u16 & 0x3F);
+        if codepoint >= 256 {
+            // Non-printable byte, reverse the mapping
+            let n = codepoint - 256;
+            let byte = if n <= 32 {
+                n as u8
+            } else if n == 33 {
+                127
+            } else if n <= 66 {
+                (128 + n - 34) as u8
+            } else {
+                173
+            };
+            return (byte, 2);
+        } else {
+            // Latin-1 supplement: codepoint = byte value
+            return (codepoint as u8, 2);
+        }
+    }
+    // 3+ byte UTF-8 or invalid: pass through first byte
+    (utf8[0], 1)
+}
 
 /// BPE Tokenizer operating on mmap'd GGUF vocabulary data.
 ///
@@ -113,7 +194,8 @@ impl<'a> BpeTokenizer<'a> {
     /// Encode text into token IDs using Greedy Longest Prefix Match.
     ///
     /// ULTRA 27: For each position, find the longest vocabulary token that matches.
-    /// ULTRA 29: ASCII spaces are converted to ▁ (U+2581) before matching.
+    /// Uses GPT-2 byte encoding: each raw input byte is converted to its GPT-2
+    /// Unicode representation before matching against vocabulary tokens.
     ///
     /// Returns the number of tokens written to `output`.
     pub fn encode(&self, text: &[u8], output: &mut [u32]) -> usize {
@@ -121,8 +203,6 @@ impl<'a> BpeTokenizer<'a> {
             return 0;
         }
 
-        // Pre-process: convert spaces to ▁ in a temporary buffer
-        // We'll work with the original text and handle space→▁ inline during matching
         let mut n_tokens = 0usize;
         let mut pos = 0usize;
 
@@ -130,17 +210,14 @@ impl<'a> BpeTokenizer<'a> {
             let mut best_id: u32 = u32::MAX;
             let mut best_len: usize = 0;
 
-            // Check if current position starts with a space
-            let at_space = text[pos] == b' ';
-
             for tok_id in 0..self.vocab_size {
                 let tok_bytes = self.token_bytes(tok_id as u32);
                 if tok_bytes.is_empty() {
                     continue;
                 }
 
-                // Try to match this token against text[pos..]
-                let matched_len = self.try_match(text, pos, tok_bytes, at_space);
+                // Try to match this token against text[pos..] using GPT-2 encoding
+                let matched_len = self.try_match_gpt2(text, pos, tok_bytes);
                 if matched_len > best_len {
                     best_len = matched_len;
                     best_id = tok_id as u32;
@@ -152,7 +229,8 @@ impl<'a> BpeTokenizer<'a> {
                 n_tokens += 1;
                 pos += best_len;
             } else {
-                // Byte fallback: find <0xHH> token for this byte
+                // Should not happen with GPT-2 encoding (every byte has a token),
+                // but fallback to byte token just in case
                 let byte_tok = self.find_byte_token(text[pos]);
                 output[n_tokens] = byte_tok;
                 n_tokens += 1;
@@ -165,41 +243,34 @@ impl<'a> BpeTokenizer<'a> {
 
     /// Try to match a vocab token against text at position `pos`.
     ///
-    /// Handles ULTRA 29: if the token starts with ▁ and text[pos] is a space,
-    /// match the ▁ against the space and continue matching the rest.
+    /// Uses GPT-2 byte encoding: each raw input byte is converted to its
+    /// GPT-2 Unicode representation (1-2 UTF-8 bytes) and compared against
+    /// the token's bytes. This correctly handles space→Ġ, newline→Ċ, etc.
     ///
-    /// Returns the number of bytes consumed from `text`, or 0 if no match.
+    /// Returns the number of raw input bytes consumed, or 0 if no match.
     #[inline]
-    fn try_match(&self, text: &[u8], pos: usize, tok: &[u8], at_space: bool) -> usize {
-        let remaining = text.len() - pos;
+    fn try_match_gpt2(&self, text: &[u8], pos: usize, tok: &[u8]) -> usize {
+        let mut text_pos = pos;
+        let mut tok_pos = 0;
 
-        // Case 1: Token starts with ▁ (3 bytes) and we're at a space
-        if at_space && tok.len() >= 3 && tok[0..3] == SPIECE_UNDERLINE {
-            // Match space against ▁, then match rest of token against text[pos+1..]
-            let tok_rest = &tok[3..];
-            let text_after_space = pos + 1;
-            if tok_rest.is_empty() {
-                // Token is just ▁ → matches single space
-                return 1;
-            }
-            if text_after_space + tok_rest.len() > text.len() {
+        while tok_pos < tok.len() && text_pos < text.len() {
+            let (encoded, enc_len) = gpt2_encode_byte(text[text_pos]);
+            let remaining_tok = tok.len() - tok_pos;
+            if remaining_tok < enc_len {
                 return 0;
             }
-            if &text[text_after_space..text_after_space + tok_rest.len()] == tok_rest {
-                return 1 + tok_rest.len(); // consumed: 1 space + rest
+            if tok[tok_pos..tok_pos + enc_len] != encoded[..enc_len] {
+                return 0;
             }
-            return 0;
+            tok_pos += enc_len;
+            text_pos += 1;
         }
 
-        // Case 2: Direct byte match
-        if tok.len() > remaining {
-            return 0;
+        if tok_pos == tok.len() {
+            text_pos - pos // number of raw input bytes consumed
+        } else {
+            0 // token not fully matched
         }
-        if &text[pos..pos + tok.len()] == tok {
-            return tok.len();
-        }
-
-        0
     }
 
     /// Find the byte fallback token for a given byte value.
@@ -241,7 +312,7 @@ impl<'a> BpeTokenizer<'a> {
 
     /// Decode token IDs back to UTF-8 text.
     ///
-    /// Writes decoded bytes to `output`, replacing ▁ with space.
+    /// Converts GPT-2 Unicode chars back to raw bytes.
     /// Returns number of bytes written.
     pub fn decode(&self, ids: &[u32], output: &mut [u8]) -> usize {
         let mut out_pos = 0;
@@ -249,18 +320,14 @@ impl<'a> BpeTokenizer<'a> {
         for &id in ids {
             let tok = self.token_bytes(id);
 
-            // Replace ▁ sequences with space
+            // Decode GPT-2 encoded bytes back to raw bytes
             let mut i = 0;
             while i < tok.len() && out_pos < output.len() {
-                if i + 3 <= tok.len() && tok[i..i + 3] == SPIECE_UNDERLINE {
-                    output[out_pos] = b' ';
-                    out_pos += 1;
-                    i += 3;
-                } else {
-                    output[out_pos] = tok[i];
-                    out_pos += 1;
-                    i += 1;
-                }
+                let (byte, consumed) = gpt2_decode_char(&tok[i..]);
+                if consumed == 0 { break; }
+                output[out_pos] = byte;
+                out_pos += 1;
+                i += consumed;
             }
         }
 

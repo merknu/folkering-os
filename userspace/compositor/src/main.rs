@@ -39,6 +39,18 @@ use libfolk::{entry, println};
 /// Virtual address for mapping shared memory received from shell
 const COMPOSITOR_SHMEM_VADDR: usize = 0x30000000;
 
+/// Virtual address for mapping TokenRing shmem (ULTRA 43: isolated from ask shmem)
+const RING_VADDR: usize = 0x32000000;
+
+/// Virtual address for query shmem to inference (ULTRA 43)
+const ASK_QUERY_VADDR: usize = 0x30000000;
+
+/// TokenRing header — must match inference-server's TokenRing layout (ULTRA 37, 40)
+/// [write_idx: AtomicU32, status: AtomicU32, _pad: [u32;2], data: [u8; 16368]]
+/// Total: 16384 bytes = 4 pages
+const RING_HEADER_SIZE: usize = 16;
+const RING_DATA_MAX: usize = 16368;
+
 /// Format a usize as a decimal string into buffer, return slice
 fn format_usize(n: usize, buf: &mut [u8; 16]) -> &str {
     if n == 0 {
@@ -668,6 +680,12 @@ fn main() -> ! {
     // ===== Clipboard buffer (Milestone 20) =====
     let mut clipboard_buf: [u8; 256] = [0; 256];
     let mut clipboard_len: usize = 0;
+
+    // ===== Async Inference / Token Streaming State =====
+    let mut inference_ring_handle: u32 = 0;     // shmem handle for TokenRing (0 = no active stream)
+    let mut inference_ring_read_idx: usize = 0;  // bytes already read from ring
+    let mut inference_win_id: u32 = 0;           // window receiving streamed tokens
+    let mut inference_query_handle: u32 = 0;     // query shmem handle (for cleanup)
 
     // Blinking caret state (toggles every ~500ms using uptime syscall)
     let mut caret_visible: bool = true;
@@ -2176,9 +2194,8 @@ fn main() -> ! {
                             }
                         }
                     } else if cmd_str.starts_with("ask ") || cmd_str.starts_with("infer ") {
-                        // AI inference command — full shmem-based inference request
+                        // AI inference command — async streaming via TokenRing
                         use libfolk::sys::inference;
-                        use libfolk::sys::{shmem_create, shmem_map, shmem_grant, shmem_unmap, shmem_destroy};
                         let query = if cmd_str.starts_with("ask ") {
                             &cmd_str[4..]
                         } else {
@@ -2187,65 +2204,72 @@ fn main() -> ! {
                         let query = query.trim();
                         if query.is_empty() {
                             win.push_line("Usage: ask <question>");
+                        } else if inference_ring_handle != 0 {
+                            // ULTRA 42: Already generating
+                            win.push_line("[AI is busy]");
                         } else {
                             match inference::ping() {
                                 Ok(has_model) => {
                                     if !has_model {
                                         win.push_line("[AI] No model loaded (stub mode)");
-                                        win.push_line("[AI] Pack a GGUF into virtio-data.img");
                                     } else {
-                                        win.push_line("[AI] Thinking...");
+                                        // Create TokenRing shmem (4 pages = 16KB)
+                                        let ring_ok = if let Ok(rh) = shmem_create(16384) {
+                                            let _ = shmem_grant(rh, inference::INFERENCE_TASK_ID);
+                                            // Create query shmem
+                                            let query_bytes = query.as_bytes();
+                                            if let Ok(qh) = shmem_create(4096) {
+                                                let _ = shmem_grant(qh, inference::INFERENCE_TASK_ID);
+                                                if shmem_map(qh, ASK_QUERY_VADDR).is_ok() {
+                                                    unsafe {
+                                                        let ptr = ASK_QUERY_VADDR as *mut u8;
+                                                        core::ptr::copy_nonoverlapping(
+                                                            query_bytes.as_ptr(), ptr, query_bytes.len()
+                                                        );
+                                                    }
+                                                    let _ = shmem_unmap(qh, ASK_QUERY_VADDR);
 
-                                        // Create shmem with query text
-                                        let query_bytes = query.as_bytes();
-                                        if let Ok(handle) = shmem_create(4096) {
-                                            let _ = shmem_grant(handle, inference::INFERENCE_TASK_ID);
-                                            const ASK_SHMEM: usize = 0x30000000;
-                                            if shmem_map(handle, ASK_SHMEM).is_ok() {
-                                                unsafe {
-                                                    let ptr = ASK_SHMEM as *mut u8;
-                                                    core::ptr::copy_nonoverlapping(
-                                                        query_bytes.as_ptr(), ptr, query_bytes.len()
-                                                    );
-                                                }
-                                                let _ = shmem_unmap(handle, ASK_SHMEM);
-
-                                                // Send ask request
-                                                match inference::ask(handle, query_bytes.len()) {
-                                                    Ok((out_shmem, out_len)) => {
-                                                        if out_len > 0 && out_shmem > 0 {
-                                                            if shmem_map(out_shmem, ASK_SHMEM).is_ok() {
-                                                                let resp = unsafe {
-                                                                    core::slice::from_raw_parts(
-                                                                        ASK_SHMEM as *const u8, out_len.min(4000)
-                                                                    )
-                                                                };
-                                                                if let Ok(text) = core::str::from_utf8(resp) {
-                                                                    // Split response into lines for terminal
-                                                                    for line in text.split('\n') {
-                                                                        if !line.is_empty() {
-                                                                            win.push_line(line);
-                                                                        }
-                                                                    }
-                                                                } else {
-                                                                    win.push_line("[AI] (non-UTF8 response)");
-                                                                }
-                                                                let _ = shmem_unmap(out_shmem, ASK_SHMEM);
+                                                    // Send async request
+                                                    match inference::ask_async(qh, query_bytes.len(), rh) {
+                                                        Ok(()) => {
+                                                            // Map ring for polling
+                                                            if shmem_map(rh, RING_VADDR).is_ok() {
+                                                                inference_ring_handle = rh;
+                                                                inference_ring_read_idx = 0;
+                                                                inference_win_id = win_id;
+                                                                inference_query_handle = qh;
+                                                                win.push_line("[AI] Thinking...");
+                                                                true
+                                                            } else {
+                                                                let _ = shmem_destroy(rh);
+                                                                let _ = shmem_destroy(qh);
+                                                                win.push_line("[AI] Ring map failed");
+                                                                false
                                                             }
-                                                            let _ = shmem_destroy(out_shmem);
-                                                        } else {
-                                                            win.push_line("[AI] (empty response)");
+                                                        }
+                                                        Err(_) => {
+                                                            let _ = shmem_destroy(rh);
+                                                            let _ = shmem_destroy(qh);
+                                                            win.push_line("[AI] Server busy or unavailable");
+                                                            false
                                                         }
                                                     }
-                                                    Err(_) => {
-                                                        win.push_line("[AI] Inference request failed");
-                                                    }
+                                                } else {
+                                                    let _ = shmem_destroy(rh);
+                                                    let _ = shmem_destroy(qh);
+                                                    win.push_line("[AI] Query map failed");
+                                                    false
                                                 }
+                                            } else {
+                                                let _ = shmem_destroy(rh);
+                                                win.push_line("[AI] Query alloc failed");
+                                                false
                                             }
-                                            let _ = shmem_destroy(handle);
                                         } else {
-                                            win.push_line("[AI] Failed to allocate shmem");
-                                        }
+                                            win.push_line("[AI] Ring alloc failed");
+                                            false
+                                        };
+                                        let _ = ring_ok; // suppress unused warning
                                     }
                                 }
                                 Err(_) => {
@@ -2912,7 +2936,54 @@ fn main() -> ! {
             Err(_) => {}
         }
 
-        // Only yield CPU if we did no work this iteration
+        // ===== Token Streaming: Poll TokenRing (ULTRA 37, 38, 46, 47) =====
+        if inference_ring_handle != 0 {
+            use core::sync::atomic::Ordering;
+            // Read ring header atomically
+            let ring_ptr = RING_VADDR as *const u32;
+            let write_idx_atomic = unsafe { &*(ring_ptr as *const core::sync::atomic::AtomicU32) };
+            let status_atomic = unsafe { &*((ring_ptr as *const core::sync::atomic::AtomicU32).add(1)) };
+
+            let new_write = write_idx_atomic.load(Ordering::Acquire) as usize;
+            if new_write > inference_ring_read_idx {
+                did_work = true;
+                // ULTRA 38: Batch-read ALL new bytes at once
+                let data_ptr = unsafe { (RING_VADDR as *const u8).add(RING_HEADER_SIZE) };
+                let new_data = unsafe {
+                    core::slice::from_raw_parts(
+                        data_ptr.add(inference_ring_read_idx),
+                        new_write - inference_ring_read_idx,
+                    )
+                };
+                // ULTRA 47: Data guaranteed valid UTF-8 by inference server
+                if let Some(win) = wm.get_window_mut(inference_win_id) {
+                    win.append_text(new_data);
+                    // ULTRA 38: dirty flag set by append_text, redraw in render cycle
+                }
+                inference_ring_read_idx = new_write;
+                need_redraw = true;
+            }
+
+            let status = status_atomic.load(Ordering::Acquire);
+            if status != 0 {
+                // DONE (1) or ERROR (2) — cleanup
+                did_work = true;
+                let _ = shmem_unmap(inference_ring_handle, RING_VADDR);
+                let _ = shmem_destroy(inference_ring_handle);
+                let _ = shmem_destroy(inference_query_handle);
+                inference_ring_handle = 0;
+                inference_query_handle = 0;
+                if let Some(win) = wm.get_window_mut(inference_win_id) {
+                    win.push_line(""); // new line after AI response
+                    if status == 2 {
+                        win.push_line("[AI] Error during generation");
+                    }
+                }
+                need_redraw = true;
+            }
+        }
+
+        // Only yield CPU if we did no work this iteration (ULTRA 46)
         if !did_work {
             yield_cpu();
         }

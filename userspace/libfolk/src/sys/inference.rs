@@ -34,6 +34,12 @@ pub const INFER_OP_STATUS: u64 = 2;
 /// Reply: (output_len << 32) | shmem_handle with answer
 pub const INFER_OP_ASK: u64 = 3;
 
+/// Async inference with token streaming (M43)
+/// Request: INFER_OP_ASK_ASYNC
+///   payload0: opcode[0:16] | query_shmem[16:32] | query_len[32:48] | ring_shmem[48:64]
+/// Reply: 0 = accepted, u64::MAX = busy/error
+pub const INFER_OP_ASK_ASYNC: u64 = 4;
+
 // ============================================================================
 // Error types
 // ============================================================================
@@ -142,4 +148,36 @@ pub fn ask(shmem_handle: u32, query_len: usize) -> Result<(u32, usize), InferErr
     }
 
     Ok((out_shmem, out_len))
+}
+
+/// Send an async inference request with token streaming.
+///
+/// Returns immediately. Tokens are streamed to the ring_shmem buffer.
+/// Compositor polls ring.write_idx (Acquire) and ring.status for completion.
+///
+/// # Arguments
+/// * `query_shmem` - Shmem handle containing query text (granted to Task 6)
+/// * `query_len` - Length of query in bytes
+/// * `ring_shmem` - Shmem handle for TokenRing (16KB, 4 pages, granted to Task 6)
+///
+/// # Returns
+/// * `Ok(())` - Request accepted, tokens will stream
+/// * `Err(InferError::ServiceUnavailable)` - Server busy or unavailable
+pub fn ask_async(query_shmem: u32, query_len: usize, ring_shmem: u32) -> Result<(), InferError> {
+    // Pack all values into payload0:
+    // opcode[0:16] | query_shmem[16:32] | query_len[32:48] | ring_shmem[48:64]
+    let request = INFER_OP_ASK_ASYNC
+        | ((query_shmem as u64) << 16)
+        | ((query_len as u64) << 32)
+        | ((ring_shmem as u64) << 48);
+
+    let ret = unsafe {
+        syscall3(SYS_IPC_SEND, INFERENCE_TASK_ID as u64, request, 0)
+    };
+
+    if ret == u64::MAX {
+        return Err(InferError::ServiceUnavailable);
+    }
+
+    Ok(())
 }

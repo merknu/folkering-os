@@ -134,7 +134,7 @@ unsafe fn gemm_dot_avx2(a_q8: &[u8], b_q4: &[u8], n_blocks: usize) -> f32 {
 
         // Load expanded Q4_0 as u8 and Q8_0 as i8 into AVX2 registers
         let va = _mm256_loadu_si256(q4_expanded.as_ptr() as *const __m256i);
-        let vb = _mm256_loadu_si256(a_q8[a_off + 4..].as_ptr() as *const __m256i);
+        let vb = _mm256_loadu_si256(a_q8[a_off + 2..].as_ptr() as *const __m256i);
 
         // u8 × i8 → i16 pairs with adjacent addition
         let prod16 = _mm256_maddubs_epi16(va, vb);
@@ -156,7 +156,7 @@ unsafe fn gemm_dot_avx2(a_q8: &[u8], b_q4: &[u8], n_blocks: usize) -> f32 {
         // Zero-point correction: subtract 8 * sum(q8_values)
         // Sum Q8_0 values
         let mut sum_q8 = 0i32;
-        let q8_vals = &a_q8[a_off + 4..a_off + 36];
+        let q8_vals = &a_q8[a_off + 2..a_off + 34];
         for i in 0..32 {
             sum_q8 += (q8_vals[i] as i8) as i32;
         }
@@ -280,14 +280,11 @@ pub fn gemm_f32_x_q8(
 
             for blk in 0..n_blocks {
                 let blk_offset = b_col_offset + blk * Q8_0_BLOCK_SIZE;
-                let scale = f32::from_le_bytes([
-                    b_q8[blk_offset], b_q8[blk_offset + 1],
-                    b_q8[blk_offset + 2], b_q8[blk_offset + 3],
-                ]);
+                let scale = quantize::q8_0_block_scale(&b_q8[blk_offset..]);
 
                 let a_base = blk * 32;
                 for i in 0..32 {
-                    let q_val = b_q8[blk_offset + 4 + i] as i8;
+                    let q_val = b_q8[blk_offset + 2 + i] as i8;
                     acc += a_row[a_base + i] * (q_val as f32) * scale;
                 }
             }

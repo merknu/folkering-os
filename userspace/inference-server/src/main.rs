@@ -45,6 +45,7 @@ pub const INFER_OP_PING: u64 = 0;
 pub const INFER_OP_GENERATE: u64 = 1;
 pub const INFER_OP_STATUS: u64 = 2;
 pub const INFER_OP_ASK: u64 = 3;
+pub const INFER_OP_ASK_ASYNC: u64 = 4;
 
 /// Bump arena size: 8MB for intermediate computation buffers
 const ARENA_SIZE: usize = 8 * 1024 * 1024;
@@ -55,9 +56,12 @@ const MAX_MODEL_SIZE: usize = 128 * 1024 * 1024;
 /// Virtual address for model mmap region
 const MODEL_MMAP_BASE: usize = 0x1_0000_0000;
 
-/// Virtual address for mapping request/response shmem
+/// Virtual address for mapping request/response shmem (ULTRA 43)
 /// Must not overlap with MMAP_BASE (0x4000_0000) region used by arena/KV-cache
 const INFER_SHMEM_VADDR: usize = 0x20000000;
+
+/// Virtual address for mapping TokenRing shmem (ULTRA 43: isolated from I/O shmem)
+const RING_SHMEM_VADDR: usize = 0x22000000;
 
 /// Maximum tokens to generate per request
 const MAX_GEN_TOKENS: usize = 64;
@@ -168,6 +172,11 @@ fn main() -> ! {
 
                                             has_model = true;
 
+                                            // ULTRA 39: Find ChatML stop token IDs
+                                            let im_end_id = find_token_id(&tok, b"<|im_end|>");
+                                            let im_start_id = find_token_id(&tok, b"<|im_start|>");
+                                            println!("[INFERENCE] ChatML tokens: im_end={}, im_start={}", im_end_id, im_start_id);
+
                                             // Store engine state — we transmute lifetimes to 'static
                                             // since the mmap'd data lives for the entire process
                                             engine = Some(InferenceEngine {
@@ -180,6 +189,9 @@ fn main() -> ! {
                                                 vocab_size: meta.vocab_size as usize,
                                                 bos_id: meta.bos_token_id,
                                                 eos_id: meta.eos_token_id,
+                                                im_end_id,
+                                                im_start_id,
+                                                is_generating: false,
                                             });
 
                                             println!("[INFERENCE] Model loaded successfully! Ready for inference.");
@@ -235,6 +247,16 @@ fn main() -> ! {
                             opcode == INFER_OP_ASK, &mut engine, &arena,
                         );
                     }
+                    INFER_OP_ASK_ASYNC => {
+                        // ULTRA 42 + async streaming: decode packed payload
+                        let query_shmem = ((msg.payload0 >> 16) & 0xFFFF) as u32;
+                        let query_len = ((msg.payload0 >> 32) & 0xFFFF) as usize;
+                        let ring_shmem = ((msg.payload0 >> 48) & 0xFFFF) as u32;
+                        handle_async_inference(
+                            msg.token, query_shmem, query_len, ring_shmem,
+                            &mut engine, &arena,
+                        );
+                    }
                     _ => {
                         let _ = reply_with_token(msg.token, u64::MAX, 0);
                     }
@@ -266,6 +288,11 @@ struct InferenceEngine {
     vocab_size: usize,
     bos_id: u32,
     eos_id: u32,
+    /// ULTRA 39: ChatML stop token IDs (u32::MAX = not found)
+    im_end_id: u32,
+    im_start_id: u32,
+    /// ULTRA 42: Reentrancy guard — true while generating
+    is_generating: bool,
 }
 
 /// Non-layer weight data extracted from GGUF.
@@ -500,6 +527,15 @@ fn handle_inference_request(
         println!("[INFERENCE] Query: ({} raw bytes)", prompt_len);
     }
 
+    // Wrap in ChatML template (ULTRA 41: system prompt injection)
+    let mut template_buf = [0u8; 2048];
+    let template_len = wrap_chat_template(&prompt_buf[..prompt_len], &mut template_buf);
+    if template_len > 0 {
+        println!("[INFERENCE] Chat template wrapped: {} bytes", template_len);
+        prompt_buf[..template_len].copy_from_slice(&template_buf[..template_len]);
+        prompt_len = template_len;
+    }
+
     let eng = engine.as_mut().unwrap();
     println!("[INFERENCE] Resetting KV-cache, building tokenizer...");
 
@@ -625,9 +661,12 @@ fn handle_inference_request(
             sample_with_penalties(logits, &gen_tokens[..gen_count], arena)
         };
 
-        // Check for EOS
-        if next_token == eng.eos_id {
-            println!("[INFERENCE] EOS at token {}", gen_idx);
+        // Check for EOS or ChatML stop tokens (ULTRA 39)
+        if next_token == eng.eos_id
+            || (eng.im_end_id != u32::MAX && next_token == eng.im_end_id)
+            || (eng.im_start_id != u32::MAX && next_token == eng.im_start_id)
+        {
+            println!("[INFERENCE] Stop token {} at gen {}", next_token, gen_idx);
             break;
         }
 
@@ -842,6 +881,326 @@ fn tcg_breathe() {
     for _ in 0..1000 {
         core::hint::spin_loop();
     }
+}
+
+// ============================================================================
+// TokenRing — shared memory streaming buffer (ULTRA 37, 40)
+// ============================================================================
+
+/// Token streaming ring buffer shared between inference server and compositor.
+/// ULTRA 37: AtomicU32 for write_idx and status (cross-task shared memory).
+/// ULTRA 40: LINEAR 16KB buffer — no wrapping, write_idx grows monotonically.
+#[repr(C)]
+struct TokenRing {
+    /// Bytes written so far (inference: Release, compositor: Acquire)
+    write_idx: core::sync::atomic::AtomicU32,
+    /// 0 = generating, 1 = done, 2 = error
+    status: core::sync::atomic::AtomicU32,
+    _pad: [u32; 2],
+    /// UTF-8 text data, linear (no wrapping)
+    data: [u8; 16368],
+}
+// Total: 16 + 16368 = 16384 bytes = 4 pages
+
+/// Maximum writable data in TokenRing (ULTRA 48: prevent overflow)
+const RING_DATA_MAX: usize = 16368;
+
+// ============================================================================
+// Chat Template (ULTRA 39, 41)
+// ============================================================================
+
+/// Wrap a user query in ChatML format with system prompt (ULTRA 41).
+/// Returns number of bytes written to output.
+fn wrap_chat_template(query: &[u8], output: &mut [u8]) -> usize {
+    // NOTE: Newline before <|im_end|> ensures greedy tokenizer doesn't merge
+    // the last text char with '<' (e.g. ".<" as a single token breaking <|im_end|>).
+    let sys = b"<|im_start|>system\nYou are Folkering OS, a helpful AI assistant.\n<|im_end|>\n";
+    let user_pre = b"<|im_start|>user\n";
+    let user_suf = b"\n<|im_end|>\n<|im_start|>assistant\n";
+
+    let total = sys.len() + user_pre.len() + query.len() + user_suf.len();
+    if total > output.len() {
+        return 0;
+    }
+
+    let mut pos = 0;
+    output[pos..pos + sys.len()].copy_from_slice(sys);
+    pos += sys.len();
+    output[pos..pos + user_pre.len()].copy_from_slice(user_pre);
+    pos += user_pre.len();
+    output[pos..pos + query.len()].copy_from_slice(query);
+    pos += query.len();
+    output[pos..pos + user_suf.len()].copy_from_slice(user_suf);
+    pos += user_suf.len();
+    pos
+}
+
+/// Find token ID for a specific string in the vocabulary (ULTRA 39).
+/// Returns u32::MAX if not found.
+fn find_token_id(tokenizer: &BpeTokenizer, needle: &[u8]) -> u32 {
+    for id in 0..tokenizer.vocab_size() {
+        if tokenizer.token_bytes(id as u32) == needle {
+            return id as u32;
+        }
+    }
+    u32::MAX
+}
+
+// ============================================================================
+// Async Inference Handler (Steg 3C)
+// ============================================================================
+
+/// Handle async inference request with token streaming via TokenRing.
+/// ULTRA 42: Rejects if already generating.
+/// ULTRA 37: Atomic writes to TokenRing.
+/// ULTRA 47: Only writes valid UTF-8 to ring.
+/// ULTRA 48: Graceful truncation at ring buffer limit.
+fn handle_async_inference(
+    token: CallerToken,
+    query_shmem: u32,
+    query_len: usize,
+    ring_shmem: u32,
+    engine: &mut Option<InferenceEngine>,
+    arena: &BumpArena,
+) {
+    use core::sync::atomic::Ordering;
+
+    // ULTRA 42: Reentrancy guard
+    if let Some(eng) = engine.as_ref() {
+        if eng.is_generating {
+            println!("[INFERENCE] BUSY — rejecting async request");
+            let _ = reply_with_token(token, u64::MAX, 0);
+            return;
+        }
+    }
+
+    if engine.is_none() {
+        let _ = reply_with_token(token, u64::MAX, 0);
+        return;
+    }
+
+    // Reply immediately to free compositor (0 = OK)
+    let _ = reply_with_token(token, 0, 0);
+
+    let eng = engine.as_mut().unwrap();
+    eng.is_generating = true;
+
+    // Read query from shmem
+    let mut prompt_buf = [0u8; 1024];
+    let mut prompt_len = 0usize;
+
+    if query_shmem > 0 && query_len > 0 {
+        match shmem_map(query_shmem, INFER_SHMEM_VADDR) {
+            Ok(()) => {
+                let copy_len = query_len.min(prompt_buf.len());
+                unsafe {
+                    let src = INFER_SHMEM_VADDR as *const u8;
+                    core::ptr::copy_nonoverlapping(src, prompt_buf.as_mut_ptr(), copy_len);
+                }
+                prompt_len = copy_len;
+                let _ = shmem_unmap(query_shmem, INFER_SHMEM_VADDR);
+            }
+            Err(_) => {
+                println!("[INFERENCE] async: shmem_map FAILED for query");
+            }
+        }
+    }
+
+    if prompt_len == 0 {
+        eng.is_generating = false;
+        return;
+    }
+
+    if let Ok(text) = core::str::from_utf8(&prompt_buf[..prompt_len]) {
+        println!("[INFERENCE] Async query: {}", text);
+    }
+
+    // Wrap in ChatML template (ULTRA 41)
+    let mut template_buf = [0u8; 2048];
+    let template_len = wrap_chat_template(&prompt_buf[..prompt_len], &mut template_buf);
+    if template_len > 0 {
+        prompt_buf[..template_len].copy_from_slice(&template_buf[..template_len]);
+        prompt_len = template_len;
+    }
+
+    // Map TokenRing shmem (ULTRA 43: at 0x22000000)
+    if shmem_map(ring_shmem, RING_SHMEM_VADDR).is_err() {
+        println!("[INFERENCE] async: ring shmem_map FAILED");
+        eng.is_generating = false;
+        return;
+    }
+
+    let ring = unsafe { &*(RING_SHMEM_VADDR as *mut TokenRing) };
+    // Initialize ring
+    ring.write_idx.store(0, Ordering::Release);
+    ring.status.store(0, Ordering::Release);
+
+    // Reset KV-cache and rebuild tokenizer
+    eng.kv_cache.reset();
+    arena.reset();
+
+    let tokenizer = match BpeTokenizer::new(
+        eng.model_data, eng.vocab_offset, eng.vocab_size,
+        eng.bos_id, eng.eos_id, arena,
+    ) {
+        Some(t) => t,
+        None => {
+            ring.status.store(2, Ordering::Release);
+            let _ = shmem_unmap(ring_shmem, RING_SHMEM_VADDR);
+            eng.is_generating = false;
+            return;
+        }
+    };
+
+    let arena_mark = arena.used();
+
+    // Tokenize
+    let mut input_tokens = [0u32; 512];
+    let n_prompt = tokenizer.encode(&prompt_buf[..prompt_len], &mut input_tokens[1..]);
+    input_tokens[0] = eng.bos_id;
+    let total_prompt = n_prompt + 1;
+    println!("[INFERENCE] Async tokenized: {} tokens", total_prompt);
+
+    // DEBUG: Log first 15 token IDs to verify chat template encoding
+    let debug_count = total_prompt.min(15);
+    for i in 0..debug_count {
+        let tid = input_tokens[i];
+        let tok_str = tokenizer.token_str(tid);
+        let display = if tok_str.len() > 20 { &tok_str[..20] } else { tok_str };
+        println!("[INFERENCE]   tok[{}] = {} \"{}\"", i, tid, display);
+    }
+    if total_prompt > 15 {
+        println!("[INFERENCE]   ... ({} more tokens)", total_prompt - 15);
+    }
+
+    let config = &eng.config;
+    let yield_cfg = YieldConfig::foreground();
+
+    let mut gen_tokens = [0u32; 128];
+    let mut gen_count = 0usize;
+    let mut last_logits_token: u32 = 0;
+
+    // Prefill
+    for i in 0..total_prompt {
+        arena.reset_to(arena_mark);
+        let (weights, _) = match build_weights_for_forward(eng, arena) {
+            Some(w) => w,
+            None => {
+                ring.status.store(2, Ordering::Release);
+                let _ = shmem_unmap(ring_shmem, RING_SHMEM_VADDR);
+                eng.is_generating = false;
+                return;
+            }
+        };
+        let logits = match forward(
+            input_tokens[i], i, config, &weights, &mut eng.kv_cache, arena, &yield_cfg,
+        ) {
+            Some(l) => l,
+            None => {
+                ring.status.store(2, Ordering::Release);
+                let _ = shmem_unmap(ring_shmem, RING_SHMEM_VADDR);
+                eng.is_generating = false;
+                return;
+            }
+        };
+        if i == total_prompt - 1 {
+            last_logits_token = sample_with_penalties(logits, &gen_tokens[..gen_count], arena);
+        }
+        if i % 4 == 0 { yield_cpu(); }
+        tcg_breathe();
+    }
+
+    println!("[INFERENCE] Async prefill done, streaming tokens...");
+
+    // Generation with streaming to TokenRing
+    let mut pos = total_prompt;
+    let mut write_idx: usize = 0;
+
+    for gen_idx in 0..MAX_GEN_TOKENS {
+        let next_token = if gen_idx == 0 {
+            last_logits_token
+        } else {
+            arena.reset_to(arena_mark);
+            let (weights, _) = match build_weights_for_forward(eng, arena) {
+                Some(w) => w,
+                None => break,
+            };
+            let logits = match forward(
+                gen_tokens[gen_count - 1], pos - 1, config, &weights, &mut eng.kv_cache, arena, &yield_cfg,
+            ) {
+                Some(l) => l,
+                None => break,
+            };
+            sample_with_penalties(logits, &gen_tokens[..gen_count], arena)
+        };
+
+        // Check for stop tokens (ULTRA 39)
+        if next_token == eng.eos_id
+            || (eng.im_end_id != u32::MAX && next_token == eng.im_end_id)
+            || (eng.im_start_id != u32::MAX && next_token == eng.im_start_id)
+        {
+            println!("[INFERENCE] Async stop token {} at gen {}", next_token, gen_idx);
+            break;
+        }
+
+        if gen_count < gen_tokens.len() {
+            gen_tokens[gen_count] = next_token;
+            gen_count += 1;
+        }
+
+        // Decode token to bytes
+        let mut tok_buf = [0u8; 64];
+        let tok_len = tokenizer.decode_token(next_token, &mut tok_buf);
+
+        if tok_len > 0 {
+            // ULTRA 48: Check ring buffer space before writing
+            if write_idx + tok_len >= RING_DATA_MAX {
+                println!("[INFERENCE] Ring buffer full at {} bytes", write_idx);
+                break;
+            }
+            // Write decoded bytes directly to ring
+            // Compositor uses from_utf8().unwrap_or("") for safe rendering (ULTRA 45)
+            unsafe {
+                let dst = (RING_SHMEM_VADDR as *mut u8)
+                    .add(16) // skip header (write_idx + status + _pad)
+                    .add(write_idx);
+                core::ptr::copy_nonoverlapping(
+                    tok_buf.as_ptr(), dst, tok_len
+                );
+            }
+            write_idx += tok_len;
+            // ULTRA 37: Release ordering so compositor sees data before updated index
+            ring.write_idx.store(write_idx as u32, Ordering::Release);
+        }
+
+        pos += 1;
+        yield_cpu();
+        tcg_breathe();
+
+        if gen_idx % 8 == 0 {
+            println!("[INFERENCE] Async gen {} tokens, {} bytes streamed", gen_idx + 1, write_idx);
+        }
+    }
+
+    // Mark done
+    ring.status.store(1, Ordering::Release);
+    let _ = shmem_unmap(ring_shmem, RING_SHMEM_VADDR);
+    eng.is_generating = false;
+
+    println!("[INFERENCE] Async generation complete: {} tokens, {} bytes", gen_count, write_idx);
+}
+
+/// Return the length of the longest valid UTF-8 prefix (ULTRA 47).
+fn valid_utf8_prefix_len(data: &[u8]) -> usize {
+    // Try from the full slice, shrinking by 1 byte at a time
+    let mut len = data.len();
+    while len > 0 {
+        if core::str::from_utf8(&data[..len]).is_ok() {
+            return len;
+        }
+        len -= 1;
+    }
+    0
 }
 
 /// Send a text response via shmem IPC

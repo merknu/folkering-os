@@ -10,9 +10,10 @@
 pub const Q4_0_BLOCK_SIZE: usize = 18; // 2 + 16
 pub const Q4_0_BLOCK_VALUES: usize = 32;
 
-/// Q8_0 block: 32 i8 values with f32 scale
-/// Layout: [f32 scale (4 bytes)][32 bytes of i8 values]
-pub const Q8_0_BLOCK_SIZE: usize = 36; // 4 + 32
+/// Q8_0 block: 32 i8 values with f16 scale
+/// Layout: [f16 scale (2 bytes)][32 bytes of i8 values]
+/// Matches GGML spec: `struct block_q8_0 { ggml_half d; int8_t qs[32]; }`
+pub const Q8_0_BLOCK_SIZE: usize = 34; // 2 + 32
 pub const Q8_0_BLOCK_VALUES: usize = 32;
 
 /// Dequantize a single Q4_0 block (32 values) into f32 output.
@@ -42,9 +43,9 @@ pub fn dequantize_q4_0_block(block: &[u8], out: &mut [f32]) {
 
 /// Dequantize a single Q8_0 block (32 values) into f32 output.
 ///
-/// Q8_0 format per block:
-/// - bytes [0..4]: f32 scale factor (little-endian)
-/// - bytes [4..36]: 32 signed i8 values
+/// Q8_0 format per block (GGML spec):
+/// - bytes [0..2]: f16 scale factor (IEEE 754 half-precision)
+/// - bytes [2..34]: 32 signed i8 values
 ///
 /// Dequantized value = i8_val * scale
 #[inline]
@@ -52,10 +53,10 @@ pub fn dequantize_q8_0_block(block: &[u8], out: &mut [f32]) {
     debug_assert!(block.len() >= Q8_0_BLOCK_SIZE);
     debug_assert!(out.len() >= Q8_0_BLOCK_VALUES);
 
-    let scale = f32::from_le_bytes([block[0], block[1], block[2], block[3]]);
+    let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
 
     for i in 0..32 {
-        out[i] = (block[4 + i] as i8) as f32 * scale;
+        out[i] = (block[2 + i] as i8) as f32 * scale;
     }
 }
 
@@ -84,9 +85,10 @@ pub fn quantize_f32_to_q8_0(input: &[f32], output: &mut [u8]) {
         let scale = if amax > 0.0 { amax / 127.0 } else { 0.0 };
         let inv_scale = if scale > 0.0 { 1.0 / scale } else { 0.0 };
 
-        // Write scale as f32
-        let scale_bytes = scale.to_le_bytes();
-        output[out_offset..out_offset + 4].copy_from_slice(&scale_bytes);
+        // Write scale as f16 (GGML spec)
+        let scale_f16 = f32_to_f16(scale);
+        let scale_bytes = scale_f16.to_le_bytes();
+        output[out_offset..out_offset + 2].copy_from_slice(&scale_bytes);
 
         // Quantize values
         for i in 0..32 {
@@ -101,9 +103,9 @@ pub fn quantize_f32_to_q8_0(input: &[f32], output: &mut [u8]) {
                 } else {
                     v as i8
                 };
-                output[out_offset + 4 + i] = q as u8;
+                output[out_offset + 2 + i] = q as u8;
             } else {
-                output[out_offset + 4 + i] = 0;
+                output[out_offset + 2 + i] = 0;
             }
         }
     }
@@ -118,13 +120,13 @@ pub fn q4_0_block_scale(block: &[u8]) -> f32 {
 /// Get scale factor from a Q8_0 block.
 #[inline]
 pub fn q8_0_block_scale(block: &[u8]) -> f32 {
-    f32::from_le_bytes([block[0], block[1], block[2], block[3]])
+    f16_to_f32(u16::from_le_bytes([block[0], block[1]]))
 }
 
 /// Get i8 values from a Q8_0 block (zero-copy).
 #[inline]
 pub fn q8_0_block_values(block: &[u8]) -> &[i8] {
-    unsafe { core::slice::from_raw_parts(block[4..36].as_ptr() as *const i8, 32) }
+    unsafe { core::slice::from_raw_parts(block[2..34].as_ptr() as *const i8, 32) }
 }
 
 /// Convert Q4_0 block values to u8 array (for integer GEMM).
@@ -221,8 +223,8 @@ pub fn dot_q4_0_q8_0_block(q4_block: &[u8], q8_block: &[u8]) -> f32 {
         let q4_lo = (byte & 0x0F) as i32;
         let q4_hi = ((byte >> 4) & 0x0F) as i32;
 
-        let q8_lo = (q8_block[4 + i * 2] as i8) as i32;
-        let q8_hi = (q8_block[4 + i * 2 + 1] as i8) as i32;
+        let q8_lo = (q8_block[2 + i * 2] as i8) as i32;
+        let q8_hi = (q8_block[2 + i * 2 + 1] as i8) as i32;
 
         sum_prod += q4_lo * q8_lo + q4_hi * q8_hi;
         sum_q8 += q8_lo + q8_hi;
