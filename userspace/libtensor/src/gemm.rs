@@ -233,17 +233,16 @@ pub fn gemm_f32_x_q4(
     yield_every: usize,
     arena: &BumpArena,
 ) {
+    // Quantize f32 activations to Q8_0, then use integer dot product
     let n_blocks_per_row = k / 32;
     let q8_row_size = n_blocks_per_row * Q8_0_BLOCK_SIZE;
     let total_q8_size = m * q8_row_size;
 
-    // Allocate Q8_0 buffer from arena
     let q8_buf = match arena.alloc_slice::<u8>(total_q8_size) {
         Some(buf) => buf,
-        None => return, // arena exhausted
+        None => return,
     };
 
-    // Quantize each row of activations
     for row in 0..m {
         let src = &a_f32[row * k..(row + 1) * k];
         let dst = &mut q8_buf[row * q8_row_size..(row + 1) * q8_row_size];

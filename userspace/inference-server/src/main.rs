@@ -1054,23 +1054,19 @@ fn handle_async_inference(
 
     let arena_mark = arena.used();
 
-    // Tokenize
-    let mut input_tokens = [0u32; 512];
-    let n_prompt = tokenizer.encode(&prompt_buf[..prompt_len], &mut input_tokens[1..]);
-    input_tokens[0] = eng.bos_id;
-    let total_prompt = n_prompt + 1;
-    println!("[INFERENCE] Async tokenized: {} tokens", total_prompt);
-
-    // DEBUG: Log first 15 token IDs to verify chat template encoding
-    let debug_count = total_prompt.min(15);
-    for i in 0..debug_count {
+    // === DETERMINISTIC ISOLATION TEST ===
+    // Hardcoded token IDs for: <|im_start|>user\nhello\n<|im_end|>\n<|im_start|>assistant\n
+    // Bypasses greedy tokenizer entirely to isolate tokenizer vs transformer bugs.
+    // BOS(1) + <|im_start|>(1) + user(4093) + \n(198) + hello(28120) + \n(198)
+    //        + <|im_end|>(2) + \n(198) + <|im_start|>(1) + Ġassistant(11173) + \n(198)
+    let input_tokens: [u32; 11] = [1, 1, 4093, 198, 28120, 198, 2, 198, 1, 11173, 198];
+    let total_prompt = 11;
+    println!("[INFERENCE] ISOLATION TEST: hardcoded {} tokens (bypassing tokenizer)", total_prompt);
+    for i in 0..total_prompt {
         let tid = input_tokens[i];
         let tok_str = tokenizer.token_str(tid);
         let display = if tok_str.len() > 20 { &tok_str[..20] } else { tok_str };
         println!("[INFERENCE]   tok[{}] = {} \"{}\"", i, tid, display);
-    }
-    if total_prompt > 15 {
-        println!("[INFERENCE]   ... ({} more tokens)", total_prompt - 15);
     }
 
     let config = &eng.config;
@@ -1103,8 +1099,26 @@ fn handle_async_inference(
                 return;
             }
         };
+        if i == 0 {
+            // Compare BOS-only logits with Python ref: argmax=28, max=19.90, range=-10.09..19.90
+            let am = argmax(logits);
+            println!("[REF-T0] argmax={} val={:.4} range={:.4}..{:.4}",
+                am, logits[am as usize],
+                logits.iter().cloned().fold(f32::MAX, f32::min),
+                logits.iter().cloned().fold(f32::MIN, f32::max));
+            println!("[REF-T0] logit[28]={:.4} logit[0]={:.4} logit[1]={:.4}",
+                logits[28], logits[0], logits[1]);
+        }
         if i == total_prompt - 1 {
-            last_logits_token = sample_with_penalties(logits, &gen_tokens[..gen_count], arena);
+            last_logits_token = argmax(logits);
+            // Compare full-prompt logits with Python ref
+            println!("[REF-CMP] argmax={} logit_max={:.4}", last_logits_token, logits[last_logits_token as usize]);
+            println!("[REF-CMP] Hello(19556)={:.4} You(2683)={:.4} Hi(26843)={:.4}",
+                logits[19556], logits[2683], logits[26843]);
+            println!("[REF-CMP] pecting(35986)={:.4} eos(0)={:.4} range={:.4}..{:.4}",
+                logits[35986], logits[0],
+                logits.iter().cloned().fold(f32::MAX, f32::min),
+                logits.iter().cloned().fold(f32::MIN, f32::max));
         }
         if i % 4 == 0 { yield_cpu(); }
         tcg_breathe();
@@ -1131,8 +1145,20 @@ fn handle_async_inference(
                 Some(l) => l,
                 None => break,
             };
-            sample_with_penalties(logits, &gen_tokens[..gen_count], arena)
+            // ISOLATION TEST: pure argmax, no sampling
+            argmax(logits)
         };
+
+        // ISOLATION TEST: Log each generated token
+        {
+            let mut tok_buf = [0u8; 32];
+            let tok_len = tokenizer.decode_token(next_token, &mut tok_buf);
+            if let Ok(s) = core::str::from_utf8(&tok_buf[..tok_len]) {
+                println!("[GEN] {} = {} \"{}\"", gen_idx, next_token, s);
+            } else {
+                println!("[GEN] {} = {} ({} bytes)", gen_idx, next_token, tok_len);
+            }
+        }
 
         // Check for stop tokens (ULTRA 39)
         if next_token == eng.eos_id

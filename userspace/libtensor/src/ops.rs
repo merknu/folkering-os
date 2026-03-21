@@ -178,7 +178,13 @@ pub fn rope_inplace(x: &mut [f32], head_dim: usize, pos: usize, rope_base: f32) 
     for h in 0..n_heads {
         let offset = h * head_dim;
         for i in 0..half_dim {
-            let freq = 1.0 / fast_powf(rope_base, (2 * i) as f32 / head_dim as f32);
+            // Use precise RoPE frequency: base^(-2i/d)
+            // Decompose: base^(2i/d) = exp(2i/d * ln(base))
+            // For rope_base=10000, ln(10000) ≈ 9.21034
+            // We compute this more precisely than fast_powf
+            let exponent = (2 * i) as f32 / head_dim as f32;
+            let ln_base = fast_ln(rope_base);
+            let freq = 1.0 / fast_exp(exponent * ln_base);
             let theta = pos as f32 * freq;
             let cos_t = fast_cos(theta);
             let sin_t = fast_sin(theta);

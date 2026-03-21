@@ -82,7 +82,7 @@ impl GgufDtype {
             Self::F16 => 2,
             Self::Q4_0 => 18,   // 32 values per block
             Self::Q4_1 => 20,
-            Self::Q8_0 => 36,   // 32 values per block
+            Self::Q8_0 => 34,   // 32 values per block (f16 scale + 32 i8)
             Self::Q8_1 => 40,
             _ => 0, // unsupported
         }
@@ -513,8 +513,12 @@ impl<'a> GgufModel<'a> {
         }
 
         // Align to data start (GGUF alignment, typically 32 bytes)
+        let pre_align = cursor.pos;
         cursor.align(32);
         let data_start = cursor.pos;
+        // DEBUG: log for data_start verification
+        // Correct data_start for SmolLM2-135M is 1786080
+        libfolk::println!("[GGUF] pre_align={} data_start={} (diff={})", pre_align, data_start, data_start - pre_align);
 
         // Create zero-copy tensor slices
         let mut tensors = Vec::with_capacity(tensor_count);

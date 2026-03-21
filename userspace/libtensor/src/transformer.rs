@@ -166,9 +166,29 @@ pub fn forward<'a>(
         // 1. RMSNorm
         ops::rmsnorm_into(x, lw.attn_norm, xb, config.rms_norm_eps);
 
+        // DEBUG: Check RMSNorm output for layer 0, token 0
+        if pos == 0 && layer == 0 {
+            let mut nan = 0u32;
+            let mut sum_sq = 0.0f32;
+            for i in 0..dim {
+                if xb[i].is_nan() { nan += 1; }
+                sum_sq += xb[i] * xb[i];
+            }
+            let rms = ops::fast_sqrt(sum_sq / dim as f32);
+            libfolk::println!("[FWD] L0 RMSNorm: NaN={} rms={:.6} xb[0]={:.6} xb[1]={:.6}", nan, rms, xb[0], xb[1]);
+        }
+
         // 2. Q/K/V projections (f32 activations × Q4_0 weights)
         gemm::gemm_f32_x_q4(q, xb, lw.wq, 1, dim, n_heads * head_dim,
             FuseOp::None, yield_cfg.gemm_yield, arena);
+
+        // DEBUG: Check Q projection output for layer 0, token 0
+        if pos == 0 && layer == 0 {
+            let mut nan = 0u32;
+            for i in 0..n_heads*head_dim { if q[i].is_nan() { nan += 1; } }
+            libfolk::println!("[FWD] L0 Q-proj: NaN={} q[0]={:.6} q[1]={:.6} q[63]={:.6}",
+                nan, q[0], q[1], q[63]);
+        }
         gemm::gemm_f32_x_q4(k, xb, lw.wk, 1, dim, kv_dim,
             FuseOp::None, yield_cfg.gemm_yield, arena);
         gemm::gemm_f32_x_q4(v, xb, lw.wv, 1, dim, kv_dim,
