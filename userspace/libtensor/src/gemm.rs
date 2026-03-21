@@ -231,25 +231,46 @@ pub fn gemm_f32_x_q4(
     n: usize,
     fuse: FuseOp,
     yield_every: usize,
-    arena: &BumpArena,
+    _arena: &BumpArena,
 ) {
-    // Quantize f32 activations to Q8_0, then use integer dot product
-    let n_blocks_per_row = k / 32;
-    let q8_row_size = n_blocks_per_row * Q8_0_BLOCK_SIZE;
-    let total_q8_size = m * q8_row_size;
-
-    let q8_buf = match arena.alloc_slice::<u8>(total_q8_size) {
-        Some(buf) => buf,
-        None => return,
-    };
+    // Direct f32 × dequant(Q4_0) — no Q8_0 quantization of activations.
+    // Eliminates Q8_0 roundtrip precision loss that accumulates across 30 layers.
+    let n_blocks = k / 32;
+    let q4_row_bytes = n_blocks * Q4_0_BLOCK_SIZE;
 
     for row in 0..m {
-        let src = &a_f32[row * k..(row + 1) * k];
-        let dst = &mut q8_buf[row * q8_row_size..(row + 1) * q8_row_size];
-        quantize::quantize_f32_to_q8_0(src, dst);
-    }
+        if yield_every > 0 && row > 0 && row % yield_every == 0 {
+            libfolk::sys::yield_cpu();
+        }
+        let a_row = &a_f32[row * k..(row + 1) * k];
 
-    gemm_q4_q8(c, q8_buf, b_q4, m, k, n, fuse, yield_every);
+        for col in 0..n {
+            let b_col_offset = col * q4_row_bytes;
+            let mut acc = 0.0f32;
+
+            for blk in 0..n_blocks {
+                let blk_start = b_col_offset + blk * Q4_0_BLOCK_SIZE;
+                let scale = quantize::q4_0_block_scale(&b_q4[blk_start..]);
+                let a_base = blk * 32;
+
+                for i in 0..16 {
+                    let byte = b_q4[blk_start + 2 + i];
+                    let lo = ((byte & 0x0F) as i8 - 8) as f32;
+                    let hi = (((byte >> 4) & 0x0F) as i8 - 8) as f32;
+                    acc += a_row[a_base + i * 2] * lo * scale;
+                    acc += a_row[a_base + i * 2 + 1] * hi * scale;
+                }
+            }
+
+            let idx = row * n + col;
+            c[idx] += acc;
+
+            match fuse {
+                FuseOp::SiLU => { c[idx] = crate::ops::silu_f32(c[idx]); }
+                FuseOp::None => {}
+            }
+        }
+    }
 }
 
 /// GEMM: f32 activations × Q8_0 weights → f32 output

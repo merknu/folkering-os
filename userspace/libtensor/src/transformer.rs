@@ -166,8 +166,8 @@ pub fn forward<'a>(
         // 1. RMSNorm
         ops::rmsnorm_into(x, lw.attn_norm, xb, config.rms_norm_eps);
 
-        // DEBUG: Check RMSNorm output for layer 0, token 0
-        if pos == 0 && layer == 0 {
+        // DEBUG: Check RMSNorm output for layers 0-1, token 0
+        if pos == 0 && layer <= 1 {
             let mut nan = 0u32;
             let mut sum_sq = 0.0f32;
             for i in 0..dim {
@@ -182,8 +182,8 @@ pub fn forward<'a>(
         gemm::gemm_f32_x_q4(q, xb, lw.wq, 1, dim, n_heads * head_dim,
             FuseOp::None, yield_cfg.gemm_yield, arena);
 
-        // DEBUG: Check Q projection output for layer 0, token 0
-        if pos == 0 && layer == 0 {
+        // DEBUG: Check Q projection output for layers 0-1, token 0
+        if pos == 0 && layer <= 1 {
             let mut nan = 0u32;
             for i in 0..n_heads*head_dim { if q[i].is_nan() { nan += 1; } }
             libfolk::println!("[FWD] L0 Q-proj: NaN={} q[0]={:.6} q[1]={:.6} q[63]={:.6}",
@@ -278,7 +278,7 @@ pub fn forward<'a>(
         for i in 0..dim { x[i] += xb[i]; }
 
         // DEBUG: Check for NaN after each layer (only for first token)
-        if pos == 0 && layer < 2 {
+        if pos == 0 && layer < 3 {
             let mut nan = 0u32;
             for i in 0..dim {
                 if x[i].is_nan() { nan += 1; }
