@@ -239,21 +239,23 @@ fn main() -> ! {
                         meta.context_length,
                         model.tensors.len(),
                     );
-                    println!("[INFERENCE] BOS={}, EOS={}, vocab_offset={}",
-                        meta.bos_token_id, meta.eos_token_id, meta.vocab_data_offset);
+                    println!("[INFERENCE] BOS={}, EOS={}, vocab_offset={}, merges={}",
+                        meta.bos_token_id, meta.eos_token_id, meta.vocab_data_offset, meta.merges_count);
 
                     // Step 5: Build ModelWeights
                     match build_model_weights(&model) {
                         Some((config, weights_data, layer_data)) => {
                             println!("[INFERENCE] ModelWeights built: {} layers mapped", config.n_layers);
 
-                            // Step 6: Build tokenizer (uses arena for offset table)
+                            // Step 6: Build tokenizer (uses arena for offset+merge tables)
                             let tokenizer = BpeTokenizer::new(
                                 model_slice,
                                 meta.vocab_data_offset,
                                 meta.vocab_size as usize,
                                 meta.bos_token_id,
                                 meta.eos_token_id,
+                                meta.merges_data_offset,
+                                meta.merges_count as usize,
                                 &arena,
                             );
 
@@ -298,6 +300,8 @@ fn main() -> ! {
                                                 vocab_size: meta.vocab_size as usize,
                                                 bos_id: meta.bos_token_id,
                                                 eos_id: meta.eos_token_id,
+                                                merges_offset: meta.merges_data_offset,
+                                                merges_count: meta.merges_count as usize,
                                                 im_end_id,
                                                 im_start_id,
                                                 is_generating: false,
@@ -397,6 +401,8 @@ struct InferenceEngine {
     vocab_size: usize,
     bos_id: u32,
     eos_id: u32,
+    merges_offset: usize,
+    merges_count: usize,
     /// ULTRA 39: ChatML stop token IDs (u32::MAX = not found)
     im_end_id: u32,
     im_start_id: u32,
@@ -662,6 +668,8 @@ fn handle_inference_request(
         eng.vocab_size,
         eng.bos_id,
         eng.eos_id,
+        eng.merges_offset,
+        eng.merges_count,
         arena,
     ) {
         Some(t) => t,
@@ -1154,7 +1162,7 @@ fn handle_async_inference(
 
     let tokenizer = match BpeTokenizer::new(
         eng.model_data, eng.vocab_offset, eng.vocab_size,
-        eng.bos_id, eng.eos_id, arena,
+        eng.bos_id, eng.eos_id, eng.merges_offset, eng.merges_count, arena,
     ) {
         Some(t) => t,
         None => {

@@ -1,10 +1,12 @@
-//! Minimal GGUF v3 parser — only extracts vocab metadata for tokenizer init.
+//! Minimal GGUF v3 parser — only extracts vocab + merges metadata for tokenizer init.
 
 pub struct VocabMeta {
     pub vocab_offset: usize,
     pub vocab_size: usize,
     pub bos_id: u32,
     pub eos_id: u32,
+    pub merges_offset: usize,
+    pub merges_count: usize,
 }
 
 pub fn parse(data: &[u8]) -> Option<VocabMeta> {
@@ -20,6 +22,8 @@ pub fn parse(data: &[u8]) -> Option<VocabMeta> {
     let mut eos_id: u32 = 2;
     let mut vocab_offset: usize = 0;
     let mut vocab_size: usize = 0;
+    let mut merges_offset: usize = 0;
+    let mut merges_count: usize = 0;
 
     // Parse metadata key-value pairs
     for _ in 0..n_metadata {
@@ -54,6 +58,22 @@ pub fn parse(data: &[u8]) -> Option<VocabMeta> {
                     pos = skip_value(data, pos, elem_type)?;
                 }
             }
+            "tokenizer.ggml.merges" => {
+                // Array of strings — BPE merge rules
+                if val_type != 9 {
+                    pos = skip_value(data, pos, val_type)?;
+                    continue;
+                }
+                let elem_type = u32_le(data, pos);
+                pos += 4;
+                let count = u64_le(data, pos) as usize;
+                pos += 8;
+                merges_count = count;
+                merges_offset = pos;
+                for _ in 0..count {
+                    pos = skip_value(data, pos, elem_type)?;
+                }
+            }
             _ => {
                 pos = skip_value(data, pos, val_type)?;
             }
@@ -67,7 +87,7 @@ pub fn parse(data: &[u8]) -> Option<VocabMeta> {
         return None;
     }
 
-    Some(VocabMeta { vocab_offset, vocab_size, bos_id, eos_id })
+    Some(VocabMeta { vocab_offset, vocab_size, bos_id, eos_id, merges_offset, merges_count })
 }
 
 fn u32_le(data: &[u8], pos: usize) -> u32 {

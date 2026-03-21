@@ -151,6 +151,10 @@ pub struct GgufMetadata {
     pub vocab_data_offset: usize,
     /// Byte offset in GGUF data where the scores float array starts
     pub scores_data_offset: usize,
+    /// Byte offset in GGUF data where the merges string array starts
+    pub merges_data_offset: usize,
+    /// Number of BPE merge rules
+    pub merges_count: u32,
 }
 
 /// Small inline string for metadata (avoids String allocation)
@@ -357,6 +361,8 @@ impl<'a> GgufModel<'a> {
             eos_token_id: 2,
             vocab_data_offset: 0,
             scores_data_offset: 0,
+            merges_data_offset: 0,
+            merges_count: 0,
         };
 
         for _ in 0..metadata_kv_count {
@@ -451,6 +457,21 @@ impl<'a> GgufModel<'a> {
                         cursor.pos += count * 4;
                         if cursor.pos > cursor.data.len() {
                             return Err(GgufError::TruncatedData);
+                        }
+                    } else {
+                        cursor.skip_value(vtype)?;
+                    }
+                }
+                "tokenizer.ggml.merges" => {
+                    // Array of strings — BPE merge rules (e.g. "Ġ t", "i n")
+                    // Index = merge rank (lower = higher priority)
+                    if vtype == 9 {
+                        let elem_type = cursor.read_u32()?;
+                        let count = cursor.read_u64()? as usize;
+                        metadata.merges_count = count as u32;
+                        metadata.merges_data_offset = cursor.pos;
+                        for _ in 0..count {
+                            cursor.skip_value(elem_type)?;
                         }
                     } else {
                         cursor.skip_value(vtype)?;

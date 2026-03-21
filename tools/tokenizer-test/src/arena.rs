@@ -51,4 +51,19 @@ impl BumpArena {
         }
         Some(slice)
     }
+
+    pub fn used(&self) -> usize {
+        let inner = unsafe { &*self.inner.get() };
+        inner.offset
+    }
+
+    pub fn reset_to(&self, mark: usize) {
+        let inner = unsafe { &mut *self.inner.get() };
+        inner.offset = mark;
+    }
+
+    #[allow(dead_code)]
+    pub fn reset(&self) {
+        self.reset_to(0);
+    }
 }

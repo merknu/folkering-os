@@ -36,16 +36,18 @@ fn main() {
             std::process::exit(1);
         });
 
-    eprintln!("Vocab: {} tokens, bos={}, eos={}, offset={}",
-        meta.vocab_size, meta.bos_id, meta.eos_id, meta.vocab_offset);
+    eprintln!("Vocab: {} tokens, bos={}, eos={}, offset={}, merges={}",
+        meta.vocab_size, meta.bos_id, meta.eos_id, meta.vocab_offset, meta.merges_count);
 
-    // Initialize arena (1MB — plenty for vocab tables: 49152 * 6 = 288KB)
-    let arena = arena::BumpArena::new(1024 * 1024);
+    // Initialize arena (4MB — vocab tables ~288KB + merge table ~782KB + hash table ~512KB)
+    let arena = arena::BumpArena::new(4 * 1024 * 1024);
 
-    // Initialize tokenizer
+    // Initialize tokenizer with BPE merge support
     let tok = tokenizer::BpeTokenizer::new(
         &gguf_data, meta.vocab_offset, meta.vocab_size,
-        meta.bos_id, meta.eos_id, &arena,
+        meta.bos_id, meta.eos_id,
+        meta.merges_offset, meta.merges_count,
+        &arena,
     ).unwrap_or_else(|| {
         eprintln!("Failed to initialize tokenizer");
         std::process::exit(1);
