@@ -1,64 +1,60 @@
 # Folkering OS
 
-**An AI-native operating system written from scratch in Rust.** Built on a microkernel architecture where AI agents are first-class citizens, not afterthoughts.
+**An AI-native operating system written from scratch in Rust.** Built on a microkernel architecture where AI inference is a first-class kernel service, not an afterthought.
 
-Folkering OS runs on bare-metal x86-64 hardware (via QEMU) with its own kernel, compositor, shell, filesystem, and IPC system. Applications describe their UI declaratively and the OS renders it — no GUI toolkit required.
+Folkering OS runs on bare-metal x86-64 hardware (via QEMU) with its own kernel, compositor, shell, filesystem, IPC system, and a complete on-device SLM inference engine. No libc, no POSIX, no Linux — pure `no_std` Rust from bootloader to token generation.
 
 ## What It Can Do Today
 
 ```
-folk> ls
-  synapse    38632
-  shell      17312
-  compositor 73920
-  hello.txt  25
+> ask hi
+[AI] Thinking...
+  <SmolLM2-135M generates 64 tokens in real-time>
 
-folk> cat hello.txt
-Hello from Folkering OS!
+> ai-status
+AI: model loaded
+Arena: 8MB
 
-folk> find shell
-Matches: 1
-  shell 17312
+> ls
+  synapse      51672
+  shell        48824
+  compositor  109944
+  inference    64944
+  files.db    253952
+  hello.txt       25
 
-folk> ps
-1 idle     Run
-2 synapse  Run
-3 shell    Blk
-4 compositor Blk
-5 intent-service Blk
-
-folk> app
-App received from Shell!
-  → [Folkering App] window with [OK] [Cancel] buttons
+> open calc
+  → [Calculator] WASM-powered app with button grid
 ```
 
 ## Architecture
 
-Five userspace services communicate via synchronous IPC over shared memory:
+Six userspace services communicate via synchronous IPC over shared memory:
 
 ```
                     +------------------+
                     |    Compositor    |  GPU framebuffer, window manager,
-                    |   (Task 4)      |  widget renderer, mouse/keyboard
-                    +--------+---------+
-                             |
-                    +--------+---------+
-                    |  Intent Service  |  Capability-based command routing
-                    |   (Task 5)      |
+                    |   (Task 4)      |  omnibar, terminal, mouse/keyboard
                     +--------+---------+
                              |
               +--------------+--------------+
               |                             |
      +--------+---------+         +--------+---------+
+     |  Intent Service  |         | Inference Server |
+     |   (Task 5)       |         |   (Task 6)       |
+     |  Command routing |         |  SLM, tokenizer  |
+     +--------+---------+         +------------------+
+              |                             |
+     +--------+---------+         +--------+---------+
      |      Shell       |         |     Synapse      |
      |   (Task 3)       |         |   (Task 2)       |
-     |  Commands, apps  |         |  SQLite, search  |
+     |  Commands, WASM  |         |  SQLite, VFS     |
      +------------------+         +------------------+
               |                             |
      +--------+-----------------------------+---------+
      |              Folkering Kernel                  |
-     |  SYSCALL/SYSRET, SWAPGS, FXSAVE, preemption  |
-     |  Page tables, shmem, mmap, IPC, scheduler     |
+     |  SYSCALL/SYSRET, preemptive scheduler, APIC   |
+     |  VirtIO DMA, shmem, mmap, IPC, page tables    |
      +------------------------------------------------+
 ```
 
@@ -82,12 +78,40 @@ w.vstack_begin(6, 3);
 
 Apps never touch pixels. Compositor renders. Shell weaves.
 
-### Semantic VFS
+### On-Device AI Inference
 
-Files live in a SQLite database inside the ramdisk. Synapse (the "data kernel") provides file listing, content reading, and text search — all via IPC:
+The inference engine runs as Task 6 — a dedicated userspace service with its own 8MB arena, KV-cache, and BPE tokenizer. The full pipeline:
 
 ```
-Compositor → Intent Service → Shell → Synapse → SQLite
+User types "ask hi" in Omnibar
+     │
+     ▼
+Compositor creates shmem with prompt text
+     │  IPC send (shmem handle + length)
+     ▼
+Inference Server (Task 6):
+  1. BPE tokenize (Greedy Prefix Match, ▁-aware)
+  2. Prepend BOS token
+  3. Prefill: N tokens × 30 layers forward pass
+  4. Generate: autoregressive loop (max 64 tokens)
+     - Q4_0/Q8_0 GEMM, RMSNorm, RoPE, SiLU-gated FFN
+     - KV-cache with sink-token eviction
+     - Top-P nucleus sampling + repetition penalty
+     - Logit clamping (ULTRA 31)
+  5. Write response to shmem, reply via IPC
+     │
+     ▼
+Compositor displays generated text in terminal window
+```
+
+Model: SmolLM2-135M-Instruct (Q4_0, 87MB) loaded from VirtIO disk via DMA bursting.
+
+### Semantic VFS
+
+Files live in a SQLite database on a VirtIO block device. Synapse (the "data kernel") provides file listing, content reading, and text search — all via IPC:
+
+```
+Compositor → Intent Service → Shell → Synapse → SQLite (VirtIO)
      ^                                              |
      └──── shmem results (zero-copy) ──────────────┘
 ```
@@ -109,25 +133,29 @@ shmem_unmap(handle, 0x30000000)?;      // unmap
 
 | Feature | Status | Details |
 |---------|--------|---------|
-| **Preemptive multitasking** | Done | Timer IRQ, RPL-checked, per-task context |
+| **Preemptive multitasking** | Done | Timer IRQ, priority scheduler, deadline support |
 | **SYSCALL/SYSRET** | Done | SWAPGS + CpuLocal per-CPU storage |
 | **FXSAVE/FXRSTOR** | Done | XMM/SSE state preserved across switches |
 | **Page tables** | Done | Per-task PML4, HHDM, user/kernel separation |
 | **Shared memory** | Done | Create, map, grant, unmap, destroy — correct page table |
-| **SYS_MMAP/MUNMAP** | Done | Anonymous pages, zero-filled, freed to PMM |
+| **SYS_MMAP/MUNMAP** | Done | Anonymous pages, chunked allocation (16MB/call) |
 | **IPC** | Done | Synchronous send/reply, async recv, CallerToken |
-| **I/O APIC** | Done | Keyboard + mouse interrupt routing |
+| **VirtIO block** | Done | DMA burst reads (64 sectors/request), FOLKDISK header |
+| **VirtIO network** | Done | DHCP, ICMP ping, DNS resolution |
+| **I/O APIC** | Done | Keyboard + mouse + VirtIO interrupt routing |
 | **Panic screen** | Done | Graphical panic with register dump, recursion guard |
 
 ## Userspace
 
 | Component | Purpose | Lines |
 |-----------|---------|-------|
-| **Compositor** | Window manager, widget renderer, omnibar, mouse/keyboard | ~1700 |
-| **Shell** | Command execution, app builder, IPC command handlers | ~1300 |
-| **Synapse** | SQLite parser, file cache, text search | ~1000 |
+| **Compositor** | Window manager, terminal, omnibar, mouse/keyboard | ~3000 |
+| **Inference Server** | GGUF model loading, tokenizer, transformer, sampling | ~1000 |
+| **Shell** | Command execution, WASM apps, IPC handlers | ~2400 |
+| **Synapse** | SQLite parser, file cache, VirtIO persistence | ~1100 |
 | **Intent Service** | Capability-based command routing | ~200 |
-| **libfolk** | Syscall wrappers, IPC, shmem, UI wire protocol | ~800 |
+| **libtensor** | Q4_0/Q8_0 GEMM, RMSNorm, RoPE, KV-cache, GGUF, BPE | ~2200 |
+| **libfolk** | Syscall wrappers, IPC, shmem, inference, UI protocol | ~1000 |
 | **libsqlite** | Custom no_std SQLite B-tree reader | ~500 |
 
 ## UI Wire Protocol
@@ -148,61 +176,78 @@ Zero-alloc serialization (`UiWriter`) and deserialization (`parse_widget`). No s
 ### Prerequisites
 
 - Rust nightly (x86_64-unknown-linux-gnu target)
-- WSL2 with Ubuntu (for cross-compilation)
+- WSL2 with Ubuntu (for cross-compilation and mtools)
 - QEMU x86_64
-- Python 3.12 (for MCP debug server)
+- Python 3.12 (for MCP servers)
 
 ### Quick Start
 
 ```bash
 # Build kernel + userspace + pack initrd + run QEMU
-# (via MCP server tools — see mcp/server.py)
+# (via MCP server tools — see folkering-mcp/server.py)
 folkering_rebuild_run()
 
 # Or manually:
 cd kernel && cargo build --release
-cd userspace && cargo build --release --target x86_64-folkering-userspace
-python tools/folk-pack create boot/initrd.fpk ...
+cd userspace && cargo build --release
+cd tools/folk-pack && cargo run --release -- create boot/initrd.fpk ...
 qemu-system-x86_64 -drive file=boot/current.img -serial file:serial.log -m 512M
 ```
 
-### MCP Debug Server
+### AI Model Setup
 
-Three tools for live debugging:
+```bash
+# Download SmolLM2-135M-Instruct Q4_0 (~87MB)
+curl -L -o boot/model.gguf \
+  "https://huggingface.co/amai-gsu/SmolLM2-135M-Instruct-Q4_0-GGUF/resolve/main/smollm2-135m-instruct-q4_0.gguf"
 
+# Pack model into VirtIO disk (ULTRA 26: 4KB-aligned)
+cd tools/folk-pack && cargo run --release -- pack-model boot/virtio-data.img boot/model.gguf
+```
+
+Model loads in ~45 seconds via multi-sector DMA bursting (ULTRA 36).
+
+### MCP Servers
+
+**folkering-os** (build/run/interact):
+- `folkering_rebuild_run` — full build→pack→boot cycle
+- `folkering_screenshot` — GUI capture via QMP
+- `folkering_interact` — scripted keyboard/mouse sequences
+
+**folkering-debug** (live debugging):
 - `kernel_symbol_lookup` — resolve hex addresses to function names
 - `serial_throttle_analyzer` — collapse loop patterns in serial logs
 - `qemu_inspect_registers` — live CPU state via QMP
 
 ## Roadmap
 
-### Completed
+### Epoch 1: Cognitive Infrastructure (Current)
 
 - [x] Phase 1-2: Kernel boot, PMM, paging, syscalls, user mode
 - [x] Phase 3-5: IPC, shmem, capability system
 - [x] Phase 6-8: Compositor, window manager, Neural Desktop
 - [x] Milestone 2.3: IPC+shmem architecture (page table fix)
-- [x] Milestone 3: Synapse SQLite integration, semantic search
-- [x] Milestone 4: Interactive terminal, SYS_MMAP/MUNMAP, App Weaver, button clicks
+- [x] Milestone 3: Synapse SQLite integration, semantic VFS
+- [x] Milestone 4: Interactive terminal, SYS_MMAP/MUNMAP, App Weaver
+- [x] M26-M30: VirtIO network, DHCP, DNS, ICMP ping, TLS 1.3
+- [x] M31-M32: GitHub API, JSON parser, clone-to-VFS
+- [x] **M33-M41: libtensor** — Q4_0/Q8_0 GEMM, RMSNorm, RoPE, SiLU, KV-cache, GGUF parser, BPE tokenizer, transformer forward pass
+- [x] **M42: First Words** — SmolLM2-135M generates tokens on bare metal
 
-### Next
+### Next: Epoch 1 Completion
 
-- [ ] **WASM Runtime**: Integrate wasmi for third-party apps
-- [ ] **Persistent Storage**: VirtIO block device driver
-- [ ] **Vector Search**: On-device embeddings for semantic file search
-- [ ] **SYS_DO_INTENT**: Declarative intent syscalls (Phase 13+ vision)
+- [ ] Token streaming (IPC per token for typewriter effect)
+- [ ] AVX2 GEMM acceleration (requires kernel XSAVE support)
+- [ ] Conversation context / multi-turn chat
+- [ ] Smaller model support (TinyStories-33M for faster iteration)
 
-## Phase 13+ Vision: The Agent-Native Paradigm
+### Epoch 2-3: Agent-Native Paradigm (Vision)
 
-Four concepts that define the long-term direction:
-
-1. **Zero-Boundary WASM UI** — AI-generated apps compile to WASM and run inside Compositor as plugins, eliminating IPC overhead for UI rendering.
-
-2. **Clairvoyant Paging** — Synapse pre-fetches pages to RAM before the user requests them, based on predictive patterns.
-
-3. **Immutable Semantic VFS** — The filesystem is an event-sourced log via SQLite. Files are never overwritten — changed via semantic diffs. Users can ask Synapse to "rewind" the filesystem to any point in time.
-
-4. **Declarative Intent Syscalls** — `SYS_DO_INTENT("save this as thumbnail")` — apps describe what they want, the OS figures out how.
+1. **MIMO State-Space Scheduling** — Replace priority schedulers with predictive state-space models
+2. **Generative Latent Memory** — Memory that reconstructs rather than retrieves
+3. **Hyperdimensional I/O** — Semantic device abstraction via high-dimensional vectors
+4. **Active Inference Immunity** — Security via free energy minimization, not signatures
+5. **Declarative Intent Syscalls** — `SYS_DO_INTENT("summarize this")` — apps describe intent, OS implements
 
 ## Author
 
