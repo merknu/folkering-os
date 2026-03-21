@@ -725,17 +725,15 @@ fn handle_inference_request(
 
         // On the last prefill token, we need the logits for generation
         if i == total_prompt - 1 {
-            // DUMP: prefill-final logits to debug mailbox (DISABLED — L1 attn_out dump on disk)
-            // debug_dump_logits(logits, "prefill_final_logits");
+            debug_dump_logits(logits, "prefill_final_logits");
 
             // Sample next token from these logits
             last_logits_token = sample_with_penalties(logits, &gen_tokens[..gen_count], arena);
         }
 
-        // DUMP: first token (BOS) logits — DISABLED, L1 attn_out dump on disk
-        // if i == 0 {
-        //     debug_dump_logits(logits, "bos_logits");
-        // }
+        if i == 0 {
+            debug_dump_logits(logits, "bos_logits");
+        }
 
         // ULTRA 28: yield periodically during prefill
         if i % 4 == 0 {
@@ -1175,11 +1173,6 @@ fn handle_async_inference(
     let mut input_tokens = [0u32; 512];
     let total_prompt = tokenizer.encode(&prompt_buf[..prompt_len], &mut input_tokens);
     println!("[INFERENCE] Async tokenized: {} tokens", total_prompt);
-    // Debug: print first 10 token IDs for verification
-    let dbg_n = total_prompt.min(10);
-    for i in 0..dbg_n {
-        println!("[INFERENCE]   token[{}] = {}", i, input_tokens[i]);
-    }
 
     let config = &eng.config;
     let yield_cfg = YieldConfig::foreground();
