@@ -1,0 +1,13 @@
+[package]
+name = "inference-server"
+version = "0.1.0"
+edition = "2021"
+description = "AI Inference Server for Folkering OS (Task 6)"
+
+[[bin]]
+name = "inference"
+path = "src/main.rs"
+
+[dependencies]
+libfolk = { path = "../libfolk" }
+libtensor = { path = "../libtensor" }

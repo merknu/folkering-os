@@ -65,6 +65,17 @@ pub const SHELL_OP_UPTIME: u64 = 0x84;
 /// Reply: (status << 32) | result_shmem_handle
 pub const SHELL_OP_EXEC: u64 = 0x85;
 
+/// Open an application by name hash
+/// Request: op | (name_hash << 8)
+/// Reply: (0x5549 << 48) | (ui_len << 32) | shmem_handle on success
+pub const SHELL_OP_OPEN_APP: u64 = 0x86;
+
+/// Inject saved app state into Shell (for boot recovery)
+/// Request: op | (shmem_handle << 16)
+/// Shmem contains 22 bytes: win_id(4) + display(8) + accumulator(8) + operator(1) + fresh_digit(1)
+/// Reply: (0x5549 << 48) | (ui_len << 32) | fkui_shmem_handle on success
+pub const SHELL_OP_INJECT_STATE: u64 = 0x87;
+
 // ============================================================================
 // Status Codes
 // ============================================================================

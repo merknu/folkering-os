@@ -22,6 +22,7 @@ pub const TAG_BUTTON: u8 = 0x02;
 pub const TAG_VSTACK: u8 = 0x03;
 pub const TAG_HSTACK: u8 = 0x04;
 pub const TAG_SPACER: u8 = 0x05;
+pub const TAG_TEXT_INPUT: u8 = 0x06;
 
 // ===== Serialization (no alloc) =====
 
@@ -85,6 +86,16 @@ impl<'a> UiWriter<'a> {
     pub fn spacer(&mut self, height: u16) {
         self.byte(TAG_SPACER);
         self.u16(height);
+    }
+
+    /// Write a TextInput widget
+    pub fn text_input(&mut self, placeholder: &str, action_id: u32, max_len: u8) {
+        let plen = placeholder.len().min(63);
+        self.byte(TAG_TEXT_INPUT);
+        self.byte(plen as u8);
+        self.u32(action_id);
+        self.byte(max_len.min(63));
+        self.bytes(&placeholder.as_bytes()[..plen]);
     }
 
     /// Get the number of bytes written
@@ -153,6 +164,7 @@ pub enum ParsedWidget<'a> {
     VStackBegin { spacing: u16, child_count: u8 },
     HStackBegin { spacing: u16, child_count: u8 },
     Spacer { height: u16 },
+    TextInput { placeholder: &'a str, action_id: u32, max_len: u8 },
 }
 
 /// Parse a single widget from bytes. Returns (widget, bytes_consumed).
@@ -197,6 +209,15 @@ pub fn parse_widget(buf: &[u8]) -> Option<(ParsedWidget<'_>, usize)> {
             if buf.len() < pos + 2 { return None; }
             let height = u16::from_le_bytes([buf[pos], buf[pos+1]]); pos += 2;
             Some((ParsedWidget::Spacer { height }, pos))
+        }
+        TAG_TEXT_INPUT => {
+            if buf.len() < pos + 6 { return None; }
+            let plen = buf[pos] as usize; pos += 1;
+            let action_id = u32::from_le_bytes([buf[pos], buf[pos+1], buf[pos+2], buf[pos+3]]); pos += 4;
+            let max_len = buf[pos]; pos += 1;
+            if buf.len() < pos + plen { return None; }
+            let placeholder = core::str::from_utf8(&buf[pos..pos+plen]).ok()?; pos += plen;
+            Some((ParsedWidget::TextInput { placeholder, action_id, max_len }, pos))
         }
         _ => None,
     }

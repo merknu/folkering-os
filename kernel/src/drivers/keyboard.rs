@@ -70,6 +70,12 @@ static SHIFT_PRESSED: AtomicBool = AtomicBool::new(false);
 /// Caps lock state
 static CAPS_LOCK: AtomicBool = AtomicBool::new(false);
 
+/// Alt key state
+static ALT_PRESSED: AtomicBool = AtomicBool::new(false);
+
+/// Ctrl key state
+static CTRL_PRESSED: AtomicBool = AtomicBool::new(false);
+
 /// Extended scancode prefix received (0xE0)
 static EXTENDED_PREFIX: AtomicBool = AtomicBool::new(false);
 
@@ -120,6 +126,9 @@ const SCANCODE_CAPS_LOCK: u8 = 0x3A;
 const SCANCODE_ESCAPE: u8 = 0x01;
 const SCANCODE_BACKSPACE: u8 = 0x0E;
 const SCANCODE_ENTER: u8 = 0x1C;
+const SCANCODE_ALT: u8 = 0x38;
+const SCANCODE_CTRL: u8 = 0x1D;
+const SCANCODE_F12: u8 = 0x58;
 
 /// Extended scancode prefix
 const SCANCODE_EXTENDED: u8 = 0xE0;
@@ -146,6 +155,11 @@ pub const KEY_ARROW_RIGHT: u8 = 0x83;
 pub const KEY_HOME: u8 = 0x84;
 pub const KEY_END: u8 = 0x85;
 pub const KEY_DELETE: u8 = 0x86;
+pub const KEY_SHIFT_TAB: u8 = 0x87;
+pub const KEY_ALT_TAB: u8 = 0x88;
+pub const KEY_CTRL_F12: u8 = 0x89;
+pub const KEY_CTRL_C: u8 = 0x8A;
+pub const KEY_CTRL_V: u8 = 0x8B;
 
 /// Initialize keyboard driver
 pub fn init() {
@@ -203,6 +217,7 @@ pub fn handle_interrupt() {
         return;
     }
 
+
     // Check if this is the extended prefix (0xE0)
     // Just ignore extended scancodes for now - they can cause issues
     if scancode == SCANCODE_EXTENDED {
@@ -244,6 +259,12 @@ pub fn handle_interrupt() {
         if released == SCANCODE_LSHIFT || released == SCANCODE_RSHIFT {
             SHIFT_PRESSED.store(false, Ordering::Relaxed);
         }
+        if released == SCANCODE_ALT {
+            ALT_PRESSED.store(false, Ordering::Relaxed);
+        }
+        if released == SCANCODE_CTRL {
+            CTRL_PRESSED.store(false, Ordering::Relaxed);
+        }
         return;
     }
 
@@ -258,7 +279,33 @@ pub fn handle_interrupt() {
             CAPS_LOCK.store(!current, Ordering::Relaxed);
             return;
         }
+        SCANCODE_ALT => {
+            ALT_PRESSED.store(true, Ordering::Relaxed);
+            return;
+        }
+        SCANCODE_CTRL => {
+            CTRL_PRESSED.store(true, Ordering::Relaxed);
+            return;
+        }
         _ => {}
+    }
+
+    // Ctrl+F12: emit special key code for UI dump
+    if scancode == SCANCODE_F12 && CTRL_PRESSED.load(Ordering::Relaxed) {
+        KEY_BUFFER.lock().push(KEY_CTRL_F12);
+        return;
+    }
+
+    // Ctrl+C: emit clipboard copy key code (scancode 0x2E = 'c')
+    if scancode == 0x2E && CTRL_PRESSED.load(Ordering::Relaxed) {
+        KEY_BUFFER.lock().push(KEY_CTRL_C);
+        return;
+    }
+
+    // Ctrl+V: emit clipboard paste key code (scancode 0x2F = 'v')
+    if scancode == 0x2F && CTRL_PRESSED.load(Ordering::Relaxed) {
+        KEY_BUFFER.lock().push(KEY_CTRL_V);
+        return;
     }
 
     // Convert scancode to ASCII
@@ -279,6 +326,18 @@ pub fn handle_interrupt() {
     } else {
         ascii
     };
+
+    // Special: Alt+Tab sends distinct keycode for window cycling
+    if ascii == b'\t' && ALT_PRESSED.load(Ordering::Relaxed) {
+        KEY_BUFFER.lock().push(KEY_ALT_TAB);
+        return;
+    }
+
+    // Special: Shift+Tab sends distinct keycode for reverse navigation
+    if ascii == b'\t' && shift {
+        KEY_BUFFER.lock().push(KEY_SHIFT_TAB);
+        return;
+    }
 
     // Push to buffer if valid
     if ascii != 0 {

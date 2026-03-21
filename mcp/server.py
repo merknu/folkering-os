@@ -38,6 +38,7 @@ _ELF_REGISTRY = {
     "compositor": PROJECT_ROOT / "userspace" / "target" / "x86_64-folkering-userspace" / "release" / "compositor",
     "shell":      PROJECT_ROOT / "userspace" / "target" / "x86_64-folkering-userspace" / "release" / "shell",
     "synapse":    PROJECT_ROOT / "userspace" / "target" / "x86_64-folkering-userspace" / "release" / "synapse",
+    "inference":  PROJECT_ROOT / "userspace" / "target" / "x86_64-folkering-userspace" / "release" / "inference",
 }
 # Where symbols live in memory (kernel is high-half, userspace is low)
 _ELF_RANGES = {
@@ -45,6 +46,7 @@ _ELF_RANGES = {
     "compositor": (0x200000,           0x4fffff),
     "shell":      (0x200000,           0x4fffff),
     "synapse":    (0x200000,           0x4fffff),
+    "inference":  (0x200000,           0x4fffff),
 }
 
 def _wsl_path(win_path: Path) -> str:

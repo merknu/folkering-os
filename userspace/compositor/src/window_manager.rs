@@ -77,6 +77,17 @@ pub enum UiWidget {
     Spacer {
         height: u16,
     },
+    /// Text input field — editable text with placeholder
+    TextInput {
+        placeholder: [u8; 64],
+        placeholder_len: usize,
+        action_id: u32,
+        max_len: u8,
+        // Mutable — compositor owns editing state
+        value: [u8; 64],
+        value_len: usize,
+        cursor_pos: usize,
+    },
 }
 
 impl UiWidget {
@@ -93,6 +104,29 @@ impl UiWidget {
         buf[..len].copy_from_slice(&label.as_bytes()[..len]);
         UiWidget::Button { label: buf, label_len: len, action_id, bg_color: bg, fg_color: fg }
     }
+
+    pub fn text_input(placeholder: &str, action_id: u32, max_len: u8) -> Self {
+        let mut buf = [0u8; 64];
+        let len = placeholder.len().min(63);
+        buf[..len].copy_from_slice(&placeholder.as_bytes()[..len]);
+        UiWidget::TextInput {
+            placeholder: buf,
+            placeholder_len: len,
+            action_id,
+            max_len: max_len.min(63),
+            value: [0u8; 64],
+            value_len: 0,
+            cursor_pos: 0,
+        }
+    }
+}
+
+// ===== Focusable Widget System (Milestone 16: TextInput) =====
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum FocusableKind {
+    Button { action_id: u32 },
+    TextInput { action_id: u32 },
 }
 
 // ===== Window =====
@@ -126,6 +160,8 @@ pub struct Window {
     pub input_buf: [u8; 128],
     pub input_len: usize,
     pub input_cursor: usize,
+    // Keyboard focus: index among all buttons (flattened), None = no focus
+    pub focused_widget: Option<usize>,
 }
 
 impl Window {
@@ -199,7 +235,7 @@ impl WindowManager {
             x, y,
             width, height,
             lines: Vec::new(),
-            widgets: Vec::new(),
+            widgets: Vec::with_capacity(32),
             kind: WindowKind::Terminal,
             owner_task: 0,
             visible: true,
@@ -210,6 +246,7 @@ impl WindowManager {
             input_buf: [0u8; 128],
             input_len: 0,
             input_cursor: 0,
+            focused_widget: None,
         };
         self.windows.push(win);
         self.focused_id = Some(id);
@@ -259,6 +296,25 @@ impl WindowManager {
             }
             // Content
             return Some((win.id, HitZone::Content));
+        }
+        None
+    }
+
+    /// Cycle focus to next window (Alt+Tab). Returns (title_buf, title_len) of newly focused window.
+    pub fn cycle_next_window(&mut self) -> Option<([u8; 32], usize)> {
+        if self.windows.len() < 2 { return None; }
+        // Move topmost visible window to the bottom of the stack
+        let last = self.windows.len() - 1;
+        if self.windows[last].visible {
+            let win = self.windows.remove(last);
+            self.windows.insert(0, win);
+        }
+        // Focus the new topmost visible window
+        for w in self.windows.iter().rev() {
+            if w.visible {
+                self.focused_id = Some(w.id);
+                return Some((w.title, w.title_len));
+            }
         }
         None
     }
@@ -317,6 +373,29 @@ fn draw_window(fb: &mut FramebufferView, win: &Window, focused: bool) {
     let wx = wx as usize;
     let wy = wy as usize;
     if wx + total_w > fb.width || wy + total_h > fb.height { return; }
+
+    // Drop shadow: dark semi-transparent band below and right of window
+    // Focused windows get a larger, more visible shadow for depth
+    let shadow_offset: usize = if focused { 6 } else { 3 };
+    let shadow_alpha: u8 = if focused { 120 } else { 60 };
+    // Bottom shadow
+    fb.fill_rect_alpha(
+        wx + shadow_offset,
+        wy + total_h,
+        total_w,
+        shadow_offset,
+        0x000000,
+        shadow_alpha,
+    );
+    // Right shadow
+    fb.fill_rect_alpha(
+        wx + total_w,
+        wy + shadow_offset,
+        shadow_offset,
+        total_h,
+        0x000000,
+        shadow_alpha,
+    );
 
     // Border color
     let border_col = rgb(fb, if focused { WIN_BORDER_FOCUSED } else { WIN_BORDER_UNFOCUSED });
@@ -418,12 +497,16 @@ fn draw_window(fb: &mut FramebufferView, win: &Window, focused: bool) {
     // Draw widgets for App windows (Milestone 4)
     if !win.widgets.is_empty() {
         let mut wy_cursor = if win.lines.is_empty() { content_y + 6 } else { text_y + 4 };
-        draw_widgets(fb, &win.widgets, content_x + 6, wy_cursor, content_w.saturating_sub(12), win_bg);
+        let mut focus_counter = 0;
+        draw_widgets(fb, &win.widgets, content_x + 6, wy_cursor, content_w.saturating_sub(12), win_bg, win.focused_widget, &mut focus_counter);
     }
 }
 
-/// Recursively render UI widgets
-fn draw_widgets(fb: &mut FramebufferView, widgets: &[UiWidget], x: usize, mut y: usize, max_w: usize, bg: u32) {
+/// Focus ring color (bright cyan)
+const FOCUS_RING_COLOR: u32 = 0x00CCFF;
+
+/// Recursively render UI widgets with optional keyboard focus highlight
+fn draw_widgets(fb: &mut FramebufferView, widgets: &[UiWidget], x: usize, mut y: usize, max_w: usize, bg: u32, focus_idx: Option<usize>, focus_counter: &mut usize) {
     for widget in widgets {
         match widget {
             UiWidget::Label { text, text_len, color } => {
@@ -435,23 +518,61 @@ fn draw_widgets(fb: &mut FramebufferView, widgets: &[UiWidget], x: usize, mut y:
                 let s = unsafe { core::str::from_utf8_unchecked(&label[..*label_len]) };
                 let btn_w = (*label_len * 8 + 16).min(max_w);
                 let btn_h = 16;
+                let is_focused = focus_idx == Some(*focus_counter);
+                *focus_counter += 1;
                 let btn_bg = rgb(fb, *bg_color);
                 let btn_fg = rgb(fb, *fg_color);
-                fb.fill_rect(x, y, btn_w, btn_h, btn_bg);
-                fb.draw_rect(x, y, btn_w, btn_h, btn_fg);
-                draw_str_small(fb, x + 8, y + 4, s, btn_fg, btn_bg);
+                if is_focused {
+                    fb.fill_rect(x, y, btn_w, btn_h, btn_fg);
+                    draw_str_small(fb, x + 8, y + 4, s, btn_bg, btn_fg);
+                    let focus_col = rgb(fb, FOCUS_RING_COLOR);
+                    fb.draw_rect(x.saturating_sub(1), y.saturating_sub(1), btn_w + 2, btn_h + 2, focus_col);
+                } else {
+                    fb.fill_rect(x, y, btn_w, btn_h, btn_bg);
+                    fb.draw_rect(x, y, btn_w, btn_h, btn_fg);
+                    draw_str_small(fb, x + 8, y + 4, s, btn_fg, btn_bg);
+                }
                 y += btn_h + 4;
+            }
+            UiWidget::TextInput { placeholder, placeholder_len, value, value_len, cursor_pos, .. } => {
+                let input_w = max_w.min(200);
+                let input_h = 16;
+                let is_focused = focus_idx == Some(*focus_counter);
+                *focus_counter += 1;
+
+                let border_col = if is_focused { rgb(fb, FOCUS_RING_COLOR) } else { rgb(fb, 0x556677) };
+                let field_bg = rgb(fb, 0x0a1520);
+
+                fb.fill_rect(x, y, input_w, input_h, field_bg);
+                fb.draw_rect(x, y, input_w, input_h, border_col);
+
+                if *value_len > 0 {
+                    let s = unsafe { core::str::from_utf8_unchecked(&value[..*value_len]) };
+                    draw_str_small(fb, x + 4, y + 4, s, rgb(fb, 0xFFFFFF), field_bg);
+                } else {
+                    let s = unsafe { core::str::from_utf8_unchecked(&placeholder[..*placeholder_len]) };
+                    draw_str_small(fb, x + 4, y + 4, s, rgb(fb, 0x667788), field_bg);
+                }
+
+                // Cursor (thin line when focused)
+                if is_focused {
+                    let cx = x + 4 + *cursor_pos * 8;
+                    if cx + 2 <= x + input_w {
+                        fb.fill_rect(cx, y + 2, 2, input_h - 4, rgb(fb, 0xFFFFFF));
+                    }
+                }
+                y += input_h + 4;
             }
             UiWidget::VStack { children, spacing } => {
                 for child in children {
-                    draw_widgets(fb, core::slice::from_ref(child), x, y, max_w, bg);
+                    draw_widgets(fb, core::slice::from_ref(child), x, y, max_w, bg, focus_idx, focus_counter);
                     y += widget_height(child) + *spacing as usize;
                 }
             }
             UiWidget::HStack { children, spacing } => {
                 let mut hx = x;
                 for child in children {
-                    draw_widgets(fb, core::slice::from_ref(child), hx, y, max_w, bg);
+                    draw_widgets(fb, core::slice::from_ref(child), hx, y, max_w, bg, focus_idx, focus_counter);
                     hx += widget_width(child) + *spacing as usize;
                 }
                 y += children.iter().map(widget_height).max().unwrap_or(12);
@@ -468,6 +589,7 @@ fn widget_height(w: &UiWidget) -> usize {
     match w {
         UiWidget::Label { .. } => 12,
         UiWidget::Button { .. } => 20,
+        UiWidget::TextInput { .. } => 20,
         UiWidget::Spacer { height } => *height as usize,
         UiWidget::VStack { children, spacing } => {
             children.iter().map(|c| widget_height(c) + *spacing as usize).sum::<usize>()
@@ -483,18 +605,205 @@ fn widget_width(w: &UiWidget) -> usize {
     match w {
         UiWidget::Label { text_len, .. } => *text_len * 8,
         UiWidget::Button { label_len, .. } => *label_len * 8 + 16,
+        UiWidget::TextInput { .. } => 200,
         UiWidget::Spacer { .. } => 0,
         _ => 100, // default
     }
 }
 
-/// Hit-test widgets to find clicked button's action_id.
-/// Returns Some(action_id) if a Button was clicked at (click_x, click_y).
+/// Count the number of Button widgets in the tree (recursively)
+pub fn count_buttons(widgets: &[UiWidget]) -> usize {
+    count_focusable(widgets)
+}
+
+/// Find action_id for the N-th button (0-indexed, depth-first order)
+pub fn nth_button_action_id(widgets: &[UiWidget], n: usize) -> Option<u32> {
+    match nth_focusable(widgets, n) {
+        Some(FocusableKind::Button { action_id }) => Some(action_id),
+        Some(FocusableKind::TextInput { action_id }) => Some(action_id),
+        None => None,
+    }
+}
+
+/// Count the number of focusable widgets (Button + TextInput) in the tree
+pub fn count_focusable(widgets: &[UiWidget]) -> usize {
+    let mut count = 0;
+    for w in widgets {
+        match w {
+            UiWidget::Button { .. } | UiWidget::TextInput { .. } => { count += 1; }
+            UiWidget::VStack { children, .. } | UiWidget::HStack { children, .. } => {
+                count += count_focusable(children);
+            }
+            _ => {}
+        }
+    }
+    count
+}
+
+/// Find the N-th focusable widget's kind (0-indexed, depth-first order)
+pub fn nth_focusable(widgets: &[UiWidget], n: usize) -> Option<FocusableKind> {
+    fn inner(widgets: &[UiWidget], target: usize, counter: &mut usize) -> Option<FocusableKind> {
+        for w in widgets {
+            match w {
+                UiWidget::Button { action_id, .. } => {
+                    if *counter == target { return Some(FocusableKind::Button { action_id: *action_id }); }
+                    *counter += 1;
+                }
+                UiWidget::TextInput { action_id, .. } => {
+                    if *counter == target { return Some(FocusableKind::TextInput { action_id: *action_id }); }
+                    *counter += 1;
+                }
+                UiWidget::VStack { children, .. } | UiWidget::HStack { children, .. } => {
+                    if let Some(kind) = inner(children, target, counter) { return Some(kind); }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+    let mut counter = 0;
+    inner(widgets, n, &mut counter)
+}
+
+/// Get a mutable reference to the N-th focusable widget (for text editing)
+pub fn nth_focusable_mut(widgets: &mut [UiWidget], n: usize) -> Option<&mut UiWidget> {
+    // Use raw pointer to work around nested borrow issues
+    fn inner(widgets: &mut [UiWidget], target: usize, counter: &mut usize) -> Option<*mut UiWidget> {
+        for w in widgets.iter_mut() {
+            match w {
+                UiWidget::Button { .. } | UiWidget::TextInput { .. } => {
+                    if *counter == target {
+                        return Some(w as *mut UiWidget);
+                    }
+                    *counter += 1;
+                }
+                UiWidget::VStack { children, .. } | UiWidget::HStack { children, .. } => {
+                    if let Some(ptr) = inner(children, target, counter) { return Some(ptr); }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+    let mut counter = 0;
+    let ptr = inner(widgets, n, &mut counter)?;
+    Some(unsafe { &mut *ptr })
+}
+
+/// Hit-test widgets to find focusable widget index at click position
+pub fn hit_test_focusable_index(widgets: &[UiWidget], x: usize, mut y: usize, click_x: usize, click_y: usize) -> Option<usize> {
+    fn inner(widgets: &[UiWidget], x: usize, y: &mut usize, click_x: usize, click_y: usize, counter: &mut usize) -> Option<usize> {
+        for widget in widgets {
+            match widget {
+                UiWidget::Label { .. } => { *y += 12; }
+                UiWidget::Button { label_len, .. } => {
+                    let btn_w = *label_len * 8 + 16;
+                    let btn_h = 16;
+                    if click_x >= x && click_x < x + btn_w && click_y >= *y && click_y < *y + btn_h {
+                        return Some(*counter);
+                    }
+                    *counter += 1;
+                    *y += btn_h + 4;
+                }
+                UiWidget::TextInput { .. } => {
+                    let input_w = 200;
+                    let input_h = 16;
+                    if click_x >= x && click_x < x + input_w && click_y >= *y && click_y < *y + input_h {
+                        return Some(*counter);
+                    }
+                    *counter += 1;
+                    *y += input_h + 4;
+                }
+                UiWidget::VStack { children, spacing } => {
+                    for child in children {
+                        if let Some(idx) = inner(core::slice::from_ref(child), x, y, click_x, click_y, counter) {
+                            return Some(idx);
+                        }
+                        *y += widget_height(child) + *spacing as usize;
+                    }
+                }
+                UiWidget::HStack { children, spacing } => {
+                    let mut hx = x;
+                    let save_y = *y;
+                    for child in children {
+                        *y = save_y;
+                        if let Some(idx) = inner(core::slice::from_ref(child), hx, y, click_x, click_y, counter) {
+                            return Some(idx);
+                        }
+                        hx += widget_width(child) + *spacing as usize;
+                    }
+                    *y = save_y + children.iter().map(widget_height).max().unwrap_or(0);
+                }
+                UiWidget::Spacer { height } => { *y += *height as usize; }
+            }
+        }
+        None
+    }
+    let mut counter = 0;
+    inner(widgets, x, &mut y, click_x, click_y, &mut counter)
+}
+
+/// Get text content from the N-th focusable widget (0-indexed, depth-first).
+/// TextInput → value, Button → label. Returns (buf, len).
+pub fn nth_focusable_text(widgets: &[UiWidget], n: usize) -> Option<([u8; 64], usize)> {
+    fn inner(widgets: &[UiWidget], target: usize, counter: &mut usize) -> Option<([u8; 64], usize)> {
+        for w in widgets {
+            match w {
+                UiWidget::TextInput { value, value_len, .. } => {
+                    if *counter == target {
+                        let mut buf = [0u8; 64];
+                        buf[..*value_len].copy_from_slice(&value[..*value_len]);
+                        return Some((buf, *value_len));
+                    }
+                    *counter += 1;
+                }
+                UiWidget::Button { label, label_len, .. } => {
+                    if *counter == target {
+                        let mut buf = [0u8; 64];
+                        let len = (*label_len).min(64);
+                        buf[..len].copy_from_slice(&label[..len]);
+                        return Some((buf, len));
+                    }
+                    *counter += 1;
+                }
+                UiWidget::VStack { children, .. } | UiWidget::HStack { children, .. } => {
+                    if let Some(result) = inner(children, target, counter) { return Some(result); }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+    let mut counter = 0;
+    inner(widgets, n, &mut counter)
+}
+
+/// Find the first Label widget's text content (depth-first).
+/// Used as fallback for copy when no widget is focused (e.g. Calc display).
+pub fn first_label_text(widgets: &[UiWidget]) -> Option<([u8; 64], usize)> {
+    for w in widgets {
+        match w {
+            UiWidget::Label { text, text_len, .. } => {
+                let mut buf = [0u8; 64];
+                buf[..*text_len].copy_from_slice(&text[..*text_len]);
+                return Some((buf, *text_len));
+            }
+            UiWidget::VStack { children, .. } | UiWidget::HStack { children, .. } => {
+                if let Some(result) = first_label_text(children) { return Some(result); }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Hit-test widgets to find clicked focusable widget's kind.
+/// Returns Some(FocusableKind) if a Button or TextInput was clicked.
 /// Coordinates are absolute screen coordinates.
-pub fn hit_test_widgets(widgets: &[UiWidget], mut x: usize, mut y: usize, click_x: usize, click_y: usize) -> Option<u32> {
+pub fn hit_test_widgets(widgets: &[UiWidget], x: usize, mut y: usize, click_x: usize, click_y: usize) -> Option<FocusableKind> {
     for widget in widgets {
         match widget {
-            UiWidget::Label { text_len, .. } => {
+            UiWidget::Label { .. } => {
                 y += 12;
             }
             UiWidget::Button { label_len, action_id, .. } => {
@@ -502,14 +811,23 @@ pub fn hit_test_widgets(widgets: &[UiWidget], mut x: usize, mut y: usize, click_
                 let btn_h = 16;
                 if click_x >= x && click_x < x + btn_w
                     && click_y >= y && click_y < y + btn_h {
-                    return Some(*action_id);
+                    return Some(FocusableKind::Button { action_id: *action_id });
                 }
                 y += btn_h + 4;
             }
+            UiWidget::TextInput { action_id, .. } => {
+                let input_w = 200;
+                let input_h = 16;
+                if click_x >= x && click_x < x + input_w
+                    && click_y >= y && click_y < y + input_h {
+                    return Some(FocusableKind::TextInput { action_id: *action_id });
+                }
+                y += input_h + 4;
+            }
             UiWidget::VStack { children, spacing } => {
                 for child in children {
-                    if let Some(id) = hit_test_widgets(core::slice::from_ref(child), x, y, click_x, click_y) {
-                        return Some(id);
+                    if let Some(kind) = hit_test_widgets(core::slice::from_ref(child), x, y, click_x, click_y) {
+                        return Some(kind);
                     }
                     y += widget_height(child) + *spacing as usize;
                 }
@@ -517,8 +835,8 @@ pub fn hit_test_widgets(widgets: &[UiWidget], mut x: usize, mut y: usize, click_
             UiWidget::HStack { children, spacing } => {
                 let mut hx = x;
                 for child in children {
-                    if let Some(id) = hit_test_widgets(core::slice::from_ref(child), hx, y, click_x, click_y) {
-                        return Some(id);
+                    if let Some(kind) = hit_test_widgets(core::slice::from_ref(child), hx, y, click_x, click_y) {
+                        return Some(kind);
                     }
                     hx += widget_width(child) + *spacing as usize;
                 }

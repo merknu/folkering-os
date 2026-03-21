@@ -19,6 +19,7 @@ pub mod dns;
 pub mod ping;
 pub mod random;
 pub mod time;
+pub mod inference;
 
 // Re-export commonly used functions at the sys level
 pub use task::{exit, yield_cpu, get_pid, spawn};

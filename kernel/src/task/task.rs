@@ -140,6 +140,10 @@ pub struct Task {
     pub cpu_time_used_ms: u64,       // Total CPU time used (for scheduling fairness)
     pub last_scheduled_ms: u64,      // Last time this was scheduled
 
+    // AI-Native scheduling fields
+    pub semantic_priority: u8,       // 0-255, Synapse can boost tasks dynamically (128 = neutral)
+    pub is_background_ai: bool,      // True for Synapse background work (vector embeddings, etc.)
+
     // Statistics fields
     pub stats: TaskStatistics,
 
@@ -365,6 +369,10 @@ impl Task {
             ptr::addr_of_mut!((*task_ptr).deadline_ms).write(None);
             ptr::addr_of_mut!((*task_ptr).cpu_time_used_ms).write(0);
             ptr::addr_of_mut!((*task_ptr).last_scheduled_ms).write(0);
+
+            // AI-Native scheduling
+            ptr::addr_of_mut!((*task_ptr).semantic_priority).write(128); // Neutral
+            ptr::addr_of_mut!((*task_ptr).is_background_ai).write(false);
 
             // Statistics
             let current_time = crate::timer::uptime_ms();

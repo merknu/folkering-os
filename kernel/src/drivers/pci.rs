@@ -22,6 +22,10 @@ pub const VIRTIO_VENDOR_ID: u16 = 0x1AF4;
 pub const VIRTIO_BLK_DEVICE_TRANSITIONAL: u16 = 0x1001;
 /// VirtIO block device (modern)
 pub const VIRTIO_BLK_DEVICE_MODERN: u16 = 0x1042;
+/// VirtIO network device (transitional)
+pub const VIRTIO_NET_DEVICE_TRANSITIONAL: u16 = 0x1000;
+/// VirtIO network device (modern)
+pub const VIRTIO_NET_DEVICE_MODERN: u16 = 0x1041;
 
 /// PCI device information
 #[derive(Clone, Debug)]
@@ -327,4 +331,12 @@ pub fn find_virtio_block() -> Option<PciDevice> {
     }
     // Fall back to transitional
     find_device(VIRTIO_VENDOR_ID, VIRTIO_BLK_DEVICE_TRANSITIONAL)
+}
+
+/// Find VirtIO network device (checks both transitional and modern IDs)
+pub fn find_virtio_net() -> Option<PciDevice> {
+    if let Some(dev) = find_device(VIRTIO_VENDOR_ID, VIRTIO_NET_DEVICE_MODERN) {
+        return Some(dev);
+    }
+    find_device(VIRTIO_VENDOR_ID, VIRTIO_NET_DEVICE_TRANSITIONAL)
 }

@@ -1086,6 +1086,61 @@ fn handle_embedding_count(_msg: AsyncIpcMessage) {
 /// Virtual address for write shmem mapping in Synapse
 const WRITE_SHMEM_VADDR: usize = 0x13000000;
 
+/// M12: Overwrite an existing BLOB in-place in SQLITE_STATE.data.
+/// Scans the "files" table for a record with matching name, then overwrites
+/// the data BLOB directly. Returns false if file not found or new data too large.
+fn overwrite_blob_inplace(name: &str, new_data: &[u8]) -> bool {
+    unsafe {
+        if !SQLITE_STATE.valid {
+            return false;
+        }
+        let db_data = &SQLITE_STATE.data[..SQLITE_STATE.size];
+        let db = match SqliteDb::open(db_data) {
+            Ok(db) => db,
+            Err(_) => return false,
+        };
+        let scanner = match db.table_scan("files") {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        for result in scanner {
+            if let Ok(record) = result {
+                if let Some(Value::Text(rec_name)) = record.get(1) {
+                    if rec_name == name {
+                        if let Some(Value::Blob(old_blob)) = record.get(4) {
+                            if new_data.len() > old_blob.len() {
+                                return false; // New data too large for in-place
+                            }
+                            // Calculate offset into SQLITE_STATE.data
+                            let base = SQLITE_STATE.data.as_ptr() as usize;
+                            let blob_ptr = old_blob.as_ptr() as usize;
+                            let offset = blob_ptr - base;
+                            // Overwrite in-place
+                            SQLITE_STATE.data[offset..offset + new_data.len()]
+                                .copy_from_slice(new_data);
+                            // Zero remaining bytes if new data is shorter
+                            if new_data.len() < old_blob.len() {
+                                for b in &mut SQLITE_STATE.data[offset + new_data.len()..offset + old_blob.len()] {
+                                    *b = 0;
+                                }
+                            }
+                            // Increment SQLite change counter (bytes 24..28, big-endian)
+                            let cc = u32::from_be_bytes([
+                                SQLITE_STATE.data[24], SQLITE_STATE.data[25],
+                                SQLITE_STATE.data[26], SQLITE_STATE.data[27],
+                            ]);
+                            let new_cc = cc.wrapping_add(1).to_be_bytes();
+                            SQLITE_STATE.data[24..28].copy_from_slice(&new_cc);
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Handle WRITE_FILE request
 /// Protocol: op | (shmem_handle << 16) | (total_size << 32)
 /// Shmem format: [name_len: u16 LE][name bytes][content bytes]
@@ -1144,9 +1199,26 @@ fn handle_write_file(msg: AsyncIpcMessage) {
             .any(|e| hash_name(e.name_str()) == name_hash)
     };
     if duplicate {
-        println!("[SYNAPSE] write_file: '{}' already exists", name);
+        // M12: In-place overwrite instead of rejecting
+        // Copy content AND name to local buffers before unmapping shmem
+        let mut ow_content = [0u8; 4096];
+        let ow_len = content.len().min(ow_content.len());
+        ow_content[..ow_len].copy_from_slice(&content[..ow_len]);
+        let mut ow_name_buf = [0u8; 64];
+        let ow_name_len = name_len.min(64);
+        ow_name_buf[..ow_name_len].copy_from_slice(&name_bytes[..ow_name_len]);
         let _ = shmem_unmap(shmem_handle, WRITE_SHMEM_VADDR);
-        let _ = reply(SYN_STATUS_ERROR, 0);
+
+        // Use local name copy — `name` pointed into now-unmapped shmem!
+        let ow_name = unsafe { core::str::from_utf8_unchecked(&ow_name_buf[..ow_name_len]) };
+        if overwrite_blob_inplace(ow_name, &ow_content[..ow_len]) {
+            println!("[SYNAPSE] write_file: '{}' overwritten in-place ({} bytes)", ow_name, ow_len);
+            flush_sqlite_to_disk();
+            let _ = reply(0, 0);
+        } else {
+            println!("[SYNAPSE] write_file: '{}' overwrite failed", ow_name);
+            let _ = reply(SYN_STATUS_ERROR, 0);
+        }
         return;
     }
 

@@ -7,10 +7,12 @@ pub mod elf;
 pub mod switch;
 pub mod statistics;
 pub mod preempt;
+pub mod preempt_lock;
 
 pub use scheduler::{init as scheduler_init, start as scheduler_start, enqueue, yield_cpu};
 pub use task::{Task, FXSAVE_CURRENT_PTR, FxsaveArea};
 pub use spawn::{spawn, spawn_raw, SpawnError};
+pub use preempt_lock::{preempt_disable, preempt_enable, is_preemption_enabled};
 pub use switch::{switch_to, init_context, init_user_context};
 pub use statistics::{
     record_context_switch,

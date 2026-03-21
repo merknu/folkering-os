@@ -21,7 +21,7 @@ extern crate alloc;
 
 use compositor::Compositor;
 use compositor::framebuffer::{FramebufferView, colors};
-use compositor::window_manager::{WindowManager, HitZone, BORDER_W, TITLE_BAR_H};
+use compositor::window_manager::{WindowManager, HitZone, BORDER_W, TITLE_BAR_H, UiWidget, WindowKind};
 use libfolk::sys::ipc::{receive, reply, recv_async, reply_with_token, send, IpcError};
 use libfolk::sys::boot_info::{get_boot_info, FramebufferConfig, BOOT_INFO_VADDR};
 use libfolk::sys::map_physical::{map_framebuffer, MapFlags};
@@ -29,7 +29,8 @@ use libfolk::sys::{yield_cpu, read_mouse, read_key, uptime, shmem_create, shmem_
 use libfolk::sys::io::{write_char, write_str};
 use libfolk::sys::shell::{
     SHELL_TASK_ID, SHELL_OP_LIST_FILES, SHELL_OP_CAT_FILE, SHELL_OP_SEARCH,
-    SHELL_OP_PS, SHELL_OP_UPTIME, SHELL_OP_EXEC,
+    SHELL_OP_PS, SHELL_OP_UPTIME, SHELL_OP_EXEC, SHELL_OP_OPEN_APP,
+    SHELL_OP_INJECT_STATE,
     SHELL_STATUS_NOT_FOUND, hash_name as shell_hash_name,
 };
 use libfolk::{entry, println};
@@ -57,6 +58,286 @@ fn format_usize(n: usize, buf: &mut [u8; 16]) -> &str {
         buf[j] = buf[16 - i + j];
     }
     unsafe { core::str::from_utf8_unchecked(&buf[..i]) }
+}
+
+/// ASCII case-insensitive prefix match: does `haystack` start with `needle`?
+fn format_arena_line<'a>(buf: &'a mut [u8; 32], kb: usize) -> &'a str {
+    let prefix = b"Arena: ";
+    let suffix = b"KB";
+    buf[..7].copy_from_slice(prefix);
+    let mut num_buf = [0u8; 16];
+    let num_str = format_usize(kb, &mut num_buf);
+    let num_bytes = num_str.as_bytes();
+    buf[7..7 + num_bytes.len()].copy_from_slice(num_bytes);
+    let end = 7 + num_bytes.len();
+    buf[end..end + 2].copy_from_slice(suffix);
+    unsafe { core::str::from_utf8_unchecked(&buf[..end + 2]) }
+}
+
+fn starts_with_ci(haystack: &str, needle: &str) -> bool {
+    if haystack.len() < needle.len() { return false; }
+    for (a, b) in haystack.bytes().zip(needle.bytes()) {
+        let la = if a >= b'A' && a <= b'Z' { a + 32 } else { a };
+        let lb = if b >= b'A' && b <= b'Z' { b + 32 } else { b };
+        if la != lb { return false; }
+    }
+    true
+}
+
+struct IntentEntry {
+    app: &'static str,
+    keywords: &'static [&'static str],
+}
+
+const INTENT_MAP: &[IntentEntry] = &[
+    IntentEntry {
+        app: "calc",
+        keywords: &[
+            "calc", "calculator", "kalkulator", "math", "matte",
+            "regn", "beregn", "compute", "tax", "skatt",
+            "add", "subtract", "multiply", "divide", "sum",
+            "budget", "prosent", "percent",
+        ],
+    },
+    IntentEntry {
+        app: "greet",
+        keywords: &[
+            "greet", "greeter", "hello", "hei", "hilsen", "name",
+        ],
+    },
+    IntentEntry {
+        app: "folkpad",
+        keywords: &[
+            "note", "folkpad", "pad", "notat", "skriv", "memo",
+        ],
+    },
+];
+
+/// Sjekk om input matcher en apps intent-keywords.
+/// Returnerer Some(app_name) ved match, None ellers.
+///
+/// Scoring:
+/// - Eksakt match (case-insensitive): +10 poeng
+/// - Prefix-match (word starts with kw, eller omvendt, kw.len()>=3): +kw.len() poeng
+/// - Terskel: score >= 4 for å matche
+fn try_intent_match(input: &str) -> Option<&'static str> {
+    let mut best_app: Option<&'static str> = None;
+    let mut best_score: usize = 0;
+
+    for entry in INTENT_MAP {
+        let mut score = 0usize;
+        for word in input.split(|c: char| !c.is_ascii_alphanumeric()) {
+            let w = word.trim();
+            if w.is_empty() { continue; }
+            for kw in entry.keywords {
+                if w.len() == kw.len() && starts_with_ci(w, kw) {
+                    // Eksakt match (case-insensitive)
+                    score += 10;
+                } else if kw.len() >= 3 && (starts_with_ci(w, kw) || starts_with_ci(kw, w)) {
+                    // Prefix-match
+                    score += kw.len();
+                }
+            }
+        }
+        if score > best_score {
+            best_score = score;
+            best_app = Some(entry.app);
+        }
+    }
+
+    if best_score >= 4 { best_app } else { None }
+}
+
+/// Emit UI state dump to serial as minified JSON between markers.
+/// Format: @@UI_DUMP@@{json}@@END_UI_DUMP@@
+/// All on one line to avoid kernel log interleaving breaking the JSON.
+fn emit_ui_dump(wm: &WindowManager, omnibar_visible: bool, text_buffer: &[u8], text_len: usize, cursor_pos: usize) {
+    // Use a stack-allocated buffer for the JSON string (4KB should be plenty)
+    let mut buf = [0u8; 4096];
+    let mut pos = 0;
+
+    buf_write(&mut buf, &mut pos, "{\"omnibar\":{\"visible\":");
+    if omnibar_visible { buf_write(&mut buf, &mut pos, "true"); } else { buf_write(&mut buf, &mut pos, "false"); }
+    if omnibar_visible && text_len > 0 {
+        buf_write(&mut buf, &mut pos, ",\"text\":\"");
+        buf_write_escaped(&mut buf, &mut pos, &text_buffer[..text_len]);
+        buf_write(&mut buf, &mut pos, "\",\"cursor\":");
+        buf_write_num(&mut buf, &mut pos, cursor_pos as u32);
+    }
+    buf_write(&mut buf, &mut pos, "},\"windows\":[");
+
+    let mut first_win = true;
+    for window in &wm.windows {
+        if !window.visible { continue; }
+        if !first_win { buf_write(&mut buf, &mut pos, ","); }
+        first_win = false;
+
+        buf_write(&mut buf, &mut pos, "{\"id\":");
+        buf_write_num(&mut buf, &mut pos, window.id);
+        buf_write(&mut buf, &mut pos, ",\"title\":\"");
+        if window.title_len > 0 {
+            buf_write_escaped(&mut buf, &mut pos, &window.title[..window.title_len]);
+        }
+        buf_write(&mut buf, &mut pos, "\"");
+
+        // focused?
+        if wm.focused_id == Some(window.id) {
+            buf_write(&mut buf, &mut pos, ",\"focused\":true");
+        }
+
+        // kind
+        buf_write(&mut buf, &mut pos, ",\"kind\":\"");
+        match window.kind {
+            WindowKind::Terminal => buf_write(&mut buf, &mut pos, "terminal"),
+            WindowKind::App => buf_write(&mut buf, &mut pos, "app"),
+        }
+        buf_write(&mut buf, &mut pos, "\"");
+
+        // Interactive terminal input
+        if window.interactive && window.input_len > 0 {
+            buf_write(&mut buf, &mut pos, ",\"input\":\"");
+            buf_write_escaped(&mut buf, &mut pos, &window.input_buf[..window.input_len]);
+            buf_write(&mut buf, &mut pos, "\"");
+        }
+
+        // Widgets
+        if !window.widgets.is_empty() {
+            buf_write(&mut buf, &mut pos, ",\"widgets\":[");
+            let mut first_w = true;
+            emit_widgets(&window.widgets, &mut buf, &mut pos, &mut first_w, window.focused_widget);
+            buf_write(&mut buf, &mut pos, "]");
+        }
+
+        // Terminal lines (last few)
+        if !window.lines.is_empty() {
+            buf_write(&mut buf, &mut pos, ",\"lines\":[");
+            // Only include last 5 lines to save space
+            let start = if window.lines.len() > 5 { window.lines.len() - 5 } else { 0 };
+            for (i, line) in window.lines[start..].iter().enumerate() {
+                if i > 0 { buf_write(&mut buf, &mut pos, ","); }
+                buf_write(&mut buf, &mut pos, "\"");
+                let line_len = line.len.min(line.buf.len());
+                buf_write_escaped(&mut buf, &mut pos, &line.buf[..line_len]);
+                buf_write(&mut buf, &mut pos, "\"");
+            }
+            buf_write(&mut buf, &mut pos, "]");
+        }
+
+        buf_write(&mut buf, &mut pos, "}");
+    }
+
+    buf_write(&mut buf, &mut pos, "],\"focused_id\":");
+    if let Some(fid) = wm.focused_id {
+        buf_write_num(&mut buf, &mut pos, fid);
+    } else {
+        buf_write(&mut buf, &mut pos, "null");
+    }
+    buf_write(&mut buf, &mut pos, "}");
+
+    // Write the complete dump atomically (as much as possible via write_str)
+    write_str("@@UI_DUMP@@");
+    // Write the JSON portion from buf
+    if let Ok(json_str) = core::str::from_utf8(&buf[..pos]) {
+        write_str(json_str);
+    }
+    write_str("@@END_UI_DUMP@@\n");
+}
+
+/// Write a string into a buffer at the given position, advancing pos
+fn buf_write(buf: &mut [u8], pos: &mut usize, s: &str) {
+    let bytes = s.as_bytes();
+    let end = (*pos + bytes.len()).min(buf.len());
+    let copy_len = end - *pos;
+    buf[*pos..*pos + copy_len].copy_from_slice(&bytes[..copy_len]);
+    *pos += copy_len;
+}
+
+/// Write a u32 as decimal into buffer
+fn buf_write_num(buf: &mut [u8], pos: &mut usize, n: u32) {
+    if n == 0 {
+        if *pos < buf.len() { buf[*pos] = b'0'; *pos += 1; }
+        return;
+    }
+    let mut digits = [0u8; 10];
+    let mut d = 0usize;
+    let mut val = n;
+    while val > 0 && d < 10 {
+        digits[9 - d] = b'0' + (val % 10) as u8;
+        val /= 10;
+        d += 1;
+    }
+    for j in (10 - d)..10 {
+        if *pos < buf.len() { buf[*pos] = digits[j]; *pos += 1; }
+    }
+}
+
+/// Write a byte slice as JSON-escaped string content into buffer
+fn buf_write_escaped(buf: &mut [u8], pos: &mut usize, data: &[u8]) {
+    for &b in data {
+        if b == b'"' || b == b'\\' {
+            if *pos < buf.len() { buf[*pos] = b'\\'; *pos += 1; }
+        }
+        if *pos < buf.len() { buf[*pos] = b; *pos += 1; }
+    }
+}
+
+/// Recursively emit widget JSON into buffer
+fn emit_widgets(widgets: &[UiWidget], buf: &mut [u8], pos: &mut usize, first: &mut bool, focused_idx: Option<usize>) {
+    for widget in widgets {
+        if !*first { buf_write(buf, pos, ","); }
+        *first = false;
+
+        match widget {
+            UiWidget::Label { text, text_len, .. } => {
+                buf_write(buf, pos, "{\"type\":\"label\",\"text\":\"");
+                let len = (*text_len).min(text.len());
+                buf_write_escaped(buf, pos, &text[..len]);
+                buf_write(buf, pos, "\"}");
+            }
+            UiWidget::Button { label, label_len, action_id, .. } => {
+                buf_write(buf, pos, "{\"type\":\"button\",\"label\":\"");
+                let len = (*label_len).min(label.len());
+                buf_write_escaped(buf, pos, &label[..len]);
+                buf_write(buf, pos, "\",\"action_id\":");
+                buf_write_num(buf, pos, *action_id);
+                buf_write(buf, pos, "}");
+            }
+            UiWidget::TextInput { placeholder, placeholder_len, value, value_len, cursor_pos, action_id, .. } => {
+                buf_write(buf, pos, "{\"type\":\"textinput\",\"placeholder\":\"");
+                let plen = (*placeholder_len).min(placeholder.len());
+                buf_write_escaped(buf, pos, &placeholder[..plen]);
+                buf_write(buf, pos, "\",\"value\":\"");
+                let vlen = (*value_len).min(value.len());
+                buf_write_escaped(buf, pos, &value[..vlen]);
+                buf_write(buf, pos, "\",\"cursor\":");
+                buf_write_num(buf, pos, *cursor_pos as u32);
+                buf_write(buf, pos, ",\"action_id\":");
+                buf_write_num(buf, pos, *action_id);
+                buf_write(buf, pos, "}");
+            }
+            UiWidget::VStack { children, spacing } => {
+                buf_write(buf, pos, "{\"type\":\"vstack\",\"spacing\":");
+                buf_write_num(buf, pos, *spacing as u32);
+                buf_write(buf, pos, ",\"children\":[");
+                let mut child_first = true;
+                emit_widgets(children, buf, pos, &mut child_first, focused_idx);
+                buf_write(buf, pos, "]}");
+            }
+            UiWidget::HStack { children, spacing } => {
+                buf_write(buf, pos, "{\"type\":\"hstack\",\"spacing\":");
+                buf_write_num(buf, pos, *spacing as u32);
+                buf_write(buf, pos, ",\"children\":[");
+                let mut child_first = true;
+                emit_widgets(children, buf, pos, &mut child_first, focused_idx);
+                buf_write(buf, pos, "]}");
+            }
+            UiWidget::Spacer { height } => {
+                buf_write(buf, pos, "{\"type\":\"spacer\",\"height\":");
+                buf_write_num(buf, pos, *height as u32);
+                buf_write(buf, pos, "}");
+            }
+        }
+    }
 }
 
 /// Format uptime in ms as "Xm Ys" or "Xs" string
@@ -307,12 +588,13 @@ fn main() -> ! {
     let omnibar_bg = fb.color_from_rgb24(0x1a1a2e);
     let omnibar_border = folk_accent;
 
-    // Draw the omnibar immediately (visible by default)
-    fb.fill_rect(omnibar_x.saturating_sub(2), omnibar_y.saturating_sub(2), omnibar_w + 4, omnibar_h + 4, dark_gray);
-    fb.fill_rect(omnibar_x, omnibar_y, omnibar_w, omnibar_h, omnibar_bg);
+    // Draw the glass omnibar immediately (visible by default)
+    let omnibar_alpha: u8 = 180;
+    fb.fill_rect_alpha(omnibar_x.saturating_sub(2), omnibar_y.saturating_sub(2), omnibar_w + 4, omnibar_h + 4, 0x333333, omnibar_alpha / 2);
+    fb.fill_rect_alpha(omnibar_x, omnibar_y, omnibar_w, omnibar_h, omnibar_bg, omnibar_alpha);
     fb.draw_rect(omnibar_x, omnibar_y, omnibar_w, omnibar_h, omnibar_border);
-    fb.draw_string(omnibar_x + 12, omnibar_y + 12, "Type here...", gray, omnibar_bg);
-    fb.draw_string(omnibar_x + omnibar_w - 24, omnibar_y + 12, ">", folk_accent, omnibar_bg);
+    fb.draw_string_alpha(omnibar_x + 12, omnibar_y + 12, "Type here...", gray, 0x1a1a2e, omnibar_alpha);
+    fb.draw_string_alpha(omnibar_x + omnibar_w - 24, omnibar_y + 12, ">", folk_accent, 0x1a1a2e, omnibar_alpha);
 
     // Hint text below omnibar
     let hint = "Type and press Enter | ESC to clear";
@@ -378,6 +660,15 @@ fn main() -> ! {
     let mut show_results: bool = false;
     let mut omnibar_visible: bool = true;  // Start VISIBLE by default
 
+    // Alt+Tab HUD state
+    let mut hud_title: [u8; 32] = [0; 32];
+    let mut hud_title_len: usize = 0;
+    let mut hud_show_until: u64 = 0;  // uptime ms when HUD should disappear
+
+    // ===== Clipboard buffer (Milestone 20) =====
+    let mut clipboard_buf: [u8; 256] = [0; 256];
+    let mut clipboard_len: usize = 0;
+
     // Blinking caret state (toggles every ~500ms using uptime syscall)
     let mut caret_visible: bool = true;
     let mut last_caret_flip_ms: u64 = 0;
@@ -422,11 +713,145 @@ fn main() -> ! {
         }
     }
 
+    // ===== M12: Restore saved app states from previous session =====
+    const RESTORE_FKUI_VADDR: usize = COMPOSITOR_SHMEM_VADDR + 0x1000;
+    const RESTORE_INJECT_VADDR: usize = COMPOSITOR_SHMEM_VADDR + 0x2000;
+    {
+        if let Ok(resp) = libfolk::sys::synapse::read_file_shmem("app_states.dat") {
+            if shmem_map(resp.shmem_handle, COMPOSITOR_SHMEM_VADDR).is_ok() {
+                let state_buf = unsafe {
+                    core::slice::from_raw_parts(COMPOSITOR_SHMEM_VADDR as *const u8, resp.size as usize)
+                };
+                let count = state_buf[0] as usize;
+                if count > 0 && count <= 8 {
+                    write_str("[WM] Restoring ");
+                    let mut nbuf = [0u8; 16];
+                    write_str(format_usize(count, &mut nbuf));
+                    write_str(" app(s) from previous session\n");
+
+                    // Copy state data to local buffer before unmapping
+                    let mut local_states = [0u8; 1 + 8 * 22];
+                    let copy_len = (1 + count * 22).min(local_states.len());
+                    local_states[..copy_len].copy_from_slice(&state_buf[..copy_len]);
+
+                    let _ = shmem_unmap(resp.shmem_handle, COMPOSITOR_SHMEM_VADDR);
+                    let _ = shmem_destroy(resp.shmem_handle);
+
+                    for i in 0..count {
+                        let off = 1 + i * 22;
+                        let mut entry_bytes = [0u8; 22];
+                        entry_bytes.copy_from_slice(&local_states[off..off + 22]);
+
+                        // Step 1: Load calc.fkui from VFS
+                        if let Ok(fkui_resp) = libfolk::sys::synapse::read_file_shmem("calc.fkui") {
+                            if shmem_map(fkui_resp.shmem_handle, RESTORE_FKUI_VADDR).is_ok() {
+                                let fkui_buf = unsafe {
+                                    core::slice::from_raw_parts(RESTORE_FKUI_VADDR as *const u8, 4096)
+                                };
+                                if let Some(header) = libfolk::ui::parse_header(fkui_buf) {
+                                    let wc = wm.windows.len() as i32;
+                                    let app_id = wm.create_terminal(
+                                        header.title,
+                                        120 + wc * 30, 100 + wc * 30,
+                                        header.width as u32, header.height as u32,
+                                    );
+
+                                    // Step 2: Overwrite entry with NEW win_id
+                                    entry_bytes[0..4].copy_from_slice(&(app_id as u32).to_le_bytes());
+
+                                    // Step 3: Create shmem for inject payload and send to Shell
+                                    if let Ok(inject_handle) = shmem_create(4096) {
+                                        let _ = shmem_grant(inject_handle, SHELL_TASK_ID);
+                                        if shmem_map(inject_handle, RESTORE_INJECT_VADDR).is_ok() {
+                                            let dst = unsafe {
+                                                core::slice::from_raw_parts_mut(
+                                                    RESTORE_INJECT_VADDR as *mut u8, 22
+                                                )
+                                            };
+                                            dst.copy_from_slice(&entry_bytes);
+                                            let _ = shmem_unmap(inject_handle, RESTORE_INJECT_VADDR);
+                                        }
+
+                                        // Send INJECT_STATE to Shell via Intent Service
+                                        let shell_payload = SHELL_OP_INJECT_STATE
+                                            | ((inject_handle as u64) << 16);
+                                        let intent_req = libfolk::sys::intent::INTENT_OP_SUBMIT
+                                            | (shell_payload << 8);
+                                        let ipc_result = unsafe {
+                                            libfolk::syscall::syscall3(
+                                                libfolk::syscall::SYS_IPC_SEND,
+                                                libfolk::sys::intent::INTENT_TASK_ID as u64,
+                                                intent_req, 0
+                                            )
+                                        };
+
+                                        // Step 4: Shell returns FKUI shmem with correct display
+                                        let magic = (ipc_result >> 48) as u16;
+                                        if magic == 0x5549 {
+                                            let ui_handle = (ipc_result & 0xFFFFFFFF) as u32;
+                                            if shmem_map(ui_handle, RESTORE_INJECT_VADDR).is_ok() {
+                                                let ui_buf = unsafe {
+                                                    core::slice::from_raw_parts(
+                                                        RESTORE_INJECT_VADDR as *const u8, 4096
+                                                    )
+                                                };
+                                                if let Some(ui_hdr) = libfolk::ui::parse_header(ui_buf) {
+                                                    if let Some(app_win) = wm.get_window_mut(app_id) {
+                                                        app_win.kind = compositor::window_manager::WindowKind::App;
+                                                        app_win.owner_task = SHELL_TASK_ID;
+                                                        app_win.widgets.clear();
+                                                        let (root, _) = parse_widget_tree(ui_hdr.widget_data);
+                                                        if let Some(widget) = root {
+                                                            app_win.widgets.push(widget);
+                                                        }
+                                                    }
+                                                }
+                                                let _ = shmem_unmap(ui_handle, RESTORE_INJECT_VADDR);
+                                            }
+                                            let _ = shmem_destroy(ui_handle);
+                                        }
+                                        let _ = shmem_destroy(inject_handle);
+                                    }
+
+                                    write_str("[WM] Restored app window\n");
+                                }
+                                let _ = shmem_unmap(fkui_resp.shmem_handle, RESTORE_FKUI_VADDR);
+                            }
+                            let _ = shmem_destroy(fkui_resp.shmem_handle);
+                        }
+                    }
+
+                    // Force redraw after restore
+                    wm.composite(&mut fb);
+                    write_str("[WM] App state restore complete\n");
+                } else {
+                    let _ = shmem_unmap(resp.shmem_handle, COMPOSITOR_SHMEM_VADDR);
+                    let _ = shmem_destroy(resp.shmem_handle);
+                }
+            } else {
+                let _ = shmem_destroy(resp.shmem_handle);
+            }
+        }
+        // No saved state or empty — normal boot, no error
+    }
+
     loop {
         // Track if we did any work this iteration
         let mut did_work = false;
         // Consolidated redraw flag — any subsystem can set this
         let mut need_redraw = false;
+
+        // Check if Alt+Tab HUD has expired — clear HUD area and trigger redraw
+        if hud_show_until > 0 && uptime() >= hud_show_until {
+            // Clear the HUD area before resetting state
+            let old_hud_w = hud_title_len * 8 + 24;
+            let old_hud_x = (fb.width.saturating_sub(old_hud_w)) / 2;
+            let old_hud_y = fb.height.saturating_sub(40);
+            fb.fill_rect(old_hud_x, old_hud_y, old_hud_w, 24, folk_dark);
+            hud_show_until = 0;
+            hud_title_len = 0;
+            need_redraw = true;
+        }
 
         // ===== Process mouse input =====
         // Accumulate all pending mouse events, then draw cursor ONCE
@@ -532,7 +957,10 @@ fn main() -> ! {
                         }
                         HitZone::Content => {
                             wm.focus(win_id);
-                            // Check if App window button was clicked
+                            // Check if App window widget was clicked
+                            let mut btn_info: Option<(u32, u32)> = None; // (action_id, owner)
+                            let mut focus_click = false;
+                            // Determine what was clicked: Button → IPC, TextInput → focus only
                             if let Some(win) = wm.get_window(win_id) {
                                 if matches!(win.kind, compositor::window_manager::WindowKind::App)
                                     && !win.widgets.is_empty()
@@ -541,28 +969,59 @@ fn main() -> ! {
                                     let content_y = win.y as usize + BORDER_W + TITLE_BAR_H + 6;
                                     let owner = win.owner_task;
 
-                                    if let Some(action_id) = compositor::window_manager::hit_test_widgets(
+                                    match compositor::window_manager::hit_test_widgets(
                                         &win.widgets, content_x, content_y, cx as usize, cy as usize
                                     ) {
-                                        // Send action event to owner task via IPC
-                                        if owner != 0 {
-                                            let event_payload = 0xAC10_u64  // "ACTION" marker
-                                                | ((action_id as u64) << 16)
-                                                | ((win_id as u64) << 48);
-                                            unsafe {
-                                                libfolk::syscall::syscall3(
-                                                    libfolk::syscall::SYS_IPC_SEND,
-                                                    owner as u64,
-                                                    event_payload,
-                                                    0
-                                                );
-                                            }
-                                            write_str("[UI] Button clicked: action=");
-                                            libfolk::sys::io::write_char(
-                                                b'0' + (action_id % 10) as u8
-                                            );
-                                            write_str("\n");
+                                        Some(compositor::window_manager::FocusableKind::Button { action_id }) => {
+                                            btn_info = Some((action_id, owner));
                                         }
+                                        Some(compositor::window_manager::FocusableKind::TextInput { .. }) => {
+                                            focus_click = true;
+                                        }
+                                        None => {}
+                                    }
+                                    // Set focus index via hit_test_focusable_index
+                                    if focus_click || btn_info.is_some() {
+                                        // We'll set focus below after releasing borrow
+                                    }
+                                }
+                            }
+                            // Set focused_widget for click on any focusable
+                            if focus_click || btn_info.is_some() {
+                                if let Some(win) = wm.get_window(win_id) {
+                                    let content_x = win.x as usize + BORDER_W + 6;
+                                    let content_y = win.y as usize + BORDER_W + TITLE_BAR_H + 6;
+                                    let idx = compositor::window_manager::hit_test_focusable_index(
+                                        &win.widgets, content_x, content_y, cx as usize, cy as usize
+                                    );
+                                    if let Some(win) = wm.get_window_mut(win_id) {
+                                        win.focused_widget = idx;
+                                    }
+                                }
+                            } else {
+                                // Click on non-focusable area clears focus
+                                if let Some(win) = wm.get_window_mut(win_id) {
+                                    win.focused_widget = None;
+                                }
+                            }
+                            // Send button IPC outside of borrow
+                            if let Some((action_id, owner)) = btn_info {
+                                if owner != 0 {
+                                    let event_payload = 0xAC10_u64
+                                        | ((action_id as u64) << 16)
+                                        | ((win_id as u64) << 48);
+                                    let reply = unsafe {
+                                        libfolk::syscall::syscall3(
+                                            libfolk::syscall::SYS_IPC_SEND,
+                                            owner as u64,
+                                            event_payload,
+                                            0
+                                        )
+                                    };
+                                    let reply_magic = (reply >> 48) as u16;
+                                    if reply_magic == 0x5549 {
+                                        let ui_handle = (reply & 0xFFFFFFFF) as u32;
+                                        update_window_widgets(&mut wm, win_id, ui_handle);
                                     }
                                 }
                             }
@@ -642,12 +1101,194 @@ fn main() -> ! {
             const KEY_HOME: u8 = 0x84;
             const KEY_END: u8 = 0x85;
             const KEY_DELETE: u8 = 0x86;
+            const KEY_SHIFT_TAB: u8 = 0x87;
+            const KEY_ALT_TAB: u8 = 0x88;
+            const KEY_CTRL_F12: u8 = 0x89;
+            const KEY_CTRL_C: u8 = 0x8A;
+            const KEY_CTRL_V: u8 = 0x8B;
+
+            // Ctrl+F12: UI state dump to serial (for MCP automation)
+            if key == KEY_CTRL_F12 {
+                emit_ui_dump(&wm, omnibar_visible, &text_buffer, text_len, cursor_pos);
+                continue;
+            }
+
+            // ===== Ctrl+C: Copy to clipboard =====
+            if key == KEY_CTRL_C {
+                let mut copied = false;
+
+                if !omnibar_visible {
+                    if let Some(focused_id) = wm.focused_id {
+                        let win_is_interactive = wm.get_window(focused_id).map(|w| w.interactive).unwrap_or(false);
+                        let win_is_app = wm.get_window(focused_id)
+                            .map(|w| matches!(w.kind, compositor::window_manager::WindowKind::App) && !w.widgets.is_empty())
+                            .unwrap_or(false);
+
+                        if win_is_app {
+                            if let Some(win) = wm.get_window(focused_id) {
+                                // Priority 1 & 2: Focused TextInput or Button
+                                if let Some(idx) = win.focused_widget {
+                                    if let Some((buf, len)) = compositor::window_manager::nth_focusable_text(&win.widgets, idx) {
+                                        if len > 0 {
+                                            let copy_len = len.min(256);
+                                            clipboard_buf[..copy_len].copy_from_slice(&buf[..copy_len]);
+                                            clipboard_len = copy_len;
+                                            copied = true;
+                                        }
+                                    }
+                                }
+                                // Priority 3: First Label (e.g. Calc display)
+                                if !copied {
+                                    if let Some((buf, len)) = compositor::window_manager::first_label_text(&win.widgets) {
+                                        if len > 0 {
+                                            let copy_len = len.min(256);
+                                            clipboard_buf[..copy_len].copy_from_slice(&buf[..copy_len]);
+                                            clipboard_len = copy_len;
+                                            copied = true;
+                                        }
+                                    }
+                                }
+                            }
+                        } else if win_is_interactive {
+                            // Priority 4: Terminal input_buf
+                            if let Some(win) = wm.get_window(focused_id) {
+                                if win.input_len > 0 {
+                                    let copy_len = win.input_len.min(256);
+                                    clipboard_buf[..copy_len].copy_from_slice(&win.input_buf[..copy_len]);
+                                    clipboard_len = copy_len;
+                                    copied = true;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Priority 5: Omnibar text
+                if !copied && omnibar_visible && text_len > 0 {
+                    let copy_len = text_len.min(256);
+                    clipboard_buf[..copy_len].copy_from_slice(&text_buffer[..copy_len]);
+                    clipboard_len = copy_len;
+                    copied = true;
+                }
+
+                if copied {
+                    // Show HUD confirmation
+                    hud_title = [0u8; 32];
+                    let prefix = b"Copied: ";
+                    hud_title[..prefix.len()].copy_from_slice(prefix);
+                    let show_len = clipboard_len.min(32 - prefix.len());
+                    hud_title[prefix.len()..prefix.len() + show_len].copy_from_slice(&clipboard_buf[..show_len]);
+                    hud_title_len = prefix.len() + show_len;
+                    hud_show_until = uptime() + 1000;
+                    need_redraw = true;
+                }
+                continue;
+            }
+
+            // ===== Ctrl+V: Paste from clipboard =====
+            if key == KEY_CTRL_V && clipboard_len > 0 {
+                let mut pasted = false;
+
+                if !omnibar_visible {
+                    if let Some(focused_id) = wm.focused_id {
+                        let win_is_interactive = wm.get_window(focused_id).map(|w| w.interactive).unwrap_or(false);
+                        let win_is_app = wm.get_window(focused_id)
+                            .map(|w| matches!(w.kind, compositor::window_manager::WindowKind::App) && !w.widgets.is_empty())
+                            .unwrap_or(false);
+
+                        if win_is_app {
+                            // Priority 1: Focused TextInput
+                            let focused_idx = wm.get_window(focused_id).and_then(|w| w.focused_widget);
+                            let is_text_input = if let Some(idx) = focused_idx {
+                                wm.get_window(focused_id)
+                                    .and_then(|w| compositor::window_manager::nth_focusable(&w.widgets, idx))
+                                    .map(|k| matches!(k, compositor::window_manager::FocusableKind::TextInput { .. }))
+                                    .unwrap_or(false)
+                            } else { false };
+
+                            if is_text_input {
+                                if let Some(idx) = focused_idx {
+                                    if let Some(win) = wm.get_window_mut(focused_id) {
+                                        if let Some(w) = compositor::window_manager::nth_focusable_mut(&mut win.widgets, idx) {
+                                            if let compositor::window_manager::UiWidget::TextInput { value, value_len, cursor_pos, max_len, .. } = w {
+                                                let available = (*max_len as usize).saturating_sub(*value_len);
+                                                let paste_len = clipboard_len.min(available);
+                                                if paste_len > 0 {
+                                                    value.copy_within(*cursor_pos..*value_len, *cursor_pos + paste_len);
+                                                    value[*cursor_pos..*cursor_pos + paste_len].copy_from_slice(&clipboard_buf[..paste_len]);
+                                                    *value_len += paste_len;
+                                                    *cursor_pos += paste_len;
+                                                    need_redraw = true;
+                                                    pasted = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else if win_is_interactive {
+                            // Priority 2: Terminal input_buf
+                            if let Some(win) = wm.get_window_mut(focused_id) {
+                                let available = 126usize.saturating_sub(win.input_len);
+                                let paste_len = clipboard_len.min(available);
+                                if paste_len > 0 {
+                                    // Shift existing text right
+                                    let mut i = win.input_len;
+                                    while i > win.input_cursor {
+                                        win.input_buf[i + paste_len - 1] = win.input_buf[i - 1];
+                                        i -= 1;
+                                    }
+                                    win.input_buf[win.input_cursor..win.input_cursor + paste_len].copy_from_slice(&clipboard_buf[..paste_len]);
+                                    win.input_len += paste_len;
+                                    win.input_cursor += paste_len;
+                                    need_redraw = true;
+                                    pasted = true;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Priority 3: Omnibar
+                if !pasted && omnibar_visible {
+                    let available = (MAX_TEXT_LEN - 1).saturating_sub(text_len);
+                    let paste_len = clipboard_len.min(available);
+                    if paste_len > 0 {
+                        // Shift existing text right using copy_within
+                        text_buffer.copy_within(cursor_pos..text_len, cursor_pos + paste_len);
+                        text_buffer[cursor_pos..cursor_pos + paste_len].copy_from_slice(&clipboard_buf[..paste_len]);
+                        text_len += paste_len;
+                        cursor_pos += paste_len;
+                        need_redraw = true;
+                    }
+                }
+                continue;
+            }
+
+            // Alt+Tab: cycle window focus (highest priority, before all other routing)
+            if key == KEY_ALT_TAB {
+                if let Some((title, tlen)) = wm.cycle_next_window() {
+                    hud_title = title;
+                    hud_title_len = tlen;
+                    hud_show_until = uptime() + 1000;
+                }
+                omnibar_visible = false;
+                need_redraw = true;
+                continue;
+            }
 
             // Route keys to focused interactive window when omnibar is hidden
             if !omnibar_visible {
+                let mut key_consumed = false;
                 if let Some(focused_id) = wm.focused_id {
-                    if let Some(win) = wm.get_window_mut(focused_id) {
-                        if win.interactive {
+                    // Check window type first with immutable borrow
+                    let win_is_interactive = wm.get_window(focused_id).map(|w| w.interactive).unwrap_or(false);
+                    let win_is_app_with_widgets = wm.get_window(focused_id)
+                        .map(|w| matches!(w.kind, compositor::window_manager::WindowKind::App) && !w.widgets.is_empty())
+                        .unwrap_or(false);
+
+                    if win_is_interactive {
+                        if let Some(win) = wm.get_window_mut(focused_id) {
                             match key {
                                 0x08 | 0x7F => {
                                     if win.input_cursor > 0 {
@@ -688,11 +1329,225 @@ fn main() -> ! {
                                 }
                                 _ => {}
                             }
-                            continue; // Key consumed by window
+                            key_consumed = true;
+                        }
+                    } else if win_is_app_with_widgets {
+                        // App window keyboard navigation (Tab/Shift+Tab/Enter/Space/Text editing)
+                        let mut activate_info: Option<(u32, u32, u32)> = None; // (action_id, owner, win_id)
+                        let mut text_submit_info: Option<(u32, u32, u32, [u8; 64], usize)> = None; // (action_id, owner, win_id, text, len)
+
+                        // Determine current focused widget kind
+                        let focused_kind = if let Some(win) = wm.get_window(focused_id) {
+                            win.focused_widget.and_then(|idx| compositor::window_manager::nth_focusable(&win.widgets, idx))
+                        } else { None };
+
+                        if let Some(win) = wm.get_window_mut(focused_id) {
+                            match key {
+                                b'\t' => {
+                                    let fc = compositor::window_manager::count_focusable(&win.widgets);
+                                    if fc > 0 {
+                                        let cur = win.focused_widget.unwrap_or(fc.wrapping_sub(1));
+                                        win.focused_widget = Some((cur + 1) % fc);
+                                        need_redraw = true;
+                                    }
+                                    key_consumed = true;
+                                }
+                                KEY_SHIFT_TAB => {
+                                    let fc = compositor::window_manager::count_focusable(&win.widgets);
+                                    if fc > 0 {
+                                        let cur = win.focused_widget.unwrap_or(1);
+                                        win.focused_widget = Some(cur.checked_sub(1).unwrap_or(fc - 1));
+                                        need_redraw = true;
+                                    }
+                                    key_consumed = true;
+                                }
+                                b'\n' | b'\r' => {
+                                    if let Some(idx) = win.focused_widget {
+                                        match focused_kind {
+                                            Some(compositor::window_manager::FocusableKind::Button { action_id }) => {
+                                                activate_info = Some((action_id, win.owner_task, win.id));
+                                            }
+                                            Some(compositor::window_manager::FocusableKind::TextInput { action_id }) => {
+                                                // Grab text from the widget for IPC submit
+                                                if let Some(w) = compositor::window_manager::nth_focusable_mut(&mut win.widgets, idx) {
+                                                    if let compositor::window_manager::UiWidget::TextInput { value, value_len, .. } = w {
+                                                        let mut buf = [0u8; 64];
+                                                        let len = *value_len;
+                                                        buf[..len].copy_from_slice(&value[..len]);
+                                                        text_submit_info = Some((action_id, win.owner_task, win.id, buf, len));
+                                                    }
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    key_consumed = true;
+                                }
+                                b' ' => {
+                                    match focused_kind {
+                                        Some(compositor::window_manager::FocusableKind::TextInput { .. }) => {
+                                            // Type space into TextInput
+                                            if let Some(idx) = win.focused_widget {
+                                                if let Some(w) = compositor::window_manager::nth_focusable_mut(&mut win.widgets, idx) {
+                                                    if let compositor::window_manager::UiWidget::TextInput { value, value_len, cursor_pos, max_len, .. } = w {
+                                                        if *value_len < (*max_len as usize) {
+                                                            // Shift right and insert
+                                                            let mut i = *value_len;
+                                                            while i > *cursor_pos { value[i] = value[i - 1]; i -= 1; }
+                                                            value[*cursor_pos] = b' ';
+                                                            *value_len += 1;
+                                                            *cursor_pos += 1;
+                                                            need_redraw = true;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            key_consumed = true;
+                                        }
+                                        Some(compositor::window_manager::FocusableKind::Button { action_id }) => {
+                                            activate_info = Some((action_id, win.owner_task, win.id));
+                                            key_consumed = true;
+                                        }
+                                        _ => { key_consumed = true; }
+                                    }
+                                }
+                                0x08 | 0x7F => {
+                                    // Backspace — only for TextInput
+                                    if matches!(focused_kind, Some(compositor::window_manager::FocusableKind::TextInput { .. })) {
+                                        if let Some(idx) = win.focused_widget {
+                                            if let Some(w) = compositor::window_manager::nth_focusable_mut(&mut win.widgets, idx) {
+                                                if let compositor::window_manager::UiWidget::TextInput { value, value_len, cursor_pos, .. } = w {
+                                                    if *cursor_pos > 0 {
+                                                        let mut i = *cursor_pos - 1;
+                                                        while i < *value_len - 1 { value[i] = value[i + 1]; i += 1; }
+                                                        *value_len -= 1;
+                                                        value[*value_len] = 0;
+                                                        *cursor_pos -= 1;
+                                                        need_redraw = true;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        key_consumed = true;
+                                    }
+                                }
+                                KEY_ARROW_LEFT => {
+                                    if matches!(focused_kind, Some(compositor::window_manager::FocusableKind::TextInput { .. })) {
+                                        if let Some(idx) = win.focused_widget {
+                                            if let Some(w) = compositor::window_manager::nth_focusable_mut(&mut win.widgets, idx) {
+                                                if let compositor::window_manager::UiWidget::TextInput { cursor_pos, .. } = w {
+                                                    if *cursor_pos > 0 { *cursor_pos -= 1; need_redraw = true; }
+                                                }
+                                            }
+                                        }
+                                        key_consumed = true;
+                                    }
+                                }
+                                KEY_ARROW_RIGHT => {
+                                    if matches!(focused_kind, Some(compositor::window_manager::FocusableKind::TextInput { .. })) {
+                                        if let Some(idx) = win.focused_widget {
+                                            if let Some(w) = compositor::window_manager::nth_focusable_mut(&mut win.widgets, idx) {
+                                                if let compositor::window_manager::UiWidget::TextInput { value_len, cursor_pos, .. } = w {
+                                                    if *cursor_pos < *value_len { *cursor_pos += 1; need_redraw = true; }
+                                                }
+                                            }
+                                        }
+                                        key_consumed = true;
+                                    }
+                                }
+                                0x21..=0x7E => {
+                                    // Printable chars — type into TextInput if focused
+                                    if matches!(focused_kind, Some(compositor::window_manager::FocusableKind::TextInput { .. })) {
+                                        if let Some(idx) = win.focused_widget {
+                                            if let Some(w) = compositor::window_manager::nth_focusable_mut(&mut win.widgets, idx) {
+                                                if let compositor::window_manager::UiWidget::TextInput { value, value_len, cursor_pos, max_len, .. } = w {
+                                                    if *value_len < (*max_len as usize) {
+                                                        let mut i = *value_len;
+                                                        while i > *cursor_pos { value[i] = value[i - 1]; i -= 1; }
+                                                        value[*cursor_pos] = key;
+                                                        *value_len += 1;
+                                                        *cursor_pos += 1;
+                                                        need_redraw = true;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        key_consumed = true;
+                                    }
+                                }
+                                0x1B => {
+                                    omnibar_visible = true;
+                                    need_redraw = true;
+                                    key_consumed = true;
+                                }
+                                _ => {}
+                            }
+                        }
+                        // Send button activation IPC outside of borrow
+                        if let Some((action_id, owner, win_id)) = activate_info {
+                            if owner != 0 {
+                                let event_payload = 0xAC10_u64
+                                    | ((action_id as u64) << 16)
+                                    | ((win_id as u64) << 48);
+                                let reply = unsafe {
+                                    libfolk::syscall::syscall3(
+                                        libfolk::syscall::SYS_IPC_SEND,
+                                        owner as u64,
+                                        event_payload,
+                                        0
+                                    )
+                                };
+                                let reply_magic = (reply >> 48) as u16;
+                                if reply_magic == 0x5549 {
+                                    let ui_handle = (reply & 0xFFFFFFFF) as u32;
+                                    update_window_widgets(&mut wm, win_id, ui_handle);
+                                    clamp_focus(&mut wm, win_id);
+                                }
+                                need_redraw = true;
+                            }
+                        }
+                        // Send text submit IPC (0xAC11) outside of borrow
+                        if let Some((action_id, owner, win_id, text_buf, text_len)) = text_submit_info {
+                            if owner != 0 && text_len > 0 {
+                                if let Ok(handle) = shmem_create(text_len + 2) {
+                                    let _ = shmem_grant(handle, owner);
+                                    if shmem_map(handle, COMPOSITOR_SHMEM_VADDR).is_ok() {
+                                        let dst = unsafe {
+                                            core::slice::from_raw_parts_mut(COMPOSITOR_SHMEM_VADDR as *mut u8, text_len + 2)
+                                        };
+                                        dst[0..2].copy_from_slice(&(text_len as u16).to_le_bytes());
+                                        dst[2..2+text_len].copy_from_slice(&text_buf[..text_len]);
+                                        let _ = shmem_unmap(handle, COMPOSITOR_SHMEM_VADDR);
+                                    }
+                                    let payload = 0xAC11_u64
+                                        | ((action_id as u64) << 16)
+                                        | ((handle as u64) << 32)
+                                        | ((win_id as u64) << 48);
+                                    let reply = unsafe {
+                                        libfolk::syscall::syscall3(
+                                            libfolk::syscall::SYS_IPC_SEND,
+                                            owner as u64,
+                                            payload,
+                                            0
+                                        )
+                                    };
+                                    let _ = shmem_destroy(handle);
+                                    let reply_magic = (reply >> 48) as u16;
+                                    if reply_magic == 0x5549 {
+                                        let ui_handle = (reply & 0xFFFFFFFF) as u32;
+                                        update_window_widgets(&mut wm, win_id, ui_handle);
+                                        clamp_focus(&mut wm, win_id);
+                                    }
+                                    need_redraw = true;
+                                }
+                            }
                         }
                     }
                 }
-                // No interactive window focused — Escape reopens omnibar
+                if key_consumed {
+                    continue;
+                }
+                // No interactive/app window focused — Escape reopens omnibar
                 if key == 0x1B {
                     omnibar_visible = true;
                     need_redraw = true;
@@ -803,8 +1658,85 @@ fn main() -> ! {
         }
 
         // ===== Milestone 2.3: Create terminal window on Enter =====
+        // Track deferred app creation from omnibar (no terminal window needed)
+        let mut deferred_app_handle: u32 = 0;
+
         if execute_command && text_len > 0 {
             if let Ok(cmd_str) = core::str::from_utf8(&text_buffer[..text_len]) {
+
+                // Special case: `open <app>` creates app window directly (no terminal)
+                let is_open_cmd = cmd_str.starts_with("open ");
+                if is_open_cmd {
+                    let app_name = cmd_str[5..].trim();
+                    if !app_name.is_empty() {
+                        // Build filename: "calc" → "calc.fkui"
+                        let mut fname = [0u8; 64];
+                        let nb = app_name.as_bytes();
+                        let ext = b".fkui";
+                        let mut vfs_loaded = false;
+                        if nb.len() + ext.len() < 64 {
+                            fname[..nb.len()].copy_from_slice(nb);
+                            fname[nb.len()..nb.len()+ext.len()].copy_from_slice(ext);
+                            let fname_str = unsafe { core::str::from_utf8_unchecked(&fname[..nb.len()+ext.len()]) };
+
+                            // Try VFS first (Synapse read_file_shmem)
+                            match libfolk::sys::synapse::read_file_shmem(fname_str) {
+                                Ok(resp) => {
+                                    deferred_app_handle = resp.shmem_handle;
+                                    vfs_loaded = true;
+                                    write_str("[WM] App loaded from VFS: ");
+                                    write_str(fname_str);
+                                    write_str("\n");
+                                }
+                                Err(_) => {}
+                            }
+                        }
+
+                        // Fallback: Shell IPC (M10 path)
+                        if !vfs_loaded {
+                            let name_hash = shell_hash_name(app_name) as u64;
+                            let shell_payload = SHELL_OP_OPEN_APP | (name_hash << 8);
+                            let intent_req = libfolk::sys::intent::INTENT_OP_SUBMIT
+                                | (shell_payload << 8);
+                            let ipc_result = unsafe {
+                                libfolk::syscall::syscall3(
+                                    libfolk::syscall::SYS_IPC_SEND,
+                                    libfolk::sys::intent::INTENT_TASK_ID as u64, intent_req, 0
+                                )
+                            };
+                            let magic = (ipc_result >> 48) as u16;
+                            if magic == 0x5549 {
+                                deferred_app_handle = (ipc_result & 0xFFFFFFFF) as u32;
+                                write_str("[WM] App launch via Shell fallback\n");
+                            } else {
+                                write_str("[WM] Unknown app\n");
+                            }
+                        }
+                    }
+                }
+
+                if !is_open_cmd {
+                // M13: Try semantic intent match BEFORE creating terminal window
+                if let Some(app_name) = try_intent_match(cmd_str) {
+                    let mut fname = [0u8; 64];
+                    let nb = app_name.as_bytes();
+                    let ext = b".fkui";
+                    if nb.len() + ext.len() < 64 {
+                        fname[..nb.len()].copy_from_slice(nb);
+                        fname[nb.len()..nb.len()+ext.len()].copy_from_slice(ext);
+                        let fname_str = unsafe {
+                            core::str::from_utf8_unchecked(&fname[..nb.len()+ext.len()])
+                        };
+                        if let Ok(resp) = libfolk::sys::synapse::read_file_shmem(fname_str) {
+                            deferred_app_handle = resp.shmem_handle;
+                            write_str("[WM] Intent match: ");
+                            write_str(app_name);
+                            write_str("\n");
+                        }
+                    }
+                }
+
+                if deferred_app_handle == 0 {
                 write_str("[WM] Creating window for: ");
                 write_str(cmd_str);
                 write_str("\n");
@@ -1210,6 +2142,117 @@ fn main() -> ! {
                         } else {
                             win.push_line("Usage: save <filename> <text>");
                         }
+                    } else if cmd_str == "poweroff" || cmd_str == "shutdown" {
+                        // M12: Save app states and shut down
+                        let name_hash = shell_hash_name("poweroff") as u64;
+                        let shell_payload = SHELL_OP_EXEC | (name_hash << 8);
+                        let intent_req = libfolk::sys::intent::INTENT_OP_SUBMIT
+                            | (shell_payload << 8);
+                        let _ = unsafe {
+                            libfolk::syscall::syscall3(
+                                libfolk::syscall::SYS_IPC_SEND,
+                                libfolk::sys::intent::INTENT_TASK_ID as u64,
+                                intent_req, 0
+                            )
+                        };
+                        win.push_line("Shutting down...");
+                    } else if cmd_str == "ai-status" {
+                        // Query inference server status
+                        use libfolk::sys::inference;
+                        match inference::status() {
+                            Ok((has_model, arena_size)) => {
+                                if has_model {
+                                    win.push_line("AI: model loaded");
+                                } else {
+                                    win.push_line("AI: stub mode (no model)");
+                                }
+                                let kb = arena_size / 1024;
+                                let mut buf = [0u8; 32];
+                                let s = format_arena_line(&mut buf, kb);
+                                win.push_line(s);
+                            }
+                            Err(_) => {
+                                win.push_line("AI: server unavailable");
+                            }
+                        }
+                    } else if cmd_str.starts_with("ask ") || cmd_str.starts_with("infer ") {
+                        // AI inference command — full shmem-based inference request
+                        use libfolk::sys::inference;
+                        use libfolk::sys::{shmem_create, shmem_map, shmem_grant, shmem_unmap, shmem_destroy};
+                        let query = if cmd_str.starts_with("ask ") {
+                            &cmd_str[4..]
+                        } else {
+                            &cmd_str[6..]
+                        };
+                        let query = query.trim();
+                        if query.is_empty() {
+                            win.push_line("Usage: ask <question>");
+                        } else {
+                            match inference::ping() {
+                                Ok(has_model) => {
+                                    if !has_model {
+                                        win.push_line("[AI] No model loaded (stub mode)");
+                                        win.push_line("[AI] Pack a GGUF into virtio-data.img");
+                                    } else {
+                                        win.push_line("[AI] Thinking...");
+
+                                        // Create shmem with query text
+                                        let query_bytes = query.as_bytes();
+                                        if let Ok(handle) = shmem_create(4096) {
+                                            let _ = shmem_grant(handle, inference::INFERENCE_TASK_ID);
+                                            const ASK_SHMEM: usize = 0x30000000;
+                                            if shmem_map(handle, ASK_SHMEM).is_ok() {
+                                                unsafe {
+                                                    let ptr = ASK_SHMEM as *mut u8;
+                                                    core::ptr::copy_nonoverlapping(
+                                                        query_bytes.as_ptr(), ptr, query_bytes.len()
+                                                    );
+                                                }
+                                                let _ = shmem_unmap(handle, ASK_SHMEM);
+
+                                                // Send ask request
+                                                match inference::ask(handle, query_bytes.len()) {
+                                                    Ok((out_shmem, out_len)) => {
+                                                        if out_len > 0 && out_shmem > 0 {
+                                                            if shmem_map(out_shmem, ASK_SHMEM).is_ok() {
+                                                                let resp = unsafe {
+                                                                    core::slice::from_raw_parts(
+                                                                        ASK_SHMEM as *const u8, out_len.min(4000)
+                                                                    )
+                                                                };
+                                                                if let Ok(text) = core::str::from_utf8(resp) {
+                                                                    // Split response into lines for terminal
+                                                                    for line in text.split('\n') {
+                                                                        if !line.is_empty() {
+                                                                            win.push_line(line);
+                                                                        }
+                                                                    }
+                                                                } else {
+                                                                    win.push_line("[AI] (non-UTF8 response)");
+                                                                }
+                                                                let _ = shmem_unmap(out_shmem, ASK_SHMEM);
+                                                            }
+                                                            let _ = shmem_destroy(out_shmem);
+                                                        } else {
+                                                            win.push_line("[AI] (empty response)");
+                                                        }
+                                                    }
+                                                    Err(_) => {
+                                                        win.push_line("[AI] Inference request failed");
+                                                    }
+                                                }
+                                            }
+                                            let _ = shmem_destroy(handle);
+                                        } else {
+                                            win.push_line("[AI] Failed to allocate shmem");
+                                        }
+                                    }
+                                }
+                                Err(_) => {
+                                    win.push_line("[AI] Inference server unavailable");
+                                }
+                            }
+                        }
                     } else {
                         win.push_line("Sent to shell...");
                     }
@@ -1217,6 +2260,8 @@ fn main() -> ! {
                         win.push_line("---");
                     }
                 }
+                } // end if deferred_app_handle == 0
+                } // end if !is_open_cmd
 
                 // Clear the omnibar input after executing
                 text_len = 0;
@@ -1225,6 +2270,37 @@ fn main() -> ! {
                 show_results = false;
                 cursor_bg_dirty = true;
             }
+        }
+
+        // ===== Deferred app creation from omnibar `open` command =====
+        if deferred_app_handle != 0 {
+            if shmem_map(deferred_app_handle, COMPOSITOR_SHMEM_VADDR).is_ok() {
+                let buf = unsafe {
+                    core::slice::from_raw_parts(COMPOSITOR_SHMEM_VADDR as *const u8, 4096)
+                };
+                if let Some(header) = libfolk::ui::parse_header(buf) {
+                    let wc = wm.windows.len() as i32;
+                    let app_id = wm.create_terminal(
+                        header.title,
+                        120 + wc * 30, 100 + wc * 30,
+                        header.width as u32, header.height as u32,
+                    );
+                    if let Some(app_win) = wm.get_window_mut(app_id) {
+                        app_win.kind = compositor::window_manager::WindowKind::App;
+                        app_win.owner_task = SHELL_TASK_ID;
+                        let (root, _) = parse_widget_tree(header.widget_data);
+                        if let Some(widget) = root {
+                            app_win.widgets.push(widget);
+                        }
+                    }
+                    write_str("[WM] Created app: ");
+                    write_str(header.title);
+                    write_str("\n");
+                    need_redraw = true;
+                }
+                let _ = shmem_unmap(deferred_app_handle, COMPOSITOR_SHMEM_VADDR);
+            }
+            let _ = shmem_destroy(deferred_app_handle);
         }
 
         // ===== Execute command from interactive terminal window =====
@@ -1470,6 +2546,53 @@ fn main() -> ! {
                                 }
                             }
                         }
+                    } else if cmd_str.starts_with("open ") {
+                        // Open app — try VFS first, fallback to Shell
+                        let app_name = cmd_str[5..].trim();
+                        if app_name.is_empty() {
+                            win.push_line("usage: open <app>");
+                        } else {
+                            let mut vfs_ok = false;
+                            // Build filename: "calc" → "calc.fkui"
+                            let mut fname = [0u8; 64];
+                            let nb = app_name.as_bytes();
+                            let ext = b".fkui";
+                            if nb.len() + ext.len() < 64 {
+                                fname[..nb.len()].copy_from_slice(nb);
+                                fname[nb.len()..nb.len()+ext.len()].copy_from_slice(ext);
+                                let fname_str = unsafe { core::str::from_utf8_unchecked(&fname[..nb.len()+ext.len()]) };
+
+                                if let Ok(resp) = libfolk::sys::synapse::read_file_shmem(fname_str) {
+                                    win.push_line("App loaded from VFS!");
+                                    win.input_buf[0..4].copy_from_slice(&resp.shmem_handle.to_le_bytes());
+                                    win.input_buf[4] = 0xAA; // marker
+                                    vfs_ok = true;
+                                }
+                            }
+
+                            if !vfs_ok {
+                                // Fallback: Shell IPC
+                                let name_hash = shell_hash_name(app_name) as u64;
+                                let shell_payload = SHELL_OP_OPEN_APP | (name_hash << 8);
+                                let intent_req = libfolk::sys::intent::INTENT_OP_SUBMIT
+                                    | (shell_payload << 8);
+                                let ipc_result = unsafe {
+                                    libfolk::syscall::syscall3(
+                                        libfolk::syscall::SYS_IPC_SEND,
+                                        libfolk::sys::intent::INTENT_TASK_ID as u64, intent_req, 0
+                                    )
+                                };
+                                let magic = (ipc_result >> 48) as u16;
+                                if magic == 0x5549 {
+                                    let ui_handle = (ipc_result & 0xFFFFFFFF) as u32;
+                                    win.push_line("App opened via Shell!");
+                                    win.input_buf[0..4].copy_from_slice(&ui_handle.to_le_bytes());
+                                    win.input_buf[4] = 0xAA; // marker
+                                } else {
+                                    win.push_line("Unknown app. Try: open calc");
+                                }
+                            }
+                        }
                     } else if cmd_str == "ui_test" || cmd_str == "app" {
                         // Route to Shell via Intent Service — Shell builds UI shmem
                         let name_hash = shell_hash_name("ui_test") as u64;
@@ -1494,8 +2617,43 @@ fn main() -> ! {
                         } else {
                             win.push_line("App launch failed");
                         }
+                    } else if cmd_str == "poweroff" || cmd_str == "shutdown" {
+                        // M12: Route poweroff to Shell via Intent Service
+                        // Shell will save app states before shutting down
+                        let name_hash = shell_hash_name("poweroff") as u64;
+                        let shell_payload = SHELL_OP_EXEC | (name_hash << 8);
+                        let intent_req = libfolk::sys::intent::INTENT_OP_SUBMIT
+                            | (shell_payload << 8);
+                        let _ = unsafe {
+                            libfolk::syscall::syscall3(
+                                libfolk::syscall::SYS_IPC_SEND,
+                                libfolk::sys::intent::INTENT_TASK_ID as u64,
+                                intent_req, 0
+                            )
+                        };
+                        win.push_line("Shutting down...");
                     } else if cmd_str == "help" {
-                        win.push_line("ls ps cat find uptime app help");
+                        win.push_line("ls ps cat find uptime open app poweroff help");
+                    } else if let Some(app_name) = try_intent_match(cmd_str) {
+                        // M13: Semantic intent match — open app from terminal
+                        let mut fname = [0u8; 64];
+                        let nb = app_name.as_bytes();
+                        let ext = b".fkui";
+                        if nb.len() + ext.len() < 64 {
+                            fname[..nb.len()].copy_from_slice(nb);
+                            fname[nb.len()..nb.len()+ext.len()].copy_from_slice(ext);
+                            let fname_str = unsafe {
+                                core::str::from_utf8_unchecked(&fname[..nb.len()+ext.len()])
+                            };
+                            if let Ok(resp) = libfolk::sys::synapse::read_file_shmem(fname_str) {
+                                win.input_buf[0..4].copy_from_slice(&resp.shmem_handle.to_le_bytes());
+                                win.input_buf[4] = 0xAA; // marker
+                                win.push_line("Intent match: opening ");
+                                win.push_line(app_name);
+                            } else {
+                                win.push_line("Intent matched but app not found");
+                            }
+                        }
                     } else {
                         win.push_line("Unknown command. Try: help");
                     }
@@ -1551,39 +2709,42 @@ fn main() -> ! {
         // Only redraw once after processing all keys
         if need_redraw {
             if omnibar_visible {
-                // ===== Draw Omnibar =====
-                // Outer glow (subtle)
-                fb.fill_rect(text_box_x.saturating_sub(2), text_box_y.saturating_sub(2), text_box_w + 4, text_box_h + 4, dark_gray);
-                // Main box
-                fb.fill_rect(text_box_x, text_box_y, text_box_w, text_box_h, text_box_bg);
+                // ===== Draw Glass Omnibar (alpha-blended) =====
+                let omnibar_alpha: u8 = 180; // 70% opaque — scene bleeds through
+
+                // Outer glow (subtle, semi-transparent)
+                fb.fill_rect_alpha(text_box_x.saturating_sub(2), text_box_y.saturating_sub(2), text_box_w + 4, text_box_h + 4, 0x333333, omnibar_alpha / 2);
+                // Main glass box
+                fb.fill_rect_alpha(text_box_x, text_box_y, text_box_w, text_box_h, 0x1a1a2e, omnibar_alpha);
                 fb.draw_rect(text_box_x, text_box_y, text_box_w, text_box_h, omnibar_border);
 
                 // Draw user input text (single line for omnibar)
+                // Text foreground is opaque, background is transparent (alpha-blended)
                 if text_len > 0 {
                     if let Ok(_input_str) = core::str::from_utf8(&text_buffer[..text_len]) {
                         // Truncate if too long
                         let display_len = if text_len > chars_per_line { chars_per_line } else { text_len };
                         if let Ok(display_str) = core::str::from_utf8(&text_buffer[..display_len]) {
-                            fb.draw_string(text_box_x + TEXT_PADDING, text_box_y + 12, display_str, white, text_box_bg);
+                            fb.draw_string_alpha(text_box_x + TEXT_PADDING, text_box_y + 12, display_str, white, 0x1a1a2e, omnibar_alpha);
                         }
                     }
                 } else {
                     // Show placeholder when empty
-                    fb.draw_string(text_box_x + TEXT_PADDING, text_box_y + 12, "Ask anything...", gray, text_box_bg);
+                    fb.draw_string_alpha(text_box_x + TEXT_PADDING, text_box_y + 12, "Ask anything...", gray, 0x1a1a2e, omnibar_alpha);
                 }
 
                 // Draw blinking text caret at cursor position
                 let caret_x_pos = text_box_x + TEXT_PADDING + (cursor_pos.min(chars_per_line) * 8);
                 if caret_x_pos < text_box_x + text_box_w - 30 {
                     let caret_char = if caret_visible { "|" } else { " " };
-                    fb.draw_string(caret_x_pos, text_box_y + 10, caret_char, folk_accent, text_box_bg);
+                    fb.draw_string_alpha(caret_x_pos, text_box_y + 10, caret_char, folk_accent, 0x1a1a2e, omnibar_alpha);
                 }
 
                 // Draw ">" icon on right
-                fb.draw_string(text_box_x + text_box_w - 24, text_box_y + 12, ">", folk_accent, text_box_bg);
+                fb.draw_string_alpha(text_box_x + text_box_w - 24, text_box_y + 12, ">", folk_accent, 0x1a1a2e, omnibar_alpha);
 
                 // Context hints below omnibar
-                let hint = "find <query> | calc <expr> | open <app>";
+                let hint = "find <query> | open calc | help";
                 let hint_x = (fb.width.saturating_sub(hint.len() * 8)) / 2;
                 fb.draw_string(hint_x, text_box_y + text_box_h + 16, hint, dark_gray, folk_dark);
 
@@ -1622,10 +2783,10 @@ fn main() -> ! {
                             fb.draw_string(results_x + 12, results_y + 56, "Press Enter to search", gray, results_bg);
                         } else if cmd_str.starts_with("open ") {
                             // Open app/file
-                            fb.draw_string(results_x + 12, results_y + 36, "Opening:", white, results_bg);
+                            fb.draw_string(results_x + 12, results_y + 36, "Open app:", white, results_bg);
                             let app_name = &cmd_str[5..];
                             fb.draw_string(results_x + 12, results_y + 56, app_name, folk_accent, results_bg);
-                            fb.draw_string(results_x + 12, results_y + 80, "(app launcher coming soon)", dark_gray, results_bg);
+                            fb.draw_string(results_x + 12, results_y + 80, "Press Enter to launch", dark_gray, results_bg);
                         } else if cmd_str == "help" {
                             // Help command
                             fb.draw_string(results_x + 12, results_y + 36, "Available commands:", white, results_bg);
@@ -1661,6 +2822,17 @@ fn main() -> ! {
             // Draw all managed windows on top of the desktop/omnibar
             if wm.has_visible() {
                 wm.composite(&mut fb);
+            }
+
+            // ===== Alt+Tab HUD overlay =====
+            if hud_show_until > 0 && hud_title_len > 0 {
+                let hud_text = unsafe { core::str::from_utf8_unchecked(&hud_title[..hud_title_len]) };
+                let hud_w = hud_title_len * 8 + 24;
+                let hud_x = (fb.width.saturating_sub(hud_w)) / 2;
+                let hud_y = fb.height.saturating_sub(40);
+                fb.fill_rect_alpha(hud_x, hud_y, hud_w, 24, 0x1a1a2e, 200);
+                fb.draw_rect(hud_x, hud_y, hud_w, 24, folk_accent);
+                fb.draw_string(hud_x + 12, hud_y + 8, hud_text, white, folk_dark);
             }
 
             // After full redraw: re-save cursor background and redraw cursor on top
@@ -1747,6 +2919,43 @@ fn main() -> ! {
     }
 }
 
+/// Clamp focused_widget index after widget tree update
+fn clamp_focus(wm: &mut WindowManager, win_id: u32) {
+    if let Some(win) = wm.get_window_mut(win_id) {
+        if let Some(idx) = win.focused_widget {
+            let fc = compositor::window_manager::count_focusable(&win.widgets);
+            if fc == 0 {
+                win.focused_widget = None;
+            } else if idx >= fc {
+                win.focused_widget = Some(fc - 1);
+            }
+        }
+    }
+}
+
+/// Update a window's widget tree from a shmem UI buffer.
+/// Maps the shmem, parses the FKUI header and widget tree,
+/// replaces the window's widgets in-place, then cleans up shmem.
+fn update_window_widgets(wm: &mut WindowManager, win_id: u32, shmem_handle: u32) {
+    if shmem_map(shmem_handle, COMPOSITOR_SHMEM_VADDR).is_ok() {
+        let buf = unsafe {
+            core::slice::from_raw_parts(COMPOSITOR_SHMEM_VADDR as *const u8, 4096)
+        };
+        if let Some(header) = libfolk::ui::parse_header(buf) {
+            let (root, _) = parse_widget_tree(header.widget_data);
+            if let Some(widget) = root {
+                if let Some(win) = wm.get_window_mut(win_id) {
+                    // clear() + push reuses Vec capacity — no new allocation in bump allocator
+                    win.widgets.clear();
+                    win.widgets.push(widget);
+                }
+            }
+        }
+        let _ = shmem_unmap(shmem_handle, COMPOSITOR_SHMEM_VADDR);
+    }
+    let _ = shmem_destroy(shmem_handle);
+}
+
 /// Recursively parse widget tree from wire format into UiWidget
 fn parse_widget_tree(data: &[u8]) -> (Option<compositor::window_manager::UiWidget>, usize) {
     use compositor::window_manager::UiWidget;
@@ -1761,6 +2970,9 @@ fn parse_widget_tree(data: &[u8]) -> (Option<compositor::window_manager::UiWidge
         }
         Some((PW::Spacer { height }, consumed)) => {
             (Some(UiWidget::Spacer { height }), consumed)
+        }
+        Some((PW::TextInput { placeholder, action_id, max_len }, consumed)) => {
+            (Some(UiWidget::text_input(placeholder, action_id, max_len)), consumed)
         }
         Some((PW::VStackBegin { spacing, child_count }, mut consumed)) => {
             let mut children = alloc::vec::Vec::new();

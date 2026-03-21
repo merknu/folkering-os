@@ -5,11 +5,13 @@
 members = [
     "libfolk",
     "libsqlite",
+    "libtensor",
     "shell",
     "synapse-service",
     "libaccesskit-folk",
     "compositor",
     "intent-service",
+    "inference-server",
 ]
 resolver = "2"
 

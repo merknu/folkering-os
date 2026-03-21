@@ -83,6 +83,16 @@ impl EnhancedScheduler {
 
                 let mut effective_priority = task_locked.priority as u16;
 
+                // AI-Native: incorporate semantic_priority
+                // semantic_priority acts as a modifier: 128 = neutral, >128 = boost, <128 = reduce
+                let semantic_delta = (task_locked.semantic_priority as i16) - 128;
+                effective_priority = (effective_priority as i16 + semantic_delta).max(0) as u16;
+
+                // Background AI tasks: lower priority when system is busy (>2 runnable tasks)
+                if task_locked.is_background_ai && self.tasks.len() > 2 {
+                    effective_priority = effective_priority.saturating_sub(50);
+                }
+
                 // Boost priority for deadline tasks
                 if let Some(deadline) = task_locked.deadline_ms {
                     let time_to_deadline = deadline.saturating_sub(current_time);

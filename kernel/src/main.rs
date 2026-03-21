@@ -306,6 +306,13 @@ extern "C" fn irq_timer() {
         // USERSPACE PATH - Full preemptive handling
         // =========================================
         "1:",
+        // Check preemption lock BEFORE saving all registers
+        "push rax",
+        "mov eax, dword ptr [rip + {preempt_count}]",
+        "test eax, eax",
+        "pop rax",
+        "jnz 4f",       // preemption disabled → fast path (tick+EOI only)
+
         // Save ALL registers for potential task switch
         "push rax",
         "push rbx",
@@ -402,12 +409,38 @@ extern "C" fn irq_timer() {
         // Return from interrupt (user -> user, has RSP/SS on stack)
         "iretq",
 
+        // =========================================
+        // FAST PATH: preemption disabled — tick+EOI+return to same task
+        // Timer still fires for timekeeping, but no task switch occurs.
+        // =========================================
+        "4:",
+        "push rax",
+        "push rcx",
+        "push rdx",
+        "push rdi",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "call {tick_fn}",
+        "call {eoi_fn}",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdi",
+        "pop rdx",
+        "pop rcx",
+        "pop rax",
+        "iretq",       // Return to same userspace task (interrupt frame intact)
+
         tick_fn = sym folkering_kernel::timer::tick,
         eoi_fn = sym folkering_kernel::arch::x86_64::apic::send_eoi,
         heartbeat_fn = sym kernel_timer_heartbeat,
         preempt_fn = sym folkering_kernel::task::preempt::timer_preempt_handler,
         fxsave_ptr = sym folkering_kernel::task::task::FXSAVE_CURRENT_PTR,
         debug_ctx_fn = sym debug_after_preempt_handler,
+        preempt_count = sym folkering_kernel::task::preempt_lock::PREEMPT_DISABLE_COUNT,
     );
 }
 /// Keyboard interrupt handler (Vector 33 / IRQ1)

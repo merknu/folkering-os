@@ -1531,26 +1531,57 @@ fn syscall_block_read(sector: u64, buf_ptr: u64, count: u64) -> u64 {
         return u64::MAX; // EINVAL (max 64KB per call)
     }
 
-    let buf_len = (count as usize) * virtio_blk::SECTOR_SIZE;
-
     // Validate userspace pointer (must be in lower half)
     if buf_ptr >= 0x0000_8000_0000_0000 {
         return u64::MAX; // EFAULT
     }
 
-    // Read sectors into a kernel buffer first, then copy to userspace
-    // This avoids issues with page table contexts during DMA
-    for i in 0..(count as usize) {
-        let mut sector_buf = [0u8; 512];
-        match virtio_blk::block_read(sector + i as u64, &mut sector_buf) {
-            Ok(()) => {
-                // Copy to userspace buffer
-                let dst = (buf_ptr as usize + i * 512) as *mut u8;
-                unsafe {
-                    core::ptr::copy_nonoverlapping(sector_buf.as_ptr(), dst, 512);
+    let count = count as usize;
+    let mut offset = 0usize;
+    let mut sec = sector;
+    let mut remaining = count;
+
+    // ULTRA 36: Use multi-sector DMA bursts for large reads.
+    // block_read_multi writes to its internal DMA buffer then copies to the
+    // output buffer. We pass the userspace pointer directly — the driver copies
+    // from its kernel DMA buffer to the destination after the transfer completes.
+    while remaining > 0 {
+        let burst = remaining.min(virtio_blk::MAX_BURST_SECTORS);
+        let data_len = burst * 512;
+
+        if burst > 1 {
+            // Multi-sector DMA burst: one VirtIO request
+            // block_read_multi copies from its internal DMA buf to user buf
+            let dst = unsafe {
+                core::slice::from_raw_parts_mut(
+                    (buf_ptr as usize + offset) as *mut u8,
+                    data_len,
+                )
+            };
+
+            match virtio_blk::block_read_multi(sec, dst, burst) {
+                Ok(()) => {
+                    offset += data_len;
+                    sec += burst as u64;
+                    remaining -= burst;
                 }
+                Err(_) => return u64::MAX,
             }
-            Err(_) => return u64::MAX,
+        } else {
+            // Single sector fallback
+            let mut sector_buf = [0u8; 512];
+            match virtio_blk::block_read(sec, &mut sector_buf) {
+                Ok(()) => {
+                    let dst = (buf_ptr as usize + offset) as *mut u8;
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(sector_buf.as_ptr(), dst, 512);
+                    }
+                    offset += 512;
+                    sec += 1;
+                    remaining -= 1;
+                }
+                Err(_) => return u64::MAX,
+            }
         }
     }
     0

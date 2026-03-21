@@ -328,6 +328,129 @@ impl FramebufferView {
         }
     }
 
+    /// Alpha-blend a pixel onto the scene.
+    ///
+    /// Reads the existing background from the shadow buffer (reliable RAM),
+    /// blends `color` on top with the given `alpha` (0=transparent, 255=opaque),
+    /// and writes the result to BOTH framebuffer and shadow buffer.
+    ///
+    /// Math per channel: out = (fg * alpha + bg * (255 - alpha)) / 255
+    /// Uses the fast approximation: (x + 1 + (x >> 8)) >> 8 ≈ x / 255
+    #[inline]
+    pub fn blend_pixel(&mut self, x: usize, y: usize, color: u32, alpha: u8) {
+        if x >= self.width || y >= self.height { return; }
+        if alpha == 255 {
+            self.set_pixel(x, y, color);
+            return;
+        }
+        if alpha == 0 { return; }
+
+        // Read background from shadow buffer (reliable)
+        let bg = if !self.shadow.is_null() {
+            unsafe { core::ptr::read(self.shadow_ptr(x, y)) }
+        } else {
+            unsafe { core::ptr::read_volatile(self.pixel_ptr(x, y)) }
+        };
+
+        let a = alpha as u32;
+        let inv_a = 255 - a;
+
+        // Extract channels (assumes 0x00RRGGBB / XRGB layout)
+        let fg_r = (color >> 16) & 0xFF;
+        let fg_g = (color >> 8) & 0xFF;
+        let fg_b = color & 0xFF;
+
+        let bg_r = (bg >> 16) & 0xFF;
+        let bg_g = (bg >> 8) & 0xFF;
+        let bg_b = bg & 0xFF;
+
+        // Blend: (fg * a + bg * inv_a + 128) / 255
+        // Fast: (x + 1 + (x >> 8)) >> 8
+        let r = {
+            let tmp = fg_r * a + bg_r * inv_a + 128;
+            (tmp + (tmp >> 8)) >> 8
+        };
+        let g = {
+            let tmp = fg_g * a + bg_g * inv_a + 128;
+            (tmp + (tmp >> 8)) >> 8
+        };
+        let b = {
+            let tmp = fg_b * a + bg_b * inv_a + 128;
+            (tmp + (tmp >> 8)) >> 8
+        };
+
+        let blended = (r << 16) | (g << 8) | b;
+        self.set_pixel(x, y, blended);
+    }
+
+    /// Fill a rectangle with alpha blending.
+    ///
+    /// Like `fill_rect` but blends `color` at `alpha` opacity over the existing scene.
+    pub fn fill_rect_alpha(&mut self, x: usize, y: usize, w: usize, h: usize, color: u32, alpha: u8) {
+        if alpha == 255 {
+            self.fill_rect(x, y, w, h, color);
+            return;
+        }
+        if alpha == 0 { return; }
+
+        let end_x = (x + w).min(self.width);
+        let end_y = (y + h).min(self.height);
+        let start_x = x.min(self.width);
+        let start_y = y.min(self.height);
+
+        for row in start_y..end_y {
+            for col in start_x..end_x {
+                self.blend_pixel(col, row, color, alpha);
+            }
+        }
+    }
+
+    /// Draw an 8x16 character with alpha blending for the background.
+    ///
+    /// Foreground pixels are drawn opaque; background pixels are blended
+    /// at `bg_alpha` so the scene behind shows through.
+    pub fn draw_char_alpha(&mut self, x: usize, y: usize, ch: char, fg: u32, bg: u32, bg_alpha: u8) {
+        use super::font::FONT_8X16;
+
+        let ch_idx = ch as usize;
+        let glyph = if ch_idx < 256 {
+            &FONT_8X16[ch_idx]
+        } else {
+            &FONT_8X16[0]
+        };
+
+        for row in 0..16 {
+            let bits = glyph[row];
+            for col in 0..8 {
+                if (bits >> (7 - col)) & 1 != 0 {
+                    self.set_pixel(x + col, y + row, fg);
+                } else {
+                    self.blend_pixel(x + col, y + row, bg, bg_alpha);
+                }
+            }
+        }
+    }
+
+    /// Draw a string with alpha-blended background.
+    pub fn draw_string_alpha(&mut self, mut x: usize, mut y: usize, s: &str, fg: u32, bg: u32, bg_alpha: u8) {
+        for ch in s.chars() {
+            if ch == '\n' {
+                x = 0;
+                y += 16;
+                continue;
+            }
+            if x + 8 > self.width {
+                x = 0;
+                y += 16;
+            }
+            if y + 16 > self.height {
+                break;
+            }
+            self.draw_char_alpha(x, y, ch, fg, bg, bg_alpha);
+            x += 8;
+        }
+    }
+
     /// Read a single pixel value from shadow buffer (reliable).
     /// Falls back to WC framebuffer read if no shadow buffer.
     #[inline]

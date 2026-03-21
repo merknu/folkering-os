@@ -24,7 +24,7 @@ use format::*;
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::process::{self, Command as ProcessCommand, Stdio};
 
@@ -47,6 +47,10 @@ struct AddEntry {
 enum Command {
     Create(String, Vec<AddEntry>),
     CreateSqlite(String, Vec<AddEntry>, bool, bool), // (embed, quantize)
+    GenFkui(String), // output path for .fkui file
+    GenAppStates(String), // output path for app_states.dat placeholder
+    GenWasmCalc(String), // output path for calc.wasm
+    PackModel(String, String), // (disk_image, gguf_model_path)
 }
 
 fn print_usage() {
@@ -55,6 +59,10 @@ fn print_usage() {
     eprintln!("Usage:");
     eprintln!("  folk-pack create <output.fpk> --add <name>:<type>:<path> [--add ...]");
     eprintln!("  folk-pack create-sqlite <output.db> --add <name>:<type>:<path> [--add ...] [--embed] [--quantize]");
+    eprintln!("  folk-pack gen-fkui <output.fkui>");
+    eprintln!("  folk-pack gen-app-states <output.dat>");
+    eprintln!("  folk-pack gen-wasm-calc <output.wasm>");
+    eprintln!("  folk-pack pack-model <disk.img> <model.gguf>");
     eprintln!();
     eprintln!("Types: elf, data");
     eprintln!();
@@ -66,8 +74,7 @@ fn print_usage() {
     eprintln!("Examples:");
     eprintln!("  folk-pack create initrd.fpk --add shell:elf:path/to/shell");
     eprintln!("  folk-pack create-sqlite initrd.db --add synapse:elf:path/to/synapse");
-    eprintln!("  folk-pack create-sqlite initrd.db --add hello.txt:data:hello.txt --embed");
-    eprintln!("  folk-pack create-sqlite initrd.db --add hello.txt:data:hello.txt --quantize");
+    eprintln!("  folk-pack pack-model boot/virtio-data.img models/SmolLM-135M-Q4_0.gguf");
     process::exit(1);
 }
 
@@ -155,8 +162,27 @@ fn parse_args() -> Command {
             let result = parse_add_entries(&args, 3);
             Command::CreateSqlite(output, result.entries, result.embed, result.quantize)
         }
+        "gen-fkui" => {
+            let output = args[2].clone();
+            Command::GenFkui(output)
+        }
+        "gen-app-states" => {
+            let output = args[2].clone();
+            Command::GenAppStates(output)
+        }
+        "gen-wasm-calc" => {
+            let output = args[2].clone();
+            Command::GenWasmCalc(output)
+        }
+        "pack-model" => {
+            if args.len() < 4 {
+                eprintln!("pack-model requires: <disk.img> <model.gguf>");
+                process::exit(1);
+            }
+            Command::PackModel(args[2].clone(), args[3].clone())
+        }
         other => {
-            eprintln!("Unknown command: {}. Use 'create' or 'create-sqlite'.", other);
+            eprintln!("Unknown command: {}. Use 'create', 'create-sqlite', 'gen-fkui', 'gen-app-states', 'gen-wasm-calc', or 'pack-model'.", other);
             process::exit(1);
         }
     }
@@ -927,9 +953,674 @@ fn create_sqlite(output_path: String, add_entries: Vec<AddEntry>, generate_embed
     }
 }
 
+// ============================================================================
+// FKUI Generator — standalone UiWriter (copied from libfolk::ui, no no_std deps)
+// ============================================================================
+
+const FKUI_MAGIC: [u8; 4] = *b"FKUI";
+const FKUI_VERSION: u8 = 1;
+const FKUI_TAG_LABEL: u8 = 0x01;
+const FKUI_TAG_BUTTON: u8 = 0x02;
+const FKUI_TAG_VSTACK: u8 = 0x03;
+const FKUI_TAG_HSTACK: u8 = 0x04;
+const FKUI_TAG_SPACER: u8 = 0x05;
+
+struct FkuiWriter<'a> {
+    buf: &'a mut [u8],
+    pos: usize,
+}
+
+impl<'a> FkuiWriter<'a> {
+    fn new(buf: &'a mut [u8]) -> Self { Self { buf, pos: 0 } }
+
+    fn header(&mut self, title: &str, width: u16, height: u16) {
+        self.bytes(&FKUI_MAGIC);
+        self.byte(FKUI_VERSION);
+        let tlen = title.len().min(63);
+        self.byte(tlen as u8);
+        self.write_u16(width);
+        self.write_u16(height);
+        self.bytes(&title.as_bytes()[..tlen]);
+    }
+
+    fn label(&mut self, text: &str, color: u32) {
+        let tlen = text.len().min(63);
+        self.byte(FKUI_TAG_LABEL);
+        self.byte(tlen as u8);
+        self.write_u32(color);
+        self.bytes(&text.as_bytes()[..tlen]);
+    }
+
+    fn button(&mut self, label: &str, action_id: u32, bg: u32, fg: u32) {
+        let llen = label.len().min(31);
+        self.byte(FKUI_TAG_BUTTON);
+        self.byte(llen as u8);
+        self.write_u32(action_id);
+        self.write_u32(bg);
+        self.write_u32(fg);
+        self.bytes(&label.as_bytes()[..llen]);
+    }
+
+    fn vstack_begin(&mut self, spacing: u16, child_count: u8) {
+        self.byte(FKUI_TAG_VSTACK);
+        self.write_u16(spacing);
+        self.byte(child_count);
+    }
+
+    fn hstack_begin(&mut self, spacing: u16, child_count: u8) {
+        self.byte(FKUI_TAG_HSTACK);
+        self.write_u16(spacing);
+        self.byte(child_count);
+    }
+
+    fn spacer(&mut self, height: u16) {
+        self.byte(FKUI_TAG_SPACER);
+        self.write_u16(height);
+    }
+
+    fn len(&self) -> usize { self.pos }
+
+    fn byte(&mut self, v: u8) {
+        if self.pos < self.buf.len() {
+            self.buf[self.pos] = v;
+            self.pos += 1;
+        }
+    }
+
+    fn bytes(&mut self, data: &[u8]) {
+        let end = (self.pos + data.len()).min(self.buf.len());
+        let len = end - self.pos;
+        self.buf[self.pos..end].copy_from_slice(&data[..len]);
+        self.pos = end;
+    }
+
+    fn write_u16(&mut self, v: u16) {
+        let b = v.to_le_bytes();
+        self.byte(b[0]);
+        self.byte(b[1]);
+    }
+
+    fn write_u32(&mut self, v: u32) {
+        let b = v.to_le_bytes();
+        self.bytes(&b);
+    }
+}
+
+fn gen_fkui(output_path: String) {
+    let mut buf = [0u8; 1024];
+    let mut w = FkuiWriter::new(&mut buf);
+
+    // Identical layout to Shell's build_calc_ui(0)
+    w.header("Calculator", 200, 260);
+    w.vstack_begin(4, 6); // 6 children: display, spacer, 4 button rows
+      w.label("0", 0xFFFFFF);
+      w.spacer(4);
+      w.hstack_begin(4, 4);
+        w.button("7", 7, 0x334455, 0xFFFFFF);
+        w.button("8", 8, 0x334455, 0xFFFFFF);
+        w.button("9", 9, 0x334455, 0xFFFFFF);
+        w.button("/", 13, 0x554433, 0xFFFFFF);
+      w.hstack_begin(4, 4);
+        w.button("4", 4, 0x334455, 0xFFFFFF);
+        w.button("5", 5, 0x334455, 0xFFFFFF);
+        w.button("6", 6, 0x334455, 0xFFFFFF);
+        w.button("*", 12, 0x554433, 0xFFFFFF);
+      w.hstack_begin(4, 4);
+        w.button("1", 1, 0x334455, 0xFFFFFF);
+        w.button("2", 2, 0x334455, 0xFFFFFF);
+        w.button("3", 3, 0x334455, 0xFFFFFF);
+        w.button("-", 11, 0x554433, 0xFFFFFF);
+      w.hstack_begin(4, 4);
+        w.button("0", 0, 0x334455, 0xFFFFFF);
+        w.button("C", 15, 0x664422, 0xFFFFFF);
+        w.button("=", 14, 0x226644, 0xFFFFFF);
+        w.button("+", 10, 0x554433, 0xFFFFFF);
+
+    let len = w.len();
+    fs::write(&output_path, &buf[..len]).unwrap_or_else(|e| {
+        eprintln!("Error writing '{}': {}", output_path, e);
+        process::exit(1);
+    });
+    println!("folk-pack: Generated {} ({} bytes)", output_path, len);
+}
+
+/// Generate empty app_states.dat placeholder for M12 state recovery.
+/// Fixed-size 177 bytes: [count=0][zero-padded to MAX_APP_INSTANCES * 22]
+fn gen_app_states(output_path: String) {
+    const MAX_APP_INSTANCES: usize = 8;
+    const APP_STATE_ENTRY_SIZE: usize = 22;
+    let buf = [0u8; 1 + MAX_APP_INSTANCES * APP_STATE_ENTRY_SIZE]; // 177 bytes, count=0
+    fs::write(&output_path, &buf).unwrap_or_else(|e| {
+        eprintln!("Error writing '{}': {}", output_path, e);
+        process::exit(1);
+    });
+    println!("folk-pack: Generated {} ({} bytes, empty app state placeholder)", output_path, buf.len());
+}
+
+// ============================================================================
+// M14: WASM Calculator Generator
+// ============================================================================
+
+/// Helper to emit WASM bytecode programmatically.
+struct WasmEmitter {
+    buf: Vec<u8>,
+}
+
+impl WasmEmitter {
+    fn new() -> Self { Self { buf: Vec::new() } }
+    fn emit(&mut self, b: u8) { self.buf.push(b); }
+    fn emit_bytes(&mut self, bs: &[u8]) { self.buf.extend_from_slice(bs); }
+
+    fn emit_leb128_u32(&mut self, mut val: u32) {
+        loop {
+            let mut byte = (val & 0x7F) as u8;
+            val >>= 7;
+            if val != 0 { byte |= 0x80; }
+            self.buf.push(byte);
+            if val == 0 { break; }
+        }
+    }
+
+    fn emit_leb128_i32(&mut self, val: i32) {
+        let mut v = val;
+        loop {
+            let mut byte = (v & 0x7F) as u8;
+            v >>= 7;
+            let done = (v == 0 && byte & 0x40 == 0) || (v == -1 && byte & 0x40 != 0);
+            if !done { byte |= 0x80; }
+            self.buf.push(byte);
+            if done { break; }
+        }
+    }
+
+    fn emit_leb128_i64(&mut self, val: i64) {
+        let mut v = val;
+        loop {
+            let mut byte = (v & 0x7F) as u8;
+            v >>= 7;
+            let done = (v == 0 && byte & 0x40 == 0) || (v == -1 && byte & 0x40 != 0);
+            if !done { byte |= 0x80; }
+            self.buf.push(byte);
+            if done { break; }
+        }
+    }
+
+    // Opcodes
+    fn i32_const(&mut self, val: i32) { self.emit(0x41); self.emit_leb128_i32(val); }
+    fn i64_const(&mut self, val: i64) { self.emit(0x42); self.emit_leb128_i64(val); }
+    fn local_get(&mut self, idx: u32) { self.emit(0x20); self.emit_leb128_u32(idx); }
+    fn local_set(&mut self, idx: u32) { self.emit(0x21); self.emit_leb128_u32(idx); }
+    fn local_tee(&mut self, idx: u32) { self.emit(0x22); self.emit_leb128_u32(idx); }
+
+    fn i64_load(&mut self, offset: u32) {
+        self.emit(0x29); self.emit_leb128_u32(3); // align=8
+        self.emit_leb128_u32(offset);
+    }
+    fn i32_load(&mut self, offset: u32) {
+        self.emit(0x28); self.emit_leb128_u32(2); // align=4
+        self.emit_leb128_u32(offset);
+    }
+    fn i64_store(&mut self, offset: u32) {
+        self.emit(0x37); self.emit_leb128_u32(3);
+        self.emit_leb128_u32(offset);
+    }
+    fn i32_store(&mut self, offset: u32) {
+        self.emit(0x36); self.emit_leb128_u32(2);
+        self.emit_leb128_u32(offset);
+    }
+
+    fn i64_add(&mut self) { self.emit(0x7C); }
+    fn i64_sub(&mut self) { self.emit(0x7D); }
+    fn i64_mul(&mut self) { self.emit(0x7E); }
+    fn i64_div_s(&mut self) { self.emit(0x7F); }
+    fn i64_eqz(&mut self) { self.emit(0x50); }
+    fn i64_eq(&mut self) { self.emit(0x51); }
+    fn i64_ne(&mut self) { self.emit(0x52); }
+    fn i32_eq(&mut self) { self.emit(0x46); }
+    fn i32_lt_s(&mut self) { self.emit(0x48); }
+    fn i64_extend_i32_s(&mut self) { self.emit(0xAC); }
+    fn i32_wrap_i64(&mut self) { self.emit(0xA7); }
+    fn drop_(&mut self) { self.emit(0x1A); }
+    fn return_(&mut self) { self.emit(0x0F); }
+
+    // block type 0x40 = void
+    fn block_void(&mut self) { self.emit(0x02); self.emit(0x40); }
+    fn loop_void(&mut self) { self.emit(0x03); self.emit(0x40); }
+    fn if_void(&mut self) { self.emit(0x04); self.emit(0x40); }
+    fn else_(&mut self) { self.emit(0x05); }
+    fn end(&mut self) { self.emit(0x0B); }
+    fn br(&mut self, depth: u32) { self.emit(0x0C); self.emit_leb128_u32(depth); }
+    fn br_if(&mut self, depth: u32) { self.emit(0x0D); self.emit_leb128_u32(depth); }
+}
+
+/// Generate calc.wasm — a valid WASM binary implementing the calculator logic.
+fn gen_wasm_calc(output_path: String) {
+    let mut wasm = Vec::new();
+
+    // === Header ===
+    wasm.extend_from_slice(b"\0asm"); // magic
+    wasm.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // version 1
+
+    // === Section 1: Type ===
+    // One type: (i32, i32) -> (i32)
+    {
+        let mut sec = Vec::new();
+        sec.push(1); // 1 type
+        sec.push(0x60); // func
+        sec.push(2); // 2 params
+        sec.push(0x7F); // i32
+        sec.push(0x7F); // i32
+        sec.push(1); // 1 result
+        sec.push(0x7F); // i32
+        emit_section(&mut wasm, 1, &sec);
+    }
+
+    // === Section 3: Function ===
+    // One function, type index 0
+    {
+        let mut sec = Vec::new();
+        sec.push(1); // 1 func
+        sec.push(0); // type idx 0
+        emit_section(&mut wasm, 3, &sec);
+    }
+
+    // === Section 5: Memory ===
+    // 1 memory, min 1 page
+    {
+        let mut sec = Vec::new();
+        sec.push(1); // 1 memory
+        sec.push(0x00); // flags: no max
+        sec.push(1); // min 1 page (64KB)
+        emit_section(&mut wasm, 5, &sec);
+    }
+
+    // === Section 7: Export ===
+    // Export "memory" (memory 0) and "handle_event" (func 0)
+    {
+        let mut sec = Vec::new();
+        sec.push(2); // 2 exports
+
+        // "memory"
+        let name = b"memory";
+        push_leb128_u32(&mut sec, name.len() as u32);
+        sec.extend_from_slice(name);
+        sec.push(0x02); // memory
+        push_leb128_u32(&mut sec, 0); // index 0
+
+        // "handle_event"
+        let name = b"handle_event";
+        push_leb128_u32(&mut sec, name.len() as u32);
+        sec.extend_from_slice(name);
+        sec.push(0x00); // func
+        push_leb128_u32(&mut sec, 0); // index 0
+
+        emit_section(&mut wasm, 7, &sec);
+    }
+
+    // === Section 10: Code ===
+    {
+        let mut sec = Vec::new();
+        sec.push(1); // 1 function body
+
+        // Build function body
+        let body = build_calc_wasm_body();
+
+        push_leb128_u32(&mut sec, body.len() as u32);
+        sec.extend_from_slice(&body);
+
+        emit_section(&mut wasm, 10, &sec);
+    }
+
+    fs::write(&output_path, &wasm).unwrap_or_else(|e| {
+        eprintln!("Error writing '{}': {}", output_path, e);
+        process::exit(1);
+    });
+    println!("folk-pack: Generated {} ({} bytes, WASM calculator)", output_path, wasm.len());
+}
+
+fn emit_section(wasm: &mut Vec<u8>, id: u8, payload: &[u8]) {
+    wasm.push(id);
+    push_leb128_u32(wasm, payload.len() as u32);
+    wasm.extend_from_slice(payload);
+}
+
+fn push_leb128_u32(buf: &mut Vec<u8>, mut val: u32) {
+    loop {
+        let mut byte = (val & 0x7F) as u8;
+        val >>= 7;
+        if val != 0 { byte |= 0x80; }
+        buf.push(byte);
+        if val == 0 { break; }
+    }
+}
+
+/// Build the function body for handle_event(state_ptr: i32, action_id: i32) -> i32
+///
+/// Params: local 0 = state_ptr (always 1024), local 1 = action_id
+/// Locals: local 2 = display (i64), local 3 = acc (i64), local 4 = op (i32), local 5 = fresh (i32)
+fn build_calc_wasm_body() -> Vec<u8> {
+    let mut body = Vec::new();
+
+    // Local declarations: 2 x i64, 2 x i32
+    push_leb128_u32(&mut body, 2); // 2 local declaration groups
+    push_leb128_u32(&mut body, 2); // 2 locals
+    body.push(0x7E); // i64
+    push_leb128_u32(&mut body, 2); // 2 locals
+    body.push(0x7F); // i32
+
+    let mut e = WasmEmitter::new();
+
+    // Load state from memory
+    // display = i64.load(state_ptr + 0)
+    e.local_get(0); e.i64_load(0); e.local_set(2);
+    // acc = i64.load(state_ptr + 8)
+    e.local_get(0); e.i64_load(8); e.local_set(3);
+    // op = i32.load(state_ptr + 16)
+    e.local_get(0); e.i32_load(16); e.local_set(4);
+    // fresh = i32.load(state_ptr + 20)
+    e.local_get(0); e.i32_load(20); e.local_set(5);
+
+    // === Dispatch on action_id ===
+
+    // if action_id < 10 (digit)
+    e.local_get(1); e.i32_const(10); e.i32_lt_s();
+    e.if_void();
+    {
+        // if fresh != 0
+        e.local_get(5);
+        e.if_void();
+        {
+            // display = i64.extend_i32_s(action_id)
+            e.local_get(1); e.i64_extend_i32_s(); e.local_set(2);
+        }
+        e.else_();
+        {
+            // display = display * 10 + i64.extend_i32_s(action_id)
+            e.local_get(2); e.i64_const(10); e.i64_mul();
+            e.local_get(1); e.i64_extend_i32_s();
+            e.i64_add(); e.local_set(2);
+        }
+        e.end(); // end inner if
+        // fresh = 0
+        e.i32_const(0); e.local_set(5);
+    }
+    e.else_();
+    {
+        // action_id == 10 (+)
+        e.local_get(1); e.i32_const(10); e.i32_eq();
+        e.if_void();
+        {
+            e.local_get(2); e.local_set(3); // acc = display
+            e.i32_const(1); e.local_set(4); // op = 1
+            e.i32_const(1); e.local_set(5); // fresh = 1
+        }
+        e.else_();
+        {
+            // action_id == 11 (-)
+            e.local_get(1); e.i32_const(11); e.i32_eq();
+            e.if_void();
+            {
+                e.local_get(2); e.local_set(3);
+                e.i32_const(2); e.local_set(4);
+                e.i32_const(1); e.local_set(5);
+            }
+            e.else_();
+            {
+                // action_id == 12 (*)
+                e.local_get(1); e.i32_const(12); e.i32_eq();
+                e.if_void();
+                {
+                    e.local_get(2); e.local_set(3);
+                    e.i32_const(3); e.local_set(4);
+                    e.i32_const(1); e.local_set(5);
+                }
+                e.else_();
+                {
+                    // action_id == 13 (/)
+                    e.local_get(1); e.i32_const(13); e.i32_eq();
+                    e.if_void();
+                    {
+                        e.local_get(2); e.local_set(3);
+                        e.i32_const(4); e.local_set(4);
+                        e.i32_const(1); e.local_set(5);
+                    }
+                    e.else_();
+                    {
+                        // action_id == 14 (=)
+                        e.local_get(1); e.i32_const(14); e.i32_eq();
+                        e.if_void();
+                        {
+                            // op == 1: display = acc + display
+                            e.local_get(4); e.i32_const(1); e.i32_eq();
+                            e.if_void();
+                            {
+                                e.local_get(3); e.local_get(2); e.i64_add(); e.local_set(2);
+                            }
+                            e.end();
+                            // op == 2: display = acc - display
+                            e.local_get(4); e.i32_const(2); e.i32_eq();
+                            e.if_void();
+                            {
+                                e.local_get(3); e.local_get(2); e.i64_sub(); e.local_set(2);
+                            }
+                            e.end();
+                            // op == 3: display = acc * display
+                            e.local_get(4); e.i32_const(3); e.i32_eq();
+                            e.if_void();
+                            {
+                                e.local_get(3); e.local_get(2); e.i64_mul(); e.local_set(2);
+                            }
+                            e.end();
+                            // op == 4: display = acc / display (if display != 0)
+                            e.local_get(4); e.i32_const(4); e.i32_eq();
+                            e.if_void();
+                            {
+                                e.local_get(2); e.i64_eqz();
+                                e.if_void();
+                                {
+                                    e.i64_const(0); e.local_set(2);
+                                }
+                                e.else_();
+                                {
+                                    e.local_get(3); e.local_get(2); e.i64_div_s(); e.local_set(2);
+                                }
+                                e.end();
+                            }
+                            e.end();
+                            // op = 0, fresh = 1
+                            e.i32_const(0); e.local_set(4);
+                            e.i32_const(1); e.local_set(5);
+                        }
+                        e.else_();
+                        {
+                            // action_id == 15 (C)
+                            e.local_get(1); e.i32_const(15); e.i32_eq();
+                            e.if_void();
+                            {
+                                e.i64_const(0); e.local_set(2);
+                                e.i64_const(0); e.local_set(3);
+                                e.i32_const(0); e.local_set(4);
+                                e.i32_const(1); e.local_set(5);
+                            }
+                            e.end();
+                        }
+                        e.end(); // else of action_id==14
+                    }
+                    e.end(); // else of action_id==13
+                }
+                e.end(); // else of action_id==12
+            }
+            e.end(); // else of action_id==11
+        }
+        e.end(); // else of action_id==10
+    }
+    e.end(); // end outer if (digit vs operator)
+
+    // Write state back to memory
+    // i64.store(state_ptr + 0, display)
+    e.local_get(0); e.local_get(2); e.i64_store(0);
+    // i64.store(state_ptr + 8, acc)
+    e.local_get(0); e.local_get(3); e.i64_store(8);
+    // i32.store(state_ptr + 16, op)
+    e.local_get(0); e.local_get(4); e.i32_store(16);
+    // i32.store(state_ptr + 20, fresh)
+    e.local_get(0); e.local_get(5); e.i32_store(20);
+
+    // return 0
+    e.i32_const(0);
+    e.end(); // function end
+
+    body.extend_from_slice(&e.buf);
+    body
+}
+
+/// FOLKDISK header offsets
+const FOLKDISK_MAGIC: &[u8; 8] = b"FOLKDISK";
+const SECTOR_SIZE: usize = 512;
+
+/// Pack a GGUF model file into a FOLKDISK virtio-data.img.
+///
+/// ULTRA 26: model_sector is page-aligned (sector % 8 == 0, i.e., 4KB boundary).
+/// Reads existing header to find synapse_db end, pads to alignment, writes GGUF,
+/// updates header with model_sector (offset 64) and model_size (offset 72).
+fn pack_model(disk_path: String, model_path: String) {
+    println!("folk-pack: Packing model into {}", disk_path);
+
+    // Validate model file
+    let model_file = Path::new(&model_path);
+    if !model_file.exists() {
+        eprintln!("Error: Model file not found: {}", model_path);
+        process::exit(1);
+    }
+    let model_data = fs::read(model_file).unwrap_or_else(|e| {
+        eprintln!("Error reading model '{}': {}", model_path, e);
+        process::exit(1);
+    });
+    let model_size = model_data.len();
+
+    // Validate GGUF magic
+    if model_size < 4 || &model_data[0..4] != b"GGUF" {
+        eprintln!("Error: Not a valid GGUF file (bad magic)");
+        process::exit(1);
+    }
+    println!("  Model: {} ({} bytes, {:.1} MB)", model_path, model_size, model_size as f64 / (1024.0 * 1024.0));
+
+    // Read existing disk header
+    let disk_file = Path::new(&disk_path);
+    if !disk_file.exists() {
+        eprintln!("Error: Disk image not found: {}", disk_path);
+        process::exit(1);
+    }
+
+    let mut disk = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(disk_file)
+        .unwrap_or_else(|e| {
+            eprintln!("Error opening disk '{}': {}", disk_path, e);
+            process::exit(1);
+        });
+
+    // Read sector 0 (header)
+    let mut header_buf = [0u8; SECTOR_SIZE];
+    disk.read_exact(&mut header_buf).unwrap_or_else(|e| {
+        eprintln!("Error reading disk header: {}", e);
+        process::exit(1);
+    });
+
+    // Validate FOLKDISK magic
+    if &header_buf[0..8] != FOLKDISK_MAGIC {
+        eprintln!("Error: Not a FOLKDISK image (bad magic)");
+        process::exit(1);
+    }
+
+    // Parse synapse_db_sector and synapse_db_size from header
+    let synapse_db_sector = u64::from_le_bytes(header_buf[48..56].try_into().unwrap());
+    let synapse_db_size = u64::from_le_bytes(header_buf[56..64].try_into().unwrap()); // in sectors
+
+    println!("  Disk header: synapse_db @ sector {}, {} sectors", synapse_db_sector, synapse_db_size);
+
+    // Calculate model start sector (ULTRA 26: page-aligned)
+    let after_db = synapse_db_sector + synapse_db_size;
+    let model_start_sector = (after_db + 7) & !7; // round up to next 8-sector (4KB) boundary
+    let model_start_offset = model_start_sector as usize * SECTOR_SIZE;
+
+    println!("  Model start: sector {} (offset 0x{:X}, page-aligned)", model_start_sector, model_start_offset);
+
+    // Calculate required disk size
+    let model_sectors = (model_size + SECTOR_SIZE - 1) / SECTOR_SIZE;
+    let required_size = model_start_offset + model_sectors * SECTOR_SIZE;
+    let current_size = disk.metadata().unwrap().len() as usize;
+
+    if required_size > current_size {
+        // Extend the disk
+        println!("  Extending disk from {} to {} bytes ({:.1} MB)",
+            current_size, required_size, required_size as f64 / (1024.0 * 1024.0));
+        disk.set_len(required_size as u64).unwrap_or_else(|e| {
+            eprintln!("Error extending disk: {}", e);
+            process::exit(1);
+        });
+    }
+
+    // Pad gap between files.db end and model start with zeros
+    let db_end_offset = (synapse_db_sector + synapse_db_size) as usize * SECTOR_SIZE;
+    if model_start_offset > db_end_offset {
+        let pad_size = model_start_offset - db_end_offset;
+        disk.seek(SeekFrom::Start(db_end_offset as u64)).unwrap();
+        let zeros = vec![0u8; pad_size];
+        disk.write_all(&zeros).unwrap();
+        println!("  Padded {} bytes between files.db and model", pad_size);
+    }
+
+    // Write model data
+    disk.seek(SeekFrom::Start(model_start_offset as u64)).unwrap();
+    disk.write_all(&model_data).unwrap();
+
+    // Pad to sector boundary
+    let remainder = model_size % SECTOR_SIZE;
+    if remainder != 0 {
+        let pad = vec![0u8; SECTOR_SIZE - remainder];
+        disk.write_all(&pad).unwrap();
+    }
+
+    // Update header: model_sector at offset 64, model_size at offset 72
+    disk.seek(SeekFrom::Start(64)).unwrap();
+    disk.write_all(&model_start_sector.to_le_bytes()).unwrap(); // offset 64: model_sector (u64)
+    disk.write_all(&(model_size as u64).to_le_bytes()).unwrap(); // offset 72: model_size in bytes (u64)
+
+    // Also update data_size to cover the full disk
+    let total_sectors = required_size / SECTOR_SIZE;
+    let data_start_sector = 2048u64;
+    let data_size_sectors = total_sectors as u64 - data_start_sector;
+    disk.seek(SeekFrom::Start(40)).unwrap();
+    disk.write_all(&data_size_sectors.to_le_bytes()).unwrap();
+
+    disk.flush().unwrap();
+
+    println!();
+    println!("folk-pack: Model packed successfully!");
+    println!("  GGUF: {} bytes at sector {} (offset 0x{:X})", model_size, model_start_sector, model_start_offset);
+    println!("  Header updated: model_sector={}, model_size={}", model_start_sector, model_size);
+    println!("  Disk size: {} bytes ({:.1} MB)", required_size, required_size as f64 / (1024.0 * 1024.0));
+
+    // Verify: read back and check GGUF magic
+    disk.seek(SeekFrom::Start(model_start_offset as u64)).unwrap();
+    let mut verify = [0u8; 4];
+    disk.read_exact(&mut verify).unwrap();
+    if &verify == b"GGUF" {
+        println!("  Verify: GGUF magic OK at sector {}", model_start_sector);
+    } else {
+        eprintln!("  WARNING: GGUF magic verification FAILED!");
+    }
+}
+
 fn main() {
     match parse_args() {
         Command::Create(output, entries) => create_fpk(output, entries),
         Command::CreateSqlite(output, entries, embed, quantize) => create_sqlite(output, entries, embed, quantize),
+        Command::GenFkui(output) => gen_fkui(output),
+        Command::GenAppStates(output) => gen_app_states(output),
+        Command::GenWasmCalc(output) => gen_wasm_calc(output),
+        Command::PackModel(disk, model) => pack_model(disk, model),
     }
 }
