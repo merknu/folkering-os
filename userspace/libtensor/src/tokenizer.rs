@@ -211,6 +211,14 @@ impl<'a> BpeTokenizer<'a> {
             let mut best_len: usize = 0;
 
             for tok_id in 0..self.vocab_size {
+                // Skip control/special tokens (BOS, EOS, UNK, PAD) during encoding.
+                // These exist in the GGUF vocab as long strings like "<|im_start|>"
+                // but should NEVER be selected by BPE — the model expects them as
+                // raw subwords [<, |, im, _, start, |, >], not collapsed single tokens.
+                if tok_id <= 3 {
+                    continue;
+                }
+
                 let tok_bytes = self.token_bytes(tok_id as u32);
                 if tok_bytes.is_empty() {
                     continue;

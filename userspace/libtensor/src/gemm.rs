@@ -252,12 +252,13 @@ pub fn gemm_f32_x_q4(
                 let scale = quantize::q4_0_block_scale(&b_q4[blk_start..]);
                 let a_base = blk * 32;
 
+                // GGML Q4_0 layout: lo nibbles → positions 0-15, hi nibbles → positions 16-31
                 for i in 0..16 {
                     let byte = b_q4[blk_start + 2 + i];
                     let lo = ((byte & 0x0F) as i8 - 8) as f32;
                     let hi = (((byte >> 4) & 0x0F) as i8 - 8) as f32;
-                    acc += a_row[a_base + i * 2] * lo * scale;
-                    acc += a_row[a_base + i * 2 + 1] * hi * scale;
+                    acc += a_row[a_base + i] * lo * scale;       // lo → first half
+                    acc += a_row[a_base + 16 + i] * hi * scale;  // hi → second half
                 }
             }
 

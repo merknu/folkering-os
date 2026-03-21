@@ -32,12 +32,13 @@ pub fn dequantize_q4_0_block(block: &[u8], out: &mut [f32]) {
 
     let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
 
+    // GGML Q4_0 layout: lo nibbles → first half (0-15), hi nibbles → second half (16-31)
     for i in 0..16 {
         let byte = block[2 + i];
         let lo = (byte & 0x0F) as i8 - 8;
         let hi = ((byte >> 4) & 0x0F) as i8 - 8;
-        out[i * 2] = lo as f32 * scale;
-        out[i * 2 + 1] = hi as f32 * scale;
+        out[i] = lo as f32 * scale;       // lo → position i (first half)
+        out[16 + i] = hi as f32 * scale;  // hi → position i+16 (second half)
     }
 }
 
@@ -90,18 +91,20 @@ pub fn quantize_f32_to_q8_0(input: &[f32], output: &mut [u8]) {
         let scale_bytes = scale_f16.to_le_bytes();
         output[out_offset..out_offset + 2].copy_from_slice(&scale_bytes);
 
-        // Quantize values
+        // Quantize values (round to nearest, matching llama.cpp's roundf())
         for i in 0..32 {
             let src_idx = start + i;
             if src_idx < end {
                 let v = input[src_idx] * inv_scale;
+                // Round to nearest integer (not truncate!)
+                let rounded = if v >= 0.0 { (v + 0.5) as i32 } else { (v - 0.5) as i32 };
                 // Clamp to i8 range
-                let q = if v > 127.0 {
+                let q = if rounded > 127 {
                     127i8
-                } else if v < -128.0 {
+                } else if rounded < -128 {
                     -128i8
                 } else {
-                    v as i8
+                    rounded as i8
                 };
                 output[out_offset + 2 + i] = q as u8;
             } else {
@@ -130,14 +133,14 @@ pub fn q8_0_block_values(block: &[u8]) -> &[i8] {
 }
 
 /// Convert Q4_0 block values to u8 array (for integer GEMM).
-/// Each nibble is extracted and offset: nibble is stored as unsigned 0-15.
+/// GGML layout: lo nibbles → first half (0-15), hi nibbles → second half (16-31).
 /// The subtraction of 8 (zero-point) is handled during accumulation.
 #[inline]
 pub fn q4_0_to_u8_block(block: &[u8], out: &mut [u8; 32]) {
     for i in 0..16 {
         let byte = block[2 + i];
-        out[i * 2] = byte & 0x0F;
-        out[i * 2 + 1] = (byte >> 4) & 0x0F;
+        out[i] = byte & 0x0F;           // lo → first half
+        out[16 + i] = (byte >> 4) & 0x0F; // hi → second half
     }
 }
 
@@ -218,16 +221,17 @@ pub fn dot_q4_0_q8_0_block(q4_block: &[u8], q8_block: &[u8]) -> f32 {
     let mut sum_prod = 0i32;
     let mut sum_q8 = 0i32;
 
+    // GGML Q4_0 layout: lo nibbles → first half (0-15), hi nibbles → second half (16-31)
     for i in 0..16 {
         let byte = q4_block[2 + i];
-        let q4_lo = (byte & 0x0F) as i32;
-        let q4_hi = ((byte >> 4) & 0x0F) as i32;
+        let q4_lo = (byte & 0x0F) as i32;      // → position i (first half)
+        let q4_hi = ((byte >> 4) & 0x0F) as i32; // → position i+16 (second half)
 
-        let q8_lo = (q8_block[2 + i * 2] as i8) as i32;
-        let q8_hi = (q8_block[2 + i * 2 + 1] as i8) as i32;
+        let q8_first = (q8_block[2 + i] as i8) as i32;      // activation at position i
+        let q8_second = (q8_block[2 + 16 + i] as i8) as i32; // activation at position i+16
 
-        sum_prod += q4_lo * q8_lo + q4_hi * q8_hi;
-        sum_q8 += q8_lo + q8_hi;
+        sum_prod += q4_lo * q8_first + q4_hi * q8_second;
+        sum_q8 += q8_first + q8_second;
     }
 
     // Apply zero-point correction and scales

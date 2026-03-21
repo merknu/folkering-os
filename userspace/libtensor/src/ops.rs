@@ -292,12 +292,16 @@ pub fn fast_sqrt(x: f32) -> f32 {
 }
 
 /// Fast approximate 1/sqrt(x).
+/// Two Newton-Raphson iterations for ~0.0001% precision (needed because
+/// RMSNorm uses this 60× across 30 layers — single iteration's 0.175%
+/// error compounds to ~11% drift and destroys logit ranking).
 #[inline]
 pub fn fast_rsqrt(x: f32) -> f32 {
     if x <= 0.0 { return 0.0; }
     let i = 0x5F375A86u32.wrapping_sub(x.to_bits() >> 1);
     let y = f32::from_bits(i);
-    y * (1.5 - 0.5 * x * y * y)
+    let y = y * (1.5 - 0.5 * x * y * y); // 1st Newton-Raphson
+    y * (1.5 - 0.5 * x * y * y)          // 2nd Newton-Raphson
 }
 
 /// Sin approximation using 5th-order Chebyshev polynomial.

@@ -40,6 +40,115 @@ entry!(main);
 /// Inference server task ID (must match kernel spawn order)
 pub const INFERENCE_TASK_ID: u32 = 6;
 
+// ============================================================================
+// Debug Tensor Dump — ULTRA 49: lightweight println! + VirtIO disk mailbox
+//
+// Two extraction paths for the host-side MCP tool:
+//   1. Serial log: [TDMP] lines with stats (always available)
+//   2. Disk mailbox: sectors 1-7 with raw f32 data (for numpy analysis)
+//
+// The MCP tool reads the disk image directly on the host — no QEMU interaction.
+// ============================================================================
+
+/// Debug mailbox: sector 1 = header, sectors 2-7 = data (max 768 f32)
+const DUMP_HEADER_SECTOR: u64 = 1;
+const DUMP_DATA_SECTOR: u64 = 2;
+const DUMP_MAX_SECTORS: usize = 6;  // sectors 2-7
+const DUMP_MAX_FLOATS: usize = DUMP_MAX_SECTORS * SECTOR_SIZE / 4;  // 768
+
+/// Monotonic sequence counter
+static mut DUMP_SEQ: u32 = 0;
+
+/// Dump a named f32 tensor: print stats to serial AND write to disk mailbox.
+///
+/// Disk mailbox layout:
+///   Sector 1 (header): magic, seq, shape, stats, name, first 100 f32 summary
+///   Sectors 2-7 (data): raw f32 values, up to 768 floats
+fn debug_dump_tensor(name: &str, data: &[f32], shape0: u32, shape1: u32) {
+    let n = data.len();
+    if n == 0 { return; }
+
+    // Compute stats
+    let mut min_val = data[0];
+    let mut max_val = data[0];
+    let mut sum = 0.0f64;
+    let mut argmax_idx = 0u32;
+    let mut argmax_val = data[0];
+
+    for i in 0..n {
+        let v = data[i];
+        if v < min_val { min_val = v; }
+        if v > max_val { max_val = v; argmax_idx = i as u32; argmax_val = v; }
+        sum += v as f64;
+    }
+    let mean = (sum / n as f64) as f32;
+
+    let seq = unsafe {
+        DUMP_SEQ += 1;
+        DUMP_SEQ
+    };
+
+    // Print to serial (always available — MCP tool parses this)
+    println!("[TDMP] seq={} name={} shape=[{},{}] n={} argmax={}({:.6}) min={:.6} max={:.6} mean={:.6}",
+        seq, name, shape0, shape1, n, argmax_idx, argmax_val, min_val, max_val, mean);
+
+    // Write to disk mailbox for full float data extraction
+    let n_dumped = n.min(DUMP_MAX_FLOATS) as u32;
+
+    // Build header sector (512 bytes)
+    let mut hdr = [0u8; SECTOR_SIZE];
+    hdr[0..4].copy_from_slice(b"TDMP");
+    hdr[4..8].copy_from_slice(&seq.to_le_bytes());
+    hdr[8..12].copy_from_slice(&(n as u32).to_le_bytes());
+    hdr[12..16].copy_from_slice(&n_dumped.to_le_bytes());
+    hdr[16..20].copy_from_slice(&shape0.to_le_bytes());
+    hdr[20..24].copy_from_slice(&shape1.to_le_bytes());
+    hdr[24..28].copy_from_slice(&argmax_idx.to_le_bytes());
+    hdr[32..36].copy_from_slice(&min_val.to_le_bytes());
+    hdr[36..40].copy_from_slice(&max_val.to_le_bytes());
+    hdr[40..44].copy_from_slice(&mean.to_le_bytes());
+    hdr[44..48].copy_from_slice(&argmax_val.to_le_bytes());
+    let name_bytes = name.as_bytes();
+    let copy_len = name_bytes.len().min(63);
+    hdr[48..48 + copy_len].copy_from_slice(&name_bytes[..copy_len]);
+    let summary_count = n.min(100);
+    for i in 0..summary_count {
+        let off = 112 + i * 4;
+        if off + 4 <= SECTOR_SIZE {
+            hdr[off..off + 4].copy_from_slice(&data[i].to_le_bytes());
+        }
+    }
+
+    let _ = libfolk::sys::block::write_sector(DUMP_HEADER_SECTOR, &hdr);
+
+    // Write data sectors (2-7)
+    let mut buf = [0u8; SECTOR_SIZE];
+    let data_sectors = ((n_dumped as usize * 4) + SECTOR_SIZE - 1) / SECTOR_SIZE;
+    let data_sectors = data_sectors.min(DUMP_MAX_SECTORS);
+    for s in 0..data_sectors {
+        let float_start = s * (SECTOR_SIZE / 4);
+        let float_end = ((s + 1) * (SECTOR_SIZE / 4)).min(n_dumped as usize);
+        for b in buf.iter_mut() { *b = 0; }
+        for i in float_start..float_end {
+            let off = (i - float_start) * 4;
+            buf[off..off + 4].copy_from_slice(&data[i].to_le_bytes());
+        }
+        let _ = libfolk::sys::block::write_sector(DUMP_DATA_SECTOR + s as u64, &buf);
+    }
+}
+
+/// Convenience: dump logits after forward pass
+#[allow(dead_code)]
+fn debug_dump_logits(logits: &[f32], label: &str) {
+    debug_dump_tensor(label, logits, logits.len() as u32, 0);
+}
+
+/// Convenience: dump a 1D hidden state
+#[allow(dead_code)]
+fn debug_dump_hidden(data: &[f32], label: &str) {
+    debug_dump_tensor(label, data, data.len() as u32, 0);
+}
+
 /// IPC opcodes for inference requests (must match libfolk::sys::inference)
 pub const INFER_OP_PING: u64 = 0;
 pub const INFER_OP_GENERATE: u64 = 1;
@@ -566,15 +675,11 @@ fn handle_inference_request(
     // so tokenizer offset/length tables are preserved across forward passes
     let arena_mark = arena.used();
 
-    // Tokenize the prompt
+    // Tokenize the prompt (starts with <|im_start|> = BOS, no extra prepend needed)
     let mut input_tokens = [0u32; 512];
-    let n_prompt = tokenizer.encode(&prompt_buf[..prompt_len], &mut input_tokens[1..]);
+    let total_prompt = tokenizer.encode(&prompt_buf[..prompt_len], &mut input_tokens);
 
-    // Prepend BOS token
-    input_tokens[0] = eng.bos_id;
-    let total_prompt = n_prompt + 1;
-
-    println!("[INFERENCE] Tokenized: {} tokens (+ BOS = {} total)", n_prompt, total_prompt);
+    println!("[INFERENCE] Tokenized: {} tokens", total_prompt);
 
     // Build LayerWeights slice for transformer::forward
     // We need to reconstruct LayerWeights from LayerData
@@ -620,9 +725,17 @@ fn handle_inference_request(
 
         // On the last prefill token, we need the logits for generation
         if i == total_prompt - 1 {
+            // DUMP: prefill-final logits to debug mailbox (DISABLED — L1 attn_out dump on disk)
+            // debug_dump_logits(logits, "prefill_final_logits");
+
             // Sample next token from these logits
             last_logits_token = sample_with_penalties(logits, &gen_tokens[..gen_count], arena);
         }
+
+        // DUMP: first token (BOS) logits — DISABLED, L1 attn_out dump on disk
+        // if i == 0 {
+        //     debug_dump_logits(logits, "bos_logits");
+        // }
 
         // ULTRA 28: yield periodically during prefill
         if i % 4 == 0 {
@@ -1057,11 +1170,16 @@ fn handle_async_inference(
     let arena_mark = arena.used();
 
     // Tokenize prompt with chat template
+    // Tokenize prompt (special tokens like <|im_start|> are handled as BPE subwords,
+    // NOT collapsed to single special token IDs — see tokenizer fix)
     let mut input_tokens = [0u32; 512];
-    let n_prompt = tokenizer.encode(&prompt_buf[..prompt_len], &mut input_tokens[1..]);
-    input_tokens[0] = eng.bos_id;
-    let total_prompt = n_prompt + 1;
+    let total_prompt = tokenizer.encode(&prompt_buf[..prompt_len], &mut input_tokens);
     println!("[INFERENCE] Async tokenized: {} tokens", total_prompt);
+    // Debug: print first 10 token IDs for verification
+    let dbg_n = total_prompt.min(10);
+    for i in 0..dbg_n {
+        println!("[INFERENCE]   token[{}] = {}", i, input_tokens[i]);
+    }
 
     let config = &eng.config;
     let yield_cfg = YieldConfig::foreground();

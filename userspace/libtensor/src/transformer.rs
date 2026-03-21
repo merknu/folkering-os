@@ -15,6 +15,7 @@ use crate::ops;
 use crate::kv_cache::KvCacheManager;
 use crate::quantize;
 use crate::FuseOp;
+use libfolk::println;
 
 /// Model configuration (parsed from GGUF metadata)
 #[derive(Clone, Copy)]
@@ -136,6 +137,11 @@ pub fn forward<'a>(
     let xb2 = arena.alloc_f32(dim)?;         // after FFN norm
     let logits = arena.alloc_f32(config.vocab_size)?; // output logits
 
+    // Q8_0 scratch buffer for quantized activations (used by gemm_q4_q8)
+    // Max size needed: intermediate_size (1536) → 48 blocks × 34 bytes = 1632
+    let q8_max_blocks = config.intermediate_size / 32;
+    let q8_buf = arena.alloc_slice::<u8>(q8_max_blocks * quantize::Q8_0_BLOCK_SIZE)?;
+
     // Attention scores buffer (per-head, reused across heads)
     let max_ctx = kv_cache.layer(0).active_length() + 1;
     let att = arena.alloc_f32(max_ctx)?;
@@ -143,6 +149,16 @@ pub fn forward<'a>(
     // === Token embedding lookup ===
     // Dequantize the embedding row for token_id from Q4_0
     embed_token(token_id as usize, config.vocab_size, dim, weights.token_embed, x);
+
+    // DEBUG: dump embedding for BOS (token 1) at pos=0
+    if token_id == 1 && pos == 0 {
+        println!("[EMB] token={} first16: {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}",
+            token_id, x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7],
+            x[8], x[9], x[10], x[11], x[12], x[13], x[14], x[15]);
+        let mut emin = x[0]; let mut emax = x[0];
+        for i in 0..dim { if x[i] < emin { emin = x[i]; } if x[i] > emax { emax = x[i]; } }
+        println!("[EMB] min={:.6} max={:.6}", emin, emax);
+    }
 
     // === Transformer layers ===
     for layer in 0..config.n_layers {
@@ -152,16 +168,17 @@ pub fn forward<'a>(
         // 1. RMSNorm
         ops::rmsnorm_into(x, lw.attn_norm, xb, config.rms_norm_eps);
 
-        // 2. Q/K/V projections (f32 activations × Q4_0 weights)
-        // Zero output buffers — GEMM uses += accumulation
+        // 2. Q/K/V projections: quantize xb to Q8_0, then use integer dot product
+        // This matches llama.cpp's approach and avoids f32 accumulation drift.
         for i in 0..n_heads * head_dim { q[i] = 0.0; }
         for i in 0..kv_dim { k[i] = 0.0; v[i] = 0.0; }
-        gemm::gemm_f32_x_q4(q, xb, lw.wq, 1, dim, n_heads * head_dim,
-            FuseOp::None, yield_cfg.gemm_yield, arena);
-        gemm::gemm_f32_x_q4(k, xb, lw.wk, 1, dim, kv_dim,
-            FuseOp::None, yield_cfg.gemm_yield, arena);
-        gemm::gemm_f32_x_q4(v, xb, lw.wv, 1, dim, kv_dim,
-            FuseOp::None, yield_cfg.gemm_yield, arena);
+        quantize::quantize_f32_to_q8_0(xb, q8_buf);
+        gemm::gemm_q4_q8(q, q8_buf, lw.wq, 1, dim, n_heads * head_dim,
+            FuseOp::None, yield_cfg.gemm_yield);
+        gemm::gemm_q4_q8(k, q8_buf, lw.wk, 1, dim, kv_dim,
+            FuseOp::None, yield_cfg.gemm_yield);
+        gemm::gemm_q4_q8(v, q8_buf, lw.wv, 1, dim, kv_dim,
+            FuseOp::None, yield_cfg.gemm_yield);
 
         // 3. RoPE on Q and K
         ops::rope_inplace(q, head_dim, pos, config.rope_base);
@@ -206,10 +223,69 @@ pub fn forward<'a>(
             }
         }
 
+        // DEBUG: dump layer 1 attn_out at pos=0 ONLY (for clean comparison with Python)
+        if layer == 1 && pos == 0 {
+            use libfolk::sys::block::{write_sector, SECTOR_SIZE};
+            // Compute stats
+            let mut d_min = attn_out[0];
+            let mut d_max = attn_out[0];
+            let mut d_sum = 0.0f64;
+            let mut d_argmax: usize = 0;
+            for i in 0..dim {
+                let val = attn_out[i];
+                if val < d_min { d_min = val; }
+                if val > d_max { d_max = val; d_argmax = i; }
+                d_sum += val as f64;
+            }
+            let d_mean = (d_sum / dim as f64) as f32;
+            println!("[TDMP] seq=0 name=L1_attn_out_pos{} shape=[{},1] n={} argmax={}({:.6}) min={:.6} max={:.6} mean={:.6}",
+                pos, dim, dim, d_argmax, attn_out[d_argmax], d_min, d_max, d_mean);
+
+            // Write header to sector 1
+            let mut hdr = [0u8; SECTOR_SIZE];
+            hdr[0..4].copy_from_slice(b"TDMP");
+            hdr[4..8].copy_from_slice(&0u32.to_le_bytes()); // seq
+            hdr[8..12].copy_from_slice(&(dim as u32).to_le_bytes()); // n
+            hdr[12..16].copy_from_slice(&(dim as u32).to_le_bytes()); // n_dumped (all 576)
+            hdr[16..20].copy_from_slice(&(dim as u32).to_le_bytes()); // shape0
+            hdr[20..24].copy_from_slice(&1u32.to_le_bytes()); // shape1
+            hdr[24..28].copy_from_slice(&(d_argmax as u32).to_le_bytes());
+            hdr[32..36].copy_from_slice(&d_min.to_le_bytes());
+            hdr[36..40].copy_from_slice(&d_max.to_le_bytes());
+            hdr[40..44].copy_from_slice(&d_mean.to_le_bytes());
+            hdr[44..48].copy_from_slice(&attn_out[d_argmax].to_le_bytes());
+            let name_str = b"L1_attn_out";
+            hdr[48..48 + name_str.len()].copy_from_slice(name_str);
+            // Write first 100 floats in summary area
+            let summary_n = dim.min(100);
+            for i in 0..summary_n {
+                let off = 112 + i * 4;
+                if off + 4 <= SECTOR_SIZE {
+                    hdr[off..off + 4].copy_from_slice(&attn_out[i].to_le_bytes());
+                }
+            }
+            let _ = write_sector(1, &hdr);
+
+            // Write data sectors 2-6 (576 floats = 2304 bytes = 5 sectors)
+            let floats_per_sector = SECTOR_SIZE / 4; // 128
+            let data_sectors = (dim + floats_per_sector - 1) / floats_per_sector;
+            for s in 0..data_sectors {
+                let mut buf = [0u8; SECTOR_SIZE];
+                let start = s * floats_per_sector;
+                let end = ((s + 1) * floats_per_sector).min(dim);
+                for i in start..end {
+                    let off = (i - start) * 4;
+                    buf[off..off + 4].copy_from_slice(&attn_out[i].to_le_bytes());
+                }
+                let _ = write_sector(2 + s as u64, &buf);
+            }
+        }
+
         // 6. Output projection (attn_out × Wo → xb)
         for i in 0..dim { xb[i] = 0.0; }
-        gemm::gemm_f32_x_q4(xb, attn_out, lw.wo, 1, dim, dim,
-            FuseOp::None, yield_cfg.gemm_yield, arena);
+        quantize::quantize_f32_to_q8_0(attn_out, q8_buf);
+        gemm::gemm_q4_q8(xb, q8_buf, lw.wo, 1, dim, dim,
+            FuseOp::None, yield_cfg.gemm_yield);
 
         // 7. Residual connection
         for i in 0..dim { x[i] += xb[i]; }
@@ -221,30 +297,39 @@ pub fn forward<'a>(
         // 1. RMSNorm
         ops::rmsnorm_into(x, lw.ffn_norm, xb2, config.rms_norm_eps);
 
-        // 2. Gate + Up projections
+        // 2. Gate + Up projections (quantize xb2 once, reuse for both)
         for i in 0..config.intermediate_size { ffn_buf1[i] = 0.0; }
         for i in 0..config.intermediate_size { ffn_buf2[i] = 0.0; }
+        quantize::quantize_f32_to_q8_0(xb2, q8_buf);
 
         // gate = xb2 × W_gate (with fused SiLU)
-        gemm::gemm_f32_x_q4(ffn_buf1, xb2, lw.w_gate, 1, dim, config.intermediate_size,
-            FuseOp::SiLU, yield_cfg.gemm_yield, arena);
+        gemm::gemm_q4_q8(ffn_buf1, q8_buf, lw.w_gate, 1, dim, config.intermediate_size,
+            FuseOp::SiLU, yield_cfg.gemm_yield);
 
         // up = xb2 × W_up
-        gemm::gemm_f32_x_q4(ffn_buf2, xb2, lw.w_up, 1, dim, config.intermediate_size,
-            FuseOp::None, yield_cfg.gemm_yield, arena);
+        gemm::gemm_q4_q8(ffn_buf2, q8_buf, lw.w_up, 1, dim, config.intermediate_size,
+            FuseOp::None, yield_cfg.gemm_yield);
 
         // 3. Element-wise gate * up
         for i in 0..config.intermediate_size {
             ffn_buf1[i] *= ffn_buf2[i];
         }
 
-        // 4. Down projection
+        // 4. Down projection (quantize gate*up, then GEMM)
         for i in 0..dim { xb[i] = 0.0; }
-        gemm::gemm_f32_x_q4(xb, ffn_buf1, lw.w_down, 1, config.intermediate_size, dim,
-            FuseOp::None, yield_cfg.gemm_yield, arena);
+        quantize::quantize_f32_to_q8_0(ffn_buf1, q8_buf);
+        gemm::gemm_q4_q8(xb, q8_buf, lw.w_down, 1, config.intermediate_size, dim,
+            FuseOp::None, yield_cfg.gemm_yield);
 
         // 5. Residual connection
         for i in 0..dim { x[i] += xb[i]; }
+
+        // DEBUG: dump hidden state after layer 0 for BOS
+        if layer == 0 && pos == 0 {
+            println!("[L0_OUT] first16: {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}",
+                x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7],
+                x[8], x[9], x[10], x[11], x[12], x[13], x[14], x[15]);
+        }
     }
 
     // === Final norm + LM head ===
@@ -258,6 +343,25 @@ pub fn forward<'a>(
     } else {
         gemm::gemm_f32_x_q4(logits, x, weights.output_weight, 1, dim, config.vocab_size,
             FuseOp::None, yield_cfg.gemm_yield, arena);
+    }
+
+    // DEBUG: dump BOS logits top-5
+    if pos == 0 {
+        let mut best = [(0u32, f32::NEG_INFINITY); 5];
+        for i in 0..config.vocab_size {
+            let v = logits[i];
+            if v > best[4].1 {
+                best[4] = (i as u32, v);
+                // bubble up
+                for j in (1..5).rev() {
+                    if best[j].1 > best[j-1].1 { best.swap(j, j-1); }
+                }
+            }
+        }
+        println!("[BOS_LOGITS] argmax=[{}]={:.6} top5: [{}]={:.4} [{}]={:.4} [{}]={:.4} [{}]={:.4} [{}]={:.4}",
+            best[0].0, best[0].1,
+            best[0].0, best[0].1, best[1].0, best[1].1, best[2].0, best[2].1,
+            best[3].0, best[3].1, best[4].0, best[4].1);
     }
 
     Some(logits)
