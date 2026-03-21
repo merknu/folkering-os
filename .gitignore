@@ -28,8 +28,17 @@ Thumbs.db
 *.bak
 output/
 
-# Keep boot images if needed (comment out if you want to track them)
-# boot/*.img
+# Boot artifacts (generated, not source)
+boot/*.img
+boot/*.dat
+boot/*.fkui
+boot/*.wasm
+boot/*.db
+boot/*.gguf
+boot/debug-*.txt
+boot/*-test.txt
+boot/working-*.txt
+boot/phase*.txt
 
 # Python
 __pycache__/

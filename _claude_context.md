@@ -3,133 +3,75 @@
 ## Project Overview
 Rust bare-metal x86-64 AI-native microkernel OS. Limine bootloader, QEMU for emulation, WSL build.
 
-**Current milestone**: 4.5 (App Weaver + interactive buttons)
+**Current milestone**: Epoch 1, M42 — First AI-generated tokens
 
-## What Works (as of 2026-03-18)
-- Graphical desktop (Neural Desktop) with draggable windows
-- Interactive terminal: `ls`, `ps`, `cat`, `find`, `uptime`, `app`, `help`
-- SQLite VFS via Synapse (custom no_std B-tree reader)
-- App Weaver: Shell builds declarative UI → shmem → Compositor renders
-- Clickable buttons with action_id IPC events back to owner task
-- SYS_MMAP/MUNMAP for dynamic anonymous memory
-- Full microkernel IPC: Compositor → Intent Service → Shell → Synapse
+## What Works (as of 2026-03-21)
+- **On-device SLM inference**: SmolLM2-135M generates tokens via omnibar `ask` command
+- Graphical desktop (Neural Desktop) with draggable terminal windows
+- BPE tokenizer (Greedy Prefix Match), 30-layer transformer forward pass
+- Top-P nucleus sampling with repetition penalty, KV-cache with sink eviction
+- VirtIO block with multi-sector DMA bursting (ULTRA 36: 87MB in 45s)
+- VirtIO network: DHCP, ICMP ping, DNS resolution
+- SQLite VFS via Synapse on persistent VirtIO disk
+- App Weaver: declarative UI → shmem → Compositor renders
+- Full microkernel IPC: Compositor → Intent → Shell → Synapse → Inference
 
-## 5 Userspace Tasks
+## 6 Userspace Tasks
 | Task | Name | Purpose |
 |------|------|---------|
 | 1 | idle | Idle loop |
-| 2 | synapse | SQLite, file cache, search |
-| 3 | shell | Commands, app builder |
-| 4 | compositor | GUI, windows, widgets |
+| 2 | synapse | SQLite, VFS, file cache |
+| 3 | shell | Commands, WASM apps |
+| 4 | compositor | GUI, windows, omnibar, terminal |
 | 5 | intent-service | Capability-based IPC routing |
+| 6 | inference | SLM inference (libtensor + GGUF) |
 
-## Critical Lessons (from this session)
+## Critical Lessons
 1. **shmem_map MUST use task PML4** — `map_page_in_table(task.page_table_phys, ...)` NOT global MAPPER
-2. **receive() truncates to 32 bits** — use recv_async() for full 64-bit payloads
-3. **B-tree right_pointer: follow exactly once** — check `next_cell == cell_count`
-4. **Avoid IPC deadlocks** — Shell can't send IPC to Compositor while Compositor waits for Shell
+2. **GGUF magic is 0x46554747** (not 0x46475547) — "GGUF" as LE u32
+3. **Kernel mmap limit = 16MB/call** — inference server mmaps in 16MB chunks
+4. **INFER_SHMEM_VADDR must not collide with MMAP_BASE** — use 0x20000000
+5. **SmolLM2-135M Q4_0 uses Q8_0 for embeddings/output** — need dtype-aware GEMM
+6. **VirtIO DMA: sector-by-sector = kernel DDoS** — multi-sector bursts essential
+7. **Compositor omnibar catches all keyboard** — commands must be handled in compositor code
 
 ## Build
-- Kernel: `kernel/` → `target/x86_64-folkering/release/kernel` (ELF)
-- Userspace: `userspace/` → `target/x86_64-folkering-userspace/release/{compositor,shell,synapse}` (ELF)
-- Build runs in WSL (Ubuntu-22.04), outputs to Windows filesystem via `/mnt/c/`
+- Kernel: `kernel/` → `target/x86_64-folkering/release/kernel`
+- Userspace: `userspace/` → `target/x86_64-folkering-userspace/release/{compositor,shell,synapse,intent-service,inference}`
+- folk-pack: `tools/folk-pack/` — creates FPK initrd + packs GGUF models
+- MCP build server: `C:\Users\merkn\folkering-mcp\server.py` (folkering_rebuild_run)
+- MCP debug server: `mcp/server.py` (kernel_symbol_lookup, serial_throttle_analyzer, qemu_inspect_registers)
 
-## Debug Session
-Start QEMU with full debug flags (QMP + GDB stub):
-```bash
-wsl -e bash -c "cd /mnt/c/Users/merkn/folkering/folkering-os && ./tools/qemu-debug-live.sh"
+## FOLKDISK Header Layout (sector 0 of virtio-data.img)
 ```
-- QMP socket: `/tmp/folkering-qmp.sock` (WSL-native)
-- Serial log:  `/tmp/folkering-serial.log`
-- GDB stub:    `localhost:1234` (QEMU starts halted — `continue` in GDB or use GDB bridge)
-
-## MCP Debug Server — `mcp/server.py`
-Registered in `~/.claude.json` as `folkering-debug`, invoked with `py -3.12`.
-
-### Tool: `kernel_symbol_lookup`
-Resolves hex addresses → function name + source location using the kernel/userspace ELF symbols.
-
-**Parameters:**
-- `addresses` (required): `["0x205AD5", "0xffffffff80000004"]`
-- `elf_path` (optional): Override ELF path (auto-detected from address range by default)
-
-**Auto-detection logic:**
-- `0xffffffff80000000–0xffffffffffffffff` → kernel ELF
-- `0x200000–0x4fffff` → compositor/shell/synapse (userspace)
-- CS=0x08 = kernel mode, CS=0x23 = user mode
-
-**Notes:**
-- Release builds have `.symtab` but NO DWARF — `addr2line` returns `??`, `nm` finds nearest symbol
-- ELF is copied to `/tmp/folkering-{name}` in WSL for native filesystem speed (avoids slow 9P `/mnt/c/`)
-
-**Example output:**
-```
-────────────────────────────────────────────────────────────
-Address  : 0x205AD5  [compositor]
-Symbol   : compositor::main  +0xc46
-Source   : (no DWARF — build with debug_assertions or use debug profile)
+[0..8]   "FOLKDISK" magic
+[8..12]  version (u32)
+[12..16] pad
+[16..24] journal_start (u64)
+[24..32] journal_size (u64)
+[32..40] data_start (u64)
+[40..48] data_size (u64)
+[48..56] synapse_db_sector (u64)
+[56..64] synapse_db_size (u64)
+[64..72] model_sector (u64) — 4KB-aligned
+[72..80] model_size (u64) — bytes
 ```
 
-### Tool: `serial_throttle_analyzer`
-Reads a serial/QEMU log and collapses repeated loop patterns. Turns millions of repetitive lines into `[LOOP xN]` summaries so anomalies (faults, panics) are immediately visible.
-
-**Parameters:**
-- `log_path` (required): Path to log file (e.g. `/tmp/folkering-serial.log`)
-- `window` (default: 5): Lines per pattern unit
-- `threshold` (default: 10): Repeats before collapsing
-- `max_output_lines` (default: 200): Output line cap
-
-**Example usage:** `serial_throttle_analyzer "/tmp/folkering-serial.log"`
-
-### Tool: `qemu_inspect_registers`
-Queries live QEMU CPU state via QMP. Returns GPR (RAX–R15, RIP, RSP, RBP, RFLAGS) and segment registers. Optionally includes XMM0–XMM15.
-
-**Parameters:**
-- `include_xmm` (default: false): Include SSE registers
-- `qmp_socket` (default: `/tmp/folkering-qmp.sock`): Override QMP socket path
-
-**Requires:** QEMU running with `-qmp unix:/tmp/folkering-qmp.sock,server,nowait`
-
-**Implementation note:** QMP socket is WSL-native, so tool embeds a Python client script and runs it via `wsl -d Ubuntu-22.04 python3 -c "..."` (NOT `wsl -e python3` — that fails with E_UNEXPECTED).
-
-**Example output:**
-```
-QEMU CPU Register State
-════════════════════════════════════════════════════════════
-RAX=0000000000000000 RBX=0000000000000000 RCX=0000000000000000
-RDX=0000000000000663 RSI=0000000000000000 RDI=0000000000000000
-...
-```
-
-## Skill: ABI Auditor (`/abi-audit`)
-Saved at `~/.claude/skills/abi-audit.md`. Activates on:
-- Shared `naked_asm!` / `global_asm!` / `.asm` blocks
-- "check my abi" / "audit this asm" / `/abi-audit`
-
-Performs SysV AMD64 ABI compliance check:
-1. Stack map diagram (RSP offset at each push/pop)
-2. 16-byte RSP alignment check before every `call`
-3. Callee-saved register clobber detection (RBX, RBP, R12–R15, XMM8–15)
-4. Argument register verification (RDI, RSI, RDX, RCX, R8, R9 order)
-5. Red zone warning (no red zone in kernel interrupt handlers)
-
-## WSL Invocation Quirks
-- `wsl -e bash -c "..."` — works for bash commands (cp, nm, addr2line)
-- `wsl -d Ubuntu-22.04 python3 -c "..."` — required for Python; `-e python3` fails with `E_UNEXPECTED`
-- ELF operations use `wsl -e bash -c` (bash + binutils)
-- QMP client uses `wsl -d Ubuntu-22.04 python3 -c` (Python socket)
+## Key Directories
+| Path | Purpose |
+|------|---------|
+| `kernel/src/drivers/virtio_blk.rs` | VirtIO block + DMA burst |
+| `userspace/libtensor/src/` | GEMM, GGUF, tokenizer, transformer, KV-cache |
+| `userspace/inference-server/src/main.rs` | Model loading, forward pass, IPC |
+| `userspace/compositor/src/main.rs` | GUI, omnibar, ask command handler |
+| `tools/folk-pack/src/main.rs` | FPK + pack-model subcommand |
+| `mcp/server.py` | Debug MCP (symbols, registers, serial) |
 
 ## Memory Layout
 | Range | Owner |
 |-------|-------|
-| `0xffffffff80000000–0xffffffffffffffff` | Kernel (high-half) |
-| `0x200000–0x4fffff` | Userspace processes |
-
-## Key Files
-| File | Purpose |
-|------|---------|
-| `mcp/server.py` | MCP debug server (3 tools) |
-| `tools/qemu-debug-live.sh` | QEMU launch script with QMP+GDB |
-| `~/.claude/skills/abi-audit.md` | ABI Auditor skill |
-| `kernel/target/x86_64-folkering/release/kernel` | Kernel ELF |
-| `userspace/target/x86_64-folkering-userspace/release/compositor` | Compositor ELF |
+| `0xffffffff80000000+` | Kernel (high-half) |
+| `0x1_0000_0000` | Model mmap (87MB) |
+| `0x4000_0000+` | Arena, KV-cache (mmap region) |
+| `0x2000_0000` | Inference shmem IPC |
+| `0x200000–0x4fffff` | Userspace code/data |
