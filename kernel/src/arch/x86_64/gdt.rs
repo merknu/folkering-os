@@ -38,6 +38,12 @@ pub fn init() {
         // Set TSS syscall stack pointer
         let stack_start = VirtAddr::from_ptr(&SYSCALL_STACK as *const _);
         let stack_end = stack_start + SYSCALL_STACK_SIZE as u64;
+
+        // Debug: print TSS RSP0 value
+        crate::drivers::serial::write_str("[GDT] TSS RSP0 = ");
+        crate::drivers::serial::write_hex(stack_end.as_u64());
+        crate::drivers::serial::write_newline();
+
         TSS.privilege_stack_table[0] = stack_end;
 
         // Build GDT layout compatible with SYSRET
@@ -63,6 +69,20 @@ pub fn init() {
         GDT.as_ref().unwrap().0.load();
         CS::set_reg(GDT.as_ref().unwrap().1.kernel_code);
         DS::set_reg(GDT.as_ref().unwrap().1.kernel_data);
+
+        // CRITICAL: Also set SS, ES, FS, GS to kernel data segment!
+        // DS::set_reg only sets DS. Without this, SS remains whatever Limine set it to,
+        // which causes #GP when timer interrupt tries to push to stack with invalid SS.
+        let kernel_data_sel = GDT.as_ref().unwrap().1.kernel_data.0;
+        core::arch::asm!(
+            "mov ss, {0:x}",
+            "mov es, {0:x}",
+            "mov fs, {0:x}",
+            "mov gs, {0:x}",
+            in(reg) kernel_data_sel,
+            options(nostack, preserves_flags)
+        );
+
         load_tss(GDT.as_ref().unwrap().1.tss);
     }
 

@@ -3,7 +3,7 @@
 //! Implements blocking and non-blocking IPC receive operations, plus reply mechanism.
 //! Critical for request-reply pattern performance.
 
-use crate::ipc::message::{IpcMessage, IpcType, TaskId};
+use crate::ipc::message::{IpcMessage, IpcType, TaskId, CallerToken};
 use crate::task::task::{current_task, get_task, TaskState};
 use super::send::Errno;
 
@@ -183,10 +183,14 @@ pub fn ipc_reply(request: &IpcMessage, reply_payload: [u64; 4]) -> Result<(), Er
     reply_msg.sender = current.lock().id;
     reply_msg.msg_id = crate::ipc::next_message_id();
 
-    // Copy reply to sender's buffer
+    // Copy reply to sender's buffer AND set context.rax to the reply value
+    // CRITICAL: When sender resumes from yield, the assembly sets RAX=0.
+    // We need to override this by setting context.rax to the actual reply value.
     {
         let mut sender_lock = sender_task.lock();
         sender_lock.ipc_reply = Some(reply_msg);
+        // Set the return value in sender's context so it resumes with correct RAX
+        sender_lock.context.rax = reply_payload[0];
     }
 
     // Unblock sender (make it runnable)
@@ -218,6 +222,153 @@ pub fn ipc_receive_timeout(_timeout_us: u64) -> Result<Option<IpcMessage>, Errno
     // TODO: Implement timeout mechanism
     // Requires timer integration
     unimplemented!("ipc_receive_timeout not yet implemented")
+}
+
+// ============================================================================
+// Reply-Later IPC (Phase 6 - Semantic Mirror Foundation)
+// ============================================================================
+
+/// Async IPC receive - returns CallerToken for deferred reply.
+///
+/// Unlike `ipc_receive()`, this function returns immediately with a token
+/// that can be used to reply later. The sender remains BLOCKED until
+/// `ipc_reply_with_token()` is called with the matching token.
+///
+/// # Use Case
+/// Servers that need to do long-running work (LLM inference, disk I/O)
+/// without blocking other IPC operations.
+///
+/// # Flow
+/// 1. Server calls `ipc_recv_async()` - returns token + message
+/// 2. Server does long-running work (sender stays blocked)
+/// 3. Server calls `ipc_reply_with_token(token, data)` - unblocks sender
+///
+/// # Returns
+/// - `Ok((token, message))`: Token for later reply + received message
+/// - `Err(EWOULDBLOCK)`: No messages in queue
+///
+/// # Example
+/// ```no_run
+/// loop {
+///     match ipc_recv_async() {
+///         Ok((token, msg)) => {
+///             // Spawn async work
+///             spawn_task(|| {
+///                 let result = do_inference(msg.payload);
+///                 ipc_reply_with_token(token, result).unwrap();
+///             });
+///         }
+///         Err(Errno::EWOULDBLOCK) => {
+///             // No messages, do other work
+///             process_background_tasks();
+///         }
+///         Err(e) => panic!("IPC error: {:?}", e),
+///     }
+/// }
+/// ```
+#[inline(never)]
+pub fn ipc_recv_async() -> Result<(CallerToken, IpcMessage), Errno> {
+    let current = current_task();
+
+    // Check if messages in queue
+    let msg = {
+        let mut current_lock = current.lock();
+        current_lock.recv_queue.pop()
+    };
+
+    match msg {
+        Some(msg) => {
+            // Generate token from sender PID and message ID
+            let token = CallerToken::new(msg.sender, msg.msg_id);
+
+            // Mark sender as WaitingForReply (if it's a Request)
+            if msg.msg_type == IpcType::Request {
+                if let Some(sender_task) = get_task(msg.sender) {
+                    let mut sender_lock = sender_task.lock();
+                    // Only update if sender is currently blocked on us
+                    let current_id = current.lock().id;
+                    if sender_lock.state == TaskState::BlockedOnSend(current_id) {
+                        sender_lock.state = TaskState::WaitingForReply(msg.msg_id);
+                    }
+                }
+            }
+
+            Ok((token, msg))
+        }
+        None => Err(Errno::EWOULDBLOCK),
+    }
+}
+
+/// Reply to a deferred request using CallerToken.
+///
+/// This function unblocks the original sender that is waiting in
+/// `WaitingForReply` state. The token must match the original request.
+///
+/// # Security
+/// - Token is decoded to extract sender_pid and request_id
+/// - Kernel verifies sender is in WaitingForReply(request_id) state
+/// - Reply is rejected if states don't match (prevents spoofing)
+///
+/// # Arguments
+/// - `token`: CallerToken from `ipc_recv_async()`
+/// - `reply_payload`: 4x u64 payload to send back
+///
+/// # Returns
+/// - `Ok(())`: Reply sent, sender unblocked
+/// - `Err(EINVAL)`: Invalid token or sender not waiting
+/// - `Err(ESRCH)`: Sender task no longer exists
+///
+/// # Performance
+/// ~200-500 cycles (similar to `ipc_reply`)
+#[inline(never)]
+pub fn ipc_reply_with_token(token: CallerToken, reply_payload: [u64; 4]) -> Result<(), Errno> {
+    let current = current_task();
+
+    // Decode token to get sender PID and request ID
+    let (sender_pid, request_id) = token.decode().ok_or(Errno::EINVAL)?;
+
+    // Get sender task
+    let sender_task = get_task(sender_pid).ok_or(Errno::ESRCH)?;
+
+    // Verify sender is waiting for THIS specific reply
+    {
+        let sender_lock = sender_task.lock();
+        match sender_lock.state {
+            TaskState::WaitingForReply(req_id) if req_id == request_id => {
+                // Valid: sender is waiting for this exact request
+            }
+            _ => {
+                // Invalid: sender is not waiting or waiting for different request
+                return Err(Errno::EINVAL);
+            }
+        }
+    }
+
+    // Create reply message
+    let mut reply_msg = IpcMessage::new_reply(reply_payload);
+    reply_msg.sender = current.lock().id;
+    reply_msg.msg_id = crate::ipc::next_message_id();
+
+    // Copy reply to sender's buffer AND set context.rax to the reply value
+    // CRITICAL: When sender resumes from yield, the assembly sets RAX=0.
+    // We need to override this by setting context.rax to the actual reply value.
+    {
+        let mut sender_lock = sender_task.lock();
+        sender_lock.ipc_reply = Some(reply_msg);
+        // Set the return value in sender's context so it resumes with correct RAX
+        sender_lock.context.rax = reply_payload[0];
+    }
+
+    // Unblock sender (make it runnable)
+    {
+        let mut sender_lock = sender_task.lock();
+        sender_lock.state = TaskState::Runnable;
+    }
+
+    // Add sender to scheduler runqueue
+    crate::task::scheduler::enqueue(sender_pid);
+
+    Ok(())
 }
 
 /// Selective receive (future enhancement)

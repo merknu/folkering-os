@@ -4,7 +4,7 @@
 //! Essential for high-performance file I/O and network operations.
 
 use crate::ipc::message::{ShmemId, TaskId};
-use crate::memory::{alloc_pages, free_pages};
+use crate::memory::physical::{alloc_page, free_pages};
 use crate::memory::paging;
 use alloc::vec::Vec;
 use hashbrown::{HashMap, hash_map::DefaultHashBuilder};
@@ -85,7 +85,7 @@ pub struct SharedMemory {
 
 /// Global shared memory table
 lazy_static! {
-    static ref SHMEM_TABLE: Mutex<HashMap<u32, SharedMemory, DefaultHashBuilder>> =
+    pub static ref SHMEM_TABLE: Mutex<HashMap<u32, SharedMemory, DefaultHashBuilder>> =
         Mutex::new(HashMap::with_hasher(DefaultHashBuilder::default()));
 }
 
@@ -157,7 +157,7 @@ pub fn shmem_create(size: usize, perms: ShmemPerms) -> Result<ShmemId, ShmemErro
     // 2. Allocate individual physical pages (order 0 each)
     let mut phys_pages = Vec::new();
     for _ in 0..num_pages {
-        match alloc_pages(0) {
+        match alloc_page() {
             Some(page_addr) => phys_pages.push(page_addr),
             None => {
                 // Free any pages we already allocated
@@ -254,16 +254,25 @@ pub fn shmem_map(id: ShmemId, virt: VirtAddr) -> Result<(), ShmemError> {
         return Err(ShmemError::PermissionDenied);
     }
 
-    // 3. Map pages into address space
+    // 3. Map pages into CURRENT TASK's page table (not the kernel's!)
     let page_flags = match shmem.perms {
         ShmemPerms::ReadOnly => PageFlags::READABLE.or(PageFlags::USER),
         ShmemPerms::WriteOnly => PageFlags::WRITABLE.or(PageFlags::USER),
         ShmemPerms::ReadWrite => PageFlags::READABLE.or(PageFlags::WRITABLE).or(PageFlags::USER),
     };
 
+    let pt_flags = convert_page_flags(page_flags);
+
+    // Get current task's PML4 physical address
+    let task_pml4 = crate::task::task::current_task().lock().page_table_phys;
+    if task_pml4 == 0 {
+        return Err(ShmemError::MapFailed); // No page table for this task
+    }
+
     for (i, &phys) in shmem.phys_pages.iter().enumerate() {
         let virt_page = virt + (i * PAGE_SIZE);
-        map_page(virt_page, phys, page_flags)?;
+        paging::map_page_in_table(task_pml4, virt_page, phys, pt_flags)
+            .map_err(|_| ShmemError::MapFailed)?;
     }
 
     Ok(())
@@ -296,10 +305,16 @@ pub fn shmem_unmap(id: ShmemId, virt: VirtAddr) -> Result<(), ShmemError> {
             .clone()
     };
 
-    // Unmap each page
+    // Unmap each page from CURRENT TASK's page table
+    let task_pml4 = crate::task::task::current_task().lock().page_table_phys;
+    if task_pml4 == 0 {
+        return Err(ShmemError::UnmapFailed);
+    }
+
     for i in 0..shmem.phys_pages.len() {
         let virt_page = virt + (i * PAGE_SIZE);
-        unmap_page(virt_page)?;
+        paging::unmap_page_in_table(task_pml4, virt_page)
+            .map_err(|_| ShmemError::UnmapFailed)?;
     }
 
     Ok(())
@@ -328,11 +343,11 @@ pub fn shmem_destroy(id: ShmemId) -> Result<(), ShmemError> {
             .ok_or(ShmemError::InvalidId)?
     };
 
-    // Check current task is the owner (first in list)
+    // Check current task has access (owner or granted)
     let current_task_id = crate::task::task::current_task().lock().id;
 
-    if shmem.tasks.first() != Some(&current_task_id) {
-        // Not the owner - restore to table
+    if !shmem.tasks.contains(&current_task_id) {
+        // No access - restore to table
         SHMEM_TABLE.lock().insert(id.get(), shmem);
         return Err(ShmemError::PermissionDenied);
     }

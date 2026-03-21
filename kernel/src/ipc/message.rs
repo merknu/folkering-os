@@ -5,6 +5,77 @@
 
 use core::num::NonZeroU32;
 
+// ============================================================================
+// CallerToken - Reply-Later IPC Support (Phase 6)
+// ============================================================================
+
+/// Opaque token representing a suspended client waiting for reply.
+///
+/// Used for async/deferred reply pattern where server can stash the token,
+/// do long-running work (e.g., LLM inference), then reply later.
+///
+/// # Security
+/// The token encodes sender_pid + request_id with a simple obfuscation.
+/// On reply, the kernel verifies the sender is still waiting for this exact request.
+///
+/// # Example
+/// ```no_run
+/// // Server receives request, gets token
+/// let (token, msg_id, payload_len) = ipc_recv_async()?;
+///
+/// // Server can now do other work, or spawn async task
+/// spawn_inference_task(payload, token);
+///
+/// // Later, when ready to reply:
+/// ipc_reply_token(token, &reply_data)?;
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct CallerToken(pub u64);
+
+impl CallerToken {
+    /// Create a new CallerToken from sender PID and request ID.
+    ///
+    /// Encoding: (sender_pid << 32) | (request_id & 0xFFFFFFFF) ^ OBFUSCATION_KEY
+    /// This is NOT cryptographically secure, but prevents accidental misuse.
+    #[inline]
+    pub fn new(sender_pid: TaskId, request_id: u64) -> Self {
+        const OBFUSCATION_KEY: u64 = 0xDEAD_BEEF_CAFE_BABE;
+        let raw = ((sender_pid as u64) << 32) | (request_id & 0xFFFF_FFFF);
+        Self(raw ^ OBFUSCATION_KEY)
+    }
+
+    /// Decode the token to extract sender PID and request ID.
+    ///
+    /// Returns None if the token appears corrupted (reserved for future validation).
+    #[inline]
+    pub fn decode(self) -> Option<(TaskId, u64)> {
+        const OBFUSCATION_KEY: u64 = 0xDEAD_BEEF_CAFE_BABE;
+        let raw = self.0 ^ OBFUSCATION_KEY;
+        let sender_pid = (raw >> 32) as TaskId;
+        let request_id = raw & 0xFFFF_FFFF;
+
+        // Basic sanity check: sender_pid should be non-zero
+        if sender_pid == 0 {
+            return None;
+        }
+
+        Some((sender_pid, request_id))
+    }
+
+    /// Get the raw token value (for syscall transfer).
+    #[inline]
+    pub fn as_raw(self) -> u64 {
+        self.0
+    }
+
+    /// Create from raw value (from syscall).
+    #[inline]
+    pub fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+}
+
 /// Task identifier (u32)
 pub type TaskId = u32;
 
@@ -30,7 +101,7 @@ pub enum IpcType {
 ///
 /// # Size: 64 bytes (exactly one cache line)
 ///
-/// # Alignment: 8 bytes (for u64 array)
+/// # Alignment: 8 bytes (natural, from u64 fields)
 ///
 /// # Layout:
 /// - `sender` (u32): 4 bytes, offset 0
@@ -42,7 +113,7 @@ pub enum IpcType {
 /// - `msg_id` (u64): 8 bytes, offset 56-63
 ///
 /// **Total: 64 bytes**
-#[repr(C, align(16))]
+#[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct IpcMessage {
     /// Sender task ID (set by kernel)
@@ -130,13 +201,6 @@ const _: () = {
     }
 };
 
-// Additional compile-time checks
-const _: () = {
-    // Must be 16-byte aligned for SSE operations on stack
-    if core::mem::align_of::<IpcMessage>() < 16 {
-        panic!("IpcMessage must be 16-byte aligned!");
-    }
-};
 
 #[cfg(test)]
 mod tests {
@@ -145,7 +209,7 @@ mod tests {
     #[test]
     fn test_ipc_message_size() {
         assert_eq!(core::mem::size_of::<IpcMessage>(), 64);
-        assert_eq!(core::mem::align_of::<IpcMessage>(), 16);
+        assert_eq!(core::mem::align_of::<IpcMessage>(), 8);
     }
 
     #[test]

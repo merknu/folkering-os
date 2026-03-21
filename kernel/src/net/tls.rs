@@ -1,0 +1,446 @@
+//! TLS 1.3 client — embedded-tls integration over smoltcp TCP
+//!
+//! Provides `https_get(host, path, ip)` for making HTTPS requests.
+//! Uses UnsecureProvider (no certificate verification) for v1.
+
+extern crate alloc;
+
+use alloc::vec;
+use embedded_io::{ErrorType, Read, Write};
+use embedded_tls::blocking::{Aes128GcmSha256, TlsConfig, TlsConnection, TlsContext};
+use embedded_tls::UnsecureProvider;
+use rand_core::{CryptoRng, RngCore};
+
+use smoltcp::socket::tcp;
+use smoltcp::time::Instant;
+use smoltcp::wire::{IpAddress, Ipv4Address};
+
+use crate::drivers::rng as hw_rng;
+
+use super::{FolkeringDevice, NetState, NET_STATE};
+
+// ── RNG Adapter ─────────────────────────────────────────────────────────────
+
+/// Wraps our kernel RNG (RDRAND/RDTSC) as a `CryptoRngCore` for embedded-tls
+struct KernelRng;
+
+impl RngCore for KernelRng {
+    fn next_u32(&mut self) -> u32 {
+        hw_rng::random_u64() as u32
+    }
+    fn next_u64(&mut self) -> u64 {
+        hw_rng::random_u64()
+    }
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        hw_rng::fill_bytes(dest);
+    }
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
+        hw_rng::fill_bytes(dest);
+        Ok(())
+    }
+}
+
+impl CryptoRng for KernelRng {}
+
+// ── TCP Socket Adapter ──────────────────────────────────────────────────────
+
+/// Wraps a smoltcp TCP socket as an `embedded_io::Read + Write` for TLS.
+/// Polls the network interface on each operation to drive packets.
+struct TcpStream<'a> {
+    state: &'a mut NetState,
+    handle: smoltcp::iface::SocketHandle,
+}
+
+#[derive(Debug)]
+struct TcpError;
+
+impl core::fmt::Display for TcpError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "TCP error")
+    }
+}
+
+impl core::error::Error for TcpError {}
+
+impl embedded_io::Error for TcpError {
+    fn kind(&self) -> embedded_io::ErrorKind {
+        embedded_io::ErrorKind::Other
+    }
+}
+
+impl ErrorType for TcpStream<'_> {
+    type Error = TcpError;
+}
+
+impl TcpStream<'_> {
+    fn poll_once(&mut self) {
+        let now = Instant::from_millis(crate::timer::uptime_ms() as i64);
+        let mut device = FolkeringDevice;
+        self.state.iface.poll(now, &mut device, &mut self.state.sockets);
+    }
+}
+
+impl Read for TcpStream<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        let start = crate::timer::uptime_ms();
+        loop {
+            self.poll_once();
+
+            let socket = self.state.sockets.get_mut::<tcp::Socket>(self.handle);
+            if socket.can_recv() {
+                return socket.recv_slice(buf).map_err(|_| TcpError);
+            }
+            if !socket.is_active() {
+                return Err(TcpError);
+            }
+            // Timeout after 30 seconds
+            if crate::timer::uptime_ms() - start > 30_000 {
+                return Err(TcpError);
+            }
+            for _ in 0..1000 {
+                core::hint::spin_loop();
+            }
+        }
+    }
+}
+
+impl Write for TcpStream<'_> {
+    fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+        let start = crate::timer::uptime_ms();
+        loop {
+            self.poll_once();
+
+            let socket = self.state.sockets.get_mut::<tcp::Socket>(self.handle);
+            if !socket.is_active() {
+                return Err(TcpError);
+            }
+            if socket.can_send() {
+                return socket.send_slice(buf).map_err(|_| TcpError);
+            }
+            if crate::timer::uptime_ms() - start > 30_000 {
+                return Err(TcpError);
+            }
+            for _ in 0..1000 {
+                core::hint::spin_loop();
+            }
+        }
+    }
+
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        self.poll_once();
+        Ok(())
+    }
+}
+
+// ── Public API ──────────────────────────────────────────────────────────────
+
+/// Perform an HTTPS request with a raw pre-built HTTP request.
+/// Returns the full HTTP response (headers + body) as a Vec<u8>.
+pub fn https_get_raw(ip: [u8; 4], host: &str, request: &[u8]) -> Result<alloc::vec::Vec<u8>, &'static str> {
+    // Take the network lock
+    let mut guard = NET_STATE.lock();
+    let state = guard.as_mut().ok_or("no network")?;
+    if !state.has_ip {
+        return Err("no IP address");
+    }
+
+    // Create TCP socket
+    let tcp_rx = smoltcp::socket::tcp::SocketBuffer::new(vec![0u8; 8192]);
+    let tcp_tx = smoltcp::socket::tcp::SocketBuffer::new(vec![0u8; 4096]);
+    let tcp_socket = smoltcp::socket::tcp::Socket::new(tcp_rx, tcp_tx);
+    let tcp_handle = state.sockets.add(tcp_socket);
+
+    let remote_addr = smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(ip[0], ip[1], ip[2], ip[3]));
+
+    {
+        let socket = state.sockets.get_mut::<smoltcp::socket::tcp::Socket>(tcp_handle);
+        socket.connect(state.iface.context(), (remote_addr, 443u16), 49153)
+            .map_err(|_| "TCP connect failed")?;
+    }
+
+    // Wait for TCP connect
+    let start = crate::timer::uptime_ms();
+    loop {
+        let now = Instant::from_millis(crate::timer::uptime_ms() as i64);
+        let mut device = FolkeringDevice;
+        state.iface.poll(now, &mut device, &mut state.sockets);
+
+        let socket = state.sockets.get_mut::<smoltcp::socket::tcp::Socket>(tcp_handle);
+        if socket.may_send() { break; }
+        if !socket.is_active() {
+            state.sockets.remove(tcp_handle);
+            return Err("TCP refused");
+        }
+        if crate::timer::uptime_ms() - start > 10_000 {
+            state.sockets.remove(tcp_handle);
+            return Err("TCP timeout");
+        }
+        for _ in 0..1000 { core::hint::spin_loop(); }
+    }
+
+    // TLS handshake
+    let mut tls_read_buf = vec![0u8; 16640];
+    let mut tls_write_buf = vec![0u8; 4096];
+    let config = TlsConfig::new().with_server_name(host);
+
+    let stream = TcpStream { state, handle: tcp_handle };
+    let mut tls: TlsConnection<'_, TcpStream<'_>, Aes128GcmSha256> =
+        TlsConnection::new(stream, &mut tls_read_buf, &mut tls_write_buf);
+
+    let rng = KernelRng;
+    let provider = UnsecureProvider::new::<Aes128GcmSha256>(rng);
+    tls.open(TlsContext::new(&config, provider))
+        .map_err(|_| "TLS handshake failed")?;
+
+    // Send request
+    let mut written = 0;
+    while written < request.len() {
+        match tls.write(&request[written..]) {
+            Ok(n) => written += n,
+            Err(_) => break,
+        }
+    }
+    let _ = tls.flush();
+
+    // Read response
+    let mut response = alloc::vec::Vec::new();
+    let mut buf = [0u8; 1024];
+    loop {
+        match tls.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                response.extend_from_slice(&buf[..n]);
+                if response.len() > 65536 { break; } // Cap at 64KB
+            }
+            Err(_) => break,
+        }
+    }
+
+    // Cleanup
+    let stream = match tls.close() {
+        Ok(s) => s,
+        Err((s, _)) => s,
+    };
+    stream.state.sockets.remove(tcp_handle);
+
+    Ok(response)
+}
+
+/// Perform an HTTPS GET request to a hardcoded IP.
+/// Logs the result to serial. Blocking — call from syscall context only.
+///
+/// `ip` = target IPv4 address (bypasses DNS)
+/// `host` = hostname for TLS SNI + HTTP Host header
+/// `path` = HTTP path (e.g. "/")
+pub fn https_get(ip: [u8; 4], host: &str, path: &str) -> Result<(), &'static str> {
+    crate::serial_str!("[TLS] HTTPS GET https://");
+    for &b in host.as_bytes() {
+        crate::drivers::serial::write_byte(b);
+    }
+    for &b in path.as_bytes() {
+        crate::drivers::serial::write_byte(b);
+    }
+    crate::serial_str!(" -> ");
+    crate::drivers::serial::write_dec(ip[0] as u32);
+    crate::serial_str!(".");
+    crate::drivers::serial::write_dec(ip[1] as u32);
+    crate::serial_str!(".");
+    crate::drivers::serial::write_dec(ip[2] as u32);
+    crate::serial_str!(".");
+    crate::drivers::serial::write_dec(ip[3] as u32);
+    crate::drivers::serial::write_newline();
+
+    // Take the network lock for the entire TLS session
+    let mut guard = NET_STATE.lock();
+    let state = guard.as_mut().ok_or("no network")?;
+
+    if !state.has_ip {
+        return Err("no IP address");
+    }
+
+    // ── Step 1: Create TCP socket and connect to port 443 ────────────
+    crate::serial_strln!("[TLS] Creating TCP socket...");
+
+    let tcp_rx = tcp::SocketBuffer::new(vec![0u8; 8192]);
+    let tcp_tx = tcp::SocketBuffer::new(vec![0u8; 4096]);
+    let tcp_socket = tcp::Socket::new(tcp_rx, tcp_tx);
+    let tcp_handle = state.sockets.add(tcp_socket);
+
+    let remote_addr = IpAddress::Ipv4(Ipv4Address::new(ip[0], ip[1], ip[2], ip[3]));
+    let remote_endpoint = (remote_addr, 443u16);
+
+    {
+        let socket = state.sockets.get_mut::<tcp::Socket>(tcp_handle);
+        socket
+            .connect(state.iface.context(), remote_endpoint, 49152)
+            .map_err(|_| "TCP connect failed")?;
+    }
+
+    crate::serial_strln!("[TLS] TCP connecting...");
+
+    // Wait for TCP handshake (SYN-ACK)
+    let start = crate::timer::uptime_ms();
+    loop {
+        let now = Instant::from_millis(crate::timer::uptime_ms() as i64);
+        let mut device = FolkeringDevice;
+        state.iface.poll(now, &mut device, &mut state.sockets);
+
+        let socket = state.sockets.get_mut::<tcp::Socket>(tcp_handle);
+        if socket.may_send() {
+            crate::serial_strln!("[TLS] TCP connected!");
+            break;
+        }
+        if !socket.is_active() {
+            state.sockets.remove(tcp_handle);
+            return Err("TCP connection refused");
+        }
+        if crate::timer::uptime_ms() - start > 10_000 {
+            state.sockets.remove(tcp_handle);
+            return Err("TCP connect timeout");
+        }
+        for _ in 0..1000 {
+            core::hint::spin_loop();
+        }
+    }
+
+    // ── Step 2: TLS 1.3 handshake ───────────────────────────────────
+    crate::serial_strln!("[TLS] Starting TLS 1.3 handshake...");
+
+    // Allocate TLS record buffers (16640 for read, 4096 for write)
+    let mut tls_read_buf = vec![0u8; 16640];
+    let mut tls_write_buf = vec![0u8; 4096];
+
+    // Create TLS config with server name (for SNI)
+    let config = TlsConfig::new().with_server_name(host);
+
+    // Create TCP stream adapter
+    let stream = TcpStream {
+        state,
+        handle: tcp_handle,
+    };
+
+    // Create TLS connection over TCP stream
+    let mut tls: TlsConnection<'_, TcpStream<'_>, Aes128GcmSha256> =
+        TlsConnection::new(stream, &mut tls_read_buf, &mut tls_write_buf);
+
+    // Perform TLS handshake (this is the big moment!)
+    let rng = KernelRng;
+    let provider = UnsecureProvider::new::<Aes128GcmSha256>(rng);
+    match tls.open(TlsContext::new(&config, provider)) {
+        Ok(()) => {
+            crate::serial_strln!("[TLS] Handshake complete! Connection encrypted.");
+        }
+        Err(e) => {
+            crate::serial_str!("[TLS] Handshake FAILED: ");
+            log_tls_error(&e);
+            // Get state back from TLS to clean up
+            let stream = match tls.close() {
+                Ok(s) => s,
+                Err((s, _)) => s,
+            };
+            stream.state.sockets.remove(tcp_handle);
+            return Err("TLS handshake failed");
+        }
+    }
+
+    // ── Step 3: Send HTTP GET request ────────────────────────────────
+    crate::serial_strln!("[TLS] Sending HTTP request...");
+
+    // Build request: "GET <path> HTTP/1.1\r\nHost: <host>\r\nConnection: close\r\n\r\n"
+    let mut req_buf = [0u8; 256];
+    let req_len = build_http_request(&mut req_buf, host, path);
+
+    let mut written = 0;
+    while written < req_len {
+        match tls.write(&req_buf[written..req_len]) {
+            Ok(n) => written += n,
+            Err(_) => break,
+        }
+    }
+    let _ = tls.flush();
+
+    // ── Step 4: Read and log HTTP response ───────────────────────────
+    crate::serial_strln!("[TLS] Reading response...");
+    crate::serial_strln!("--- HTTPS RESPONSE ---");
+
+    let mut total_bytes = 0usize;
+    let mut resp_buf = [0u8; 512];
+    loop {
+        match tls.read(&mut resp_buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                // Print response bytes to serial
+                for &b in &resp_buf[..n] {
+                    if b == b'\n' || b == b'\r' || b == b'\t' || (b >= 0x20 && b < 0x7F) {
+                        crate::drivers::serial::write_byte(b);
+                    } else {
+                        crate::drivers::serial::write_byte(b'.');
+                    }
+                }
+                total_bytes += n;
+                // Cap output at 2KB to avoid flooding serial
+                if total_bytes > 2048 {
+                    crate::serial_strln!("\n[TLS] (response truncated at 2KB)");
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    crate::serial_strln!("\n--- END RESPONSE ---");
+    crate::serial_str!("[TLS] Total: ");
+    crate::drivers::serial::write_dec(total_bytes as u32);
+    crate::serial_strln!(" bytes received");
+
+    // ── Step 5: Clean up ─────────────────────────────────────────────
+    let stream = match tls.close() {
+        Ok(s) => s,
+        Err((s, _)) => s,
+    };
+    stream.state.sockets.remove(tcp_handle);
+
+    crate::serial_strln!("[TLS] Connection closed.");
+    Ok(())
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Build "GET <path> HTTP/1.1\r\nHost: <host>\r\nConnection: close\r\n\r\n"
+fn build_http_request(buf: &mut [u8], host: &str, path: &str) -> usize {
+    let mut pos = 0;
+    let parts: &[&[u8]] = &[
+        b"GET ",
+        path.as_bytes(),
+        b" HTTP/1.1\r\nHost: ",
+        host.as_bytes(),
+        b"\r\nConnection: close\r\n\r\n",
+    ];
+    for part in parts {
+        let len = part.len().min(buf.len() - pos);
+        buf[pos..pos + len].copy_from_slice(&part[..len]);
+        pos += len;
+    }
+    pos
+}
+
+/// Log TLS error to serial
+fn log_tls_error(e: &embedded_tls::TlsError) {
+    use embedded_tls::TlsError;
+    let msg = match e {
+        TlsError::Io(_) => "I/O error",
+        TlsError::MissingHandshake => "missing handshake",
+        TlsError::InternalError => "internal error",
+        TlsError::InvalidRecord => "invalid record",
+        TlsError::UnknownContentType => "unknown content type",
+        TlsError::InvalidHandshake => "invalid handshake",
+        TlsError::InvalidCertificate => "invalid certificate",
+        TlsError::InvalidSignature => "invalid signature",
+        TlsError::DecodeError => "decode error",
+        TlsError::EncodeError => "encode error",
+        TlsError::CryptoError => "crypto error",
+        _ => "other TLS error",
+    };
+    crate::drivers::serial::write_str(msg);
+    crate::drivers::serial::write_newline();
+}

@@ -49,46 +49,47 @@ impl CapabilityTable {
     }
 
     fn allocate(&mut self, entry: CapabilityEntry) -> Result<CapabilityId, CapError> {
-        // Find a free slot
-        for i in 0..MAX_CAPABILITIES {
-            if self.entries[i].is_none() {
-                self.entries[i] = Some(entry);
-                let id = self.next_id;
-                self.next_id = self.next_id.wrapping_add(1);
-                if self.next_id == 0 {
-                    self.next_id = 1;
-                }
-                return Ok(id);
-            }
+        let id = self.next_id;
+        let idx = id as usize;
+        if idx >= MAX_CAPABILITIES {
+            return Err(CapError::TableFull);
         }
-        Err(CapError::TableFull)
+        if self.entries[idx].is_some() {
+            // Slot taken — find next free
+            for i in 1..MAX_CAPABILITIES {
+                if self.entries[i].is_none() {
+                    self.entries[i] = Some(entry);
+                    self.next_id = (i as u32) + 1;
+                    return Ok(i as CapabilityId);
+                }
+            }
+            return Err(CapError::TableFull);
+        }
+        self.entries[idx] = Some(entry);
+        self.next_id = id + 1;
+        Ok(id)
     }
 
     fn get(&self, id: CapabilityId) -> Option<&CapabilityEntry> {
-        if id == 0 || id as usize > MAX_CAPABILITIES {
+        let idx = id as usize;
+        if idx >= MAX_CAPABILITIES {
             return None;
         }
-        // For now, use id as index (simple approach)
-        // In production, we'd use a hash map for O(1) lookup
-        for entry in self.entries.iter().flatten() {
-            if entry.valid {
-                // This is a simplified lookup - in production we'd track ID properly
-                return Some(entry);
-            }
-        }
-        None
+        self.entries[idx].as_ref()
     }
 
     fn revoke(&mut self, id: CapabilityId) -> Result<(), CapError> {
-        if id == 0 || id as usize > MAX_CAPABILITIES {
+        let idx = id as usize;
+        if idx >= MAX_CAPABILITIES {
             return Err(CapError::InvalidId);
         }
-        // Mark the capability as invalid
-        for entry in self.entries.iter_mut().flatten() {
-            entry.valid = false;
-            return Ok(());
+        match self.entries[idx].as_mut() {
+            Some(entry) => {
+                entry.valid = false;
+                Ok(())
+            }
+            None => Err(CapError::NotFound),
         }
-        Err(CapError::NotFound)
     }
 }
 
@@ -172,6 +173,19 @@ pub fn grant_all(task_id: TaskId) -> Result<CapabilityId, CapError> {
 /// Revoke a capability
 pub fn revoke(cap_id: CapabilityId) -> Result<(), CapError> {
     CAP_TABLE.lock().revoke(cap_id)
+}
+
+/// Grant framebuffer capability to a task
+pub fn grant_framebuffer(task_id: TaskId, phys_base: u64, size: u64) -> Result<CapabilityId, CapError> {
+    grant(task_id, CapabilityType::Framebuffer { phys_base, size })
+}
+
+/// Check if task has framebuffer capability covering the given range
+pub fn has_framebuffer_access(task_id: TaskId, phys_addr: u64, size: u64) -> bool {
+    has_capability(task_id, CapabilityType::Framebuffer {
+        phys_base: phys_addr,
+        size,
+    })
 }
 
 /// Transfer a capability from one task to another

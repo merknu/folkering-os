@@ -51,7 +51,7 @@ impl BuddyAllocator {
     fn init(&mut self, boot_info: &BootInfo) {
         use limine::memory_map::EntryType;
 
-        crate::serial_println!("[PMM] Scanning memory map...");
+        crate::serial_strln!("[PMM] Scanning memory map...");
 
         // TEMPORARY WORKAROUND: Just count memory, don't try to add regions yet
         // The intrusive list approach (writing FreeBlock to memory) doesn't work
@@ -59,11 +59,13 @@ impl BuddyAllocator {
 
         let mut total_mem = 0;
         let mut usable_mem = 0;
-        let mut region_count = 0;
+        let mut region_count = 0u32;
 
         for entry in boot_info.memory_map {
             region_count += 1;
-            crate::serial_print!("[{}]", region_count);
+            crate::serial_str!("[");
+            crate::drivers::serial::write_dec(region_count);
+            crate::serial_str!("]");
 
             if entry.entry_type == EntryType::USABLE {
                 crate::serial_print!("U");
@@ -97,11 +99,11 @@ impl BuddyAllocator {
         self.total_pages = total_mem;
         self.free_pages = usable_mem;
 
-        crate::serial_println!(
-            "[PMM] Total: {} MB, Usable: {} MB (buddy allocator deferred)",
-            total_mem * PAGE_SIZE / (1024 * 1024),
-            usable_mem * PAGE_SIZE / (1024 * 1024)
-        );
+        crate::serial_str!("[PMM] Total: ");
+        crate::drivers::serial::write_dec((total_mem * PAGE_SIZE / (1024 * 1024)) as u32);
+        crate::serial_str!(" MB, Usable: ");
+        crate::drivers::serial::write_dec((usable_mem * PAGE_SIZE / (1024 * 1024)) as u32);
+        crate::serial_strln!(" MB");
 
         // Set up bootstrap allocator with first usable region > 1MB
         // We'll use this for heap initialization

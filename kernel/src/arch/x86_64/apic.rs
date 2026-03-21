@@ -22,6 +22,8 @@ const APIC_VERSION: usize = 0x30;
 const APIC_TPR: usize = 0x80;
 const APIC_EOI: usize = 0xB0;
 const APIC_SPURIOUS: usize = 0xF0;
+const APIC_LVT_LINT0: usize = 0x350;
+const APIC_LVT_LINT1: usize = 0x360;
 const APIC_LVT_TIMER: usize = 0x320;
 const APIC_TIMER_INIT_COUNT: usize = 0x380;
 const APIC_TIMER_CURRENT_COUNT: usize = 0x390;
@@ -61,14 +63,30 @@ pub fn init() {
 
         crate::drivers::serial::write_str("[APIC] APIC registers mapped successfully\n");
 
+        // Print Local APIC ID for debugging
+        let apic_id_reg = read_apic_reg(apic_virt, APIC_ID);
+        let apic_id = (apic_id_reg >> 24) & 0xFF;
+        crate::drivers::serial::write_str("[APIC] Local APIC ID: ");
+        crate::drivers::serial::write_dec(apic_id);
+        crate::drivers::serial::write_newline();
+
         // 2. Enable APIC by setting spurious interrupt vector
         let spurious = read_apic_reg(apic_virt, APIC_SPURIOUS);
         write_apic_reg(apic_virt, APIC_SPURIOUS, spurious | 0x100 | 0xFF);
 
-        // 3. Disable legacy PIC (8259A) by masking all interrupts
-        disable_pic();
+        // 2b. Set Task Priority to 0 to accept all interrupts
+        write_apic_reg(apic_virt, APIC_TPR, 0);
 
-        // 4. Set up APIC timer
+        // 3. Mask LINT0 - we use IOAPIC for device interrupts, not virtual wire mode
+        // LINT0 is masked (bit 16 = 1) since IOAPIC handles keyboard/mouse
+        write_apic_reg(apic_virt, APIC_LVT_LINT0, 0x10000);
+        crate::drivers::serial::write_str("[APIC] LINT0 masked (using IOAPIC for device interrupts)\n");
+
+        // 5. Configure LINT1 for NMI (standard configuration)
+        // Delivery mode: NMI (100b = 0x400), edge triggered
+        write_apic_reg(apic_virt, APIC_LVT_LINT1, 0x400);
+
+        // 6. Set up APIC timer
         setup_timer(apic_virt);
 
         crate::drivers::serial::write_str("[APIC] Local APIC initialized\n");

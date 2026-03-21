@@ -34,7 +34,7 @@ unsafe impl FrameAllocator<Size4KiB> for BootFrameAllocator {
 ///
 /// Sets up recursive page table mapping and creates kernel page table mapper.
 pub fn init(boot_info: &BootInfo) {
-    crate::serial_println!("[PAGING] Initializing page table management...");
+    crate::serial_strln!("[PAGING] Initializing page table management...");
 
     // Get active level 4 page table from CR3
     let level_4_table = unsafe { active_level_4_table() };
@@ -46,7 +46,7 @@ pub fn init(boot_info: &BootInfo) {
 
     *MAPPER.lock() = Some(mapper);
 
-    crate::serial_println!("[PAGING] Page table management initialized");
+    crate::serial_strln!("[PAGING] Page table management initialized");
 }
 
 /// Get active level 4 page table
@@ -115,6 +115,22 @@ pub fn unmap_page(virt_addr: usize) -> Result<usize, MapError> {
 
     let (frame, flush) = mapper.unmap(page).map_err(|_| MapError::UnmapFailed)?;
 
+    flush.flush();
+
+    Ok(frame.start_address().as_u64() as usize)
+}
+
+/// Unmap a page from a specific task's page table
+pub fn unmap_page_in_table(pml4_phys: u64, virt_addr: usize) -> Result<usize, MapError> {
+    let pml4_virt = crate::phys_to_virt(pml4_phys as usize);
+    let hhdm = crate::HHDM_OFFSET.load(core::sync::atomic::Ordering::Relaxed);
+    let phys_mem_offset = VirtAddr::new(hhdm as u64);
+
+    let pml4 = unsafe { &mut *(pml4_virt as *mut PageTable) };
+    let mut mapper = unsafe { OffsetPageTable::new(pml4, phys_mem_offset) };
+
+    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(virt_addr as u64));
+    let (frame, flush) = mapper.unmap(page).map_err(|_| MapError::UnmapFailed)?;
     flush.flush();
 
     Ok(frame.start_address().as_u64() as usize)
@@ -256,6 +272,39 @@ pub fn flush_tlb_all() {
     unsafe {
         Cr3::write(frame, flags);
     }
+}
+
+/// Virtual address of the kernel stack guard page (0 = not installed).
+///
+/// Set by `map_guard_page`. The `#PF` handler can compare CR2 against
+/// [STACK_GUARD_BASE, STACK_GUARD_BASE + 4096) to detect stack overflows.
+pub static STACK_GUARD_BASE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Map (or record) a non-present guard page at `virt_addr`.
+///
+/// Any access to this virtual address will trigger `#PF` immediately, turning
+/// silent kernel stack overflow into a clean fault that the panic screen can show.
+///
+/// If the page is currently mapped (e.g. it is part of the BSS range), it is
+/// unmapped to create the guard hole. If it was already unmapped, it is already
+/// a guard by virtue of being non-present.
+pub fn map_guard_page(virt_addr: VirtAddr) {
+    let addr = virt_addr.as_u64() as usize;
+    STACK_GUARD_BASE.store(addr, core::sync::atomic::Ordering::Relaxed);
+    // Best-effort: unmap the page if it happens to be currently mapped.
+    // Ignore errors — if the page was not mapped it is already a guard.
+    let _ = unmap_page(addr);
+    crate::serial_str!("[GUARD] Stack guard page installed at ");
+    crate::drivers::serial::write_hex(addr as u64);
+    crate::drivers::serial::write_newline();
+}
+
+/// Returns `true` if `cr2` falls inside the installed stack guard page.
+#[inline]
+pub fn is_stack_guard_fault(cr2: u64) -> bool {
+    let guard = STACK_GUARD_BASE.load(core::sync::atomic::Ordering::Relaxed);
+    guard != 0 && (cr2 as usize).wrapping_sub(guard) < 4096
 }
 
 /// Page mapping errors
@@ -437,4 +486,75 @@ pub mod flags {
 
     /// Guard page - not present (triggers page fault on access)
     pub const GUARD: PTF = PTF::empty();
+
+    /// Framebuffer mapping - Write-Combining (PAT index 4)
+    /// Uses bit 7 (PAT bit for 4K pages) to select PAT index 4
+    /// Note: We use from_bits_truncate since BIT_7/PAT isn't directly exposed
+    pub const USER_FRAMEBUFFER_WC: PTF = PTF::PRESENT
+        .union(PTF::WRITABLE)
+        .union(PTF::USER_ACCESSIBLE)
+        .union(PTF::NO_EXECUTE)
+        .union(PTF::from_bits_truncate(0x80));  // PAT bit (bit 7) for index 4 (Write-Combining)
+
+    /// Uncached MMIO mapping
+    pub const USER_MMIO_UNCACHED: PTF = PTF::PRESENT
+        .union(PTF::WRITABLE)
+        .union(PTF::USER_ACCESSIBLE)
+        .union(PTF::NO_EXECUTE)
+        .union(PTF::NO_CACHE)
+        .union(PTF::WRITE_THROUGH);
+}
+
+/// Map a page with Write-Combining caching (PAT index 4)
+///
+/// This is used for framebuffer mappings where write-combining
+/// improves performance by batching sequential writes.
+///
+/// # Arguments
+/// * `virt_addr` - Virtual address to map
+/// * `phys_addr` - Physical address to map to
+///
+/// # Returns
+/// `Ok(())` on success, `Err` if mapping fails.
+pub fn map_page_wc(virt_addr: usize, phys_addr: usize) -> Result<(), MapError> {
+    map_page(virt_addr, phys_addr, flags::USER_FRAMEBUFFER_WC)
+}
+
+/// Map a page with Write-Combining in a specific task's page table
+///
+/// # Arguments
+/// * `pml4_phys` - Physical address of the task's PML4
+/// * `virt_addr` - Virtual address to map
+/// * `phys_addr` - Physical address to map to
+pub fn map_page_wc_in_table(
+    pml4_phys: u64,
+    virt_addr: usize,
+    phys_addr: usize,
+) -> Result<(), MapError> {
+    map_page_in_table(pml4_phys, virt_addr, phys_addr, flags::USER_FRAMEBUFFER_WC)
+}
+
+/// Map a range of pages with Write-Combining
+///
+/// # Arguments
+/// * `pml4_phys` - Physical address of the task's PML4
+/// * `virt_start` - Starting virtual address
+/// * `phys_start` - Starting physical address
+/// * `num_pages` - Number of pages to map
+pub fn map_range_wc_in_table(
+    pml4_phys: u64,
+    virt_start: usize,
+    phys_start: usize,
+    num_pages: usize,
+) -> Result<(), MapError> {
+    let virt_aligned = virt_start & !(PAGE_SIZE - 1);
+    let phys_aligned = phys_start & !(PAGE_SIZE - 1);
+
+    for i in 0..num_pages {
+        let virt = virt_aligned + i * PAGE_SIZE;
+        let phys = phys_aligned + i * PAGE_SIZE;
+        map_page_wc_in_table(pml4_phys, virt, phys)?;
+    }
+
+    Ok(())
 }

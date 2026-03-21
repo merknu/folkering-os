@@ -11,5 +11,10 @@ pub fn uptime_ms() -> u64 {
 
 /// Increment uptime (called by timer interrupt)
 pub fn tick() {
-    UPTIME_MS.fetch_add(1, Ordering::Relaxed);
+    let ms = UPTIME_MS.fetch_add(10, Ordering::Relaxed);
+
+    // Poll network stack every ~50ms (every 5th tick)
+    if ms % 50 == 0 {
+        crate::net::poll();
+    }
 }

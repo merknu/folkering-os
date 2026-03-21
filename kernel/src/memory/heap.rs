@@ -17,7 +17,9 @@ pub fn init() {
     use crate::memory::physical;
     use x86_64::structures::paging::PageTableFlags;
 
-    crate::serial_println!("[HEAP] Initializing kernel heap ({} MB)...", HEAP_SIZE / (1024 * 1024));
+    crate::serial_str!("[HEAP] Initializing kernel heap (");
+    crate::drivers::serial::write_dec((HEAP_SIZE / (1024 * 1024)) as u32);
+    crate::serial_strln!(" MB)...");
 
     // Calculate number of pages needed
     let num_pages = (HEAP_SIZE + 4095) / 4096;
@@ -37,14 +39,18 @@ pub fn init() {
 
     // Setup guard page at end (unmapped - causes page fault on overflow)
     // Guard page is NOT mapped, so accessing it triggers a page fault
-    crate::serial_println!("[HEAP] Guard page at 0x{:x} (unmapped)", HEAP_START + HEAP_SIZE);
+    crate::serial_str!("[HEAP] Guard page at ");
+    crate::drivers::serial::write_hex((HEAP_START + HEAP_SIZE) as u64);
+    crate::serial_strln!(" (unmapped)");
 
     // Initialize allocator
     unsafe {
         ALLOCATOR.lock().init(HEAP_START as *mut u8, HEAP_SIZE);
     }
 
-    crate::serial_println!("[HEAP] Kernel heap initialized at 0x{:x}", HEAP_START);
+    crate::serial_str!("[HEAP] Kernel heap initialized at ");
+    crate::drivers::serial::write_hex(HEAP_START as u64);
+    crate::drivers::serial::write_newline();
 }
 
 /// Allocation error handler

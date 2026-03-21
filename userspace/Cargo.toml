@@ -1,0 +1,21 @@
+# Folkering OS Userspace Workspace
+# Only includes #![no_std] programs that target the OS
+
+[workspace]
+members = [
+    "libfolk",
+    "libsqlite",
+    "libtensor",
+    "shell",
+    "synapse-service",
+    "libaccesskit-folk",
+    "compositor",
+    "intent-service",
+    "inference-server",
+]
+resolver = "2"
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = "s"

@@ -83,6 +83,16 @@ impl EnhancedScheduler {
 
                 let mut effective_priority = task_locked.priority as u16;
 
+                // AI-Native: incorporate semantic_priority
+                // semantic_priority acts as a modifier: 128 = neutral, >128 = boost, <128 = reduce
+                let semantic_delta = (task_locked.semantic_priority as i16) - 128;
+                effective_priority = (effective_priority as i16 + semantic_delta).max(0) as u16;
+
+                // Background AI tasks: lower priority when system is busy (>2 runnable tasks)
+                if task_locked.is_background_ai && self.tasks.len() > 2 {
+                    effective_priority = effective_priority.saturating_sub(50);
+                }
+
                 // Boost priority for deadline tasks
                 if let Some(deadline) = task_locked.deadline_ms {
                     let time_to_deadline = deadline.saturating_sub(current_time);
@@ -226,15 +236,6 @@ static SCHEDULER: Mutex<EnhancedScheduler> = Mutex::new(EnhancedScheduler::new()
 
 /// Initialize scheduler
 pub fn init() {
-    // Enhanced scheduler is already initialized
-    crate::serial_println!("[SCHED] Priority + Deadline Scheduler initialized");
-    crate::serial_println!("[SCHED] Features:");
-    crate::serial_println!("[SCHED]   - Priority scheduling (0-255)");
-    crate::serial_println!("[SCHED]   - Deadline support for time-critical tasks");
-    crate::serial_println!("[SCHED]   - Dynamic priority adjustment via BrainBridge");
-    crate::serial_println!("[SCHED]   - Aging to prevent starvation");
-    crate::serial_println!("[SCHED] Brain Bridge integration enabled (hints checked every 10ms)");
-
     // Note: BrainBridge reader will be initialized later when shared memory is set up
     // via bridge::reader_init(phys_addr) after userspace creates the bridge page
 }
@@ -255,79 +256,54 @@ pub fn enqueue(task_id: TaskId) {
 pub fn yield_cpu() {
     use super::task;
 
-    // CRITICAL DEBUG: Print immediately at function entry
-    let marker_value = crate::arch::x86_64::syscall::get_debug_marker();
-    crate::serial_println!("[YIELD_CPU] Function entered! DEBUG_MARKER = {:#x}", marker_value);
-
     // Record voluntary yield
     let current_id = task::get_current_task();
     super::statistics::record_voluntary_yield(current_id);
 
-    // DEBUG: Set marker 100 at yield entry
-    crate::arch::x86_64::syscall::set_debug_marker(100);
-
     // Disable interrupts during context switch
     x86_64::instructions::interrupts::disable();
-
-    // DEBUG: Set marker 101 after disable interrupts
-    crate::arch::x86_64::syscall::set_debug_marker(101);
 
     // Get next task to run
     let next_id = match schedule_next() {
         Some(id) => id,
         None => {
-            // No tasks to run, re-enable interrupts and return
             x86_64::instructions::interrupts::enable();
             return;
         }
     };
 
-    // DEBUG: Set marker 102 after schedule_next
-    crate::arch::x86_64::syscall::set_debug_marker(102);
-
     // Get current task ID
     let current_id = task::get_current_task();
 
-    // DEBUG: Set marker 103 after get_current_task
-    crate::arch::x86_64::syscall::set_debug_marker(103);
-
     if current_id == next_id {
         // Same task, just return
-        // CRITICAL FIX: Must update context pointer before returning!
-        // Otherwise next syscall will get stale/NULL pointer
         if let Some(task_arc) = task::get_task(current_id) {
             let task_locked = task_arc.lock();
             let ctx_ptr = &task_locked.context as *const task::Context as usize;
             crate::arch::x86_64::syscall::set_current_context_ptr(ctx_ptr as *mut task::Context);
-            crate::serial_println!("[YIELD_CPU] Same task, updated context ptr to {:#x}", ctx_ptr);
         }
         x86_64::instructions::interrupts::enable();
         return;
     }
 
-    // DEBUG: Set marker 104 before get_task
-    crate::arch::x86_64::syscall::set_debug_marker(104);
+    // Note: FXSAVE of the current task's XMM is done in the assembly yield_path
+    // (syscall_entry) BEFORE calling this Rust function, so user XMM is already
+    // saved correctly. Do NOT do fxsave64 here — Rust may have clobbered XMM.
 
-    // Get target task's context pointer and page table
+    // Get target task's context pointer, page table, and fxsave area
     let target = task::get_task(next_id).expect("Target task not found");
 
-    // DEBUG: Set marker 105 after get_task
-    crate::arch::x86_64::syscall::set_debug_marker(105);
-
-    let (target_ctx_ptr, target_page_table_phys) = {
+    let (target_ctx_ptr, target_page_table_phys, target_fxsave_ptr) = {
         let target_locked = target.lock();
         (
             &target_locked.context as *const task::Context as usize,
             target_locked.page_table_phys,
+            &target_locked.fxsave_area as *const _ as usize,
         )
     };
 
-    // DEBUG: Set marker 106 after getting context pointer
-    crate::arch::x86_64::syscall::set_debug_marker(106);
-
     // Switch to target task's page table
     if target_page_table_phys != 0 {
-        crate::serial_println!("[YIELD_CPU] Switching to page table {:#x}", target_page_table_phys);
         unsafe {
             crate::memory::paging::switch_page_table(target_page_table_phys);
         }
@@ -339,29 +315,20 @@ pub fn yield_cpu() {
     // Record context switch
     super::statistics::record_context_switch(next_id);
 
+    // Update FXSAVE_CURRENT_PTR to target task's fxsave area so that
+    // restore_context_only can FXRSTOR the correct FPU/SSE state.
+    use crate::task::task::FXSAVE_CURRENT_PTR;
+    FXSAVE_CURRENT_PTR.store(target_fxsave_ptr, core::sync::atomic::Ordering::Release);
+
     // Update current context pointer for syscalls
     crate::arch::x86_64::syscall::set_current_context_ptr(target_ctx_ptr as *mut task::Context);
 
-    // CANARY CHECKPOINT #2: SWITCH_POINT - Verify target task Context before switch
-    crate::serial_println!("[YIELD_CPU] About to switch to task {}", next_id);
-    crate::arch::x86_64::syscall::verify_task_context(next_id, "SWITCH_POINT");
-
-    // If we're switching AWAY from a task, also verify we saved its context correctly
-    if current_id != 0 && current_id != next_id {
-        crate::serial_println!("[YIELD_CPU] Also verifying outgoing task {}", current_id);
-        crate::arch::x86_64::syscall::verify_task_context(current_id, "SWITCH_POINT_OUTGOING");
-    }
-
-    // DEBUG: Set marker 107 before restore_context_only
-    crate::arch::x86_64::syscall::set_debug_marker(107);
-
     // Jump to new task using IRETQ (does not return!)
-    // Note: Current task's context was saved when it last yielded via syscall
     unsafe {
         super::switch::restore_context_only(target_ctx_ptr);
     }
 
-    // Never reached - restore_context_only does not return
+    // Never reached
 }
 
 /// Get next task to run
@@ -444,29 +411,15 @@ fn apply_brain_hint(hint: &BrainBridgeSnapshot, cpu_boost: &mut bool) {
 
 /// Start scheduler (enter idle loop)
 pub fn start() -> ! {
-    crate::serial_println!("[SCHED] Scheduler started, entering task execution loop");
-
     // Disable interrupts during initial context switch
     x86_64::instructions::interrupts::disable();
 
-    let mut iterations = 0u64;
-
     loop {
-        // Print syscall counter every 1000 iterations
-        if iterations % 1000 == 0 && iterations > 0 {
-            let count = crate::arch::x86_64::syscall::get_syscall_count();
-            crate::serial_println!("[SCHED] Iteration {}, syscalls: {}", iterations, count);
-        }
-        iterations += 1;
-
         if let Some(task_id) = schedule_next() {
-            // Perform context switch
             unsafe {
                 super::switch::switch_to(task_id);
             }
         } else {
-            // No tasks runnable, halt until interrupt
-            crate::serial_println!("[SCHED] No runnable tasks, halting");
             x86_64::instructions::interrupts::enable();
             x86_64::instructions::hlt();
             x86_64::instructions::interrupts::disable();
@@ -511,80 +464,3 @@ pub fn reset_time_slice() {
     TICKS_REMAINING.store(TIME_SLICE_TICKS, Ordering::Relaxed);
 }
 
-/// Handle timer preemption - save current context and get next task
-///
-/// # Arguments
-/// * `saved_rsp` - RSP pointing to saved registers on stack
-///
-/// # Returns
-/// Pointer to the Context to restore (may be same or different task)
-#[no_mangle]
-pub extern "C" fn do_preemption(saved_rsp: usize) -> usize {
-    use super::task;
-
-    let current_id = task::get_current_task();
-
-    // Save interrupted context from stack to task's Context
-    if let Some(current_arc) = task::get_task(current_id) {
-        let mut current = current_arc.lock();
-
-        // Stack layout (pushed in reverse order in handler):
-        // [ss, rsp, rflags, cs, rip, rax, rcx, rdx, rsi, rdi, r8, r9, r10, r11]
-        // At saved_rsp: r11 is first (top of stack)
-        unsafe {
-            let frame_ptr = saved_rsp as *const u64;
-
-            current.context.r11 = *frame_ptr.add(0);
-            current.context.r10 = *frame_ptr.add(1);
-            current.context.r9 = *frame_ptr.add(2);
-            current.context.r8 = *frame_ptr.add(3);
-            current.context.rdi = *frame_ptr.add(4);
-            current.context.rsi = *frame_ptr.add(5);
-            current.context.rdx = *frame_ptr.add(6);
-            current.context.rcx = *frame_ptr.add(7);
-            current.context.rax = *frame_ptr.add(8);
-            current.context.rip = *frame_ptr.add(9);
-            current.context.cs = *frame_ptr.add(10);
-            current.context.rflags = *frame_ptr.add(11);
-            current.context.rsp = *frame_ptr.add(12);
-            current.context.ss = *frame_ptr.add(13);
-        }
-    }
-
-    // Re-enqueue current task
-    enqueue(current_id);
-
-    // Get next task
-    let next_id = match schedule_next() {
-        Some(id) => id,
-        None => current_id, // No other task, continue current
-    };
-
-    if next_id != current_id {
-        crate::serial_println!("[PREEMPT] {} -> {}", current_id, next_id);
-    }
-
-    // Update current task
-    task::set_current_task(next_id);
-
-    // Record context switch
-    super::statistics::record_context_switch(next_id);
-
-    // Get next task's context
-    let next_arc = task::get_task(next_id).expect("Next task not found");
-    let next = next_arc.lock();
-
-    // Switch page table if different
-    if next.page_table_phys != 0 {
-        unsafe {
-            crate::memory::paging::switch_page_table(next.page_table_phys);
-        }
-    }
-
-    // Update context pointer for syscalls
-    let ctx_ptr = &next.context as *const task::Context;
-    crate::arch::x86_64::syscall::set_current_context_ptr(ctx_ptr as *mut task::Context);
-
-    // Return pointer to context for restore
-    ctx_ptr as usize
-}

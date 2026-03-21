@@ -1,0 +1,18 @@
+[package]
+name = "libaccesskit-folk"
+version = "0.1.0"
+edition = "2021"
+description = "AccessKit-compatible UI tree schema for Folkering OS (no_std)"
+authors = ["Folkering OS Team"]
+
+# NOTE: rkyv disabled for now due to hashbrown no_std issues
+# Will add back when we have proper alloc support or use manual serialization
+
+[dependencies]
+# bitflags for efficient state management (focused, selected, etc.)
+bitflags = { version = "2.4", default-features = false }
+
+[features]
+default = []
+# Enable std for testing on host
+std = []

@@ -17,6 +17,15 @@ lazy_static! {
         // Timer interrupt (vector 32)
         idt[32].set_handler_fn(timer_interrupt_handler);
 
+        // Keyboard interrupt (vector 33 = IRQ1)
+        idt[33].set_handler_fn(keyboard_interrupt_handler);
+
+        // Mouse interrupt (vector 44 = IRQ12)
+        idt[44].set_handler_fn(mouse_interrupt_handler);
+
+        // VirtIO block device interrupt (vector 45)
+        idt[45].set_handler_fn(virtio_blk_interrupt_handler);
+
         idt
     };
 }
@@ -71,6 +80,9 @@ extern "x86-interrupt" fn gpf_handler(
 }
 
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    // Debug marker to verify handler is called
+    crate::serial_str!("T");
+
     // Update system uptime
     crate::timer::tick();
 
@@ -84,6 +96,11 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
         crate::drivers::serial::write_str("s\n");
     }
 
+    // Debug: Print IOAPIC status every 500 ticks (~5 seconds)
+    if ticks == 500 {
+        super::ioapic::debug_print_status();
+    }
+
     // Send EOI to APIC
     super::apic::send_eoi();
 
@@ -91,4 +108,21 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
     // Note: We don't force preemption here yet because the timer interrupt
     // arrives while we're in user mode, and we need proper interrupt-context
     // task switching. For now, tasks yield voluntarily via syscall.
+}
+
+extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    // Handle keyboard interrupt
+    crate::serial_str!("[IDT33]");
+    crate::drivers::keyboard::handle_interrupt();
+}
+
+extern "x86-interrupt" fn mouse_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    // Handle mouse interrupt (IRQ12)
+    crate::serial_str!("[M44]");
+    crate::drivers::mouse::handle_interrupt();
+}
+
+extern "x86-interrupt" fn virtio_blk_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    // Handle VirtIO block device interrupt
+    crate::drivers::virtio_blk::irq_handler();
 }

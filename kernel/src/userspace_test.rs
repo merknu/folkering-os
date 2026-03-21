@@ -323,6 +323,158 @@ impl IpcReceiverProgram {
 pub static IPC_SENDER: IpcSenderProgram = IpcSenderProgram::new();
 pub static IPC_RECEIVER: IpcReceiverProgram = IpcReceiverProgram::new();
 
+/// Simple Shell Program (keyboard echo + prompt)
+///
+/// This program:
+/// 1. Prints a prompt "> "
+/// 2. Reads keyboard input
+/// 3. Echoes characters as they're typed
+/// 4. On Enter, prints newline and new prompt
+///
+/// Syscalls used:
+/// - 8: READ_KEY (returns key or 0 if none)
+/// - 9: WRITE_CHAR (writes character to console)
+/// - 7: YIELD (when no key available)
+#[repr(align(4096))]
+pub struct ShellProgram {
+    pub code: [u8; 4096],
+}
+
+impl ShellProgram {
+    pub const fn new() -> Self {
+        let mut code = [0u8; 4096];
+
+        // === PRINT PROMPT "> " === (pos 0-31)
+        // shell_start: (pos 0)
+
+        // mov rax, 9 (WRITE_CHAR)
+        code[0] = 0x48;   // REX.W
+        code[1] = 0xc7;   // MOV r/m64, imm32
+        code[2] = 0xc0;   // ModR/M: RAX
+        code[3] = 0x09;   // Immediate: 9
+        code[4] = 0x00;
+        code[5] = 0x00;
+        code[6] = 0x00;
+
+        // mov rdi, '>' (0x3e)
+        code[7] = 0x48;
+        code[8] = 0xc7;
+        code[9] = 0xc7;   // ModR/M: RDI
+        code[10] = 0x3e;  // '>'
+        code[11] = 0x00;
+        code[12] = 0x00;
+        code[13] = 0x00;
+
+        // syscall
+        code[14] = 0x0f;
+        code[15] = 0x05;
+
+        // mov rax, 9 (WRITE_CHAR)
+        code[16] = 0x48;
+        code[17] = 0xc7;
+        code[18] = 0xc0;
+        code[19] = 0x09;
+        code[20] = 0x00;
+        code[21] = 0x00;
+        code[22] = 0x00;
+
+        // mov rdi, ' ' (0x20)
+        code[23] = 0x48;
+        code[24] = 0xc7;
+        code[25] = 0xc7;
+        code[26] = 0x20;  // space
+        code[27] = 0x00;
+        code[28] = 0x00;
+        code[29] = 0x00;
+
+        // syscall
+        code[30] = 0x0f;
+        code[31] = 0x05;
+
+        // === READ_LOOP === (pos 32-40)
+        // mov rax, 8 (READ_KEY)
+        code[32] = 0x48;
+        code[33] = 0xc7;
+        code[34] = 0xc0;
+        code[35] = 0x08;
+        code[36] = 0x00;
+        code[37] = 0x00;
+        code[38] = 0x00;
+
+        // syscall
+        code[39] = 0x0f;
+        code[40] = 0x05;
+
+        // test rax, rax (check if key available)
+        code[41] = 0x48;  // REX.W
+        code[42] = 0x85;  // TEST r/m64, r64
+        code[43] = 0xc0;  // ModR/M: RAX, RAX
+
+        // jz yield_and_retry (jump to pos 64)
+        // From pos 46 to pos 64 = 18 bytes forward
+        code[44] = 0x74;  // JZ rel8
+        code[45] = 18;    // offset
+
+        // === ECHO CHARACTER === (pos 46-54)
+        // mov rdi, rax (character to write)
+        code[46] = 0x48;  // REX.W
+        code[47] = 0x89;  // MOV r/m64, r64
+        code[48] = 0xc7;  // ModR/M: RDI, RAX
+
+        // mov rax, 9 (WRITE_CHAR)
+        code[49] = 0x48;
+        code[50] = 0xc7;
+        code[51] = 0xc0;
+        code[52] = 0x09;
+        code[53] = 0x00;
+        code[54] = 0x00;
+        code[55] = 0x00;
+
+        // syscall
+        code[56] = 0x0f;
+        code[57] = 0x05;
+
+        // jmp read_loop (back to pos 32)
+        // From pos 60 to pos 32 = -28 = 0xE4
+        code[58] = 0xeb;  // JMP rel8
+        code[59] = 0xe4;  // -28
+
+        // Padding to align yield_and_retry at pos 64
+        code[60] = 0x90;  // NOP
+        code[61] = 0x90;  // NOP
+        code[62] = 0x90;  // NOP
+        code[63] = 0x90;  // NOP
+
+        // === YIELD_AND_RETRY === (pos 64-74)
+        // mov rax, 7 (YIELD)
+        code[64] = 0x48;
+        code[65] = 0xc7;
+        code[66] = 0xc0;
+        code[67] = 0x07;
+        code[68] = 0x00;
+        code[69] = 0x00;
+        code[70] = 0x00;
+
+        // syscall
+        code[71] = 0x0f;
+        code[72] = 0x05;
+
+        // jmp read_loop (back to pos 32)
+        // From pos 75 to pos 32 = -43 = 0xD5
+        code[73] = 0xeb;  // JMP rel8
+        code[74] = 0xd5;  // -43
+
+        ShellProgram { code }
+    }
+
+    pub const fn code_size() -> usize {
+        75 // Total bytes of actual code
+    }
+}
+
+/// Static shell program instance
+pub static SHELL_PROGRAM: ShellProgram = ShellProgram::new();
+
 /// Load user program into memory at specified address
 ///
 /// # Arguments

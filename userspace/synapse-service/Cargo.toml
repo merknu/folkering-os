@@ -1,0 +1,13 @@
+[package]
+name = "synapse-service"
+version = "0.1.0"
+edition = "2021"
+description = "Synapse - The Data Kernel for Folkering OS"
+
+[[bin]]
+name = "synapse"
+path = "src/main.rs"
+
+[dependencies]
+libfolk = { path = "../libfolk" }
+libsqlite = { path = "../libsqlite" }

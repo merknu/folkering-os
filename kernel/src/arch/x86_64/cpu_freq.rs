@@ -41,21 +41,16 @@ pub struct FrequencyController {
 impl FrequencyController {
     /// Initialize frequency controller
     pub fn new() -> Self {
-        let (base, min, max, speedstep, turbo) = detect_capabilities();
-
-        crate::serial_println!("[CPU_FREQ] Detected capabilities:");
-        crate::serial_println!("[CPU_FREQ]   Base: {} MHz", base);
-        crate::serial_println!("[CPU_FREQ]   Range: {} - {} MHz", min, max);
-        crate::serial_println!("[CPU_FREQ]   SpeedStep: {}", speedstep);
-        crate::serial_println!("[CPU_FREQ]   Turbo: {}", turbo);
+        // Use bypass macro to avoid format_args! hang
+        crate::serial_strln!("[CPU_FREQ] Using defaults");
 
         Self {
-            current_freq_mhz: base,
-            base_freq_mhz: base,
-            max_freq_mhz: max,
-            min_freq_mhz: min,
-            supports_speedstep: speedstep,
-            supports_turbo: turbo,
+            current_freq_mhz: 2400,
+            base_freq_mhz: 2400,
+            max_freq_mhz: 3500,
+            min_freq_mhz: 1200,
+            supports_speedstep: false,
+            supports_turbo: false,
         }
     }
 
@@ -140,53 +135,8 @@ impl FrequencyController {
 
 /// Detect CPU frequency scaling capabilities
 fn detect_capabilities() -> (u32, u32, u32, bool, bool) {
-    // CPUID function 0x16: Processor Frequency Information
-    const CPUID_FREQ_INFO: u32 = 0x16;
-
-    // Check if CPUID 0x16 is supported
-    let max_basic = unsafe {
-        let cpuid_result = core::arch::x86_64::__cpuid(0);
-        cpuid_result.eax
-    };
-
-    if max_basic >= CPUID_FREQ_INFO {
-        unsafe {
-            let freq_info = core::arch::x86_64::__cpuid(CPUID_FREQ_INFO);
-
-            // EAX: Base frequency (MHz)
-            // EBX: Maximum frequency (MHz)
-            // ECX: Bus (reference) frequency (MHz)
-            let base_mhz = freq_info.eax as u32;
-            let max_mhz = freq_info.ebx as u32;
-            let bus_mhz = freq_info.ecx as u32;
-
-            // Estimate minimum (typically 50-60% of base)
-            let min_mhz = if base_mhz > 0 {
-                (base_mhz * 6) / 10 // 60% of base
-            } else {
-                1000 // Fallback: 1 GHz
-            };
-
-            let max_mhz_actual = if max_mhz > 0 { max_mhz } else { base_mhz };
-
-            // Check for SpeedStep/PowerNow support
-            // CPUID.01H:ECX[7] = EIST (Enhanced Intel SpeedStep Technology)
-            let features = core::arch::x86_64::__cpuid(1);
-            let supports_speedstep = (features.ecx & (1 << 7)) != 0;
-
-            // Check for Turbo Boost support
-            // CPUID.06H:EAX[1] = Intel Turbo Boost Technology
-            let power_mgmt = core::arch::x86_64::__cpuid(6);
-            let supports_turbo = (power_mgmt.eax & (1 << 1)) != 0;
-
-            if base_mhz > 0 {
-                return (base_mhz, min_mhz, max_mhz_actual, supports_speedstep, supports_turbo);
-            }
-        }
-    }
-
-    // Fallback: use defaults if CPUID doesn't provide frequency info
-    // Typical values for a modern CPU
+    // TEMPORARILY: Skip CPUID detection which crashes in QEMU
+    // Just return safe defaults for debugging
     (2400, 1200, 3500, false, false)
 }
 
@@ -212,7 +162,7 @@ pub fn init() {
         FREQ_CONTROLLER = Some(FrequencyController::new());
     }
 
-    crate::serial_println!("[CPU_FREQ] Frequency scaling initialized");
+    crate::serial_strln!("[CPU_FREQ] Frequency scaling initialized");
 }
 
 /// Set CPU frequency
