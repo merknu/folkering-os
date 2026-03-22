@@ -156,52 +156,33 @@ pub fn ipc_try_receive() -> Result<Option<IpcMessage>, Errno> {
 #[inline]
 pub fn ipc_reply(request: &IpcMessage, reply_payload: [u64; 4]) -> Result<(), Errno> {
     let current = current_task();
-
-    // CRITICAL FIX: Use request.sender (the task that sent us the request),
-    // not reply.sender (which would be wrong!)
     let sender_id = request.sender;
     let sender_task = get_task(sender_id).ok_or(Errno::EINVAL)?;
 
-    // Verify sender is blocked on us (security check)
-    {
-        let sender_lock = sender_task.lock();
-        let current_id = current.lock().id;
+    // Read current task ID ONCE — avoids lock ordering violation.
+    // Previously: sender_task.lock() THEN current.lock() → deadlock risk.
+    let current_id = current.lock().id;
 
+    // Single sender lock acquisition for verify + update + unblock
+    {
+        let mut sender_lock = sender_task.lock();
+
+        // Verify sender is blocked on us (security check)
         match sender_lock.state {
-            TaskState::BlockedOnSend(target) if target == current_id => {
-                // Valid: sender is blocked waiting for our reply
-            }
-            _ => {
-                // Invalid: sender is not blocked on us
-                return Err(Errno::EINVAL);
-            }
+            TaskState::BlockedOnSend(target) if target == current_id => {}
+            _ => return Err(Errno::EINVAL),
         }
-    }
 
-    // Create reply message
-    let mut reply_msg = IpcMessage::new_reply(reply_payload);
-    reply_msg.sender = current.lock().id;
-    reply_msg.msg_id = crate::ipc::next_message_id();
-
-    // Copy reply to sender's buffer AND set context.rax to the reply value
-    // CRITICAL: When sender resumes from yield, the assembly sets RAX=0.
-    // We need to override this by setting context.rax to the actual reply value.
-    {
-        let mut sender_lock = sender_task.lock();
+        // Create reply and deliver in one critical section
+        let mut reply_msg = IpcMessage::new_reply(reply_payload);
+        reply_msg.sender = current_id;
+        reply_msg.msg_id = crate::ipc::next_message_id();
         sender_lock.ipc_reply = Some(reply_msg);
-        // Set the return value in sender's context so it resumes with correct RAX
         sender_lock.context.rax = reply_payload[0];
-    }
-
-    // Unblock sender (make it runnable)
-    {
-        let mut sender_lock = sender_task.lock();
         sender_lock.state = TaskState::Runnable;
     }
 
-    // Add sender to scheduler runqueue
     crate::task::scheduler::enqueue(sender_id);
-
     Ok(())
 }
 
@@ -323,51 +304,30 @@ pub fn ipc_recv_async() -> Result<(CallerToken, IpcMessage), Errno> {
 #[inline(never)]
 pub fn ipc_reply_with_token(token: CallerToken, reply_payload: [u64; 4]) -> Result<(), Errno> {
     let current = current_task();
-
-    // Decode token to get sender PID and request ID
     let (sender_pid, request_id) = token.decode().ok_or(Errno::EINVAL)?;
-
-    // Get sender task
     let sender_task = get_task(sender_pid).ok_or(Errno::ESRCH)?;
 
-    // Verify sender is waiting for THIS specific reply
+    // Read current ID ONCE — avoids lock ordering violation
+    let current_id = current.lock().id;
+
+    // Single sender lock acquisition for verify + update + unblock
     {
-        let sender_lock = sender_task.lock();
+        let mut sender_lock = sender_task.lock();
+
         match sender_lock.state {
-            TaskState::WaitingForReply(req_id) if req_id == request_id => {
-                // Valid: sender is waiting for this exact request
-            }
-            _ => {
-                // Invalid: sender is not waiting or waiting for different request
-                return Err(Errno::EINVAL);
-            }
+            TaskState::WaitingForReply(req_id) if req_id == request_id => {}
+            _ => return Err(Errno::EINVAL),
         }
-    }
 
-    // Create reply message
-    let mut reply_msg = IpcMessage::new_reply(reply_payload);
-    reply_msg.sender = current.lock().id;
-    reply_msg.msg_id = crate::ipc::next_message_id();
-
-    // Copy reply to sender's buffer AND set context.rax to the reply value
-    // CRITICAL: When sender resumes from yield, the assembly sets RAX=0.
-    // We need to override this by setting context.rax to the actual reply value.
-    {
-        let mut sender_lock = sender_task.lock();
+        let mut reply_msg = IpcMessage::new_reply(reply_payload);
+        reply_msg.sender = current_id;
+        reply_msg.msg_id = crate::ipc::next_message_id();
         sender_lock.ipc_reply = Some(reply_msg);
-        // Set the return value in sender's context so it resumes with correct RAX
         sender_lock.context.rax = reply_payload[0];
-    }
-
-    // Unblock sender (make it runnable)
-    {
-        let mut sender_lock = sender_task.lock();
         sender_lock.state = TaskState::Runnable;
     }
 
-    // Add sender to scheduler runqueue
     crate::task::scheduler::enqueue(sender_pid);
-
     Ok(())
 }
 

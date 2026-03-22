@@ -446,8 +446,18 @@ pub fn current_page_table_phys() -> u64 {
 /// # Safety
 /// Must not be called while the page table is active (loaded in CR3).
 pub fn free_task_page_table(pml4_phys: u64) -> Result<(), MapError> {
-    // For now, just free the PML4 page itself
-    // TODO: Walk and free intermediate page tables for user space
+    let hhdm = crate::HHDM_OFFSET.load(core::sync::atomic::Ordering::Relaxed) as u64;
+
+    // Walk user-space entries only (indices 0-255, lower half of address space).
+    // Kernel mappings (indices 256-511) are shared and must NOT be freed.
+    let pml4_virt = (pml4_phys + hhdm) as *const u64;
+    for i in 0..256usize {
+        let entry = unsafe { *pml4_virt.add(i) };
+        if entry & 1 != 0 { // Present bit
+            free_intermediate_table(entry & !0xFFF, 2, hhdm);
+        }
+    }
+
     physical::free_page(pml4_phys as usize);
 
     crate::drivers::serial::write_str("[PAGING] Freed task page table at ");
@@ -455,6 +465,29 @@ pub fn free_task_page_table(pml4_phys: u64) -> Result<(), MapError> {
     crate::drivers::serial::write_newline();
 
     Ok(())
+}
+
+/// Recursively free intermediate page table frames (PDPT, PD, PT).
+/// depth=2: PDPT level, depth=1: PD level, depth=0: PT level.
+/// At depth 0, we don't iterate into the PT (data pages freed elsewhere),
+/// but we ALWAYS free the table frame itself.
+fn free_intermediate_table(table_phys: u64, depth: usize, hhdm: u64) {
+    if depth > 0 {
+        let table_virt = (table_phys + hhdm) as *const u64;
+        for i in 0..512usize {
+            let entry = unsafe { *table_virt.add(i) };
+            if entry & 1 != 0 {
+                // CRITICAL: Check Huge Page bit (bit 7 = 0x80).
+                // PD entries with PS=1 are 2MB huge pages pointing to user data,
+                // NOT page tables. Recursing into them corrupts physical memory.
+                if entry & 0x80 == 0 {
+                    free_intermediate_table(entry & !0xFFF, depth - 1, hhdm);
+                }
+            }
+        }
+    }
+    // Free this table frame (PDPT, PD, or PT — all are 4KB pages)
+    physical::free_page(table_phys as usize);
 }
 
 /// Common page table flag combinations

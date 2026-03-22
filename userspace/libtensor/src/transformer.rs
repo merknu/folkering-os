@@ -220,13 +220,16 @@ pub fn forward<'a>(
             let q_offset = h * head_dim;
 
             // Compute attention scores: Q · K^T / sqrt(head_dim)
+            // AVX2-accelerated dot product for 4-8x speedup over scalar
             let scale = crate::ops::fast_rsqrt(head_dim as f32);
+            let q_slice = &q[q_offset..q_offset + head_dim];
             for t in 0..seq_len {
                 let k_vec = kv_cache.layer(layer).get_key(t, kv_h);
-                let mut score = 0.0f32;
-                for d in 0..head_dim {
-                    score += q[q_offset + d] * k_vec[d];
-                }
+                let score = if crate::simd::has_avx2() {
+                    unsafe { crate::simd::avx2::dot_f32_avx2(q_slice, k_vec, head_dim) }
+                } else {
+                    crate::simd::dot_f32_scalar(q_slice, k_vec, head_dim)
+                };
                 att[t] = score * scale;
             }
 
@@ -238,13 +241,25 @@ pub fn forward<'a>(
                 dump.store(layer, h, pos, att, seq_len);
             }
 
-            // Weighted sum of values
+            // Weighted sum of values (AVX2 AXPY: out += w * V)
             let out_offset = h * head_dim;
             for t in 0..seq_len {
                 let v_vec = kv_cache.layer(layer).get_value(t, kv_h);
                 let w = att[t];
-                for d in 0..head_dim {
-                    attn_out[out_offset + d] += w * v_vec[d];
+                if crate::simd::has_avx2() {
+                    unsafe {
+                        crate::simd::axpy_f32_avx2(
+                            w, v_vec,
+                            &mut attn_out[out_offset..out_offset + head_dim],
+                            head_dim,
+                        );
+                    }
+                } else {
+                    crate::simd::axpy_f32_scalar(
+                        w, v_vec,
+                        &mut attn_out[out_offset..out_offset + head_dim],
+                        head_dim,
+                    );
                 }
             }
         }
