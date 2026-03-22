@@ -178,17 +178,85 @@ const MAX_GEN_TOKENS: usize = 64;
 /// KV-cache window size (power of 2)
 const KV_WINDOW_SIZE: usize = 256;
 
-/// Temperature for sampling (ULTRA 33)
-const TEMPERATURE: f32 = 0.8;
+// === Default sampling parameters (overridable via control sector 258) ===
+const DEFAULT_TEMPERATURE: f32 = 0.8;
+const DEFAULT_REP_PENALTY: f32 = 1.15;
+const DEFAULT_TOP_P: f32 = 0.9;
+const DEFAULT_TOP_K: u32 = 0;       // 0 = disabled (use Top-P only)
+const DEFAULT_REP_WINDOW: usize = 32;
 
-/// Repetition penalty factor (ULTRA 33)
-const REP_PENALTY: f32 = 1.15;
+/// Control sector number — MCP tools write config here, inference server reads
+const CONTROL_SECTOR: u64 = 258;
 
-/// Top-P nucleus sampling threshold (ULTRA 33)
-const TOP_P: f32 = 0.9;
+/// Sampling configuration — populated from control sector or defaults
+#[derive(Clone, Copy)]
+struct SamplingConfig {
+    temperature: f32,
+    top_p: f32,
+    top_k: u32,
+    rep_penalty: f32,
+    rep_window: usize,
+    dump_layer: usize,
+}
 
-/// Number of recent tokens to apply repetition penalty to
-const REP_WINDOW: usize = 32;
+impl SamplingConfig {
+    fn defaults() -> Self {
+        Self {
+            temperature: DEFAULT_TEMPERATURE,
+            top_p: DEFAULT_TOP_P,
+            top_k: DEFAULT_TOP_K,
+            rep_penalty: DEFAULT_REP_PENALTY,
+            rep_window: DEFAULT_REP_WINDOW,
+            dump_layer: 0,
+        }
+    }
+}
+
+/// Read control sector (258) and return config. Falls back to defaults if not present.
+fn read_control_sector() -> SamplingConfig {
+    let mut buf = [0u8; SECTOR_SIZE];
+    let mut cfg = SamplingConfig::defaults();
+
+    if libfolk::sys::block::read_sector(CONTROL_SECTOR, &mut buf).is_err() {
+        return cfg;
+    }
+
+    // Check magic "FCTL"
+    if &buf[0..4] != b"FCTL" {
+        return cfg;
+    }
+
+    // Parse fields (all little-endian, 0 = use default)
+    let dump_layer = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+    if dump_layer <= 29 {
+        cfg.dump_layer = dump_layer as usize;
+    }
+
+    let temp = f32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]);
+    if temp > 0.0 {
+        cfg.temperature = temp;
+    }
+
+    let top_p = f32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]);
+    if top_p > 0.0 {
+        cfg.top_p = top_p;
+    }
+
+    let top_k = u32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]]);
+    cfg.top_k = top_k; // 0 = disabled is valid
+
+    let rep_pen = f32::from_le_bytes([buf[28], buf[29], buf[30], buf[31]]);
+    if rep_pen > 0.0 {
+        cfg.rep_penalty = rep_pen;
+    }
+
+    let rep_win = u32::from_le_bytes([buf[32], buf[33], buf[34], buf[35]]);
+    if rep_win > 0 {
+        cfg.rep_window = rep_win as usize;
+    }
+
+    cfg
+}
 
 fn main() -> ! {
     println!("[INFERENCE] === ENTRY ===");
@@ -690,9 +758,9 @@ fn handle_inference_request(
     println!("[INFERENCE] Tokenized: {} tokens", total_prompt);
 
     // Build LayerWeights slice for transformer::forward
-    // We need to reconstruct LayerWeights from LayerData
     let config = &eng.config;
     let yield_cfg = YieldConfig::foreground();
+    let cfg = read_control_sector();
 
     // Allocate response buffer (in a separate region)
     let mut response_buf = [0u8; 4096];
@@ -737,7 +805,7 @@ fn handle_inference_request(
             debug_dump_logits(logits, "prefill_final_logits");
 
             // Sample next token from these logits
-            last_logits_token = sample_with_penalties(logits, &gen_tokens[..gen_count], arena);
+            last_logits_token = sample_with_penalties(logits, &gen_tokens[..gen_count], arena, &cfg);
         }
 
         if i == 0 {
@@ -781,7 +849,7 @@ fn handle_inference_request(
                 }
             };
 
-            sample_with_penalties(logits, &gen_tokens[..gen_count], arena)
+            sample_with_penalties(logits, &gen_tokens[..gen_count], arena, &cfg)
         };
 
         // Check for EOS or ChatML stop tokens (ULTRA 39)
@@ -883,7 +951,7 @@ fn bytes_as_f32(data: &[u8]) -> &[f32] {
 }
 
 /// Sample next token with repetition penalty and top-P (ULTRA 33, 31)
-fn sample_with_penalties(logits: &[f32], recent_tokens: &[u32], arena: &BumpArena) -> u32 {
+fn sample_with_penalties(logits: &[f32], recent_tokens: &[u32], arena: &BumpArena, cfg: &SamplingConfig) -> u32 {
     let vocab_size = logits.len();
 
     // Allocate a mutable copy of logits for manipulation
@@ -904,24 +972,24 @@ fn sample_with_penalties(logits: &[f32], recent_tokens: &[u32], arena: &BumpAren
         }
     }
 
-    // ULTRA 33: Repetition penalty
-    let penalty_window = recent_tokens.len().min(REP_WINDOW);
-    if penalty_window > 0 {
-        let start = recent_tokens.len().saturating_sub(REP_WINDOW);
+    // Repetition penalty
+    let penalty_window = recent_tokens.len().min(cfg.rep_window);
+    if penalty_window > 0 && cfg.rep_penalty != 1.0 {
+        let start = recent_tokens.len().saturating_sub(cfg.rep_window);
         for &tok in &recent_tokens[start..] {
             if (tok as usize) < vocab_size {
                 if logits_copy[tok as usize] > 0.0 {
-                    logits_copy[tok as usize] /= REP_PENALTY;
+                    logits_copy[tok as usize] /= cfg.rep_penalty;
                 } else {
-                    logits_copy[tok as usize] *= REP_PENALTY;
+                    logits_copy[tok as usize] *= cfg.rep_penalty;
                 }
             }
         }
     }
 
     // Apply temperature
-    if TEMPERATURE > 0.0 && TEMPERATURE != 1.0 {
-        let inv_t = 1.0 / TEMPERATURE;
+    if cfg.temperature > 0.0 && cfg.temperature != 1.0 {
+        let inv_t = 1.0 / cfg.temperature;
         for v in logits_copy.iter_mut() {
             *v *= inv_t;
         }
@@ -931,17 +999,17 @@ fn sample_with_penalties(logits: &[f32], recent_tokens: &[u32], arena: &BumpAren
     // 1. Softmax
     libtensor::ops::softmax(logits_copy);
 
-    // 2. Sort indices by probability (descending) — use simple selection
-    //    For efficiency, we only need to find the nucleus set (cumsum >= TOP_P)
+    // 2. Top-K + Top-P nucleus sampling
     let mut cumsum = 0.0f32;
     let mut nucleus_count = 0usize;
-
-    // Find top probs by iteratively finding max
-    // Use a small buffer for the nucleus set
     let mut nucleus_ids = [0u32; 128];
     let mut nucleus_probs = [0.0f32; 128];
-    // Mark picked probs as -1 in logits_copy after picking
-    let max_nucleus = 128;
+    // Top-K limits the nucleus size (0 = no limit, use all 128 slots)
+    let max_nucleus = if cfg.top_k > 0 {
+        (cfg.top_k as usize).min(128)
+    } else {
+        128
+    };
 
     for n in 0..max_nucleus {
         // Find max remaining prob
@@ -964,7 +1032,7 @@ fn sample_with_penalties(logits: &[f32], recent_tokens: &[u32], arena: &BumpAren
         logits_copy[best_idx] = -1.0; // mark as used
 
         cumsum += best_prob;
-        if cumsum >= TOP_P {
+        if cumsum >= cfg.top_p {
             break;
         }
     }
@@ -1177,6 +1245,11 @@ fn handle_async_inference(
 
     let arena_mark = arena.used();
 
+    // Read control sector for sampling params + dump layer
+    let cfg = read_control_sector();
+    println!("[INFERENCE] Config: temp={:.2} top_p={:.2} top_k={} rep={:.2} dump_layer={}",
+        cfg.temperature, cfg.top_p, cfg.top_k, cfg.rep_penalty, cfg.dump_layer);
+
     // Tokenize prompt with chat template
     // Tokenize prompt (special tokens like <|im_start|> are handled as BPE subwords,
     // NOT collapsed to single special token IDs — see tokenizer fix)
@@ -1193,10 +1266,7 @@ fn handle_async_inference(
 
     // Attention dump: capture layer 0 attention weights during prefill
     // Buffer layout: [n_heads, total_prompt, total_prompt] = n_heads * seq^2 floats
-    // Which transformer layer to dump attention weights for (0-29).
-    // Change this to inspect different layers. Layer 0 = first, 29 = last.
-    // The MCP attention_heatmap tool will visualize the dumped layer.
-    const ATTN_DUMP_LAYER: usize = 0;
+    // Dump layer comes from control sector (cfg.dump_layer, default 0)
     let attn_buf_size = config.n_heads * total_prompt * total_prompt;
     let attn_buf_fits = attn_buf_size <= DUMP_MAX_FLOATS; // fits in 128KB mailbox?
     // Allocate from arena BEFORE arena_mark so it persists across forward calls
@@ -1225,7 +1295,7 @@ fn handle_async_inference(
             use libtensor::transformer::AttnDump;
             AttnDump {
                 buffer: buf,
-                dump_layer: ATTN_DUMP_LAYER,
+                dump_layer: cfg.dump_layer,
                 n_heads: config.n_heads,
                 max_seq: total_prompt,
             }
@@ -1244,7 +1314,7 @@ fn handle_async_inference(
             }
         };
         if i == total_prompt - 1 {
-            last_logits_token = sample_with_penalties(logits, &gen_tokens[..gen_count], arena);
+            last_logits_token = sample_with_penalties(logits, &gen_tokens[..gen_count], arena, &cfg);
         }
         if i % 4 == 0 { yield_cpu(); }
         tcg_breathe();
@@ -1258,7 +1328,7 @@ fn handle_async_inference(
             (config.n_heads * total_prompt) as u32,
             total_prompt as u32,
         );
-        println!("[INFERENCE] Attention dumped: layer {} ({} heads, {} seq)", ATTN_DUMP_LAYER, config.n_heads, total_prompt);
+        println!("[INFERENCE] Attention dumped: layer {} ({} heads, {} seq)", cfg.dump_layer, config.n_heads, total_prompt);
     }
 
     println!("[INFERENCE] Async prefill done, streaming tokens...");
@@ -1283,7 +1353,7 @@ fn handle_async_inference(
                 Some(l) => l,
                 None => break,
             };
-            sample_with_penalties(logits, &gen_tokens[..gen_count], arena)
+            sample_with_penalties(logits, &gen_tokens[..gen_count], arena, &cfg)
         };
 
         // Check for stop tokens (ULTRA 39)

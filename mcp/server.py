@@ -398,6 +398,44 @@ TOOLS = [
             },
             "required": ["prompt"]
         }
+    },
+    {
+        "name": "set_control",
+        "description": (
+            "Write control parameters to VirtIO disk sector 258. "
+            "The inference server reads this at the start of each request. "
+            "Parameters with value 0 or 0.0 mean 'use compiled default'. "
+            "Changes take effect on the NEXT inference request (no recompile needed)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "dump_layer": {
+                    "type": "integer",
+                    "description": "Which transformer layer to dump attention for (0-29, default: 0)"
+                },
+                "temperature": {
+                    "type": "number",
+                    "description": "Sampling temperature (default: 0.8, higher = more random)"
+                },
+                "top_p": {
+                    "type": "number",
+                    "description": "Top-P nucleus sampling threshold (default: 0.9)"
+                },
+                "top_k": {
+                    "type": "integer",
+                    "description": "Top-K filter, 0 = disabled (default: 0)"
+                },
+                "rep_penalty": {
+                    "type": "number",
+                    "description": "Repetition penalty factor (default: 1.15)"
+                },
+                "rep_window": {
+                    "type": "integer",
+                    "description": "Repetition penalty window size (default: 32)"
+                }
+            }
+        }
     }
 ]
 
@@ -1128,6 +1166,66 @@ def _read_mailbox_raw(disk_image: str | None = None) -> tuple[str | None, np.nda
         return None, None, 0
 
 
+def set_control(
+    dump_layer: int = 0,
+    temperature: float = 0.0,
+    top_p: float = 0.0,
+    top_k: int = 0,
+    rep_penalty: float = 0.0,
+    rep_window: int = 0,
+) -> str:
+    """Write control parameters to VirtIO disk sector 258."""
+    img_path = PROJECT_ROOT / "boot" / "virtio-data.img"
+    if not img_path.exists():
+        return f"ERROR: Disk image not found: {img_path}"
+
+    SECTOR = 512
+    CONTROL_SECTOR = 258
+    offset = CONTROL_SECTOR * SECTOR
+
+    try:
+        # Read current sector to get sequence counter
+        with open(img_path, "rb") as f:
+            f.seek(offset)
+            current = f.read(SECTOR)
+
+        seq = 1
+        if len(current) >= 8 and current[:4] == b"FCTL":
+            seq = struct.unpack_from("<I", current, 4)[0] + 1
+
+        # Build control sector
+        buf = bytearray(SECTOR)
+        buf[0:4] = b"FCTL"
+        struct.pack_into("<I", buf, 4, seq)
+        struct.pack_into("<I", buf, 8, dump_layer)
+        # offset 12: dump_module (reserved)
+        struct.pack_into("<f", buf, 16, temperature)
+        struct.pack_into("<f", buf, 20, top_p)
+        struct.pack_into("<I", buf, 24, top_k)
+        struct.pack_into("<f", buf, 28, rep_penalty)
+        struct.pack_into("<I", buf, 32, rep_window)
+
+        # Write to disk image
+        with open(img_path, "r+b") as f:
+            f.seek(offset)
+            f.write(buf)
+
+        lines = [
+            f"Control sector written (seq={seq}):",
+            f"  dump_layer:    {dump_layer}",
+            f"  temperature:   {temperature} {'(default)' if temperature == 0.0 else ''}",
+            f"  top_p:         {top_p} {'(default)' if top_p == 0.0 else ''}",
+            f"  top_k:         {top_k} {'(disabled)' if top_k == 0 else ''}",
+            f"  rep_penalty:   {rep_penalty} {'(default)' if rep_penalty == 0.0 else ''}",
+            f"  rep_window:    {rep_window} {'(default)' if rep_window == 0 else ''}",
+            f"",
+            f"Changes take effect on the NEXT inference request.",
+        ]
+        return "\n".join(lines)
+    except Exception as e:
+        return f"ERROR writing control sector: {e}"
+
+
 def _wrap_chatml(query: str) -> str:
     """Wrap a user query in the same ChatML template as the Folkering inference server."""
     return (
@@ -1566,6 +1664,15 @@ def handle(req: dict) -> dict:
                     module=args.get("module", "self_attn.q_proj"),
                     model_path=args.get("model_path"),
                     chatml=args.get("chatml", True),
+                )
+            elif name == "set_control":
+                result = set_control(
+                    dump_layer=args.get("dump_layer", 0),
+                    temperature=args.get("temperature", 0.0),
+                    top_p=args.get("top_p", 0.0),
+                    top_k=args.get("top_k", 0),
+                    rep_penalty=args.get("rep_penalty", 0.0),
+                    rep_window=args.get("rep_window", 0),
                 )
             else:
                 result = f"Unknown tool: {name}"
