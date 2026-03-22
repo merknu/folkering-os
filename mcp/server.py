@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Folkering OS - MCP Debug Server v2.0 (Bare-Metal ML Inspection Studio)
+Folkering OS - MCP Debug Server v3.0 (Bare-Metal ML Inspection Studio)
 
 Tools:
   kernel_symbol_lookup    — resolve hex addresses to function names
@@ -8,6 +8,8 @@ Tools:
   qemu_inspect_registers  — read CPU state via QMP
   tensor_dump             — read inference tensor data from disk mailbox or serial log
   python_ref_runner       — PyTorch whitebox oracle with forward hooks (ULTRA 50)
+  attention_heatmap       — visual attention heatmap with drift comparison (v3.0)
+  topo_parity_map         — automated MSE/cosine drift analysis per layer+module (v3.0)
 """
 
 import sys
@@ -32,6 +34,17 @@ try:
     HAS_LLAMA = True
 except ImportError:
     HAS_LLAMA = False
+
+import io
+import base64
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    HAS_MATPLOTLIB = True
+except ImportError:
+    HAS_MATPLOTLIB = False
 
 # ── MCP stdio transport ────────────────────────────────────────────────────────
 
@@ -302,6 +315,79 @@ TOOLS = [
             },
             "required": ["prompt"]
         }
+    },
+    {
+        "name": "attention_heatmap",
+        "description": (
+            "Generate a visual heatmap of attention patterns from the PyTorch oracle. "
+            "If Rust data is available in the VirtIO disk mailbox, shows the DRIFT "
+            "(absolute difference) between Python and Rust attention. "
+            "If no Rust data, shows the PyTorch baseline (titled 'BASELINE ONLY'). "
+            "Applies causal mask (lower-triangular) so masked values don't distort colors. "
+            "Returns a PNG heatmap image alongside diagnostic statistics."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "Input prompt to visualize attention for"
+                },
+                "layer": {
+                    "type": "integer",
+                    "description": "Transformer layer to visualize (0-29, default: 0)",
+                    "default": 0
+                },
+                "head": {
+                    "description": "Attention head index (0-8), or 'all' for all 9 heads + average (default: 'all')",
+                    "default": "all"
+                },
+                "model_path": {
+                    "type": "string",
+                    "description": "Path to GGUF model file (default: boot/model.gguf)"
+                }
+            },
+            "required": ["prompt"]
+        }
+    },
+    {
+        "name": "topo_parity_map",
+        "description": (
+            "Automated drift analysis for ONE specific layer+module. "
+            "Runs prompt through PyTorch oracle, extracts the raw float activation array, "
+            "then reads the matching raw float array from the VirtIO disk mailbox. "
+            "Computes MSE, cosine similarity, max absolute error, and per-element divergence counts. "
+            "WARNING: If the Rust tensor was truncated (mailbox limit), metrics are flagged as partial."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "Input prompt to run through both Python and compare with Rust"
+                },
+                "layer": {
+                    "type": "integer",
+                    "description": "Layer index (0-29, default: 0)",
+                    "default": 0
+                },
+                "module": {
+                    "type": "string",
+                    "description": (
+                        "Module within the layer. Default: 'self_attn.q_proj'. "
+                        "Options: self_attn.q_proj, self_attn.k_proj, self_attn.v_proj, "
+                        "self_attn.o_proj, self_attn, mlp.gate_proj, mlp.up_proj, "
+                        "mlp.down_proj, mlp, input_layernorm, post_attention_layernorm"
+                    ),
+                    "default": "self_attn.q_proj"
+                },
+                "model_path": {
+                    "type": "string",
+                    "description": "Path to GGUF model file (default: boot/model.gguf)"
+                }
+            },
+            "required": ["prompt"]
+        }
     }
 ]
 
@@ -546,7 +632,7 @@ def tensor_dump(
     SECTOR = 512
     HDR_SECTOR = 1
     DATA_SECTOR = 2
-    MAX_DATA_SECTORS = 6  # sectors 2-7
+    MAX_DATA_SECTORS = 256  # sectors 2-257 (128KB, 32768 f32)
 
     try:
         with open(img_path, "rb") as f:
@@ -770,6 +856,7 @@ def _ensure_ref_model(model_path: str | None = None) -> str | None:
             gguf_file=gguf_path.name,
             local_files_only=True,
             dtype=torch.float32,
+            attn_implementation="eager",
         )
         _REF_MODEL.eval()
         _REF_MODEL_PATH = str(gguf_path)
@@ -779,6 +866,7 @@ def _ensure_ref_model(model_path: str | None = None) -> str | None:
             _REF_MODEL = AutoModelForCausalLM.from_pretrained(
                 "HuggingFaceTB/SmolLM2-135M",
                 dtype=torch.float32,
+                attn_implementation="eager",
             )
             _REF_MODEL.eval()
             _REF_MODEL_PATH = "HuggingFaceTB/SmolLM2-135M"
@@ -920,8 +1008,8 @@ def python_ref_runner(
                                 # Element-wise comparison if data available
                                 if n_dumped > 0:
                                     f.seek(1024)  # sector 2
-                                    raw = f.read(min(n_dumped * 4, 6 * 512))
-                                    rust_data = np.frombuffer(raw[:min(n_dumped, 768) * 4], dtype=np.float32).copy()
+                                    raw = f.read(min(n_dumped * 4, 256 * 512))
+                                    rust_data = np.frombuffer(raw[:n_dumped * 4], dtype=np.float32).copy()
                                     py_data = logits_np[:len(rust_data)]
                                     diff = np.abs(rust_data - py_data)
                                     lines.extend([
@@ -982,6 +1070,376 @@ def python_ref_runner(
     return "\n".join(lines)
 
 
+# ── Attention Heatmap (v3.0) ───────────────────────────────────────────────────
+
+# Max data sectors for expanded mailbox reader (256 sectors = 128KB = 32768 f32)
+MAILBOX_MAX_SECTORS = 256
+MAILBOX_MAX_FLOATS = MAILBOX_MAX_SECTORS * 512 // 4  # 32768
+
+
+def _read_mailbox_raw(disk_image: str | None = None) -> tuple[str | None, np.ndarray | None, int]:
+    """Read raw f32 array from VirtIO disk mailbox.
+
+    Returns (tensor_name, data_array, total_elements).
+    tensor_name is None if no dump found.
+    total_elements is the FULL tensor size (may be > len(data_array) if truncated).
+    """
+    if not HAS_NUMPY:
+        return None, None, 0
+
+    img_path = Path(disk_image) if disk_image else PROJECT_ROOT / "boot" / "virtio-data.img"
+    if not img_path.exists():
+        return None, None, 0
+
+    SECTOR = 512
+    try:
+        with open(img_path, "rb") as f:
+            f.seek(SECTOR)  # sector 1 = header
+            hdr = f.read(SECTOR)
+            if hdr[:4] != b"TDMP":
+                return None, None, 0
+
+            n_elements = struct.unpack_from("<I", hdr, 8)[0]
+            n_dumped = struct.unpack_from("<I", hdr, 12)[0]
+            name = hdr[48:112].split(b"\x00")[0].decode("utf-8", errors="replace")
+
+            if n_dumped == 0:
+                return name, np.array([], dtype=np.float32), n_elements
+
+            # Read data sectors (2+), up to MAILBOX_MAX_SECTORS
+            data_bytes = n_dumped * 4
+            sectors_needed = min((data_bytes + SECTOR - 1) // SECTOR, MAILBOX_MAX_SECTORS)
+            f.seek(2 * SECTOR)  # sector 2 = first data sector
+            raw = f.read(sectors_needed * SECTOR)
+            data = np.frombuffer(raw[:n_dumped * 4], dtype=np.float32).copy()
+
+            return name, data, n_elements
+    except Exception:
+        return None, None, 0
+
+
+def attention_heatmap(
+    prompt: str,
+    layer: int = 0,
+    head: str | int = "all",
+    model_path: str | None = None,
+) -> list[dict]:
+    """Generate attention heatmap. Returns MCP content items (text + image)."""
+    if not HAS_MATPLOTLIB:
+        return [{"type": "text", "text": "ERROR: matplotlib not installed. Run: py -3.12 -m pip install matplotlib"}]
+    if not HAS_NUMPY:
+        return [{"type": "text", "text": "ERROR: numpy not installed."}]
+
+    import torch
+
+    err = _ensure_ref_model(model_path)
+    if err:
+        return [{"type": "text", "text": err}]
+
+    # Validate params
+    if not 0 <= layer <= 29:
+        return [{"type": "text", "text": f"ERROR: layer must be 0-29, got {layer}"}]
+
+    inputs = _REF_TOKENIZER(prompt, return_tensors="pt")
+    input_ids = inputs["input_ids"]
+    token_list = input_ids[0].tolist()
+    token_strs = [_REF_TOKENIZER.decode([t]).replace("\n", "\\n") for t in token_list]
+    seq_len = len(token_list)
+
+    if seq_len < 2:
+        return [{"type": "text", "text": f"Prompt tokenizes to {seq_len} token(s). Need >= 2 for a meaningful heatmap."}]
+
+    # Forward pass with attention output (requires eager attention)
+    with torch.no_grad():
+        outputs = _REF_MODEL(input_ids, output_attentions=True)
+
+    # outputs.attentions[layer] shape: [1, n_heads, seq, seq]
+    py_attn = outputs.attentions[layer][0].numpy()  # [9, seq, seq]
+    n_heads = py_attn.shape[0]
+
+    # Check for Rust data in disk mailbox
+    rust_name, rust_data, rust_total = _read_mailbox_raw()
+    has_rust = rust_data is not None and len(rust_data) > 0
+
+    # If Rust data matches attention shape, compute diff
+    # Attention is [n_heads, seq, seq] = n_heads * seq * seq floats
+    expected_attn_floats = n_heads * seq_len * seq_len
+    rust_attn = None
+    is_drift_mode = False
+
+    if has_rust and len(rust_data) >= expected_attn_floats:
+        try:
+            rust_attn = rust_data[:expected_attn_floats].reshape(n_heads, seq_len, seq_len)
+            is_drift_mode = True
+        except Exception:
+            pass
+
+    # Apply causal mask: upper triangle → NaN
+    causal_mask = np.tri(seq_len, dtype=bool)  # lower triangle = True
+    py_masked = py_attn.copy()
+    py_masked[:, ~causal_mask] = np.nan
+
+    if is_drift_mode:
+        diff = np.abs(py_attn - rust_attn)
+        diff[:, ~causal_mask] = np.nan
+        plot_data = diff
+        title_suffix = "DRIFT (|Python - Rust|)"
+        cmap = "hot"
+        vmin, vmax = 0, float(np.nanmax(diff))
+    else:
+        plot_data = py_masked
+        title_suffix = "BASELINE ONLY - NO RUST DATA"
+        cmap = "viridis"
+        vmin, vmax = 0, float(np.nanmax(py_masked))
+
+    # Determine which heads to plot
+    if head == "all":
+        head_indices = list(range(n_heads))
+    else:
+        h = int(head)
+        if not 0 <= h < n_heads:
+            return [{"type": "text", "text": f"ERROR: head must be 0-{n_heads-1}, got {h}"}]
+        head_indices = [h]
+
+    # Generate figure
+    if head == "all":
+        ncols = 5
+        nrows = 2
+        fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 4 * nrows))
+        axes_flat = axes.flatten()
+
+        # Plot average in first cell (suppress nanmean warning for masked cells)
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            avg = np.nanmean(plot_data, axis=0)
+        im = axes_flat[0].imshow(avg, cmap=cmap, vmin=vmin, vmax=vmax, aspect="auto")
+        axes_flat[0].set_title("Average", fontsize=10, fontweight="bold")
+        _label_attn_axes(axes_flat[0], token_strs, seq_len)
+
+        # Plot each head
+        for i, h in enumerate(head_indices):
+            ax = axes_flat[i + 1]
+            ax.imshow(plot_data[h], cmap=cmap, vmin=vmin, vmax=vmax, aspect="auto")
+            ax.set_title(f"Head {h}", fontsize=9)
+            _label_attn_axes(ax, token_strs, seq_len)
+
+        fig.suptitle(f"Layer {layer} — {title_suffix}", fontsize=13, fontweight="bold")
+        fig.subplots_adjust(right=0.88)
+        fig.colorbar(im, ax=axes_flat.tolist(), shrink=0.6, pad=0.02)
+    else:
+        fig, ax = plt.subplots(1, 1, figsize=(8, 7))
+        h = head_indices[0]
+        im = ax.imshow(plot_data[h], cmap=cmap, vmin=vmin, vmax=vmax, aspect="auto")
+        ax.set_title(f"Layer {layer}, Head {h} — {title_suffix}", fontsize=12, fontweight="bold")
+        ax.set_xlabel("Key position")
+        ax.set_ylabel("Query position")
+        _label_attn_axes(ax, token_strs, seq_len)
+        fig.colorbar(im, ax=ax)
+
+    if head != "all":
+        plt.tight_layout()
+
+    # Encode to base64 PNG
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    img_b64 = base64.b64encode(buf.read()).decode("ascii")
+
+    # Diagnostic stats
+    valid_attn = py_masked[~np.isnan(py_masked)]
+    bos_frac = float(np.nanmean(py_masked[:, :, 0])) if seq_len > 0 else 0
+    entropy_per_row = -np.nansum(py_masked * np.log(py_masked + 1e-10), axis=-1)
+    mean_entropy = float(np.nanmean(entropy_per_row))
+    max_entropy = float(np.log(seq_len))
+
+    lines = [
+        f"Attention Heatmap — Layer {layer} | {title_suffix}",
+        f"Prompt: {prompt!r}",
+        f"Tokens ({seq_len}): {token_strs}",
+        f"BOS attention fraction: {bos_frac:.3f}",
+        f"Mean entropy: {mean_entropy:.3f} / {max_entropy:.3f} (max)",
+    ]
+    if bos_frac > 0.8:
+        lines.append("WARNING: Attention is collapsing to BOS token!")
+    if mean_entropy < 0.3 * max_entropy and seq_len > 2:
+        lines.append("WARNING: Very low entropy — attention may be collapsing")
+    if is_drift_mode:
+        lines.append(f"Drift max: {float(np.nanmax(diff)):.6f}, mean: {float(np.nanmean(diff)):.6f}")
+    else:
+        lines.append("(Run inference in QEMU and dump attention to disk mailbox for drift comparison)")
+
+    content = [
+        {"type": "text", "text": "\n".join(lines)},
+        {"type": "image", "data": img_b64, "mimeType": "image/png"},
+    ]
+    return content
+
+
+def _label_attn_axes(ax, token_strs: list[str], seq_len: int):
+    """Label attention heatmap axes with token strings."""
+    if seq_len <= 20:
+        ax.set_xticks(range(seq_len))
+        ax.set_xticklabels(token_strs, rotation=45, ha="right", fontsize=max(6, 10 - seq_len // 4))
+        ax.set_yticks(range(seq_len))
+        ax.set_yticklabels(token_strs, fontsize=max(6, 10 - seq_len // 4))
+    else:
+        # Too many tokens for labels — show every Nth
+        step = max(1, seq_len // 10)
+        ax.set_xticks(range(0, seq_len, step))
+        ax.set_xticklabels([token_strs[i] for i in range(0, seq_len, step)], rotation=45, ha="right", fontsize=6)
+        ax.set_yticks(range(0, seq_len, step))
+        ax.set_yticklabels([token_strs[i] for i in range(0, seq_len, step)], fontsize=6)
+
+
+# ── Topological Parity Map (v3.0) ────────────────────────────────────────────
+
+
+def topo_parity_map(
+    prompt: str,
+    layer: int = 0,
+    module: str = "self_attn.q_proj",
+    model_path: str | None = None,
+) -> str:
+    """Compare ONE Python activation with ONE Rust tensor from the disk mailbox."""
+    if not HAS_NUMPY:
+        return "ERROR: numpy not installed."
+
+    import torch
+
+    err = _ensure_ref_model(model_path)
+    if err:
+        return err
+
+    if not 0 <= layer <= 29:
+        return f"ERROR: layer must be 0-29, got {layer}"
+
+    # Step 1: Run PyTorch oracle with forward hook
+    hook_target = f"model.layers.{layer}.{module}"
+    _install_hooks([hook_target])
+
+    inputs = _REF_TOKENIZER(prompt, return_tensors="pt")
+    token_list = inputs["input_ids"][0].tolist()
+
+    with torch.no_grad():
+        _REF_MODEL(inputs["input_ids"])
+
+    if hook_target not in _REF_HOOKS:
+        _REF_HOOKS.clear()
+        return f"ERROR: Forward hook did not capture '{hook_target}'. Check module name."
+
+    py_tensor = _REF_HOOKS[hook_target]
+    _REF_HOOKS.clear()
+    py_np = py_tensor.numpy().flatten().astype(np.float32)
+    py_shape = list(py_tensor.shape)
+
+    # Step 2: Read Rust tensor from disk mailbox
+    rust_name, rust_data, rust_total = _read_mailbox_raw()
+
+    lines = [
+        f"{'=' * 70}",
+        f"Topological Parity Map",
+        f"{'=' * 70}",
+        f"  prompt:     {prompt!r}",
+        f"  tokens:     {token_list} ({len(token_list)} tokens)",
+        f"  target:     {hook_target}",
+        f"",
+        f"  Python:",
+        f"    shape:    {py_shape}",
+        f"    elements: {len(py_np)}",
+        f"    min:      {float(py_np.min()):.6f}",
+        f"    max:      {float(py_np.max()):.6f}",
+        f"    mean:     {float(py_np.mean()):.6f}",
+        f"    std:      {float(py_np.std()):.6f}",
+    ]
+
+    if rust_data is None or len(rust_data) == 0:
+        lines.extend([
+            f"",
+            f"  Rust: NO DATA IN DISK MAILBOX",
+            f"  (Run inference in QEMU first. The inference-server dumps tensors to sectors 1-7.)",
+            f"",
+            f"  To get Rust data for this specific module, add to inference-server/main.rs:",
+            f"    debug_dump_hidden(&{module.replace('.', '_')}, \"L{layer}_{module.replace('.', '_')}\");",
+        ])
+        return "\n".join(lines)
+
+    # Step 3: Compare
+    truncated = len(rust_data) < len(py_np)
+    compare_len = min(len(py_np), len(rust_data))
+    py_slice = py_np[:compare_len]
+    r_slice = rust_data[:compare_len]
+
+    diff = np.abs(py_slice - r_slice)
+    mse = float(np.mean(diff ** 2))
+    py_norm = float(np.linalg.norm(py_slice))
+    r_norm = float(np.linalg.norm(r_slice))
+    cosine = float(np.dot(py_slice, r_slice) / (py_norm * r_norm + 1e-10))
+    max_err = float(diff.max())
+    mean_err = float(diff.mean())
+    count_01 = int((diff > 0.01).sum())
+    count_1 = int((diff > 0.1).sum())
+    count_10 = int((diff > 1.0).sum())
+
+    lines.extend([
+        f"",
+        f"  Rust (disk mailbox):",
+        f"    name:     {rust_name}",
+        f"    elements: {len(rust_data)} (full tensor: {rust_total})",
+        f"    min:      {float(r_slice.min()):.6f}",
+        f"    max:      {float(r_slice.max()):.6f}",
+        f"    mean:     {float(r_slice.mean()):.6f}",
+        f"    std:      {float(r_slice.std()):.6f}",
+    ])
+
+    if truncated:
+        lines.extend([
+            f"",
+            f"  *** WARNING: METRICS COMPUTED ON TRUNCATED SLICE ***",
+            f"  *** Rust: {len(rust_data)} / Python: {len(py_np)} floats ***",
+            f"  *** Full tensor has {rust_total} elements, mailbox holds {len(rust_data)} ***",
+            f"  *** Expand Rust DUMP_MAX_SECTORS for full comparison ***",
+        ])
+
+    lines.extend([
+        f"",
+        f"{'─' * 70}",
+        f"  Comparison ({compare_len} elements):",
+        f"{'─' * 70}",
+        f"  MSE:              {mse:.2e}",
+        f"  Cosine Similarity:{cosine:.8f}",
+        f"  Max Abs Error:    {max_err:.6f}",
+        f"  Mean Abs Error:   {mean_err:.6f}",
+        f"  |diff| > 0.01:   {count_01} / {compare_len} ({100*count_01/compare_len:.1f}%)",
+        f"  |diff| > 0.1:    {count_1} / {compare_len} ({100*count_1/compare_len:.1f}%)",
+        f"  |diff| > 1.0:    {count_10} / {compare_len} ({100*count_10/compare_len:.1f}%)",
+    ])
+
+    # Top-5 worst divergences
+    if compare_len > 0:
+        worst_idx = diff.argsort()[-5:][::-1]
+        lines.extend([
+            f"",
+            f"  Top-5 worst divergences:",
+        ])
+        for i, idx in enumerate(worst_idx):
+            lines.append(f"    [{idx:6d}] python={py_slice[idx]:12.6f}  rust={r_slice[idx]:12.6f}  diff={diff[idx]:.6f}")
+
+    # Verdict
+    lines.append(f"")
+    if cosine > 0.999 and mse < 1e-4:
+        lines.append(f"  VERDICT: EXCELLENT — tensors are nearly identical")
+    elif cosine > 0.99 and mse < 1e-2:
+        lines.append(f"  VERDICT: GOOD — minor quantization noise, direction preserved")
+    elif cosine > 0.95:
+        lines.append(f"  VERDICT: CONCERNING — noticeable drift, investigate accumulation")
+    else:
+        lines.append(f"  VERDICT: CRITICAL DIVERGENCE — tensors have different directions")
+
+    return "\n".join(lines)
+
+
 # ── MCP dispatch ───────────────────────────────────────────────────────────────
 
 def handle(req: dict) -> dict:
@@ -994,7 +1452,7 @@ def handle(req: dict) -> dict:
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "folkering-debug", "version": "2.0.0"}
+                "serverInfo": {"name": "folkering-debug", "version": "3.0.0"}
             }
         }
 
@@ -1007,24 +1465,24 @@ def handle(req: dict) -> dict:
 
         try:
             if name == "kernel_symbol_lookup":
-                text = kernel_symbol_lookup(
+                result = kernel_symbol_lookup(
                     addresses=args["addresses"],
                     elf_path=args.get("elf_path")
                 )
             elif name == "serial_throttle_analyzer":
-                text = serial_throttle_analyzer(
+                result = serial_throttle_analyzer(
                     log_path=args["log_path"],
                     window=args.get("window", 5),
                     threshold=args.get("threshold", 10),
                     max_output_lines=args.get("max_output_lines", 200)
                 )
             elif name == "qemu_inspect_registers":
-                text = qemu_inspect_registers(
+                result = qemu_inspect_registers(
                     include_xmm=args.get("include_xmm", False),
                     qmp_socket=args.get("qmp_socket")
                 )
             elif name == "tensor_dump":
-                text = tensor_dump(
+                result = tensor_dump(
                     disk_image=args.get("disk_image"),
                     return_data=args.get("return_data", False),
                     max_values=args.get("max_values", 64),
@@ -1035,7 +1493,7 @@ def handle(req: dict) -> dict:
                     name_filter=args.get("name_filter"),
                 )
             elif name == "python_ref_runner":
-                text = python_ref_runner(
+                result = python_ref_runner(
                     prompt=args["prompt"],
                     mode=args.get("mode", "logits"),
                     top_k=args.get("top_k", 20),
@@ -1046,14 +1504,35 @@ def handle(req: dict) -> dict:
                     layer=args.get("layer"),
                     module_name=args.get("module_name"),
                 )
+            elif name == "attention_heatmap":
+                result = attention_heatmap(
+                    prompt=args["prompt"],
+                    layer=args.get("layer", 0),
+                    head=args.get("head", "all"),
+                    model_path=args.get("model_path"),
+                )
+            elif name == "topo_parity_map":
+                result = topo_parity_map(
+                    prompt=args["prompt"],
+                    layer=args.get("layer", 0),
+                    module=args.get("module", "self_attn.q_proj"),
+                    model_path=args.get("model_path"),
+                )
             else:
-                text = f"Unknown tool: {name}"
+                result = f"Unknown tool: {name}"
         except Exception as e:
-            text = f"Tool error: {e}"
+            import traceback
+            result = f"Tool error: {e}\n{traceback.format_exc()}"
+
+        # Support mixed content (text + image) from tools
+        if isinstance(result, list):
+            content = result
+        else:
+            content = [{"type": "text", "text": result}]
 
         return {
             "jsonrpc": "2.0", "id": req_id,
-            "result": {"content": [{"type": "text", "text": text}]}
+            "result": {"content": content}
         }
 
     if method == "notifications/initialized":

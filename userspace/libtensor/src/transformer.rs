@@ -16,6 +16,37 @@ use crate::kv_cache::KvCacheManager;
 use crate::quantize;
 use crate::FuseOp;
 
+/// Attention dump buffer for capturing post-softmax attention weights.
+///
+/// During prefill, the caller allocates a buffer of `n_heads * max_seq * max_seq` f32
+/// and passes it to forward(). After softmax, each head's attention weights are copied
+/// into the buffer at `[head * max_seq * max_seq + pos * max_seq]`.
+///
+/// The resulting buffer contains the full causal attention matrix for one layer,
+/// ready for writing to the disk mailbox and visualization via MCP attention_heatmap.
+pub struct AttnDump<'a> {
+    pub buffer: &'a mut [f32],
+    pub dump_layer: usize,
+    pub n_heads: usize,
+    pub max_seq: usize,
+}
+
+impl<'a> AttnDump<'a> {
+    /// Store post-softmax attention weights for one head at one position.
+    #[inline]
+    pub fn store(&mut self, layer: usize, head: usize, pos: usize, att: &[f32], seq_len: usize) {
+        if layer != self.dump_layer {
+            return;
+        }
+        // Layout: [head, query_pos, key_pos] in row-major
+        let offset = head * self.max_seq * self.max_seq + pos * self.max_seq;
+        let end = offset + seq_len;
+        if end <= self.buffer.len() {
+            self.buffer[offset..end].copy_from_slice(&att[..seq_len]);
+        }
+    }
+}
+
 /// Model configuration (parsed from GGUF metadata)
 #[derive(Clone, Copy)]
 pub struct ModelConfig {
@@ -117,6 +148,7 @@ pub fn forward<'a>(
     kv_cache: &mut KvCacheManager,
     arena: &'a BumpArena,
     yield_cfg: &YieldConfig,
+    mut attn_dump: Option<&mut AttnDump>,
 ) -> Option<&'a [f32]> {
     let dim = config.embed_dim;
     let head_dim = config.head_dim;
@@ -200,6 +232,11 @@ pub fn forward<'a>(
 
             // Softmax over attention scores
             ops::softmax(&mut att[..seq_len]);
+
+            // Capture post-softmax attention for visualization
+            if let Some(ref mut dump) = attn_dump {
+                dump.store(layer, h, pos, att, seq_len);
+            }
 
             // Weighted sum of values
             let out_offset = h * head_dim;

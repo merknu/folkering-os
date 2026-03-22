@@ -45,16 +45,16 @@ pub const INFERENCE_TASK_ID: u32 = 6;
 //
 // Two extraction paths for the host-side MCP tool:
 //   1. Serial log: [TDMP] lines with stats (always available)
-//   2. Disk mailbox: sectors 1-7 with raw f32 data (for numpy analysis)
+//   2. Disk mailbox: sectors 1-257 with raw f32 data (128KB, for attention/logits)
 //
 // The MCP tool reads the disk image directly on the host — no QEMU interaction.
 // ============================================================================
 
-/// Debug mailbox: sector 1 = header, sectors 2-7 = data (max 768 f32)
+/// Debug mailbox: sector 1 = header, sectors 2-257 = data (max 32768 f32, 128KB)
 const DUMP_HEADER_SECTOR: u64 = 1;
 const DUMP_DATA_SECTOR: u64 = 2;
-const DUMP_MAX_SECTORS: usize = 6;  // sectors 2-7
-const DUMP_MAX_FLOATS: usize = DUMP_MAX_SECTORS * SECTOR_SIZE / 4;  // 768
+const DUMP_MAX_SECTORS: usize = 256;  // sectors 2-257 (128KB)
+const DUMP_MAX_FLOATS: usize = DUMP_MAX_SECTORS * SECTOR_SIZE / 4;  // 32768
 
 /// Monotonic sequence counter
 static mut DUMP_SEQ: u32 = 0;
@@ -63,7 +63,7 @@ static mut DUMP_SEQ: u32 = 0;
 ///
 /// Disk mailbox layout:
 ///   Sector 1 (header): magic, seq, shape, stats, name, first 100 f32 summary
-///   Sectors 2-7 (data): raw f32 values, up to 768 floats
+///   Sectors 2-257 (data): raw f32 values, up to 32768 floats (128KB)
 fn debug_dump_tensor(name: &str, data: &[f32], shape0: u32, shape1: u32) {
     let n = data.len();
     if n == 0 { return; }
@@ -722,6 +722,7 @@ fn handle_inference_request(
 
         let logits = match forward(
             input_tokens[i], i, config, &weights, &mut eng.kv_cache, arena, &yield_cfg,
+            None,
         ) {
             Some(l) => l,
             None => {
@@ -771,6 +772,7 @@ fn handle_inference_request(
 
             let logits = match forward(
                 gen_tokens[gen_count - 1], pos - 1, config, &weights, &mut eng.kv_cache, arena, &yield_cfg,
+                None,
             ) {
                 Some(l) => l,
                 None => {
@@ -1189,9 +1191,22 @@ fn handle_async_inference(
     let mut gen_count = 0usize;
     let mut last_logits_token: u32 = 0;
 
+    // Attention dump: capture layer 0 attention weights during prefill
+    // Buffer layout: [n_heads, total_prompt, total_prompt] = n_heads * seq^2 floats
+    const ATTN_DUMP_LAYER: usize = 0;
+    let attn_buf_size = config.n_heads * total_prompt * total_prompt;
+    let attn_buf_fits = attn_buf_size <= DUMP_MAX_FLOATS; // fits in 128KB mailbox?
+    // Allocate from arena BEFORE arena_mark so it persists across forward calls
+    let mut attn_buf = if attn_buf_fits {
+        arena.alloc_f32(attn_buf_size)
+    } else {
+        None
+    };
+    let arena_mark2 = arena.used(); // new mark after attn buffer
+
     // Prefill
     for i in 0..total_prompt {
-        arena.reset_to(arena_mark);
+        arena.reset_to(arena_mark2);
         let (weights, _) = match build_weights_for_forward(eng, arena) {
             Some(w) => w,
             None => {
@@ -1201,8 +1216,21 @@ fn handle_async_inference(
                 return;
             }
         };
+
+        // Build AttnDump for this forward call (borrows attn_buf mutably)
+        let mut attn_dump_obj = attn_buf.as_deref_mut().map(|buf| {
+            use libtensor::transformer::AttnDump;
+            AttnDump {
+                buffer: buf,
+                dump_layer: ATTN_DUMP_LAYER,
+                n_heads: config.n_heads,
+                max_seq: total_prompt,
+            }
+        });
+
         let logits = match forward(
             input_tokens[i], i, config, &weights, &mut eng.kv_cache, arena, &yield_cfg,
+            attn_dump_obj.as_mut(),
         ) {
             Some(l) => l,
             None => {
@@ -1217,6 +1245,17 @@ fn handle_async_inference(
         }
         if i % 4 == 0 { yield_cpu(); }
         tcg_breathe();
+    }
+
+    // Dump attention weights to disk mailbox
+    if let Some(ref buf) = attn_buf {
+        debug_dump_tensor(
+            "attn_layer0",
+            &buf[..attn_buf_size],
+            (config.n_heads * total_prompt) as u32,
+            total_prompt as u32,
+        );
+        println!("[INFERENCE] Attention dumped: layer {} ({} heads, {} seq)", ATTN_DUMP_LAYER, config.n_heads, total_prompt);
     }
 
     println!("[INFERENCE] Async prefill done, streaming tokens...");
@@ -1236,6 +1275,7 @@ fn handle_async_inference(
             };
             let logits = match forward(
                 gen_tokens[gen_count - 1], pos - 1, config, &weights, &mut eng.kv_cache, arena, &yield_cfg,
+                None,
             ) {
                 Some(l) => l,
                 None => break,
