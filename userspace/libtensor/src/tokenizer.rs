@@ -137,15 +137,24 @@ fn pt_is_newline(b: u8) -> bool {
     b == b'\n' || b == b'\r'
 }
 
+/// Control whitespace: \t, \x0b, \x0c — whitespace that is NOT space and NOT newline.
+/// GPT-2 regex treats these as a separate alternation from space/newline whitespace.
+#[inline]
+fn pt_is_ctrl_ws(b: u8) -> bool {
+    matches!(b, b'\t' | 0x0b | 0x0c)
+}
+
 /// Try to match a contraction ('s, 't, 're, 've, 'm, 'll, 'd) at pos.
+/// LOWERCASE ONLY — llama-cpp/HuggingFace do NOT match uppercase contractions
+/// (e.g., "DON'T" is NOT split as contraction, but "don't" IS).
 fn pt_try_contraction(text: &[u8], pos: usize) -> usize {
     if pos >= text.len() || text[pos] != b'\'' {
         return 0;
     }
     let rem = text.len() - pos;
     if rem >= 3 {
-        let c1 = text[pos + 1] | 0x20; // to lowercase
-        let c2 = text[pos + 2] | 0x20;
+        let c1 = text[pos + 1];
+        let c2 = text[pos + 2];
         if (c1 == b'r' && c2 == b'e')
             || (c1 == b'v' && c2 == b'e')
             || (c1 == b'l' && c2 == b'l')
@@ -154,7 +163,7 @@ fn pt_try_contraction(text: &[u8], pos: usize) -> usize {
         }
     }
     if rem >= 2 {
-        let c1 = text[pos + 1] | 0x20;
+        let c1 = text[pos + 1];
         if matches!(c1, b's' | b't' | b'm' | b'd') {
             return 2;
         }
@@ -234,24 +243,54 @@ fn pt_next(text: &[u8], pos: usize) -> usize {
         return pt_digits(text, pos);
     }
 
-    // Whitespace
-    if pt_is_ws(b) {
+    // Control whitespace (\t, \x0b, \x0c): separate segment from space/newline.
+    // GPT-2 regex alt 5: [\s&&[^\S\r\n]]+(?:\r\n|\r|\n)?
+    // These get their own segment, optionally followed by one newline.
+    if pt_is_ctrl_ws(b) {
+        let mut i = pos;
+        while i < text.len() && pt_is_ctrl_ws(text[i]) {
+            i += 1;
+        }
+        // Optional trailing newline (\r\n, \r, or \n)
+        if i < text.len() && text[i] == b'\r' {
+            i += 1;
+            if i < text.len() && text[i] == b'\n' {
+                i += 1;
+            }
+        } else if i < text.len() && text[i] == b'\n' {
+            i += 1;
+        }
+        return i - pos;
+    }
+
+    // Space or newline whitespace (\n, \r, space)
+    // Key rules:
+    // - Multiple ws before a letter: consume all but last, last space becomes word prefix
+    // - Single newline directly before letter: keep separate (NOT a word prefix)
+    // - Single space before letter: include as word prefix
+    // - Space(s) before newline: group together (GPT-2 alt 5)
+    if b == b' ' || pt_is_newline(b) {
         let ws_end = pt_ws_end(text, pos);
         if ws_end < text.len() {
-            // Followed by non-whitespace: leave 1 space for the next segment's prefix
+            // Followed by non-whitespace
             if ws_end - pos > 1 {
-                // Multiple whitespace chars: consume all but last space
+                // Multiple ws chars: consume all but last (last becomes word prefix)
                 return ws_end - pos - 1;
             }
-            // Exactly 1 space: include it with the following segment
+            // Single whitespace char before non-whitespace
             let next = text[pos + 1];
+            // Newlines are NEVER word prefixes — keep them separate
+            if pt_is_newline(b) {
+                return 1;
+            }
+            // Space (0x20): include as prefix with following segment
             if pt_is_letter(next) {
                 return 1 + pt_letters(text, pos + 1);
             }
             if pt_is_digit(next) {
                 return 1 + pt_digits(text, pos + 1);
             }
-            // Space + punctuation group (GPT-2 regex rule 4: ` ?[^\s\p{L}\p{N}]+`)
+            // Space + punctuation group (GPT-2 regex rule 4)
             return 1 + pt_punct(text, pos + 1);
         }
         // Whitespace at end of text: consume all
