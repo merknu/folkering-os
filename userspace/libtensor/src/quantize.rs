@@ -16,6 +16,12 @@ pub const Q4_0_BLOCK_VALUES: usize = 32;
 pub const Q8_0_BLOCK_SIZE: usize = 34; // 2 + 32
 pub const Q8_0_BLOCK_VALUES: usize = 32;
 
+/// Q6_K block: 256 6-bit values with per-sub-block i8 scales + f16 super-scale
+/// Layout: [ql: 128 bytes][qh: 64 bytes][scales: 16 bytes][d: 2 bytes f16]
+/// Total: 210 bytes per 256 values
+pub const Q6_K_BLOCK_SIZE: usize = 210; // 128 + 64 + 16 + 2
+pub const Q6_K_BLOCK_VALUES: usize = 256;
+
 /// Dequantize a single Q4_0 block (32 values) into f32 output.
 ///
 /// Q4_0 format per block:
@@ -58,6 +64,42 @@ pub fn dequantize_q8_0_block(block: &[u8], out: &mut [f32]) {
 
     for i in 0..32 {
         out[i] = (block[2 + i] as i8) as f32 * scale;
+    }
+}
+
+/// Dequantize a single Q6_K block (256 values) into f32 output.
+///
+/// Q6_K layout (210 bytes total):
+/// - ql[128]: lower 4 bits (2 nibbles per byte, 256 values)
+/// - qh[64]:  upper 2 bits (4 values per byte, 256 values)
+/// - scales[16]: per-16-value sub-block scales (i8)
+/// - d[2]: f16 super-block scale
+///
+/// Reconstruction: value = ((ql_nibble | (qh_2bits << 4)) - 32) * scales[sub] * d
+pub fn dequantize_q6_k_block(block: &[u8], out: &mut [f32]) {
+    debug_assert!(block.len() >= Q6_K_BLOCK_SIZE);
+
+    let ql = &block[0..128];    // lower 4 bits
+    let qh = &block[128..192];  // upper 2 bits
+    let scales = &block[192..208]; // 16 × i8 sub-block scales
+    let d = f16_to_f32(u16::from_le_bytes([block[208], block[209]]));
+
+    for i in 0..256 {
+        // Extract lower 4 bits from ql (2 nibbles per byte)
+        let ql_byte = ql[i / 2];
+        let ql_val = if i % 2 == 0 { ql_byte & 0x0F } else { ql_byte >> 4 };
+
+        // Extract upper 2 bits from qh (4 values per byte)
+        let qh_byte = qh[i / 4];
+        let qh_shift = (i % 4) * 2;
+        let qh_val = (qh_byte >> qh_shift) & 0x03;
+
+        // Combine: 6-bit value = ql(4 bits) | qh(2 bits) << 4, centered at 32
+        let q = ((ql_val as i32) | ((qh_val as i32) << 4)) - 32;
+
+        // Scale by sub-block scale and super-block scale
+        let sub_scale = scales[i / 16] as i8;
+        out[i] = q as f32 * sub_scale as f32 * d;
     }
 }
 

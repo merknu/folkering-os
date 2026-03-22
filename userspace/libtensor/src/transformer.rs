@@ -573,29 +573,47 @@ fn embed_token(token_id: usize, vocab_size: usize, dim: usize, embed_data: &[u8]
 
     let blocks_per_row = dim / 32;
 
-    // Detect format: check total data size to determine block size
-    let expected_q4 = vocab_size * blocks_per_row * quantize::Q4_0_BLOCK_SIZE;
-    let expected_q8 = vocab_size * blocks_per_row * quantize::Q8_0_BLOCK_SIZE;
+    // Detect format from total data size
+    // Q6_K: 256 values/block, 210 bytes/block
+    // Q8_0: 32 values/block, 34 bytes/block
+    // Q4_0: 32 values/block, 18 bytes/block
+    let blocks_q6k = dim / quantize::Q6_K_BLOCK_VALUES; // 256 values per block
+    let expected_q6k = vocab_size * blocks_q6k * quantize::Q6_K_BLOCK_SIZE;
 
-    let (block_size, is_q8) = if embed_data.len() >= expected_q8 {
-        (quantize::Q8_0_BLOCK_SIZE, true)
-    } else {
-        (quantize::Q4_0_BLOCK_SIZE, false)
-    };
-
-    let row_bytes = blocks_per_row * block_size;
-    let row_start = token_id * row_bytes;
-
-    let mut out_idx = 0;
-    for blk in 0..blocks_per_row {
-        let block_start = row_start + blk * block_size;
-        let block = &embed_data[block_start..block_start + block_size];
-        if is_q8 {
-            quantize::dequantize_q8_0_block(block, &mut output[out_idx..out_idx + 32]);
-        } else {
-            quantize::dequantize_q4_0_block(block, &mut output[out_idx..out_idx + 32]);
+    if embed_data.len() >= expected_q6k && blocks_q6k > 0 {
+        // Q6_K format (Qwen3 embeddings)
+        let row_bytes = blocks_q6k * quantize::Q6_K_BLOCK_SIZE;
+        let row_start = token_id * row_bytes;
+        let mut out_idx = 0;
+        for blk in 0..blocks_q6k {
+            let block_start = row_start + blk * quantize::Q6_K_BLOCK_SIZE;
+            let block = &embed_data[block_start..block_start + quantize::Q6_K_BLOCK_SIZE];
+            let vals = quantize::Q6_K_BLOCK_VALUES.min(dim - out_idx);
+            quantize::dequantize_q6_k_block(block, &mut output[out_idx..out_idx + vals]);
+            out_idx += vals;
         }
-        out_idx += 32;
+    } else {
+        // Q4_0 or Q8_0 format (SmolLM2 embeddings)
+        let expected_q8 = vocab_size * blocks_per_row * quantize::Q8_0_BLOCK_SIZE;
+        let (block_size, is_q8) = if embed_data.len() >= expected_q8 {
+            (quantize::Q8_0_BLOCK_SIZE, true)
+        } else {
+            (quantize::Q4_0_BLOCK_SIZE, false)
+        };
+
+        let row_bytes = blocks_per_row * block_size;
+        let row_start = token_id * row_bytes;
+        let mut out_idx = 0;
+        for blk in 0..blocks_per_row {
+            let block_start = row_start + blk * block_size;
+            let block = &embed_data[block_start..block_start + block_size];
+            if is_q8 {
+                quantize::dequantize_q8_0_block(block, &mut output[out_idx..out_idx + 32]);
+            } else {
+                quantize::dequantize_q4_0_block(block, &mut output[out_idx..out_idx + 32]);
+            }
+            out_idx += 32;
+        }
     }
 }
 

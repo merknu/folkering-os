@@ -1732,6 +1732,7 @@ fn load_model_from_disk() -> Result<(*const u8, usize), &'static str> {
     println!("[INFERENCE] Reading {} sectors ({} MB) via {} DMA bursts...",
         total_sectors, model_size / (1024 * 1024), (total_sectors + burst_sectors - 1) / burst_sectors);
 
+    let mut burst_count = 0u32;
     while remaining > 0 {
         let n = remaining.min(burst_sectors);
         let buf = unsafe {
@@ -1743,14 +1744,19 @@ fn load_model_from_disk() -> Result<(*const u8, usize), &'static str> {
                 total_read += n * SECTOR_SIZE;
                 sector += n as u64;
                 remaining -= n;
+                burst_count += 1;
 
-                // Progress logging every 1MB for debugging
-                let current_mb = total_read / (1024 * 1024);
-                if current_mb > last_progress_mb {
-                    println!("[INFERENCE] Loaded {}MB / {}MB (sector {})",
-                        current_mb, model_size / (1024 * 1024), sector);
-                    last_progress_mb = current_mb;
+                // Yield every 4 bursts (128KB) — helps VirtIO interrupt delivery
+                if burst_count % 4 == 0 {
                     yield_cpu();
+                }
+
+                // Progress logging every 4MB
+                let current_mb = total_read / (1024 * 1024);
+                if current_mb >= last_progress_mb + 4 {
+                    println!("[INFERENCE] Loaded {}MB / {}MB",
+                        current_mb, model_size / (1024 * 1024));
+                    last_progress_mb = current_mb;
                 }
 
                 // If we don't know model_size, check for zero sectors
