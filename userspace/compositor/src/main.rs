@@ -2219,11 +2219,11 @@ fn main() -> ! {
                                     } else {
                                         // Create TokenRing shmem (4 pages = 16KB)
                                         let ring_ok = if let Ok(rh) = shmem_create(16384) {
-                                            let _ = shmem_grant(rh, inference::INFERENCE_TASK_ID);
+                                            let _ = shmem_grant(rh, inference::inference_task_id());
                                             // Create query shmem
                                             let query_bytes = query.as_bytes();
                                             if let Ok(qh) = shmem_create(4096) {
-                                                let _ = shmem_grant(qh, inference::INFERENCE_TASK_ID);
+                                                let _ = shmem_grant(qh, inference::inference_task_id());
                                                 if shmem_map(qh, ASK_QUERY_VADDR).is_ok() {
                                                     unsafe {
                                                         let ptr = ASK_QUERY_VADDR as *mut u8;
@@ -2255,7 +2255,7 @@ fn main() -> ! {
                                                         Err(_) => {
                                                             let _ = shmem_destroy(rh);
                                                             let _ = shmem_destroy(qh);
-                                                            win.push_line("[AI] Server busy or unavailable");
+                                                            win.push_line("[AI] Server offline — AI Core may need restart");
                                                             false
                                                         }
                                                     }
@@ -2278,7 +2278,8 @@ fn main() -> ! {
                                     }
                                 }
                                 Err(_) => {
-                                    win.push_line("[AI] Inference server unavailable");
+                                    win.push_line("[AI] Inference server unavailable (may have crashed)");
+                                    win.push_line("[AI] Try again — server may auto-recover on next request");
                                 }
                             }
                         }

@@ -5,7 +5,20 @@
 
 use crate::syscall::{syscall3, SYS_IPC_SEND};
 
-/// Inference Server task ID (spawned at boot as Task 6)
+/// Inference Server task ID (initially Task 6, updated on respawn).
+static INFERENCE_TASK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(6);
+
+/// Get the current inference server task ID.
+pub fn inference_task_id() -> u32 {
+    INFERENCE_TASK.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Update the inference server task ID (after respawn).
+pub fn set_inference_task_id(new_id: u32) {
+    INFERENCE_TASK.store(new_id, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Default task ID (backward compatibility for shmem_grant etc.)
 pub const INFERENCE_TASK_ID: u32 = 6;
 
 // ============================================================================
@@ -65,7 +78,7 @@ pub enum InferError {
 /// Returns true if model is loaded, false if running in stub mode.
 pub fn ping() -> Result<bool, InferError> {
     let ret = unsafe {
-        syscall3(SYS_IPC_SEND, INFERENCE_TASK_ID as u64, INFER_OP_PING, 0)
+        syscall3(SYS_IPC_SEND, inference_task_id() as u64, INFER_OP_PING, 0)
     };
 
     if ret == u64::MAX {
@@ -79,7 +92,7 @@ pub fn ping() -> Result<bool, InferError> {
 /// Returns (has_model, arena_size_bytes).
 pub fn status() -> Result<(bool, usize), InferError> {
     let ret = unsafe {
-        syscall3(SYS_IPC_SEND, INFERENCE_TASK_ID as u64, INFER_OP_STATUS, 0)
+        syscall3(SYS_IPC_SEND, inference_task_id() as u64, INFER_OP_STATUS, 0)
     };
 
     if ret == u64::MAX {
@@ -107,7 +120,7 @@ pub fn generate(shmem_handle: u32, prompt_len: usize) -> Result<(u32, usize), In
         | ((prompt_len as u64) << 32);
 
     let ret = unsafe {
-        syscall3(SYS_IPC_SEND, INFERENCE_TASK_ID as u64, request, 0)
+        syscall3(SYS_IPC_SEND, inference_task_id() as u64, request, 0)
     };
 
     if ret == u64::MAX {
@@ -133,7 +146,7 @@ pub fn ask(shmem_handle: u32, query_len: usize) -> Result<(u32, usize), InferErr
         | ((query_len as u64) << 32);
 
     let ret = unsafe {
-        syscall3(SYS_IPC_SEND, INFERENCE_TASK_ID as u64, request, 0)
+        syscall3(SYS_IPC_SEND, inference_task_id() as u64, request, 0)
     };
 
     if ret == u64::MAX {
@@ -172,7 +185,7 @@ pub fn ask_async(query_shmem: u32, query_len: usize, ring_shmem: u32) -> Result<
         | ((ring_shmem as u64) << 48);
 
     let ret = unsafe {
-        syscall3(SYS_IPC_SEND, INFERENCE_TASK_ID as u64, request, 0)
+        syscall3(SYS_IPC_SEND, inference_task_id() as u64, request, 0)
     };
 
     if ret == u64::MAX {
