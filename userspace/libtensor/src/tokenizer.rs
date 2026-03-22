@@ -107,6 +107,168 @@ fn fnv1a(data: &[u8]) -> u32 {
 }
 
 // ============================================================================
+// GPT-2 Pre-tokenizer
+// ============================================================================
+//
+// Splits text into segments at word boundaries before BPE. Merges do not cross
+// segment boundaries. Matches HuggingFace/llama-cpp behavior:
+// - Words carry their leading space: "hello world" → ["hello", " world"]
+// - Contractions split: "don't" → ["don", "'t"]
+// - Digits grouped 1-3: "12345" → ["123", "45"]
+// - Whitespace before words leaves 1 space for the word prefix
+
+#[inline]
+fn pt_is_letter(b: u8) -> bool {
+    b.is_ascii_alphabetic() || b >= 128 // non-ASCII treated as letter
+}
+
+#[inline]
+fn pt_is_digit(b: u8) -> bool {
+    b.is_ascii_digit()
+}
+
+#[inline]
+fn pt_is_ws(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
+}
+
+#[inline]
+fn pt_is_newline(b: u8) -> bool {
+    b == b'\n' || b == b'\r'
+}
+
+/// Try to match a contraction ('s, 't, 're, 've, 'm, 'll, 'd) at pos.
+fn pt_try_contraction(text: &[u8], pos: usize) -> usize {
+    if pos >= text.len() || text[pos] != b'\'' {
+        return 0;
+    }
+    let rem = text.len() - pos;
+    if rem >= 3 {
+        let c1 = text[pos + 1] | 0x20; // to lowercase
+        let c2 = text[pos + 2] | 0x20;
+        if (c1 == b'r' && c2 == b'e')
+            || (c1 == b'v' && c2 == b'e')
+            || (c1 == b'l' && c2 == b'l')
+        {
+            return 3;
+        }
+    }
+    if rem >= 2 {
+        let c1 = text[pos + 1] | 0x20;
+        if matches!(c1, b's' | b't' | b'm' | b'd') {
+            return 2;
+        }
+    }
+    0
+}
+
+/// Count consecutive letters starting at pos.
+#[inline]
+fn pt_letters(text: &[u8], pos: usize) -> usize {
+    let mut i = pos;
+    while i < text.len() && pt_is_letter(text[i]) {
+        i += 1;
+    }
+    i - pos
+}
+
+/// Count consecutive digits (max 3) starting at pos.
+#[inline]
+fn pt_digits(text: &[u8], pos: usize) -> usize {
+    let mut i = pos;
+    while i < text.len() && pt_is_digit(text[i]) && (i - pos) < 3 {
+        i += 1;
+    }
+    i - pos
+}
+
+/// Find end of whitespace run starting at pos.
+#[inline]
+fn pt_ws_end(text: &[u8], pos: usize) -> usize {
+    let mut i = pos;
+    while i < text.len() && pt_is_ws(text[i]) {
+        i += 1;
+    }
+    i
+}
+
+/// Count consecutive punctuation (non-letter, non-digit, non-whitespace).
+fn pt_punct(text: &[u8], pos: usize) -> usize {
+    let mut i = pos;
+    while i < text.len() && !pt_is_letter(text[i]) && !pt_is_digit(text[i]) && !pt_is_ws(text[i]) {
+        i += 1;
+    }
+    // Include trailing newlines (GPT-2 regex rule 4)
+    while i < text.len() && pt_is_newline(text[i]) {
+        i += 1;
+    }
+    (i - pos).max(1)
+}
+
+/// Get the length of the next pre-token segment starting at pos.
+///
+/// Implements GPT-2 pre-tokenizer rules:
+/// 1. Contractions ('s, 't, etc.) are separate segments
+/// 2. Letters with optional leading space/punct prefix
+/// 3. 1-3 digits
+/// 4. Punctuation groups
+/// 5. Whitespace: leaves 1 space for next word's prefix
+fn pt_next(text: &[u8], pos: usize) -> usize {
+    let b = text[pos];
+
+    // Contraction: 's 't 're 've 'm 'll 'd
+    if b == b'\'' {
+        let clen = pt_try_contraction(text, pos);
+        if clen > 0 {
+            return clen;
+        }
+    }
+
+    // Letter: consume consecutive letters
+    if pt_is_letter(b) {
+        return pt_letters(text, pos);
+    }
+
+    // Digit: consume 1-3 digits
+    if pt_is_digit(b) {
+        return pt_digits(text, pos);
+    }
+
+    // Whitespace
+    if pt_is_ws(b) {
+        let ws_end = pt_ws_end(text, pos);
+        if ws_end < text.len() {
+            // Followed by non-whitespace: leave 1 space for the next segment's prefix
+            if ws_end - pos > 1 {
+                // Multiple whitespace chars: consume all but last space
+                return ws_end - pos - 1;
+            }
+            // Exactly 1 space: include it with the following segment
+            let next = text[pos + 1];
+            if pt_is_letter(next) {
+                return 1 + pt_letters(text, pos + 1);
+            }
+            if pt_is_digit(next) {
+                return 1 + pt_digits(text, pos + 1);
+            }
+            // Space + punctuation group (GPT-2 regex rule 4: ` ?[^\s\p{L}\p{N}]+`)
+            return 1 + pt_punct(text, pos + 1);
+        }
+        // Whitespace at end of text: consume all
+        return ws_end - pos;
+    }
+
+    // Punctuation: non-letter, non-digit, non-whitespace
+    // If followed by a letter, this char is the word's optional prefix
+    if pos + 1 < text.len() && pt_is_letter(text[pos + 1]) {
+        return 1 + pt_letters(text, pos + 1);
+    }
+
+    // Consume punctuation group
+    pt_punct(text, pos)
+}
+
+// ============================================================================
 // Hash Table
 // ============================================================================
 
@@ -553,13 +715,30 @@ impl<'a> BpeTokenizer<'a> {
                 }
             }
 
-            // Apply BPE to the segment text[pos..seg_end]
+            // Pre-tokenize segment, then BPE each pre-token independently
             let segment = &text[pos..seg_end];
-            let added = self.encode_bpe_segment(segment, &mut output[n_tokens..]);
+            let added = self.encode_pretokenized(segment, &mut output[n_tokens..]);
             n_tokens += added;
             pos = seg_end;
         }
 
+        n_tokens
+    }
+
+    /// Pre-tokenize text segment, then BPE-encode each pre-token independently.
+    /// This prevents BPE merges from crossing word boundaries.
+    fn encode_pretokenized(&self, text: &[u8], output: &mut [u32]) -> usize {
+        if text.is_empty() || output.is_empty() {
+            return 0;
+        }
+        let mut n_tokens = 0;
+        let mut pos = 0;
+        while pos < text.len() && n_tokens < output.len() {
+            let seg_len = pt_next(text, pos);
+            let added = self.encode_bpe_segment(&text[pos..pos + seg_len], &mut output[n_tokens..]);
+            n_tokens += added;
+            pos += seg_len;
+        }
         n_tokens
     }
 

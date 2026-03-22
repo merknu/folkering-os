@@ -345,6 +345,11 @@ TOOLS = [
                 "model_path": {
                     "type": "string",
                     "description": "Path to GGUF model file (default: boot/model.gguf)"
+                },
+                "chatml": {
+                    "type": "boolean",
+                    "description": "Wrap prompt in ChatML template matching Folkering inference server (default: true)",
+                    "default": True
                 }
             },
             "required": ["prompt"]
@@ -384,6 +389,11 @@ TOOLS = [
                 "model_path": {
                     "type": "string",
                     "description": "Path to GGUF model file (default: boot/model.gguf)"
+                },
+                "chatml": {
+                    "type": "boolean",
+                    "description": "Wrap prompt in ChatML template matching Folkering inference server (default: true)",
+                    "default": True
                 }
             },
             "required": ["prompt"]
@@ -1118,13 +1128,31 @@ def _read_mailbox_raw(disk_image: str | None = None) -> tuple[str | None, np.nda
         return None, None, 0
 
 
+def _wrap_chatml(query: str) -> str:
+    """Wrap a user query in the same ChatML template as the Folkering inference server."""
+    return (
+        "<|im_start|>system\n"
+        "You are Folkering OS, a helpful AI assistant.\n"
+        "<|im_end|>\n"
+        "<|im_start|>user\n"
+        f"{query}\n"
+        "<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    )
+
+
 def attention_heatmap(
     prompt: str,
     layer: int = 0,
     head: str | int = "all",
     model_path: str | None = None,
+    chatml: bool = True,
 ) -> list[dict]:
-    """Generate attention heatmap. Returns MCP content items (text + image)."""
+    """Generate attention heatmap. Returns MCP content items (text + image).
+
+    If chatml=True (default), wraps prompt in ChatML template matching the
+    Folkering inference server for accurate Rust/Python drift comparison.
+    """
     if not HAS_MATPLOTLIB:
         return [{"type": "text", "text": "ERROR: matplotlib not installed. Run: py -3.12 -m pip install matplotlib"}]
     if not HAS_NUMPY:
@@ -1140,7 +1168,9 @@ def attention_heatmap(
     if not 0 <= layer <= 29:
         return [{"type": "text", "text": f"ERROR: layer must be 0-29, got {layer}"}]
 
-    inputs = _REF_TOKENIZER(prompt, return_tensors="pt")
+    # Wrap in ChatML template if requested (matches Rust inference server prompt)
+    effective_prompt = _wrap_chatml(prompt) if chatml else prompt
+    inputs = _REF_TOKENIZER(effective_prompt, return_tensors="pt")
     input_ids = inputs["input_ids"]
     token_list = input_ids[0].tolist()
     token_strs = [_REF_TOKENIZER.decode([t]).replace("\n", "\\n") for t in token_list]
@@ -1301,8 +1331,13 @@ def topo_parity_map(
     layer: int = 0,
     module: str = "self_attn.q_proj",
     model_path: str | None = None,
+    chatml: bool = True,
 ) -> str:
-    """Compare ONE Python activation with ONE Rust tensor from the disk mailbox."""
+    """Compare ONE Python activation with ONE Rust tensor from the disk mailbox.
+
+    If chatml=True (default), wraps prompt in ChatML template matching the
+    Folkering inference server for accurate comparison.
+    """
     if not HAS_NUMPY:
         return "ERROR: numpy not installed."
 
@@ -1319,7 +1354,8 @@ def topo_parity_map(
     hook_target = f"model.layers.{layer}.{module}"
     _install_hooks([hook_target])
 
-    inputs = _REF_TOKENIZER(prompt, return_tensors="pt")
+    effective_prompt = _wrap_chatml(prompt) if chatml else prompt
+    inputs = _REF_TOKENIZER(effective_prompt, return_tensors="pt")
     token_list = inputs["input_ids"][0].tolist()
 
     with torch.no_grad():
@@ -1358,10 +1394,21 @@ def topo_parity_map(
         lines.extend([
             f"",
             f"  Rust: NO DATA IN DISK MAILBOX",
-            f"  (Run inference in QEMU first. The inference-server dumps tensors to sectors 1-7.)",
+            f"  (Run inference in QEMU first. The inference-server dumps tensors to sectors 1-257.)",
             f"",
             f"  To get Rust data for this specific module, add to inference-server/main.rs:",
             f"    debug_dump_hidden(&{module.replace('.', '_')}, \"L{layer}_{module.replace('.', '_')}\");",
+        ])
+        return "\n".join(lines)
+
+    # Check if mailbox data matches what we're comparing
+    if rust_name and rust_name.startswith("attn_layer") and module != "self_attn":
+        lines.extend([
+            f"",
+            f"  WARNING: Mailbox contains attention weights ('{rust_name}') but you requested '{module}'.",
+            f"  The mailbox currently dumps post-softmax attention, not intermediate activations.",
+            f"  Use attention_heatmap(prompt, layer={layer}) for attention comparison.",
+            f"  For module-level comparison, modify inference-server to dump '{module}' instead.",
         ])
         return "\n".join(lines)
 
@@ -1510,6 +1557,7 @@ def handle(req: dict) -> dict:
                     layer=args.get("layer", 0),
                     head=args.get("head", "all"),
                     model_path=args.get("model_path"),
+                    chatml=args.get("chatml", True),
                 )
             elif name == "topo_parity_map":
                 result = topo_parity_map(
@@ -1517,6 +1565,7 @@ def handle(req: dict) -> dict:
                     layer=args.get("layer", 0),
                     module=args.get("module", "self_attn.q_proj"),
                     model_path=args.get("model_path"),
+                    chatml=args.get("chatml", True),
                 )
             else:
                 result = f"Unknown tool: {name}"

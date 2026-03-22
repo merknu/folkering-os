@@ -1193,6 +1193,9 @@ fn handle_async_inference(
 
     // Attention dump: capture layer 0 attention weights during prefill
     // Buffer layout: [n_heads, total_prompt, total_prompt] = n_heads * seq^2 floats
+    // Which transformer layer to dump attention weights for (0-29).
+    // Change this to inspect different layers. Layer 0 = first, 29 = last.
+    // The MCP attention_heatmap tool will visualize the dumped layer.
     const ATTN_DUMP_LAYER: usize = 0;
     let attn_buf_size = config.n_heads * total_prompt * total_prompt;
     let attn_buf_fits = attn_buf_size <= DUMP_MAX_FLOATS; // fits in 128KB mailbox?
