@@ -149,6 +149,26 @@ fn debug_dump_hidden(data: &[f32], label: &str) {
     debug_dump_tensor(label, data, data.len() as u32, 0);
 }
 
+/// Write health telemetry to sector 259.
+/// Layout: HLTH(4) + gen_step(u32) + token_id(u32) + mse(f32) + threshold(f32)
+///       + min_mse(f32) + min_mse_step(u32) + total_steps(u32)
+fn write_health_sector(
+    gen_step: u32, token_id: u32, mse: f32, threshold: f32,
+    min_mse: f32, min_mse_step: u32, total_steps: u32,
+) {
+    let mut buf = [0u8; SECTOR_SIZE];
+    buf[0..4].copy_from_slice(b"HLTH");
+    buf[4..8].copy_from_slice(&gen_step.to_le_bytes());
+    buf[8..12].copy_from_slice(&token_id.to_le_bytes());
+    buf[12..16].copy_from_slice(&mse.to_le_bytes());
+    buf[16..20].copy_from_slice(&threshold.to_le_bytes());
+    // "Check Engine" light: lowest MSE seen this run (worst collapse point)
+    buf[20..24].copy_from_slice(&min_mse.to_le_bytes());
+    buf[24..28].copy_from_slice(&min_mse_step.to_le_bytes());
+    buf[28..32].copy_from_slice(&total_steps.to_le_bytes());
+    let _ = libfolk::sys::block::write_sector(HEALTH_SECTOR, &buf);
+}
+
 /// IPC opcodes for inference requests (must match libfolk::sys::inference)
 pub const INFER_OP_PING: u64 = 0;
 pub const INFER_OP_GENERATE: u64 = 1;
@@ -188,6 +208,12 @@ const DEFAULT_REP_WINDOW: usize = 32;
 /// Control sector number — MCP tools write config here, inference server reads
 const CONTROL_SECTOR: u64 = 258;
 
+/// Health telemetry sector — MSE between consecutive logits
+const HEALTH_SECTOR: u64 = 259;
+
+/// Default MSE threshold for logit collapse detection
+const DEFAULT_DRIFT_THRESHOLD: f32 = 0.001;
+
 /// Sampling configuration — populated from control sector or defaults
 #[derive(Clone, Copy)]
 struct SamplingConfig {
@@ -197,6 +223,8 @@ struct SamplingConfig {
     rep_penalty: f32,
     rep_window: usize,
     dump_layer: usize,
+    drift_threshold: f32,
+    telemetry_mode: u32, // 0=off, 1=anomalies_only, 2=continuous
 }
 
 impl SamplingConfig {
@@ -208,6 +236,8 @@ impl SamplingConfig {
             rep_penalty: DEFAULT_REP_PENALTY,
             rep_window: DEFAULT_REP_WINDOW,
             dump_layer: 0,
+            drift_threshold: DEFAULT_DRIFT_THRESHOLD,
+            telemetry_mode: 0,
         }
     }
 }
@@ -254,6 +284,14 @@ fn read_control_sector() -> SamplingConfig {
     if rep_win > 0 {
         cfg.rep_window = rep_win as usize;
     }
+
+    let drift_thresh = f32::from_le_bytes([buf[40], buf[41], buf[42], buf[43]]);
+    if drift_thresh > 0.0 {
+        cfg.drift_threshold = drift_thresh;
+    }
+
+    let telem_mode = u32::from_le_bytes([buf[44], buf[45], buf[46], buf[47]]);
+    cfg.telemetry_mode = telem_mode;
 
     cfg
 }
@@ -1333,6 +1371,18 @@ fn handle_async_inference(
 
     println!("[INFERENCE] Async prefill done, streaming tokens...");
 
+    // Allocate prev_logits for MSE health monitoring (persists across gen loop)
+    let mut prev_logits = if cfg.telemetry_mode > 0 {
+        arena.alloc_f32(config.vocab_size)
+    } else {
+        None
+    };
+    let mut has_prev_logits = false;
+    let mut min_mse: f32 = f32::MAX;    // "Check Engine" light: worst (lowest) MSE
+    let mut min_mse_step: u32 = 0;
+    let mut health_gen_count: u32 = 0;
+    let arena_mark_gen = arena.used();   // mark AFTER prev_logits
+
     // Generation with streaming to TokenRing
     let mut pos = total_prompt;
     let mut write_idx: usize = 0;
@@ -1341,7 +1391,7 @@ fn handle_async_inference(
         let next_token = if gen_idx == 0 {
             last_logits_token
         } else {
-            arena.reset_to(arena_mark);
+            arena.reset_to(arena_mark_gen);
             let (weights, _) = match build_weights_for_forward(eng, arena) {
                 Some(w) => w,
                 None => break,
@@ -1353,6 +1403,49 @@ fn handle_async_inference(
                 Some(l) => l,
                 None => break,
             };
+
+            // Health monitoring: MSE between consecutive logits
+            if let Some(ref mut prev) = prev_logits {
+                if has_prev_logits {
+                    let mut mse_sum = 0.0f64;
+                    for j in 0..config.vocab_size {
+                        let d = (logits[j] - prev[j]) as f64;
+                        mse_sum += d * d;
+                    }
+                    let mse = (mse_sum / config.vocab_size as f64) as f32;
+                    health_gen_count = gen_idx as u32;
+
+                    // Track minimum MSE (worst collapse point)
+                    if mse < min_mse {
+                        min_mse = mse;
+                        min_mse_step = gen_idx as u32;
+                    }
+
+                    // Serial warning on collapse (both modes)
+                    if mse < cfg.drift_threshold {
+                        println!("[HEALTH] Logit collapse! MSE={:.6} gen={}", mse, gen_idx);
+                    }
+
+                    // Disk write depends on mode
+                    match cfg.telemetry_mode {
+                        1 => {
+                            // Anomalies only: write only if below threshold
+                            if mse < cfg.drift_threshold {
+                                write_health_sector(gen_idx as u32, gen_tokens[gen_count - 1], mse,
+                                    cfg.drift_threshold, min_mse, min_mse_step, health_gen_count);
+                            }
+                        }
+                        _ => {
+                            // Continuous: always write
+                            write_health_sector(gen_idx as u32, gen_tokens[gen_count - 1], mse,
+                                cfg.drift_threshold, min_mse, min_mse_step, health_gen_count);
+                        }
+                    }
+                }
+                prev[..config.vocab_size].copy_from_slice(logits);
+                has_prev_logits = true;
+            }
+
             sample_with_penalties(logits, &gen_tokens[..gen_count], arena, &cfg)
         };
 
@@ -1402,6 +1495,12 @@ fn handle_async_inference(
         if gen_idx % 8 == 0 {
             println!("[INFERENCE] Async gen {} tokens, {} bytes streamed", gen_idx + 1, write_idx);
         }
+    }
+
+    // Final health snapshot: write min_mse summary so Python reads the worst point
+    if cfg.telemetry_mode > 0 && health_gen_count > 0 {
+        write_health_sector(health_gen_count, 0, min_mse, cfg.drift_threshold,
+            min_mse, min_mse_step, health_gen_count);
     }
 
     // Mark done

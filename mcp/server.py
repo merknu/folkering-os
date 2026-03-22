@@ -400,6 +400,16 @@ TOOLS = [
         }
     },
     {
+        "name": "read_activation_health",
+        "description": (
+            "Read activation health telemetry from VirtIO sector 259. "
+            "Shows MSE between consecutive logits during generation to detect "
+            "hallucination loops and logit collapse. Requires telemetry_mode >= 1 "
+            "via set_control."
+        ),
+        "inputSchema": {"type": "object", "properties": {}}
+    },
+    {
         "name": "set_control",
         "description": (
             "Write control parameters to VirtIO disk sector 258. "
@@ -433,6 +443,14 @@ TOOLS = [
                 "rep_window": {
                     "type": "integer",
                     "description": "Repetition penalty window size (default: 32)"
+                },
+                "drift_threshold": {
+                    "type": "number",
+                    "description": "MSE threshold for logit collapse detection (default: 0.001)"
+                },
+                "telemetry_mode": {
+                    "type": "integer",
+                    "description": "Health telemetry: 0=off, 1=anomalies only, 2=continuous (default: 0)"
                 }
             }
         }
@@ -1173,6 +1191,8 @@ def set_control(
     top_k: int = 0,
     rep_penalty: float = 0.0,
     rep_window: int = 0,
+    drift_threshold: float = 0.0,
+    telemetry_mode: int = 0,
 ) -> str:
     """Write control parameters to VirtIO disk sector 258."""
     img_path = PROJECT_ROOT / "boot" / "virtio-data.img"
@@ -1204,6 +1224,8 @@ def set_control(
         struct.pack_into("<I", buf, 24, top_k)
         struct.pack_into("<f", buf, 28, rep_penalty)
         struct.pack_into("<I", buf, 32, rep_window)
+        struct.pack_into("<f", buf, 40, drift_threshold)
+        struct.pack_into("<I", buf, 44, telemetry_mode)
 
         # Write to disk image
         with open(img_path, "r+b") as f:
@@ -1218,12 +1240,67 @@ def set_control(
             f"  top_k:         {top_k} {'(disabled)' if top_k == 0 else ''}",
             f"  rep_penalty:   {rep_penalty} {'(default)' if rep_penalty == 0.0 else ''}",
             f"  rep_window:    {rep_window} {'(default)' if rep_window == 0 else ''}",
+            f"  drift_thresh:  {drift_threshold} {'(default 0.001)' if drift_threshold == 0.0 else ''}",
+            f"  telemetry:     {telemetry_mode} ({'off' if telemetry_mode == 0 else 'anomalies' if telemetry_mode == 1 else 'continuous'})",
             f"",
             f"Changes take effect on the NEXT inference request.",
         ]
         return "\n".join(lines)
     except Exception as e:
         return f"ERROR writing control sector: {e}"
+
+
+def read_activation_health() -> str:
+    """Read activation health telemetry from VirtIO sector 259."""
+    img_path = PROJECT_ROOT / "boot" / "virtio-data.img"
+    if not img_path.exists():
+        return f"ERROR: Disk image not found: {img_path}"
+
+    SECTOR = 512
+    HEALTH_SECTOR = 259
+
+    try:
+        with open(img_path, "rb") as f:
+            f.seek(HEALTH_SECTOR * SECTOR)
+            buf = f.read(SECTOR)
+
+        if len(buf) < 20 or buf[:4] != b"HLTH":
+            return (
+                "No health telemetry data found.\n"
+                "Enable with: set_control(telemetry_mode=2)\n"
+                "Then run an inference request."
+            )
+
+        gen_step = struct.unpack_from("<I", buf, 4)[0]
+        token_id = struct.unpack_from("<I", buf, 8)[0]
+        mse = struct.unpack_from("<f", buf, 12)[0]
+        threshold = struct.unpack_from("<f", buf, 16)[0]
+        min_mse = struct.unpack_from("<f", buf, 20)[0]
+        min_mse_step = struct.unpack_from("<I", buf, 24)[0]
+        total_steps = struct.unpack_from("<I", buf, 28)[0]
+
+        lines = [
+            "═" * 50,
+            "Activation Health Monitor",
+            "═" * 50,
+            f"  Total gen steps: {total_steps}",
+            f"  Last MSE:        {mse:.6f}",
+            f"  Min MSE:         {min_mse:.6f} (at step {min_mse_step})",
+            f"  Threshold:       {threshold:.6f}",
+        ]
+
+        # "Check Engine" light: use min_mse (worst point during generation)
+        if threshold > 0 and min_mse < threshold:
+            lines.append(f"  [!] CHECK ENGINE: Logit collapse detected at step {min_mse_step}!")
+            lines.append(f"      Lowest MSE={min_mse:.6f} < threshold={threshold:.6f}")
+        elif min_mse < 0.01:
+            lines.append(f"  [~] Low MSE observed — monitor for potential repetition")
+        else:
+            lines.append(f"  [OK] Normal logit variation throughout generation")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"ERROR reading health sector: {e}"
 
 
 def _wrap_chatml(query: str) -> str:
@@ -1673,7 +1750,11 @@ def handle(req: dict) -> dict:
                     top_k=args.get("top_k", 0),
                     rep_penalty=args.get("rep_penalty", 0.0),
                     rep_window=args.get("rep_window", 0),
+                    drift_threshold=args.get("drift_threshold", 0.0),
+                    telemetry_mode=args.get("telemetry_mode", 0),
                 )
+            elif name == "read_activation_health":
+                result = read_activation_health()
             else:
                 result = f"Unknown tool: {name}"
         except Exception as e:
