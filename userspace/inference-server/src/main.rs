@@ -868,7 +868,12 @@ fn handle_inference_request(
         let next_token = if gen_idx == 0 {
             last_logits_token
         } else {
-            // Forward pass for the previously generated token
+            // KV-cache overflow guard
+            if pos >= KV_WINDOW_SIZE {
+                println!("[INFERENCE] Context limit: pos={} >= KV={}", pos, KV_WINDOW_SIZE);
+                break;
+            }
+
             arena.reset_to(arena_mark);
 
             let (weights, _) = match build_weights_for_forward(eng, arena) {
@@ -1391,6 +1396,21 @@ fn handle_async_inference(
         let next_token = if gen_idx == 0 {
             last_logits_token
         } else {
+            // KV-cache overflow guard: prevent OOB in attention forward pass
+            if pos >= KV_WINDOW_SIZE {
+                let msg = b"\n[Context Limit Reached]";
+                if write_idx + msg.len() < RING_DATA_MAX {
+                    unsafe {
+                        let dst = (RING_SHMEM_VADDR as *mut u8).add(16).add(write_idx);
+                        core::ptr::copy_nonoverlapping(msg.as_ptr(), dst, msg.len());
+                    }
+                    write_idx += msg.len();
+                    ring.write_idx.store(write_idx as u32, Ordering::Release);
+                }
+                println!("[INFERENCE] Context limit: pos={} >= KV={}", pos, KV_WINDOW_SIZE);
+                break;
+            }
+
             arena.reset_to(arena_mark_gen);
             let (weights, _) = match build_weights_for_forward(eng, arena) {
                 Some(w) => w,

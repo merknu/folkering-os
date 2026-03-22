@@ -166,6 +166,8 @@ pub struct Window {
     pub focused_widget: Option<usize>,
     /// ULTRA 38: Dirty flag — set when content changes, cleared after redraw
     pub dirty: bool,
+    /// True while AI is streaming tokens to this window (shows typing cursor)
+    pub typing: bool,
 }
 
 impl Window {
@@ -284,6 +286,7 @@ impl WindowManager {
             input_cursor: 0,
             focused_widget: None,
             dirty: true,
+            typing: false,
         };
         self.windows.push(win);
         self.focused_id = Some(id);
@@ -507,6 +510,17 @@ fn draw_window(fb: &mut FramebufferView, win: &Window, focused: bool) {
         }
         draw_str_small(fb, text_x, text_y, line.as_str(), text_fg, win_bg);
         text_y += line_h;
+    }
+
+    // Typewriter cursor: solid block at end of last line while AI is streaming
+    if win.typing {
+        let visible_lines = win.lines.len().saturating_sub(skip);
+        let cursor_col = win.lines.last().map(|l| l.len).unwrap_or(0);
+        let cursor_x = text_x + cursor_col * 8;
+        let cursor_y = content_y + 6 + visible_lines.saturating_sub(1) * line_h;
+        if cursor_x + 8 <= content_x + content_w && cursor_y + 8 <= content_y + content_h {
+            fb.fill_rect(cursor_x, cursor_y, 8, 8, text_fg);
+        }
     }
 
     // Draw input prompt for interactive windows

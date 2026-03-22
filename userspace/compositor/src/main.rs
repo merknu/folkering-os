@@ -961,6 +961,10 @@ fn main() -> ! {
                     match zone {
                         HitZone::CloseButton => {
                             wm.close_window(win_id);
+                            // Prevent token stream from hijacking a recycled window ID
+                            if win_id == inference_win_id {
+                                inference_win_id = 0;
+                            }
                             need_redraw = true;
                             cursor_bg_dirty = true;
                             handled = true;
@@ -2239,6 +2243,7 @@ fn main() -> ! {
                                                                 inference_win_id = win_id;
                                                                 inference_query_handle = qh;
                                                                 win.push_line("[AI] Thinking...");
+                                                                win.typing = true;
                                                                 true
                                                             } else {
                                                                 let _ = shmem_destroy(rh);
@@ -2974,6 +2979,7 @@ fn main() -> ! {
                 inference_ring_handle = 0;
                 inference_query_handle = 0;
                 if let Some(win) = wm.get_window_mut(inference_win_id) {
+                    win.typing = false;
                     win.push_line(""); // new line after AI response
                     if status == 2 {
                         win.push_line("[AI] Error during generation");
