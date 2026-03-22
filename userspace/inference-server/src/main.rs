@@ -1322,8 +1322,44 @@ fn handle_async_inference(
     };
     let arena_mark2 = arena.used(); // new mark after attn buffer
 
-    // Prefill
-    for i in 0..total_prompt {
+    // Prefill — 3-Phase Batched Architecture
+    // Process prompt in batches of 8 for L2 cache reuse, then single-token
+    // forward for the last token to get logits for sampling.
+    const PREFILL_BATCH: usize = 8;
+
+    if total_prompt > 1 {
+        // Batched prefill for all tokens except the last
+        let batch_end = total_prompt - 1; // last token needs logits
+        let mut pos = 0;
+        while pos < batch_end {
+            arena.reset_to(arena_mark2);
+            let (weights, _) = match build_weights_for_forward(eng, arena) {
+                Some(w) => w,
+                None => {
+                    ring.status.store(2, Ordering::Release);
+                    let _ = shmem_unmap(ring_shmem, RING_SHMEM_VADDR);
+                    eng.is_generating = false;
+                    return;
+                }
+            };
+
+            let chunk_end = (pos + PREFILL_BATCH).min(batch_end);
+            let chunk = &input_tokens[pos..chunk_end];
+
+            use libtensor::transformer::forward_prefill_batch;
+            if forward_prefill_batch(chunk, pos, config, &weights, &mut eng.kv_cache, arena, &yield_cfg).is_none() {
+                ring.status.store(2, Ordering::Release);
+                let _ = shmem_unmap(ring_shmem, RING_SHMEM_VADDR);
+                eng.is_generating = false;
+                return;
+            }
+            pos = chunk_end;
+            tcg_breathe();
+        }
+    }
+
+    // Final token: single-token forward to get logits for sampling
+    {
         arena.reset_to(arena_mark2);
         let (weights, _) = match build_weights_for_forward(eng, arena) {
             Some(w) => w,
@@ -1335,7 +1371,7 @@ fn handle_async_inference(
             }
         };
 
-        // Build AttnDump for this forward call (borrows attn_buf mutably)
+        let last_idx = total_prompt - 1;
         let mut attn_dump_obj = attn_buf.as_deref_mut().map(|buf| {
             use libtensor::transformer::AttnDump;
             AttnDump {
@@ -1347,7 +1383,7 @@ fn handle_async_inference(
         });
 
         let logits = match forward(
-            input_tokens[i], i, config, &weights, &mut eng.kv_cache, arena, &yield_cfg,
+            input_tokens[last_idx], last_idx, config, &weights, &mut eng.kv_cache, arena, &yield_cfg,
             attn_dump_obj.as_mut(),
         ) {
             Some(l) => l,
@@ -1358,11 +1394,7 @@ fn handle_async_inference(
                 return;
             }
         };
-        if i == total_prompt - 1 {
-            last_logits_token = sample_with_penalties(logits, &gen_tokens[..gen_count], arena, &cfg);
-        }
-        if i % 4 == 0 { yield_cpu(); }
-        tcg_breathe();
+        last_logits_token = sample_with_penalties(logits, &gen_tokens[..gen_count], arena, &cfg);
     }
 
     // Dump attention weights to disk mailbox

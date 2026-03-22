@@ -329,6 +329,240 @@ pub fn forward<'a>(
     Some(logits)
 }
 
+/// Batched prefill forward pass — 3-Phase Architecture.
+///
+/// Processes a batch of prompt tokens with improved L2 cache utilization:
+/// - Phase A (Batched): RMSNorm + Q/K/V GEMMs — weight matrices stay in L2
+/// - Phase B (Sequential): Per-token RoPE, KV-store, Attention, Output Proj
+/// - Phase C (Batched): FFN GEMMs — weight matrices stay in L2
+///
+/// Only processes transformer layers. Does NOT compute final logits (caller
+/// should use single-token `forward()` for the last prompt token to get logits).
+pub fn forward_prefill_batch(
+    tokens: &[u32],
+    start_pos: usize,
+    config: &ModelConfig,
+    weights: &ModelWeights,
+    kv_cache: &mut KvCacheManager,
+    arena: &BumpArena,
+    yield_cfg: &YieldConfig,
+) -> Option<()> {
+    let batch = tokens.len();
+    if batch == 0 { return Some(()); }
+
+    let dim = config.embed_dim;
+    let head_dim = config.head_dim;
+    let n_heads = config.n_heads;
+    let n_kv_heads = config.n_kv_heads;
+    let kv_dim = n_kv_heads * head_dim;
+    let qk_dim = n_heads * head_dim;
+    let intermediate = config.intermediate_size;
+
+    // Q8_0 row size for dim-length vectors
+    let q8_blocks = dim / 32;
+    let q8_row_bytes = q8_blocks * quantize::Q8_0_BLOCK_SIZE;
+    // Q8_0 row size for intermediate-length vectors (FFN down proj)
+    let q8_inter_blocks = intermediate / 32;
+    let q8_inter_row_bytes = q8_inter_blocks * quantize::Q8_0_BLOCK_SIZE;
+
+    // === Allocate ALL batched buffers (batch × per_token_size) ===
+    let x_batch   = arena.alloc_f32(batch * dim)?;
+    let xb_batch  = arena.alloc_f32(batch * dim)?;
+    let q_batch   = arena.alloc_f32(batch * qk_dim)?;
+    let k_batch   = arena.alloc_f32(batch * kv_dim)?;
+    let v_batch   = arena.alloc_f32(batch * kv_dim)?;
+    let attn_out  = arena.alloc_f32(dim)?;             // per-token (Phase B reuse)
+    let xb_single = arena.alloc_f32(dim)?;             // per-token scratch
+    let q8_batch  = arena.alloc_slice::<u8>(batch * q8_row_bytes)?;
+
+    // Phase C buffers
+    let xb2_batch  = arena.alloc_f32(batch * dim)?;
+    let ffn1_batch = arena.alloc_f32(batch * intermediate)?;
+    let ffn2_batch = arena.alloc_f32(batch * intermediate)?;
+    let q8_inter   = arena.alloc_slice::<u8>(q8_inter_row_bytes)?; // per-token for down proj
+
+    // Attention scratch (per-token, reused in Phase B)
+    let max_ctx = kv_cache.layer(0).active_length() + batch;
+    let att = arena.alloc_f32(max_ctx)?;
+
+    // KV dequant scratch (per-head, reused in Phase B)
+    let k_dequant = arena.alloc_f32(head_dim)?;
+    let v_dequant = arena.alloc_f32(head_dim)?;
+
+    // === Step 1: Batched Embedding ===
+    for i in 0..batch {
+        embed_token(
+            tokens[i] as usize, config.vocab_size, dim,
+            weights.token_embed,
+            &mut x_batch[i * dim..(i + 1) * dim],
+        );
+    }
+
+    // === Step 2: For each layer ===
+    for layer in 0..config.n_layers {
+        let lw = &weights.layers[layer];
+
+        // ============================================================
+        // PHASE A (Batched): RMSNorm + Q/K/V GEMMs
+        // Weight matrices wq/wk/wv stay hot in L2 across batch iterations
+        // ============================================================
+
+        for i in 0..batch {
+            let x_row = &x_batch[i * dim..(i + 1) * dim];
+            let xb_row = &mut xb_batch[i * dim..(i + 1) * dim];
+            ops::rmsnorm_into(x_row, lw.attn_norm, xb_row, config.rms_norm_eps);
+
+            // Quantize per-token (NEVER across token boundaries)
+            let q8_row = &mut q8_batch[i * q8_row_bytes..(i + 1) * q8_row_bytes];
+            quantize::quantize_f32_to_q8_0(xb_row, q8_row);
+
+            // Q/K/V GEMMs — wq/wk/wv stay in L2 from previous iteration
+            let q_row = &mut q_batch[i * qk_dim..(i + 1) * qk_dim];
+            let k_row = &mut k_batch[i * kv_dim..(i + 1) * kv_dim];
+            let v_row = &mut v_batch[i * kv_dim..(i + 1) * kv_dim];
+            for j in 0..qk_dim { q_row[j] = 0.0; }
+            for j in 0..kv_dim { k_row[j] = 0.0; v_row[j] = 0.0; }
+
+            gemm::gemm_q4_q8(q_row, q8_row, lw.wq, 1, dim, qk_dim,
+                FuseOp::None, yield_cfg.gemm_yield);
+            gemm::gemm_q4_q8(k_row, q8_row, lw.wk, 1, dim, kv_dim,
+                FuseOp::None, yield_cfg.gemm_yield);
+            gemm::gemm_q4_q8(v_row, q8_row, lw.wv, 1, dim, kv_dim,
+                FuseOp::None, yield_cfg.gemm_yield);
+        }
+
+        // Yield between Phase A and B
+        libfolk::sys::yield_cpu();
+
+        // ============================================================
+        // PHASE B (Sequential): Per-token Attention
+        // Must be sequential due to causal dependency in KV-cache
+        // ============================================================
+
+        let kv_group_size = n_heads / n_kv_heads;
+
+        for i in 0..batch {
+            let pos = start_pos + i;
+
+            // RoPE on Q and K (must be done before immutable borrow for store)
+            ops::rope_inplace(
+                &mut q_batch[i * qk_dim..(i + 1) * qk_dim],
+                head_dim, pos, config.rope_base,
+            );
+            ops::rope_inplace(
+                &mut k_batch[i * kv_dim..(i + 1) * kv_dim],
+                head_dim, pos, config.rope_base,
+            );
+
+            // Store K,V in cache (immutable borrows after RoPE mutation)
+            let k_row = &k_batch[i * kv_dim..(i + 1) * kv_dim];
+            let v_row = &v_batch[i * kv_dim..(i + 1) * kv_dim];
+            kv_cache.layer_mut(layer).store(k_row, v_row, pos);
+
+            // Multi-head attention
+            let seq_len = kv_cache.layer(layer).active_length();
+            for j in 0..dim { attn_out[j] = 0.0; }
+
+            for h in 0..n_heads {
+                let kv_h = h / kv_group_size;
+                let q_offset = i * qk_dim + h * head_dim;
+                let q_slice = &q_batch[q_offset..q_offset + head_dim];
+
+                let scale = crate::ops::fast_rsqrt(head_dim as f32);
+                for t in 0..seq_len {
+                    kv_cache.layer(layer).get_key(t, kv_h, k_dequant);
+                    let score = if crate::simd::has_avx2() {
+                        unsafe { crate::simd::avx2::dot_f32_avx2(q_slice, k_dequant, head_dim) }
+                    } else {
+                        crate::simd::dot_f32_scalar(q_slice, k_dequant, head_dim)
+                    };
+                    att[t] = score * scale;
+                }
+
+                ops::softmax(&mut att[..seq_len]);
+
+                let out_offset = h * head_dim;
+                for t in 0..seq_len {
+                    kv_cache.layer(layer).get_value(t, kv_h, v_dequant);
+                    let w = att[t];
+                    if crate::simd::has_avx2() {
+                        unsafe {
+                            crate::simd::axpy_f32_avx2(
+                                w, v_dequant,
+                                &mut attn_out[out_offset..out_offset + head_dim],
+                                head_dim,
+                            );
+                        }
+                    } else {
+                        crate::simd::axpy_f32_scalar(
+                            w, v_dequant,
+                            &mut attn_out[out_offset..out_offset + head_dim],
+                            head_dim,
+                        );
+                    }
+                }
+            }
+
+            // Output projection: attn_out × Wo → xb_single
+            for j in 0..dim { xb_single[j] = 0.0; }
+            let q8_row = &mut q8_batch[i * q8_row_bytes..(i + 1) * q8_row_bytes];
+            quantize::quantize_f32_to_q8_0(attn_out, q8_row);
+            gemm::gemm_q4_q8(xb_single, q8_row, lw.wo, 1, dim, dim,
+                FuseOp::None, yield_cfg.gemm_yield);
+
+            // Attention residual
+            let x_row = &mut x_batch[i * dim..(i + 1) * dim];
+            for j in 0..dim { x_row[j] += xb_single[j]; }
+        }
+
+        // Yield between Phase B and C
+        libfolk::sys::yield_cpu();
+
+        // ============================================================
+        // PHASE C (Batched): FFN GEMMs
+        // Weight matrices w_gate/w_up/w_down stay hot in L2
+        // ============================================================
+
+        for i in 0..batch {
+            let x_row = &x_batch[i * dim..(i + 1) * dim];
+            let xb2_row = &mut xb2_batch[i * dim..(i + 1) * dim];
+            ops::rmsnorm_into(x_row, lw.ffn_norm, xb2_row, config.rms_norm_eps);
+
+            // Quantize per-token
+            let q8_row = &mut q8_batch[i * q8_row_bytes..(i + 1) * q8_row_bytes];
+            quantize::quantize_f32_to_q8_0(xb2_row, q8_row);
+
+            // Gate projection (with fused SiLU)
+            let ffn1_row = &mut ffn1_batch[i * intermediate..(i + 1) * intermediate];
+            for j in 0..intermediate { ffn1_row[j] = 0.0; }
+            gemm::gemm_q4_q8(ffn1_row, q8_row, lw.w_gate, 1, dim, intermediate,
+                FuseOp::SiLU, yield_cfg.gemm_yield);
+
+            // Up projection
+            let ffn2_row = &mut ffn2_batch[i * intermediate..(i + 1) * intermediate];
+            for j in 0..intermediate { ffn2_row[j] = 0.0; }
+            gemm::gemm_q4_q8(ffn2_row, q8_row, lw.w_up, 1, dim, intermediate,
+                FuseOp::None, yield_cfg.gemm_yield);
+
+            // Element-wise gate * up
+            for j in 0..intermediate { ffn1_row[j] *= ffn2_row[j]; }
+
+            // Down projection
+            let xb_row = &mut xb_batch[i * dim..(i + 1) * dim];
+            for j in 0..dim { xb_row[j] = 0.0; }
+            quantize::quantize_f32_to_q8_0(ffn1_row, q8_inter);
+            gemm::gemm_q4_q8(xb_row, q8_inter, lw.w_down, 1, intermediate, dim,
+                FuseOp::None, yield_cfg.gemm_yield);
+
+            // FFN residual
+            let x_row = &mut x_batch[i * dim..(i + 1) * dim];
+            for j in 0..dim { x_row[j] += xb_row[j]; }
+        }
+    }
+
+    Some(())
+}
+
 /// Dequantize a token embedding from quantized weight table.
 ///
 /// Supports both Q4_0 and Q8_0 formats. The block size determines format:
