@@ -175,12 +175,16 @@ pub fn spawn(binary: &[u8], _args: &[&str]) -> Result<TaskId, SpawnError> {
         }
     }
 
-    // 5. Allocate user stack (64KB = 16 pages)
-    // Stack at a high address in user space
+    // 5. Allocate user stack (256KB = 64 pages) with guard page
+    // Stack at a high address in user space.
+    // Guard page at stack_base - 4096: NOT mapped, triggers #PF on overflow.
     let stack_pages = 64usize;
-    let stack_size = stack_pages * 4096; // 256KB (increased from 64KB for compositor)
+    let stack_size = stack_pages * 4096; // 256KB
     let stack_top_addr = 0x7FFF_FFFF_0000u64;
     let stack_base = stack_top_addr - stack_size as u64;
+    // Guard page is at stack_base - 4096 — intentionally NOT mapped.
+    // Any stack overflow past stack_base will access unmapped memory → #PF.
+    let _guard_page_addr = stack_base - 4096;
 
     for i in 0..stack_pages {
         let page_vaddr = stack_base + (i * 4096) as u64;
@@ -201,6 +205,10 @@ pub fn spawn(binary: &[u8], _args: &[&str]) -> Result<TaskId, SpawnError> {
             flags::USER_STACK,
         ).map_err(|_| SpawnError::OutOfMemory)?;
     }
+
+    crate::serial_str!("[SPAWN_ELF] User stack guard page at ");
+    crate::drivers::serial::write_hex(_guard_page_addr);
+    crate::serial_strln!(" (unmapped)");
 
     let user_stack_top = stack_top_addr - 8;
     crate::serial_str!("[SPAWN_ELF] User stack at ");

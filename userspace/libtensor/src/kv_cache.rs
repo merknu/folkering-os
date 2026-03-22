@@ -29,6 +29,11 @@ pub struct KvCache {
     /// Value ring buffer
     ring_values: *mut f32,
 
+    /// Absolute position stored with each sink token (for RoPE)
+    sink_positions: [u32; NUM_SINK_TOKENS],
+    /// Absolute position for each ring buffer slot (for RoPE)
+    ring_positions: *mut u32,
+
     /// Number of attention heads
     n_heads: usize,
     /// Dimension per head
@@ -78,16 +83,21 @@ impl KvCache {
         offset += ring_size * 4;
 
         let ring_values = base.add(offset) as *mut f32;
-        // offset += ring_size * 4;
+        offset += ring_size * 4;
 
-        // Zero-initialize
-        core::ptr::write_bytes(base, 0, offset + ring_size * 4);
+        let ring_positions = base.add(offset) as *mut u32;
+        offset += window_size * 4;
+
+        // Zero-initialize all buffers
+        core::ptr::write_bytes(base, 0, offset);
 
         Self {
             sink_keys,
             sink_values,
             ring_keys,
             ring_values,
+            sink_positions: [0; NUM_SINK_TOKENS],
+            ring_positions,
             n_heads,
             head_dim,
             window_size,
@@ -101,13 +111,15 @@ impl KvCache {
     pub fn required_bytes(n_heads: usize, head_dim: usize, window_size: usize) -> usize {
         let sink_size = NUM_SINK_TOKENS * n_heads * head_dim * 4; // f32
         let ring_size = window_size * n_heads * head_dim * 4;
-        2 * (sink_size + ring_size) // keys + values
+        let ring_pos_size = window_size * 4; // u32 per ring slot
+        2 * (sink_size + ring_size) + ring_pos_size // keys + values + positions
     }
 
-    /// Store key/value for the current token position.
+    /// Store key/value for the current token at absolute position `abs_pos`.
     ///
     /// `key` and `value` are [n_heads × head_dim] f32 vectors.
-    pub fn store(&mut self, key: &[f32], value: &[f32]) {
+    /// `abs_pos` is the absolute sequence position (used for RoPE alignment).
+    pub fn store(&mut self, key: &[f32], value: &[f32], abs_pos: usize) {
         let vec_size = self.n_heads * self.head_dim;
         debug_assert!(key.len() >= vec_size);
         debug_assert!(value.len() >= vec_size);
@@ -117,30 +129,24 @@ impl KvCache {
             let offset = self.tokens_seen * vec_size;
             unsafe {
                 core::ptr::copy_nonoverlapping(
-                    key.as_ptr(),
-                    self.sink_keys.add(offset),
-                    vec_size,
+                    key.as_ptr(), self.sink_keys.add(offset), vec_size,
                 );
                 core::ptr::copy_nonoverlapping(
-                    value.as_ptr(),
-                    self.sink_values.add(offset),
-                    vec_size,
+                    value.as_ptr(), self.sink_values.add(offset), vec_size,
                 );
             }
+            self.sink_positions[self.tokens_seen] = abs_pos as u32;
         } else {
             // Store in ring buffer (overwrites oldest if full)
             let ring_offset = self.ring_pos * vec_size;
             unsafe {
                 core::ptr::copy_nonoverlapping(
-                    key.as_ptr(),
-                    self.ring_keys.add(ring_offset),
-                    vec_size,
+                    key.as_ptr(), self.ring_keys.add(ring_offset), vec_size,
                 );
                 core::ptr::copy_nonoverlapping(
-                    value.as_ptr(),
-                    self.ring_values.add(ring_offset),
-                    vec_size,
+                    value.as_ptr(), self.ring_values.add(ring_offset), vec_size,
                 );
+                *self.ring_positions.add(self.ring_pos) = abs_pos as u32;
             }
             self.ring_pos = (self.ring_pos + 1) & self.window_mask;
         }
@@ -203,6 +209,17 @@ impl KvCache {
         } else {
             // Ring is full — oldest entry is at ring_pos
             (self.ring_pos + logical) & self.window_mask
+        }
+    }
+
+    /// Get the absolute position for logical KV entry `pos`.
+    /// Used by the transformer to retrieve the correct RoPE position.
+    pub fn get_position(&self, pos: usize) -> usize {
+        if pos < NUM_SINK_TOKENS {
+            self.sink_positions[pos] as usize
+        } else {
+            let ring_idx = self.ring_logical_to_physical(pos - NUM_SINK_TOKENS);
+            unsafe { *self.ring_positions.add(ring_idx) as usize }
         }
     }
 

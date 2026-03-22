@@ -205,8 +205,8 @@ pub fn forward<'a>(
         ops::rope_inplace(q, head_dim, pos, config.rope_base);
         ops::rope_inplace(k, head_dim, pos, config.rope_base);
 
-        // 4. Store K,V in cache
-        kv_cache.layer_mut(layer).store(k, v);
+        // 4. Store K,V in cache with absolute position (for RoPE alignment)
+        kv_cache.layer_mut(layer).store(k, v, pos);
 
         // 5. Multi-head attention with KV-cache
         let seq_len = kv_cache.layer(layer).active_length();
