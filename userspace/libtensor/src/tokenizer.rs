@@ -387,6 +387,16 @@ fn merge_lt(a: &MergeEntry, b: &MergeEntry) -> bool {
 /// Maximum input bytes for BPE working buffer (stack-allocated)
 const MAX_BPE_WORK: usize = 2048;
 
+/// Replacement token for invalid UTF-8 bytes (U+FFFD).
+/// llama-cpp maps all bytes 0x80-0xFF that don't form valid UTF-8 to this token.
+/// NOTE: This is model-specific (SmolLM2 vocab). Ideally should be parsed from
+/// GGUF metadata (`tokenizer.ggml.unknown_token_id`) in the future.
+const REPLACEMENT_TOKEN: u32 = 24211;
+
+/// Control bytes that llama-cpp skips entirely (produces no tokens).
+/// These are ASCII control characters that the tokenizer strips from input.
+const SKIP_BYTES: [u8; 6] = [0x04, 0x06, 0x13, 0x14, 0x16, 0x1D];
+
 // ============================================================================
 // BPE Tokenizer
 // ============================================================================
@@ -763,13 +773,104 @@ impl<'a> BpeTokenizer<'a> {
             return 0;
         }
 
-        // Step 1: Convert each byte to its initial character token
+        // Step 1: Convert bytes to initial tokens with UTF-8 sequence detection.
+        //
+        // llama-cpp uses LENIENT UTF-8 decoding: it accepts overlong sequences
+        // and surrogates (just checks lead byte + continuation byte structure).
+        // Bytes not part of any multi-byte sequence → REPLACEMENT_TOKEN (24211).
         let n = text.len().min(MAX_BPE_WORK);
         let mut work = [0u32; MAX_BPE_WORK];
-        for i in 0..n {
-            work[i] = self.byte_tokens[text[i] as usize];
+        let mut len = 0;
+        let mut i = 0;
+        while i < n {
+            let b = text[i];
+            if b < 0x80 {
+                // ASCII byte: check if it's a skipped control byte
+                if SKIP_BYTES.contains(&b) {
+                    i += 1;
+                    continue;
+                }
+                work[len] = self.byte_tokens[b as usize];
+                len += 1;
+                i += 1;
+            } else {
+                // Non-ASCII: determine expected UTF-8 sequence length from lead byte.
+                // LENIENT: accepts 0xC0-0xC1 (overlong) and 0xED 0xA0+ (surrogates).
+                let seq_len = match b {
+                    0xC0..=0xDF => 2,   // 2-byte (including overlong 0xC0-0xC1)
+                    0xE0..=0xEF => 3,   // 3-byte (including surrogates)
+                    0xF0..=0xF4 => 4,   // 4-byte
+                    _ => 0,             // 0x80-0xBF (bare continuation), 0xF5+: invalid
+                };
+
+                // Check that continuation bytes (0x80-0xBF) are present
+                let valid = seq_len >= 2
+                    && i + seq_len <= n
+                    && {
+                        let mut ok = true;
+                        for j in 1..seq_len {
+                            if text[i + j] & 0xC0 != 0x80 {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        ok
+                    };
+
+                if valid {
+                    // Check for OVERLONG encoding: the codepoint could be
+                    // represented in fewer bytes. llama-cpp decodes overlongs
+                    // to the underlying codepoint. Min codepoints per seq_len:
+                    //   2-byte: 0x0080 (lead 0xC2). Overlong if lead is 0xC0-0xC1.
+                    //   3-byte: 0x0800 (lead 0xE0, second >= 0xA0). Overlong if less.
+                    //   4-byte: 0x10000 (lead 0xF0, second >= 0x90). Overlong if less.
+                    let is_overlong = match seq_len {
+                        2 => b <= 0xC1,
+                        3 => b == 0xE0 && text[i + 1] < 0xA0,
+                        4 => b == 0xF0 && text[i + 1] < 0x90,
+                        _ => false,
+                    };
+
+                    if is_overlong {
+                        // Decode the overlong to its codepoint, use byte_tokens[cp].
+                        // Overlong means the codepoint was encoded with too many bytes.
+                        let cp = match seq_len {
+                            2 => ((b as u32 & 0x1F) << 6) | (text[i + 1] as u32 & 0x3F),
+                            3 => ((b as u32 & 0x0F) << 12)
+                                | ((text[i + 1] as u32 & 0x3F) << 6)
+                                | (text[i + 2] as u32 & 0x3F),
+                            _ => ((b as u32 & 0x07) << 18)
+                                | ((text[i + 1] as u32 & 0x3F) << 12)
+                                | ((text[i + 2] as u32 & 0x3F) << 6)
+                                | (text[i + 3] as u32 & 0x3F),
+                        };
+                        if cp < 256 {
+                            // Overlong for a byte-range codepoint: emit byte token
+                            if !SKIP_BYTES.contains(&(cp as u8)) {
+                                work[len] = self.byte_tokens[cp as usize];
+                                len += 1;
+                            }
+                        } else {
+                            // Overlong for cp >= 256: treat as invalid, emit replacement
+                            work[len] = REPLACEMENT_TOKEN;
+                            len += 1;
+                        }
+                    } else {
+                        // Normal UTF-8: process each byte via GPT-2 encoding
+                        for j in 0..seq_len {
+                            work[len] = self.byte_tokens[text[i + j] as usize];
+                            len += 1;
+                        }
+                    }
+                    i += seq_len;
+                } else {
+                    // Invalid/standalone byte: replacement token
+                    work[len] = REPLACEMENT_TOKEN;
+                    len += 1;
+                    i += 1;
+                }
+            }
         }
-        let mut len = n;
 
         // Step 2: Iteratively apply BPE merges
         loop {
