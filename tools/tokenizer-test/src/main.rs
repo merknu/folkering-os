@@ -48,6 +48,7 @@ fn main() {
         &gguf_data, meta.vocab_offset, meta.vocab_size,
         meta.bos_id, meta.eos_id,
         meta.merges_offset, meta.merges_count,
+        meta.unknown_token_id, meta.token_type_offset,
         &arena,
     ).unwrap_or_else(|| {
         eprintln!("Failed to initialize tokenizer");

@@ -7,6 +7,8 @@ pub struct VocabMeta {
     pub eos_id: u32,
     pub merges_offset: usize,
     pub merges_count: usize,
+    pub unknown_token_id: u32,
+    pub token_type_offset: usize,
 }
 
 pub fn parse(data: &[u8]) -> Option<VocabMeta> {
@@ -24,6 +26,8 @@ pub fn parse(data: &[u8]) -> Option<VocabMeta> {
     let mut vocab_size: usize = 0;
     let mut merges_offset: usize = 0;
     let mut merges_count: usize = 0;
+    let mut unknown_token_id: u32 = u32::MAX;
+    let mut token_type_offset: usize = 0;
 
     // Parse metadata key-value pairs
     for _ in 0..n_metadata {
@@ -74,6 +78,22 @@ pub fn parse(data: &[u8]) -> Option<VocabMeta> {
                     pos = skip_value(data, pos, elem_type)?;
                 }
             }
+            "tokenizer.ggml.unknown_token_id" => {
+                unknown_token_id = read_u32_val(data, pos, val_type).unwrap_or(u32::MAX);
+                pos = skip_value(data, pos, val_type)?;
+            }
+            "tokenizer.ggml.token_type" => {
+                if val_type == 9 {
+                    let _elem_type = u32_le(data, pos);
+                    pos += 4;
+                    let count = u64_le(data, pos) as usize;
+                    pos += 8;
+                    token_type_offset = pos;
+                    pos += count * 4; // skip i32 array
+                } else {
+                    pos = skip_value(data, pos, val_type)?;
+                }
+            }
             _ => {
                 pos = skip_value(data, pos, val_type)?;
             }
@@ -87,7 +107,7 @@ pub fn parse(data: &[u8]) -> Option<VocabMeta> {
         return None;
     }
 
-    Some(VocabMeta { vocab_offset, vocab_size, bos_id, eos_id, merges_offset, merges_count })
+    Some(VocabMeta { vocab_offset, vocab_size, bos_id, eos_id, merges_offset, merges_count, unknown_token_id, token_type_offset })
 }
 
 fn u32_le(data: &[u8], pos: usize) -> u32 {

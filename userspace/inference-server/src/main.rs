@@ -364,6 +364,8 @@ fn main() -> ! {
                                 meta.eos_token_id,
                                 meta.merges_data_offset,
                                 meta.merges_count as usize,
+                                meta.unknown_token_id,
+                                meta.token_type_offset,
                                 &arena,
                             );
 
@@ -410,6 +412,8 @@ fn main() -> ! {
                                                 eos_id: meta.eos_token_id,
                                                 merges_offset: meta.merges_data_offset,
                                                 merges_count: meta.merges_count as usize,
+                                                unknown_token_id: meta.unknown_token_id,
+                                                token_type_offset: meta.token_type_offset,
                                                 im_end_id,
                                                 im_start_id,
                                                 is_generating: false,
@@ -511,6 +515,8 @@ struct InferenceEngine {
     eos_id: u32,
     merges_offset: usize,
     merges_count: usize,
+    unknown_token_id: u32,
+    token_type_offset: usize,
     /// ULTRA 39: ChatML stop token IDs (u32::MAX = not found)
     im_end_id: u32,
     im_start_id: u32,
@@ -778,6 +784,8 @@ fn handle_inference_request(
         eng.eos_id,
         eng.merges_offset,
         eng.merges_count,
+        eng.unknown_token_id,
+        eng.token_type_offset,
         arena,
     ) {
         Some(t) => t,
@@ -1277,7 +1285,8 @@ fn handle_async_inference(
 
     let tokenizer = match BpeTokenizer::new(
         eng.model_data, eng.vocab_offset, eng.vocab_size,
-        eng.bos_id, eng.eos_id, eng.merges_offset, eng.merges_count, arena,
+        eng.bos_id, eng.eos_id, eng.merges_offset, eng.merges_count,
+        eng.unknown_token_id, eng.token_type_offset, arena,
     ) {
         Some(t) => t,
         None => {

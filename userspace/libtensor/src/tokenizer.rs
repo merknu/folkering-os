@@ -396,15 +396,9 @@ fn merge_lt(a: &MergeEntry, b: &MergeEntry) -> bool {
 /// Maximum input bytes for BPE working buffer (stack-allocated)
 const MAX_BPE_WORK: usize = 2048;
 
-/// Replacement token for invalid UTF-8 bytes (U+FFFD).
-/// llama-cpp maps all bytes 0x80-0xFF that don't form valid UTF-8 to this token.
-/// NOTE: This is model-specific (SmolLM2 vocab). Ideally should be parsed from
-/// GGUF metadata (`tokenizer.ggml.unknown_token_id`) in the future.
-const REPLACEMENT_TOKEN: u32 = 24211;
-
-/// Control bytes that llama-cpp skips entirely (produces no tokens).
-/// These are ASCII control characters that the tokenizer strips from input.
-const SKIP_BYTES: [u8; 6] = [0x04, 0x06, 0x13, 0x14, 0x16, 0x1D];
+// REPLACEMENT_TOKEN and SKIP_BYTES are now dynamic:
+// - replacement_token: from GGUF unknown_token_id or U+FFFD vocab search
+// - Token type 5 (unused) in GGUF token_type array = skip byte
 
 // ============================================================================
 // BPE Tokenizer
@@ -441,6 +435,10 @@ pub struct BpeTokenizer<'a> {
     n_merges: usize,
     /// Raw byte value (0-255) -> initial character token ID
     byte_tokens: &'a [u32],
+    /// Replacement token for invalid UTF-8 bytes (from GGUF unknown_token_id)
+    replacement_token: u32,
+    /// Token types from GGUF (type 5 = unused/skipped, type 3 = control)
+    token_types: &'a [u8], // empty if not available
 }
 
 impl<'a> BpeTokenizer<'a> {
@@ -458,6 +456,8 @@ impl<'a> BpeTokenizer<'a> {
         eos_id: u32,
         merges_offset: usize,
         merges_count: usize,
+        unknown_token_id: u32,
+        token_type_offset: usize,
         arena: &'a BumpArena,
     ) -> Option<Self> {
         if vocab_offset == 0 || vocab_size == 0 {
@@ -499,6 +499,20 @@ impl<'a> BpeTokenizer<'a> {
             *v = 0;
         }
 
+        // Build token_types from GGUF token_type array (persistent, before arena mark)
+        // Type 1=normal, 2=unknown, 3=control, 4=user_defined, 5=unused, 6=byte
+        let token_types: &'a [u8] = if token_type_offset > 0 && token_type_offset + vocab_size * 4 <= data.len() {
+            let tt = arena.alloc_slice::<u8>(vocab_size)?;
+            for i in 0..vocab_size {
+                let off = token_type_offset + i * 4;
+                let t = i32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
+                tt[i] = t.clamp(0, 255) as u8;
+            }
+            tt
+        } else {
+            &[]
+        };
+
         // Allocate merge table (may be empty if no merges in GGUF)
         let merges_buf = if merges_count > 0 {
             arena.alloc_slice::<MergeEntry>(merges_count)?
@@ -520,6 +534,8 @@ impl<'a> BpeTokenizer<'a> {
                 merges: &[],
                 n_merges: 0,
                 byte_tokens,
+                replacement_token: if unknown_token_id != u32::MAX { unknown_token_id } else { 0 },
+                token_types: &[],
             });
         };
 
@@ -632,6 +648,18 @@ impl<'a> BpeTokenizer<'a> {
         // Sort merge table by (left, right) for binary search
         heapsort_merges(&mut merges_buf[..n_valid]);
 
+        // Determine replacement token for invalid UTF-8 bytes:
+        // 1. Use GGUF unknown_token_id if specified
+        // 2. Otherwise, search vocab for U+FFFD replacement char (UTF-8: EF BF BD)
+        // 3. Fallback to token 0
+        let replacement_token = if unknown_token_id != u32::MAX {
+            unknown_token_id
+        } else {
+            // Search for U+FFFD in vocab (common replacement character)
+            let ufffd = [0xEF, 0xBF, 0xBD]; // UTF-8 for U+FFFD
+            hash_find(hash_table, data, offsets, lengths, &ufffd).unwrap_or(0)
+        };
+
         // Free hash table memory — persistent data is below arena_mark
         arena.reset_to(arena_mark);
 
@@ -649,6 +677,8 @@ impl<'a> BpeTokenizer<'a> {
             merges,
             n_merges: n_valid,
             byte_tokens,
+            replacement_token,
+            token_types,
         })
     }
 
@@ -792,7 +822,7 @@ impl<'a> BpeTokenizer<'a> {
         //
         // llama-cpp uses LENIENT UTF-8 decoding: it accepts overlong sequences
         // and surrogates (just checks lead byte + continuation byte structure).
-        // Bytes not part of any multi-byte sequence → REPLACEMENT_TOKEN (24211).
+        // Bytes not part of any multi-byte sequence → self.replacement_token.
         let n = text.len().min(MAX_BPE_WORK);
         let mut work = [0u32; MAX_BPE_WORK];
         let mut len = 0;
@@ -800,8 +830,10 @@ impl<'a> BpeTokenizer<'a> {
         while i < n {
             let b = text[i];
             if b < 0x80 {
-                // ASCII byte: check if it's a skipped control byte
-                if SKIP_BYTES.contains(&b) {
+                // ASCII byte: check if its token is unused (type 5) or has no vocab entry
+                let tok = self.byte_tokens[b as usize];
+                if tok == 0 && b != 0 {
+                    // Token 0 for non-NUL byte = no vocab entry → skip
                     i += 1;
                     continue;
                 }
@@ -861,13 +893,14 @@ impl<'a> BpeTokenizer<'a> {
                         };
                         if cp < 256 {
                             // Overlong for a byte-range codepoint: emit byte token
-                            if !SKIP_BYTES.contains(&(cp as u8)) {
-                                work[len] = self.byte_tokens[cp as usize];
+                            let tok = self.byte_tokens[cp as usize];
+                            if tok != 0 || cp == 0 {
+                                work[len] = tok;
                                 len += 1;
                             }
                         } else {
                             // Overlong for cp >= 256: treat as invalid, emit replacement
-                            work[len] = REPLACEMENT_TOKEN;
+                            work[len] = self.replacement_token;
                             len += 1;
                         }
                     } else {
@@ -880,7 +913,7 @@ impl<'a> BpeTokenizer<'a> {
                     i += seq_len;
                 } else {
                     // Invalid/standalone byte: replacement token
-                    work[len] = REPLACEMENT_TOKEN;
+                    work[len] = self.replacement_token;
                     len += 1;
                     i += 1;
                 }
