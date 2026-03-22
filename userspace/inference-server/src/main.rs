@@ -179,8 +179,8 @@ pub const INFER_OP_ASK_ASYNC: u64 = 4;
 /// Bump arena size: 8MB for intermediate computation buffers
 const ARENA_SIZE: usize = 8 * 1024 * 1024;
 
-/// Maximum GGUF model size we'll attempt to load (128MB)
-const MAX_MODEL_SIZE: usize = 128 * 1024 * 1024;
+/// Maximum GGUF model size we'll attempt to load (512MB for SmolLM2-360M+)
+const MAX_MODEL_SIZE: usize = 512 * 1024 * 1024;
 
 /// Virtual address for model mmap region
 const MODEL_MMAP_BASE: usize = 0x1_0000_0000;
