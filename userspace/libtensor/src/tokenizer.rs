@@ -282,13 +282,21 @@ fn pt_next(text: &[u8], pos: usize) -> usize {
 // Hash Table
 // ============================================================================
 
-/// Hash table size (power of 2, ~75% load for 49152 vocab entries)
-const HASH_SIZE: usize = 65536;
-const HASH_MASK: usize = HASH_SIZE - 1;
 /// Sentinel for empty hash table slot
 const HASH_EMPTY: u32 = u32::MAX;
 
-/// Look up a byte string in the vocab hash table.
+/// Compute hash table size: next power of 2 above vocab_size * 1.5 (for ~67% load).
+/// Supports vocabs up to 200K+ (Qwen3 = 152K).
+fn hash_table_size(vocab_size: usize) -> usize {
+    let target = vocab_size + vocab_size / 2; // ~1.5x vocab for good load factor
+    let mut size = 1usize;
+    while size < target {
+        size <<= 1;
+    }
+    size.max(256) // minimum 256 slots
+}
+
+/// Look up a byte string in the vocab hash table (dynamic size).
 /// Each entry is [fnv1a_hash, token_id]. Empty slots have token_id = HASH_EMPTY.
 fn hash_find(
     table: &[[u32; 2]],
@@ -297,9 +305,10 @@ fn hash_find(
     lengths: &[u16],
     needle: &[u8],
 ) -> Option<u32> {
+    let mask = table.len() - 1; // table size is power of 2
     let h = fnv1a(needle);
-    let mut slot = (h as usize) & HASH_MASK;
-    for _ in 0..HASH_SIZE {
+    let mut slot = (h as usize) & mask;
+    for _ in 0..table.len() {
         if table[slot][1] == HASH_EMPTY {
             return None;
         }
@@ -311,7 +320,7 @@ fn hash_find(
                 return Some(table[slot][1]);
             }
         }
-        slot = (slot + 1) & HASH_MASK;
+        slot = (slot + 1) & mask;
     }
     None
 }
@@ -403,11 +412,14 @@ const SKIP_BYTES: [u8; 6] = [0x04, 0x06, 0x13, 0x14, 0x16, 0x1D];
 
 /// BPE Tokenizer operating on mmap'd GGUF vocabulary and merge data.
 ///
-/// Init-time arena usage:
-/// - offsets[vocab_size] + lengths[vocab_size]: ~288KB (persistent)
+/// Supports vocabularies up to 200K+ tokens (Qwen3 = 152K, GPT-2 = 49K).
+/// All tables are dynamically sized from GGUF metadata via BumpArena.
+///
+/// Init-time arena usage (scales with vocab_size):
+/// - offsets[vocab_size] + lengths[vocab_size]: vocab_size * 6 bytes
 /// - byte_tokens[256]: 1KB (persistent)
-/// - merges[merges_count]: ~782KB (persistent)
-/// - hash_table[65536]: 512KB (temporary, freed after init)
+/// - merges[merges_count]: merges_count * 16 bytes (persistent)
+/// - hash_table[next_pow2(vocab*1.5)]: temporary, freed after init
 pub struct BpeTokenizer<'a> {
     /// Raw GGUF file data (mmap'd)
     data: &'a [u8],
@@ -515,8 +527,11 @@ impl<'a> BpeTokenizer<'a> {
         let arena_mark = arena.used();
 
         // === Temporary hash table (freed after init) ===
+        // Size scales dynamically with vocab: next power of 2 above vocab * 1.5
+        let ht_size = hash_table_size(vocab_size);
+        let ht_mask = ht_size - 1;
 
-        let hash_table = arena.alloc_slice::<[u32; 2]>(HASH_SIZE)?;
+        let hash_table = arena.alloc_slice::<[u32; 2]>(ht_size)?;
         for e in hash_table.iter_mut() {
             *e = [0, HASH_EMPTY];
         }
@@ -526,13 +541,13 @@ impl<'a> BpeTokenizer<'a> {
             let off = offsets[id] as usize;
             let len = lengths[id] as usize;
             let h = fnv1a(&data[off..off + len]);
-            let mut slot = (h as usize) & HASH_MASK;
+            let mut slot = (h as usize) & ht_mask;
             loop {
                 if hash_table[slot][1] == HASH_EMPTY {
                     hash_table[slot] = [h, id as u32];
                     break;
                 }
-                slot = (slot + 1) & HASH_MASK;
+                slot = (slot + 1) & ht_mask;
             }
         }
 
