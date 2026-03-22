@@ -173,6 +173,10 @@ pub fn forward<'a>(
     let q8_max_blocks = config.intermediate_size / 32;
     let q8_buf = arena.alloc_slice::<u8>(q8_max_blocks * quantize::Q8_0_BLOCK_SIZE)?;
 
+    // Scratch buffers for dequantizing Q8_0 KV-cache entries (one head at a time)
+    let k_dequant = arena.alloc_f32(head_dim)?;
+    let v_dequant = arena.alloc_f32(head_dim)?;
+
     // Attention scores buffer (per-head, reused across heads)
     let max_ctx = kv_cache.layer(0).active_length() + 1;
     let att = arena.alloc_f32(max_ctx)?;
@@ -224,11 +228,11 @@ pub fn forward<'a>(
             let scale = crate::ops::fast_rsqrt(head_dim as f32);
             let q_slice = &q[q_offset..q_offset + head_dim];
             for t in 0..seq_len {
-                let k_vec = kv_cache.layer(layer).get_key(t, kv_h);
+                kv_cache.layer(layer).get_key(t, kv_h, k_dequant);
                 let score = if crate::simd::has_avx2() {
-                    unsafe { crate::simd::avx2::dot_f32_avx2(q_slice, k_vec, head_dim) }
+                    unsafe { crate::simd::avx2::dot_f32_avx2(q_slice, k_dequant, head_dim) }
                 } else {
-                    crate::simd::dot_f32_scalar(q_slice, k_vec, head_dim)
+                    crate::simd::dot_f32_scalar(q_slice, k_dequant, head_dim)
                 };
                 att[t] = score * scale;
             }
@@ -244,19 +248,19 @@ pub fn forward<'a>(
             // Weighted sum of values (AVX2 AXPY: out += w * V)
             let out_offset = h * head_dim;
             for t in 0..seq_len {
-                let v_vec = kv_cache.layer(layer).get_value(t, kv_h);
+                kv_cache.layer(layer).get_value(t, kv_h, v_dequant);
                 let w = att[t];
                 if crate::simd::has_avx2() {
                     unsafe {
                         crate::simd::axpy_f32_avx2(
-                            w, v_vec,
+                            w, v_dequant,
                             &mut attn_out[out_offset..out_offset + head_dim],
                             head_dim,
                         );
                     }
                 } else {
                     crate::simd::axpy_f32_scalar(
-                        w, v_vec,
+                        w, v_dequant,
                         &mut attn_out[out_offset..out_offset + head_dim],
                         head_dim,
                     );

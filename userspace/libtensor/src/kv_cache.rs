@@ -19,15 +19,15 @@ pub const NUM_SINK_TOKENS: usize = 4;
 ///
 /// Total active context = NUM_SINK_TOKENS + min(tokens_seen, window_size)
 pub struct KvCache {
-    /// Key cache for sink tokens: [NUM_SINK_TOKENS × n_heads × head_dim] as f32
-    sink_keys: *mut f32,
-    /// Value cache for sink tokens
-    sink_values: *mut f32,
+    /// Key cache for sink tokens: Q8_0 blocks [NUM_SINK_TOKENS × q8_vec_bytes]
+    sink_keys: *mut u8,
+    /// Value cache for sink tokens: Q8_0 blocks
+    sink_values: *mut u8,
 
-    /// Key ring buffer: [window_size × n_heads × head_dim] as f32
-    ring_keys: *mut f32,
-    /// Value ring buffer
-    ring_values: *mut f32,
+    /// Key ring buffer: Q8_0 blocks [window_size × q8_vec_bytes]
+    ring_keys: *mut u8,
+    /// Value ring buffer: Q8_0 blocks
+    ring_values: *mut u8,
 
     /// Absolute position stored with each sink token (for RoPE)
     sink_positions: [u32; NUM_SINK_TOKENS],
@@ -38,6 +38,8 @@ pub struct KvCache {
     n_heads: usize,
     /// Dimension per head
     head_dim: usize,
+    /// Q8_0 bytes per vector (n_heads * head_dim / 32 * 34)
+    q8_vec_bytes: usize,
     /// Size of the rolling window (power of 2 for fast modulo)
     window_size: usize,
     /// Mask for modulo addressing: window_size - 1
@@ -68,22 +70,23 @@ impl KvCache {
     ) -> Self {
         debug_assert!(window_size.is_power_of_two(), "window_size must be power of 2");
 
-        let sink_size = NUM_SINK_TOKENS * n_heads * head_dim;
-        let ring_size = window_size * n_heads * head_dim;
+        let q8_vec = Self::q8_vec_bytes(n_heads, head_dim);
+        let sink_q8_size = NUM_SINK_TOKENS * q8_vec;
+        let ring_q8_size = window_size * q8_vec;
 
         let mut offset = 0usize;
 
-        let sink_keys = base.add(offset) as *mut f32;
-        offset += sink_size * 4;
+        let sink_keys = base.add(offset);
+        offset += sink_q8_size;
 
-        let sink_values = base.add(offset) as *mut f32;
-        offset += sink_size * 4;
+        let sink_values = base.add(offset);
+        offset += sink_q8_size;
 
-        let ring_keys = base.add(offset) as *mut f32;
-        offset += ring_size * 4;
+        let ring_keys = base.add(offset);
+        offset += ring_q8_size;
 
-        let ring_values = base.add(offset) as *mut f32;
-        offset += ring_size * 4;
+        let ring_values = base.add(offset);
+        offset += ring_q8_size;
 
         let ring_positions = base.add(offset) as *mut u32;
         offset += window_size * 4;
@@ -100,6 +103,7 @@ impl KvCache {
             ring_positions,
             n_heads,
             head_dim,
+            q8_vec_bytes: q8_vec,
             window_size,
             window_mask: window_size - 1,
             tokens_seen: 0,
@@ -107,12 +111,20 @@ impl KvCache {
         }
     }
 
-    /// Required bytes for this KV-cache configuration.
+    /// Q8_0 bytes per KV vector (n_heads × head_dim values → Q8_0 blocks)
+    fn q8_vec_bytes(n_heads: usize, head_dim: usize) -> usize {
+        let n_values = n_heads * head_dim;
+        let n_blocks = (n_values + 31) / 32; // ceiling division
+        n_blocks * crate::quantize::Q8_0_BLOCK_SIZE
+    }
+
+    /// Required bytes for this KV-cache configuration (Q8_0 quantized).
     pub fn required_bytes(n_heads: usize, head_dim: usize, window_size: usize) -> usize {
-        let sink_size = NUM_SINK_TOKENS * n_heads * head_dim * 4; // f32
-        let ring_size = window_size * n_heads * head_dim * 4;
+        let q8_vec = Self::q8_vec_bytes(n_heads, head_dim);
+        let sink_size = NUM_SINK_TOKENS * q8_vec;
+        let ring_size = window_size * q8_vec;
         let ring_pos_size = window_size * 4; // u32 per ring slot
-        2 * (sink_size + ring_size) + ring_pos_size // keys + values + positions
+        2 * (sink_size + ring_size) + ring_pos_size
     }
 
     /// Store key/value for the current token at absolute position `abs_pos`.
@@ -125,29 +137,21 @@ impl KvCache {
         debug_assert!(value.len() >= vec_size);
 
         if self.tokens_seen < NUM_SINK_TOKENS {
-            // Store in sink slots
-            let offset = self.tokens_seen * vec_size;
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    key.as_ptr(), self.sink_keys.add(offset), vec_size,
-                );
-                core::ptr::copy_nonoverlapping(
-                    value.as_ptr(), self.sink_values.add(offset), vec_size,
-                );
-            }
+            // Quantize and store in sink slots
+            let offset = self.tokens_seen * self.q8_vec_bytes;
+            let k_dst = unsafe { core::slice::from_raw_parts_mut(self.sink_keys.add(offset), self.q8_vec_bytes) };
+            let v_dst = unsafe { core::slice::from_raw_parts_mut(self.sink_values.add(offset), self.q8_vec_bytes) };
+            crate::quantize::quantize_f32_to_q8_0(&key[..vec_size], k_dst);
+            crate::quantize::quantize_f32_to_q8_0(&value[..vec_size], v_dst);
             self.sink_positions[self.tokens_seen] = abs_pos as u32;
         } else {
-            // Store in ring buffer (overwrites oldest if full)
-            let ring_offset = self.ring_pos * vec_size;
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    key.as_ptr(), self.ring_keys.add(ring_offset), vec_size,
-                );
-                core::ptr::copy_nonoverlapping(
-                    value.as_ptr(), self.ring_values.add(ring_offset), vec_size,
-                );
-                *self.ring_positions.add(self.ring_pos) = abs_pos as u32;
-            }
+            // Quantize and store in ring buffer
+            let offset = self.ring_pos * self.q8_vec_bytes;
+            let k_dst = unsafe { core::slice::from_raw_parts_mut(self.ring_keys.add(offset), self.q8_vec_bytes) };
+            let v_dst = unsafe { core::slice::from_raw_parts_mut(self.ring_values.add(offset), self.q8_vec_bytes) };
+            crate::quantize::quantize_f32_to_q8_0(&key[..vec_size], k_dst);
+            crate::quantize::quantize_f32_to_q8_0(&value[..vec_size], v_dst);
+            unsafe { *self.ring_positions.add(self.ring_pos) = abs_pos as u32; }
             self.ring_pos = (self.ring_pos + 1) & self.window_mask;
         }
 
@@ -167,34 +171,51 @@ impl KvCache {
         }
     }
 
-    /// Get key vector for logical position `pos` (0-indexed over active entries).
+    /// Dequantize key vector for logical position `pos` into `out`.
     ///
     /// Positions 0..NUM_SINK_TOKENS → sink slots.
     /// Positions NUM_SINK_TOKENS.. → ring buffer (modulo-addressed).
-    pub fn get_key(&self, pos: usize, head: usize) -> &[f32] {
-        let head_offset = head * self.head_dim;
-
-        if pos < NUM_SINK_TOKENS {
-            let offset = pos * self.n_heads * self.head_dim + head_offset;
-            unsafe { core::slice::from_raw_parts(self.sink_keys.add(offset), self.head_dim) }
-        } else {
-            let ring_idx = self.ring_logical_to_physical(pos - NUM_SINK_TOKENS);
-            let offset = ring_idx * self.n_heads * self.head_dim + head_offset;
-            unsafe { core::slice::from_raw_parts(self.ring_keys.add(offset), self.head_dim) }
-        }
+    /// `out` must be at least `head_dim` elements.
+    pub fn get_key(&self, pos: usize, head: usize, out: &mut [f32]) {
+        self.dequant_vec(pos, head, true, out);
     }
 
-    /// Get value vector for logical position `pos`.
-    pub fn get_value(&self, pos: usize, head: usize) -> &[f32] {
-        let head_offset = head * self.head_dim;
+    /// Dequantize value vector for logical position `pos` into `out`.
+    pub fn get_value(&self, pos: usize, head: usize, out: &mut [f32]) {
+        self.dequant_vec(pos, head, false, out);
+    }
+
+    /// Internal: dequantize one head's K or V vector from Q8_0 storage.
+    fn dequant_vec(&self, pos: usize, head: usize, is_key: bool, out: &mut [f32]) {
+        let slot_idx;
+        let storage: *mut u8;
 
         if pos < NUM_SINK_TOKENS {
-            let offset = pos * self.n_heads * self.head_dim + head_offset;
-            unsafe { core::slice::from_raw_parts(self.sink_values.add(offset), self.head_dim) }
+            slot_idx = pos;
+            storage = if is_key { self.sink_keys } else { self.sink_values };
         } else {
-            let ring_idx = self.ring_logical_to_physical(pos - NUM_SINK_TOKENS);
-            let offset = ring_idx * self.n_heads * self.head_dim + head_offset;
-            unsafe { core::slice::from_raw_parts(self.ring_values.add(offset), self.head_dim) }
+            slot_idx = self.ring_logical_to_physical(pos - NUM_SINK_TOKENS);
+            storage = if is_key { self.ring_keys } else { self.ring_values };
+        }
+
+        // Each slot stores n_heads × head_dim values as Q8_0 blocks.
+        // We need the slice for just one head: head_dim values starting at head*head_dim.
+        let slot_offset = slot_idx * self.q8_vec_bytes;
+        let head_values_offset = head * self.head_dim;
+
+        // Q8_0 blocks cover 32 values each. Find the starting block for this head.
+        let block_start = head_values_offset / 32;
+        let block_count = (self.head_dim + 31) / 32;
+
+        for b in 0..block_count {
+            let block_byte_offset = slot_offset + (block_start + b) * crate::quantize::Q8_0_BLOCK_SIZE;
+            let block_data = unsafe {
+                core::slice::from_raw_parts(storage.add(block_byte_offset), crate::quantize::Q8_0_BLOCK_SIZE)
+            };
+            let out_start = b * 32;
+            let out_end = (out_start + 32).min(self.head_dim);
+            let out_slice = &mut out[out_start..out_end];
+            crate::quantize::dequantize_q8_0_block(block_data, out_slice);
         }
     }
 
