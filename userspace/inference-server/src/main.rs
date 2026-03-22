@@ -193,10 +193,12 @@ const INFER_SHMEM_VADDR: usize = 0x20000000;
 const RING_SHMEM_VADDR: usize = 0x22000000;
 
 /// Maximum tokens to generate per request
-const MAX_GEN_TOKENS: usize = 64;
+/// Maximum tokens to generate per request (expanded with 1024-token context)
+const MAX_GEN_TOKENS: usize = 256;
 
-/// KV-cache window size (power of 2)
-const KV_WINDOW_SIZE: usize = 256;
+/// KV-cache window size (power of 2).
+/// With Q8_0 quantization, 1024 tokens uses ~3.1MB (same as 256 with f32).
+const KV_WINDOW_SIZE: usize = 1024;
 
 // === Default sampling parameters (overridable via control sector 258) ===
 const DEFAULT_TEMPERATURE: f32 = 0.8;
