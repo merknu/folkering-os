@@ -137,13 +137,6 @@ fn pt_is_newline(b: u8) -> bool {
     b == b'\n' || b == b'\r'
 }
 
-/// Control whitespace: \t, \x0b, \x0c — whitespace that is NOT space and NOT newline.
-/// GPT-2 regex treats these as a separate alternation from space/newline whitespace.
-#[inline]
-fn pt_is_ctrl_ws(b: u8) -> bool {
-    matches!(b, b'\t' | 0x0b | 0x0c)
-}
-
 /// Try to match a contraction ('s, 't, 're, 've, 'm, 'll, 'd) at pos.
 /// LOWERCASE ONLY — llama-cpp/HuggingFace do NOT match uppercase contractions
 /// (e.g., "DON'T" is NOT split as contraction, but "don't" IS).
@@ -202,13 +195,10 @@ fn pt_ws_end(text: &[u8], pos: usize) -> usize {
 }
 
 /// Count consecutive punctuation (non-letter, non-digit, non-whitespace).
+/// Does NOT consume trailing newlines — whitespace handler manages those.
 fn pt_punct(text: &[u8], pos: usize) -> usize {
     let mut i = pos;
     while i < text.len() && !pt_is_letter(text[i]) && !pt_is_digit(text[i]) && !pt_is_ws(text[i]) {
-        i += 1;
-    }
-    // Include trailing newlines (GPT-2 regex rule 4)
-    while i < text.len() && pt_is_newline(text[i]) {
         i += 1;
     }
     (i - pos).max(1)
@@ -243,57 +233,38 @@ fn pt_next(text: &[u8], pos: usize) -> usize {
         return pt_digits(text, pos);
     }
 
-    // Control whitespace (\t, \x0b, \x0c): separate segment from space/newline.
-    // GPT-2 regex alt 5: [\s&&[^\S\r\n]]+(?:\r\n|\r|\n)?
-    // These get their own segment, optionally followed by one newline.
-    if pt_is_ctrl_ws(b) {
-        let mut i = pos;
-        while i < text.len() && pt_is_ctrl_ws(text[i]) {
-            i += 1;
-        }
-        // Optional trailing newline (\r\n, \r, or \n)
-        if i < text.len() && text[i] == b'\r' {
-            i += 1;
-            if i < text.len() && text[i] == b'\n' {
-                i += 1;
-            }
-        } else if i < text.len() && text[i] == b'\n' {
-            i += 1;
-        }
-        return i - pos;
-    }
-
-    // Space or newline whitespace (\n, \r, space)
-    // Key rules:
-    // - Multiple ws before a letter: consume all but last, last space becomes word prefix
-    // - Single newline directly before letter: keep separate (NOT a word prefix)
-    // - Single space before letter: include as word prefix
-    // - Space(s) before newline: group together (GPT-2 alt 5)
-    if b == b' ' || pt_is_newline(b) {
+    // Unified whitespace handler (matches llama-cpp pre-tokenizer).
+    //
+    // Rules:
+    // - Before DIGIT: consume ALL whitespace (GPT-2 regex has no digit prefix)
+    // - Before LETTER/PUNCT: consume all but last; last space → word prefix, else → 1-char
+    // - End of text: consume all remaining whitespace
+    if pt_is_ws(b) {
         let ws_end = pt_ws_end(text, pos);
         if ws_end < text.len() {
-            // Followed by non-whitespace
+            let next_char = text[ws_end];
+
+            // Before digit: consume ALL whitespace (no prefix for digits)
+            if pt_is_digit(next_char) {
+                return ws_end - pos;
+            }
+
+            // Before letter or punct: consume all but last
             if ws_end - pos > 1 {
-                // Multiple ws chars: consume all but last (last becomes word prefix)
                 return ws_end - pos - 1;
             }
-            // Single whitespace char before non-whitespace
-            let next = text[pos + 1];
-            // Newlines are NEVER word prefixes — keep them separate
-            if pt_is_newline(b) {
-                return 1;
+            // Single whitespace char before letter/punct
+            if b == b' ' {
+                // Space: word prefix (merged with following segment)
+                if pt_is_letter(next_char) {
+                    return 1 + pt_letters(text, pos + 1);
+                }
+                return 1 + pt_punct(text, pos + 1);
             }
-            // Space (0x20): include as prefix with following segment
-            if pt_is_letter(next) {
-                return 1 + pt_letters(text, pos + 1);
-            }
-            if pt_is_digit(next) {
-                return 1 + pt_digits(text, pos + 1);
-            }
-            // Space + punctuation group (GPT-2 regex rule 4)
-            return 1 + pt_punct(text, pos + 1);
+            // Non-space whitespace: individual 1-char segment
+            return 1;
         }
-        // Whitespace at end of text: consume all
+        // End of text: consume all remaining whitespace
         return ws_end - pos;
     }
 
@@ -774,6 +745,11 @@ impl<'a> BpeTokenizer<'a> {
         let mut pos = 0;
         while pos < text.len() && n_tokens < output.len() {
             let seg_len = pt_next(text, pos);
+            if seg_len == 0 {
+                // Safety: avoid infinite loop
+                pos += 1;
+                continue;
+            }
             let added = self.encode_bpe_segment(&text[pos..pos + seg_len], &mut output[n_tokens..]);
             n_tokens += added;
             pos += seg_len;
