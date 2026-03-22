@@ -445,12 +445,15 @@ impl<'a> GgufModel<'a> {
                     else { cursor.skip_value(vtype)?; }
                 }
                 "tokenizer.ggml.tokens" => {
-                    // Array of strings — record offset before skipping
+                    // Array of strings — record offset AND set vocab_size if not yet set
                     if vtype == 9 {
-                        // Array header: elem_type(u32) + count(u64)
                         let elem_type = cursor.read_u32()?;
                         let count = cursor.read_u64()? as usize;
                         metadata.vocab_data_offset = cursor.pos;
+                        // Set vocab_size from token array if not already set by arch key
+                        if metadata.vocab_size == 0 {
+                            metadata.vocab_size = count as u32;
+                        }
                         // Skip all string elements
                         for _ in 0..count {
                             cursor.skip_value(elem_type)?;

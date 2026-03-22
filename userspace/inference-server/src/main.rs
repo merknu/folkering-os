@@ -176,8 +176,8 @@ pub const INFER_OP_STATUS: u64 = 2;
 pub const INFER_OP_ASK: u64 = 3;
 pub const INFER_OP_ASK_ASYNC: u64 = 4;
 
-/// Bump arena size: 8MB for intermediate computation buffers
-const ARENA_SIZE: usize = 8 * 1024 * 1024;
+/// Bump arena size: 16MB for tokenizer tables (152K vocab) + inference buffers
+const ARENA_SIZE: usize = 16 * 1024 * 1024;
 
 /// Maximum GGUF model size we'll attempt to load (512MB for SmolLM2-360M+)
 const MAX_MODEL_SIZE: usize = 512 * 1024 * 1024;
