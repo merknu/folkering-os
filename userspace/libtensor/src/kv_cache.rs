@@ -282,14 +282,26 @@ impl KvCacheManager {
         head_dim: usize,
         window_size: usize,
     ) -> Result<Self, ()> {
-        use libfolk::sys::memory::{mmap, PROT_READ, PROT_WRITE};
+        use libfolk::sys::memory::{mmap_at, PROT_READ, PROT_WRITE};
 
         let per_layer = KvCache::required_bytes(n_heads, head_dim, window_size);
         let total_kv = n_layers * per_layer;
         let cache_structs_size = n_layers * core::mem::size_of::<KvCache>();
         let total = total_kv + cache_structs_size;
 
-        let backing = mmap(total, PROT_READ | PROT_WRITE).map_err(|_| ())?;
+        // Allocate in 16MB chunks (kernel mmap limit)
+        const KV_MMAP_BASE: usize = 0x2_0000_0000; // 8GB offset, separate from model
+        const MMAP_CHUNK: usize = 16 * 1024 * 1024;
+        let mut mapped = 0usize;
+        while mapped < total {
+            let chunk = (total - mapped).min(MMAP_CHUNK);
+            let addr = KV_MMAP_BASE + mapped;
+            if mmap_at(addr, chunk, PROT_READ | PROT_WRITE).is_err() {
+                return Err(());
+            }
+            mapped += chunk;
+        }
+        let backing = KV_MMAP_BASE as *mut u8;
 
         // Place KvCache structs at the beginning
         let layers = backing as *mut KvCache;

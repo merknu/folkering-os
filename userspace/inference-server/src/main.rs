@@ -1687,18 +1687,24 @@ fn load_model_from_disk() -> Result<(*const u8, usize), &'static str> {
 
     // Allocate mmap region in chunks (kernel limits mmap to 16MB per call)
     const MMAP_CHUNK: usize = 16 * 1024 * 1024; // 16MB per mmap call
+    let n_chunks = (mmap_size + MMAP_CHUNK - 1) / MMAP_CHUNK;
+    println!("[INFERENCE] Allocating {}MB in {} chunks of 16MB...", mmap_size / (1024 * 1024), n_chunks);
     let mut mapped = 0usize;
+    let mut chunk_idx = 0usize;
     while mapped < mmap_size {
         let chunk = (mmap_size - mapped).min(MMAP_CHUNK);
         let addr = MODEL_MMAP_BASE + mapped;
+        println!("[INFERENCE]   mmap chunk {}/{}: addr=0x{:X} size={}MB",
+            chunk_idx + 1, n_chunks, addr, chunk / (1024 * 1024));
         if mmap_at(addr, chunk, PROT_READ | PROT_WRITE).is_err() {
-            println!("[INFERENCE] mmap failed at offset {}MB", mapped / (1024 * 1024));
+            println!("[INFERENCE] *** mmap FAILED at chunk {} (offset {}MB) ***", chunk_idx, mapped / (1024 * 1024));
             return Err("mmap failed");
         }
         mapped += chunk;
+        chunk_idx += 1;
     }
     let model_ptr = MODEL_MMAP_BASE as *mut u8;
-    println!("[INFERENCE] Mapped {}MB in {} chunks", mmap_size / (1024 * 1024), (mmap_size + MMAP_CHUNK - 1) / MMAP_CHUNK);
+    println!("[INFERENCE] All {} mmap chunks allocated OK", chunk_idx);
 
     // Read model data from disk
     let sectors_to_read = if model_size > 0 {
@@ -1716,8 +1722,8 @@ fn load_model_from_disk() -> Result<(*const u8, usize), &'static str> {
     let total_sectors = sectors_to_read;
     let mut last_progress_mb = 0usize;
     let mut remaining = total_sectors;
-    println!("[INFERENCE] Reading {} sectors ({} MB) via DMA bursts...",
-        total_sectors, model_size / (1024 * 1024));
+    println!("[INFERENCE] Reading {} sectors ({} MB) via {} DMA bursts...",
+        total_sectors, model_size / (1024 * 1024), (total_sectors + burst_sectors - 1) / burst_sectors);
 
     while remaining > 0 {
         let n = remaining.min(burst_sectors);
@@ -1731,10 +1737,11 @@ fn load_model_from_disk() -> Result<(*const u8, usize), &'static str> {
                 sector += n as u64;
                 remaining -= n;
 
-                // Progress logging every 4MB
+                // Progress logging every 1MB for debugging
                 let current_mb = total_read / (1024 * 1024);
-                if current_mb >= last_progress_mb + 4 {
-                    println!("[INFERENCE] Loaded {}MB / {}MB", current_mb, model_size / (1024 * 1024));
+                if current_mb > last_progress_mb {
+                    println!("[INFERENCE] Loaded {}MB / {}MB (sector {})",
+                        current_mb, model_size / (1024 * 1024), sector);
                     last_progress_mb = current_mb;
                     yield_cpu();
                 }
@@ -1748,7 +1755,10 @@ fn load_model_from_disk() -> Result<(*const u8, usize), &'static str> {
                     }
                 }
             }
-            Err(_) => break,
+            Err(_) => {
+                println!("[INFERENCE] *** DMA read FAILED at sector {}, {}MB read so far ***", sector, total_read / (1024*1024));
+                break;
+            }
         }
     }
 
