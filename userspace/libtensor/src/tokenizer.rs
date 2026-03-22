@@ -119,7 +119,7 @@ fn fnv1a(data: &[u8]) -> u32 {
 
 #[inline]
 fn pt_is_letter(b: u8) -> bool {
-    b.is_ascii_alphabetic() || b >= 128 // non-ASCII treated as letter
+    b.is_ascii_alphabetic() || b >= 128
 }
 
 #[inline]
