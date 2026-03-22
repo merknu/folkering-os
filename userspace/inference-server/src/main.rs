@@ -1676,14 +1676,12 @@ fn load_model_from_disk() -> Result<(*const u8, usize), &'static str> {
     // Determine mmap size
     // ULTRA 35: Round up to 4KB boundary
     let mmap_size = if model_size > 0 {
-        (model_size + 4095) & !4095
+        (model_size + 4095) & !4095 // page-align
     } else {
-        MAX_MODEL_SIZE // unknown size, allocate max
+        MAX_MODEL_SIZE // unknown size, allocate max as fallback
     };
 
-    if mmap_size > MAX_MODEL_SIZE {
-        return Err("model too large");
-    }
+    // No hard limit — trust FOLKDISK header. QEMU RAM is sized dynamically.
 
     // Allocate mmap region in chunks (kernel limits mmap to 16MB per call)
     const MMAP_CHUNK: usize = 16 * 1024 * 1024; // 16MB per mmap call
