@@ -687,6 +687,19 @@ fn main() -> ! {
     let mut inference_win_id: u32 = 0;           // window receiving streamed tokens
     let mut inference_query_handle: u32 = 0;     // query shmem handle (for cleanup)
 
+    // ===== Tool Calling State Machine =====
+    // Detects <|tool|>...<|/tool|> in AI stream, hides from display, executes via IPC
+    let mut tool_state: u8 = 0;      // 0=scanning open, 1=buffering body, 3=completed
+    let mut tool_open_match: usize = 0;
+    let mut tool_close_match: usize = 0;
+    let mut tool_buf: [u8; 512] = [0; 512];
+    let mut tool_buf_len: usize = 0;
+    let mut tool_pending: [u8; 9] = [0; 9]; // max tag length for flush on partial match fail
+    let mut tool_pending_len: usize = 0;
+
+    const TOOL_OPEN: &[u8] = b"<|tool|>";    // 8 bytes
+    const TOOL_CLOSE: &[u8] = b"<|/tool|>";  // 9 bytes
+
     // Blinking caret state (toggles every ~500ms using uptime syscall)
     let mut caret_visible: bool = true;
     let mut last_caret_flip_ms: u64 = 0;
@@ -2962,9 +2975,98 @@ fn main() -> ! {
                     )
                 };
                 // ULTRA 47: Data guaranteed valid UTF-8 by inference server
-                if let Some(win) = wm.get_window_mut(inference_win_id) {
-                    win.append_text(new_data);
-                    // ULTRA 38: dirty flag set by append_text, redraw in render cycle
+                // Tool call interception: scan for <|tool|>...<|/tool|> tags
+                let mut visible_buf: [u8; 512] = [0; 512];
+                let mut vis_len: usize = 0;
+
+                for &byte in new_data.iter() {
+                    match tool_state {
+                        0 => {
+                            // Scanning for TOOL_OPEN tag
+                            if byte == TOOL_OPEN[tool_open_match] {
+                                tool_pending[tool_pending_len] = byte;
+                                tool_pending_len += 1;
+                                tool_open_match += 1;
+                                if tool_open_match == TOOL_OPEN.len() {
+                                    // Full open tag — start buffering body
+                                    tool_state = 1;
+                                    tool_open_match = 0;
+                                    tool_pending_len = 0;
+                                    tool_buf_len = 0;
+                                }
+                            } else if tool_open_match > 0 {
+                                // Partial match failed — flush pending bytes to visible
+                                for j in 0..tool_pending_len {
+                                    if vis_len < visible_buf.len() {
+                                        visible_buf[vis_len] = tool_pending[j];
+                                        vis_len += 1;
+                                    }
+                                }
+                                tool_open_match = 0;
+                                tool_pending_len = 0;
+                                if vis_len < visible_buf.len() {
+                                    visible_buf[vis_len] = byte;
+                                    vis_len += 1;
+                                }
+                            } else {
+                                // Normal visible byte
+                                if vis_len < visible_buf.len() {
+                                    visible_buf[vis_len] = byte;
+                                    vis_len += 1;
+                                }
+                            }
+                        }
+                        1 => {
+                            // Buffering tool body, scanning for TOOL_CLOSE
+                            if byte == TOOL_CLOSE[tool_close_match] {
+                                tool_close_match += 1;
+                                if tool_close_match == TOOL_CLOSE.len() {
+                                    // Tool call complete
+                                    tool_state = 3;
+                                    tool_close_match = 0;
+                                }
+                            } else {
+                                // Flush partial close match into tool buffer
+                                for j in 0..tool_close_match {
+                                    if tool_buf_len < tool_buf.len() {
+                                        tool_buf[tool_buf_len] = TOOL_CLOSE[j];
+                                        tool_buf_len += 1;
+                                    }
+                                }
+                                tool_close_match = 0;
+                                if tool_buf_len < tool_buf.len() {
+                                    tool_buf[tool_buf_len] = byte;
+                                    tool_buf_len += 1;
+                                }
+                            }
+                        }
+                        _ => {
+                            // After completion, pass through
+                            if vis_len < visible_buf.len() {
+                                visible_buf[vis_len] = byte;
+                                vis_len += 1;
+                            }
+                        }
+                    }
+                }
+
+                // Append visible (non-tool) text to window
+                if vis_len > 0 {
+                    if let Some(win) = wm.get_window_mut(inference_win_id) {
+                        win.append_text(&visible_buf[..vis_len]);
+                    }
+                }
+
+                // Execute completed tool call
+                if tool_state == 3 {
+                    let tool_content = core::str::from_utf8(&tool_buf[..tool_buf_len]).unwrap_or("");
+                    let result = execute_tool_call(tool_content);
+                    if let Some(win) = wm.get_window_mut(inference_win_id) {
+                        win.push_line(result);
+                    }
+                    tool_state = 0;
+                    tool_buf_len = 0;
+                    need_redraw = true;
                 }
                 inference_ring_read_idx = new_write;
                 need_redraw = true;
@@ -2979,6 +3081,14 @@ fn main() -> ! {
                 let _ = shmem_destroy(inference_query_handle);
                 inference_ring_handle = 0;
                 inference_query_handle = 0;
+                // Flush incomplete tool tag if generation ended mid-tag
+                if tool_state != 0 {
+                    tool_state = 0;
+                    tool_open_match = 0;
+                    tool_close_match = 0;
+                    tool_buf_len = 0;
+                    tool_pending_len = 0;
+                }
                 if let Some(win) = wm.get_window_mut(inference_win_id) {
                     win.typing = false;
                     win.push_line(""); // new line after AI response
@@ -2998,6 +3108,55 @@ fn main() -> ! {
 }
 
 /// Clamp focused_widget index after widget tree update
+/// Execute a tool call parsed from the AI stream.
+/// Called by the compositor when <|tool|>COMMAND args<|/tool|> is detected.
+fn execute_tool_call(tool_content: &str) -> &'static str {
+    let trimmed = tool_content.trim();
+    let (cmd, args) = if let Some(pos) = trimmed.find(' ') {
+        (&trimmed[..pos], trimmed[pos + 1..].trim())
+    } else {
+        (trimmed, "")
+    };
+
+    match cmd {
+        "write" => {
+            if let Some(pos) = args.find(' ') {
+                let filename = args[..pos].trim();
+                let content = args[pos + 1..].trim();
+                if filename.is_empty() || content.is_empty() {
+                    return "[Tool: write requires FILENAME CONTENT]";
+                }
+                // Security: no path traversal, max 4KB
+                if filename.contains("..") || content.len() > 4096 {
+                    return "[Tool: write denied (security)]";
+                }
+                match libfolk::sys::synapse::write_file(filename, content.as_bytes()) {
+                    Ok(()) => "[Tool: File written]",
+                    Err(_) => "[Tool: Write failed]",
+                }
+            } else {
+                "[Tool: write requires FILENAME CONTENT]"
+            }
+        }
+        "read" => {
+            if args.is_empty() {
+                return "[Tool: read requires FILENAME]";
+            }
+            match libfolk::sys::synapse::read_file_shmem(args) {
+                Ok(_resp) => "[Tool: File read]",
+                Err(_) => "[Tool: File not found]",
+            }
+        }
+        "ls" => {
+            match libfolk::sys::shell::list_files() {
+                Ok(_) => "[Tool: Files listed]",
+                Err(_) => "[Tool: List failed]",
+            }
+        }
+        _ => "[Tool: Unknown command]",
+    }
+}
+
 fn clamp_focus(wm: &mut WindowManager, win_id: u32) {
     if let Some(win) = wm.get_window_mut(win_id) {
         if let Some(idx) = win.focused_widget {
