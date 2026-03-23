@@ -84,6 +84,11 @@ impl GgufDtype {
             Self::Q4_1 => 20,
             Self::Q8_0 => 34,   // 32 values per block (f16 scale + 32 i8)
             Self::Q8_1 => 40,
+            Self::Q2K => 84,    // 256 values per block
+            Self::Q3K => 110,
+            Self::Q4K => 144,
+            Self::Q5K => 176,
+            Self::Q6K => 210,   // 256 values per block (ql[128]+qh[64]+sc[16]+d[2])
             _ => 0, // unsupported
         }
     }
@@ -95,6 +100,7 @@ impl GgufDtype {
             Self::F16 => 1,
             Self::Q4_0 | Self::Q4_1 => 32,
             Self::Q8_0 | Self::Q8_1 => 32,
+            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K => 256,
             _ => 1,
         }
     }

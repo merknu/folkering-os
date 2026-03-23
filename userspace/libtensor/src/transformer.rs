@@ -78,8 +78,16 @@ pub struct ModelWeights<'a> {
     /// Often shares weights with token_embed (tied embeddings)
     pub output_weight: &'a [u8],
 
-    /// True if output_weight is Q8_0 (otherwise Q4_0)
-    pub output_is_q8: bool,
+    /// Quantization format of output_weight
+    pub output_quant: OutputQuant,
+}
+
+/// Quantization format for the output projection weight
+#[derive(Clone, Copy, PartialEq)]
+pub enum OutputQuant {
+    Q4_0,
+    Q8_0,
+    Q6_K,
 }
 
 /// Weights for a single transformer layer
@@ -318,12 +326,19 @@ pub fn forward<'a>(
 
     // Output projection: x × W_output → logits
     for i in 0..config.vocab_size { logits[i] = 0.0; }
-    if weights.output_is_q8 {
-        gemm::gemm_f32_x_q8(logits, x, weights.output_weight, 1, dim, config.vocab_size,
-            FuseOp::None, yield_cfg.gemm_yield, arena);
-    } else {
-        gemm::gemm_f32_x_q4(logits, x, weights.output_weight, 1, dim, config.vocab_size,
-            FuseOp::None, yield_cfg.gemm_yield, arena);
+    match weights.output_quant {
+        OutputQuant::Q8_0 => {
+            gemm::gemm_f32_x_q8(logits, x, weights.output_weight, 1, dim, config.vocab_size,
+                FuseOp::None, yield_cfg.gemm_yield, arena);
+        }
+        OutputQuant::Q6_K => {
+            gemm::gemm_f32_x_q6k(logits, x, weights.output_weight, 1, dim, config.vocab_size,
+                yield_cfg.gemm_yield);
+        }
+        OutputQuant::Q4_0 => {
+            gemm::gemm_f32_x_q4(logits, x, weights.output_weight, 1, dim, config.vocab_size,
+                FuseOp::None, yield_cfg.gemm_yield, arena);
+        }
     }
 
     Some(logits)
@@ -571,9 +586,17 @@ pub fn forward_prefill_batch(
 fn embed_token(token_id: usize, vocab_size: usize, dim: usize, embed_data: &[u8], output: &mut [f32]) {
     debug_assert!(token_id < vocab_size);
 
-    let blocks_per_row = dim / 32;
+    let blocks_per_row = dim / 32; // for Q4_0/Q8_0
 
     // Detect format from total data size
+    // Debug: log on first call only
+    static EMBED_LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if !EMBED_LOGGED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        let blocks_q6k = dim / quantize::Q6_K_BLOCK_VALUES;
+        let expected_q6k = vocab_size * blocks_q6k * quantize::Q6_K_BLOCK_SIZE;
+        libfolk::println!("[EMBED] data_len={} expected_q6k={} blocks_q6k={} dim={} vocab={}",
+            embed_data.len(), expected_q6k, blocks_q6k, dim, vocab_size);
+    }
     // Q6_K: 256 values/block, 210 bytes/block
     // Q8_0: 32 values/block, 34 bytes/block
     // Q4_0: 32 values/block, 18 bytes/block

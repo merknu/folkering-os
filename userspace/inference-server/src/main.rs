@@ -530,8 +530,8 @@ struct WeightsData {
     token_embed: &'static [u8],
     final_norm: &'static [u8],
     output_weight: &'static [u8],
-    /// True if output_weight is Q8_0 (otherwise Q4_0)
-    output_is_q8: bool,
+    /// Quantization format of output_weight
+    output_quant: libtensor::transformer::OutputQuant,
 }
 
 /// Per-layer weight data. All slices point into mmap'd data.
@@ -642,15 +642,20 @@ fn build_model_weights(model: &GgufModel)
     println!("[INFERENCE]   output: {:?} {:?} {}", output_weight.shape, output_weight.dtype,
         if model.tensor("output.weight").is_none() { "(tied)" } else { "" });
 
-    // Detect output weight dtype
-    let output_is_q8 = output_weight.dtype == libtensor::gguf::GgufDtype::Q8_0;
+    // Detect output weight quantization format
+    use libtensor::transformer::OutputQuant;
+    let output_quant = match output_weight.dtype {
+        libtensor::gguf::GgufDtype::Q8_0 => OutputQuant::Q8_0,
+        libtensor::gguf::GgufDtype::Q6K => OutputQuant::Q6_K,
+        _ => OutputQuant::Q4_0,
+    };
 
     // Safety: tensor data points into mmap'd memory that lives for the entire process
     let weights_data = WeightsData {
         token_embed: unsafe { core::mem::transmute::<&[u8], &'static [u8]>(token_embed.data) },
         final_norm: unsafe { core::mem::transmute::<&[u8], &'static [u8]>(final_norm.data) },
         output_weight: unsafe { core::mem::transmute::<&[u8], &'static [u8]>(output_weight.data) },
-        output_is_q8,
+        output_quant,
     };
 
     // Build per-layer weights
@@ -989,7 +994,7 @@ fn build_weights_for_forward<'a>(
         layers: layer_weights,
         final_norm: bytes_as_f32(eng.weights_data.final_norm),
         output_weight: eng.weights_data.output_weight,
-        output_is_q8: eng.weights_data.output_is_q8,
+        output_quant: eng.weights_data.output_quant,
     };
 
     Some((weights, layer_weights))

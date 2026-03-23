@@ -10,7 +10,7 @@
 //! and B = weights (stored as Q4_0 from GGUF).
 
 use crate::arena::BumpArena;
-use crate::quantize::{self, Q4_0_BLOCK_SIZE, Q8_0_BLOCK_SIZE};
+use crate::quantize::{self, Q4_0_BLOCK_SIZE, Q8_0_BLOCK_SIZE, Q6_K_BLOCK_SIZE, Q6_K_BLOCK_VALUES};
 use crate::simd;
 use crate::FuseOp;
 use crate::ops;
@@ -320,6 +320,55 @@ pub fn gemm_f32_x_q8(
                 }
                 FuseOp::None => {}
             }
+        }
+
+        if yield_every > 0 && row > 0 && row % yield_every == 0 {
+            libfolk::sys::yield_cpu();
+        }
+    }
+}
+
+/// f32 input × Q6_K weights → f32 output.
+/// Used for output projection in Qwen3 (token_embd and output are Q6_K).
+/// Dequantizes Q6_K blocks on-the-fly and accumulates dot products.
+pub fn gemm_f32_x_q6k(
+    c: &mut [f32],
+    a_f32: &[f32],
+    b_q6k: &[u8],
+    m: usize,
+    k: usize,
+    n: usize,
+    yield_every: usize,
+) {
+    let n_blocks = k / Q6_K_BLOCK_VALUES; // 256 values per Q6_K block
+    let q6k_row_bytes = n_blocks * Q6_K_BLOCK_SIZE;
+
+    // Temporary buffer for dequantized block values
+    let mut dequant_buf = [0.0f32; Q6_K_BLOCK_VALUES];
+
+    for row in 0..m {
+        let a_row = &a_f32[row * k..(row + 1) * k];
+
+        for col in 0..n {
+            let b_col_offset = col * q6k_row_bytes;
+            let mut acc = 0.0f32;
+
+            for blk in 0..n_blocks {
+                let blk_start = b_col_offset + blk * Q6_K_BLOCK_SIZE;
+                let block = &b_q6k[blk_start..blk_start + Q6_K_BLOCK_SIZE];
+
+                // Dequantize Q6_K block to f32
+                quantize::dequantize_q6_k_block(block, &mut dequant_buf);
+
+                // Dot product with input
+                let a_base = blk * Q6_K_BLOCK_VALUES;
+                let vals = Q6_K_BLOCK_VALUES.min(k - a_base);
+                for i in 0..vals {
+                    acc += a_row[a_base + i] * dequant_buf[i];
+                }
+            }
+
+            c[row * n + col] += acc;
         }
 
         if yield_every > 0 && row > 0 && row % yield_every == 0 {
