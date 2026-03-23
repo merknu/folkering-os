@@ -40,7 +40,7 @@ Rust bare-metal x86-64 AI-native microkernel OS. Limine bootloader, QEMU for emu
 - Userspace: `userspace/` → `target/x86_64-folkering-userspace/release/{compositor,shell,synapse,intent-service,inference}`
 - folk-pack: `tools/folk-pack/` — creates FPK initrd + packs GGUF models
 - MCP build server: `C:\Users\merkn\folkering-mcp\server.py` (folkering_rebuild_run)
-- MCP debug server: `mcp/server.py` v2.0 — see "ML Inspection Studio" section below
+- MCP debug server: `mcp/server.py` v3.0 — see "ML Inspection Studio" section below
 
 ## FOLKDISK Header Layout (sector 0 of virtio-data.img)
 ```
@@ -65,7 +65,7 @@ Rust bare-metal x86-64 AI-native microkernel OS. Limine bootloader, QEMU for emu
 | `userspace/inference-server/src/main.rs` | Model loading, forward pass, IPC |
 | `userspace/compositor/src/main.rs` | GUI, omnibar, ask command handler |
 | `tools/folk-pack/src/main.rs` | FPK + pack-model subcommand |
-| `mcp/server.py` | Debug MCP v2.0 (symbols, registers, serial, **tensor_dump**, **python_ref_runner**) |
+| `mcp/server.py` | Debug MCP v3.0 (symbols, registers, tensor_dump, python_ref_runner, **attention_heatmap**, **topo_parity_map**) |
 
 ## Memory Layout
 | Range | Owner |
@@ -166,5 +166,48 @@ python_ref_runner(prompt="Hello", capture_layers=[
 6. Compare with Rust serial output for layer L
 7. When divergence layer found: check GEMM, RoPE, attention score computation
 
+### Tool: `attention_heatmap` — Visual Attention Pattern Inspector (v3.0)
+
+Generates PNG heatmap of attention weights. Returns MCP image content (renders in chat).
+
+**When to use:** Diagnose attention collapse (uniform/BOS-dominated) or compare Python vs Rust patterns.
+
+**Usage:**
+```
+# All 9 heads + average for layer 0
+attention_heatmap(prompt="Hello world", layer=0, head="all")
+
+# Single head
+attention_heatmap(prompt="Hello world", layer=5, head=3)
+```
+
+**Features:**
+- Causal mask applied (upper triangle = NaN, won't distort colors)
+- If Rust data in disk mailbox matches attention shape: shows DRIFT heatmap (`|python - rust|`)
+- If no Rust data: shows BASELINE ONLY (clearly labeled)
+- Auto-detects BOS attention collapse (>80%) and low entropy warnings
+- Model loaded with `attn_implementation="eager"` for `output_attentions=True`
+
+### Tool: `topo_parity_map` — Automated Drift Analysis (v3.0)
+
+Compares ONE Python activation vs ONE Rust tensor from disk mailbox. Computes MSE, cosine similarity, max/mean abs error, divergence counts.
+
+**When to use:** Pin down exactly WHERE in the transformer the Rust inference diverges from Python ground truth.
+
+**Usage:**
+```
+# Compare layer 0 Q projection
+topo_parity_map(prompt="Hello", layer=0, module="self_attn.q_proj")
+
+# Compare layer 15 FFN output
+topo_parity_map(prompt="Hello", layer=15, module="mlp")
+```
+
+**Features:**
+- Truncation warning if mailbox holds fewer floats than full tensor
+- Verdicts: EXCELLENT (cosine>0.999), GOOD (>0.99), CONCERNING (>0.95), CRITICAL (<0.95)
+- Top-5 worst divergent indices shown with both values
+- 256-sector mailbox reader (supports up to 32768 floats when Rust side expands)
+
 ### Dependencies (py -3.12)
-torch 2.10.0+cpu, transformers 5.3.0, numpy 2.4.3, llama-cpp-python 0.3.16
+torch 2.10.0+cpu, transformers 5.3.0, numpy 2.4.3, matplotlib 3.10.8, llama-cpp-python 0.3.16
