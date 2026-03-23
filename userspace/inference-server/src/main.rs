@@ -347,6 +347,8 @@ fn main() -> ! {
                         meta.context_length,
                         model.tensors.len(),
                     );
+                    println!("[INFERENCE] head_dim={}, kv_heads={}, rope_base={}, inter={}",
+                        meta.head_dim, meta.n_kv_heads, meta.rope_base as u32, meta.intermediate_size);
                     println!("[INFERENCE] BOS={}, EOS={}, vocab_offset={}, merges={}",
                         meta.bos_token_id, meta.eos_token_id, meta.vocab_data_offset, meta.merges_count);
 
@@ -1315,6 +1317,13 @@ fn handle_async_inference(
     let mut input_tokens = [0u32; 512];
     let total_prompt = tokenizer.encode(&prompt_buf[..prompt_len], &mut input_tokens);
     println!("[INFERENCE] Async tokenized: {} tokens", total_prompt);
+    // Debug: print first 10 input token IDs
+    if total_prompt >= 10 {
+        println!("[TOKENS] {} {} {} {} {} {} {} {} {} {}",
+            input_tokens[0], input_tokens[1], input_tokens[2], input_tokens[3],
+            input_tokens[4], input_tokens[5], input_tokens[6], input_tokens[7],
+            input_tokens[8], input_tokens[9]);
+    }
 
     let config = &eng.config;
     let yield_cfg = YieldConfig::foreground();
@@ -1563,6 +1572,11 @@ fn handle_async_inference(
         if gen_idx % 8 == 0 {
             println!("[INFERENCE] Async gen {} tokens, {} bytes streamed", gen_idx + 1, write_idx);
         }
+        // Debug: log first 16 tokens as token_id + decoded text
+        if gen_idx < 16 {
+            let preview = core::str::from_utf8(&tok_buf[..tok_len]).unwrap_or("?");
+            println!("[TOKEN] #{} id={} len={} {:?}", gen_idx, next_token, tok_len, preview);
+        }
     }
 
     // Final health snapshot: write min_mse summary so Python reads the worst point
@@ -1728,16 +1742,14 @@ fn load_model_from_disk() -> Result<(*const u8, usize), &'static str> {
     let mut total_read = 0usize;
     let mut sector = model_start_sector;
 
-    // ULTRA 36: Read in 64-sector DMA bursts (32KB per VirtIO request)
-    let burst_sectors = 64usize;
-    let burst_bytes = burst_sectors * SECTOR_SIZE;
+    // DMA: 128-sector bursts (64KB per VirtIO request), no yielding
+    let burst_sectors = 128usize;
     let total_sectors = sectors_to_read;
     let mut last_progress_mb = 0usize;
     let mut remaining = total_sectors;
-    println!("[INFERENCE] Reading {} sectors ({} MB) via {} DMA bursts...",
+    println!("[INFERENCE] Reading {} sectors ({} MB) via {} DMA bursts (256KB each)...",
         total_sectors, model_size / (1024 * 1024), (total_sectors + burst_sectors - 1) / burst_sectors);
 
-    let mut burst_count = 0u32;
     while remaining > 0 {
         let n = remaining.min(burst_sectors);
         let buf = unsafe {
@@ -1749,16 +1761,10 @@ fn load_model_from_disk() -> Result<(*const u8, usize), &'static str> {
                 total_read += n * SECTOR_SIZE;
                 sector += n as u64;
                 remaining -= n;
-                burst_count += 1;
 
-                // Yield every 4 bursts (128KB) — helps VirtIO interrupt delivery
-                if burst_count % 4 == 0 {
-                    yield_cpu();
-                }
-
-                // Progress logging every 4MB
+                // Progress logging every 32MB
                 let current_mb = total_read / (1024 * 1024);
-                if current_mb >= last_progress_mb + 4 {
+                if current_mb >= last_progress_mb + 32 {
                     println!("[INFERENCE] Loaded {}MB / {}MB",
                         current_mb, model_size / (1024 * 1024));
                     last_progress_mb = current_mb;

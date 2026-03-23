@@ -440,6 +440,12 @@ impl<'a> GgufModel<'a> {
                     if vtype == 6 { metadata.rms_norm_eps = cursor.read_f32()?; }
                     else { cursor.skip_value(vtype)?; }
                 }
+                k if k.ends_with(".attention.key_length") => {
+                    // Explicit head_dim from GGUF (overrides dim/n_heads default)
+                    if vtype == 4 { metadata.head_dim = cursor.read_u32()?; }
+                    else if vtype == 5 { metadata.head_dim = cursor.read_i32()? as u32; }
+                    else { cursor.skip_value(vtype)?; }
+                }
                 "tokenizer.ggml.bos_token_id" => {
                     if vtype == 4 { metadata.bos_token_id = cursor.read_u32()?; }
                     else if vtype == 5 { metadata.bos_token_id = cursor.read_i32()? as u32; }

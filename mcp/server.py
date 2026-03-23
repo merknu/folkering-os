@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Folkering OS - MCP Debug Server v3.0 (Bare-Metal ML Inspection Studio)
+Folkering OS - MCP Debug Server v4.0 (Bare-Metal ML Inspection Studio)
 
 Tools:
   kernel_symbol_lookup    — resolve hex addresses to function names
@@ -10,6 +10,9 @@ Tools:
   python_ref_runner       — PyTorch whitebox oracle with forward hooks (ULTRA 50)
   attention_heatmap       — visual attention heatmap with drift comparison (v3.0)
   topo_parity_map         — automated MSE/cosine drift analysis per layer+module (v3.0)
+  await_serial_log        — watch serial log for regex match, return on first hit
+  run_host_tensor_test    — compile & run isolated Rust tests on host (~1s vs 15min)
+  qmp_memory_dump         — read memory from live QEMU (structs, tensors, globals)
 """
 
 import sys
@@ -453,6 +456,117 @@ TOOLS = [
                     "description": "Health telemetry: 0=off, 1=anomalies only, 2=continuous (default: 0)"
                 }
             }
+        }
+    },
+    {
+        "name": "await_serial_log",
+        "description": (
+            "Watch /tmp/folkering-serial.log for a regex pattern match and return "
+            "immediately when found. Eliminates blind 'sleep 300' waits — get feedback "
+            "the second the OS boots, a PANIC occurs, or inference completes. "
+            "Returns the matching line plus surrounding context lines. "
+            "On timeout, returns the last N lines for debugging. "
+            "QEMU must be running with: -serial file:/tmp/folkering-serial.log"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "Regex pattern to match (e.g. 'Model loaded|PANIC|inference complete')"
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Max seconds to wait (default: 300)",
+                    "default": 300
+                },
+                "context_lines": {
+                    "type": "integer",
+                    "description": "Lines of context before match to include (default: 30)",
+                    "default": 30
+                },
+                "from_start": {
+                    "type": "boolean",
+                    "description": "Scan entire log from beginning (true) or only new content from tail (false). Default: false",
+                    "default": False
+                },
+                "log_path": {
+                    "type": "string",
+                    "description": "Override log file path (default: /tmp/folkering-serial.log)"
+                }
+            },
+            "required": ["pattern"]
+        }
+    },
+    {
+        "name": "run_host_tensor_test",
+        "description": (
+            "Compile and run isolated Rust code on the host machine (via WSL rustc). "
+            "Test libtensor math (RoPE, dequantize, GEMM, RMSNorm, softmax) in ~1 second "
+            "instead of 15 minutes for a full QEMU boot cycle. "
+            "Write a self-contained fn main() — std is available (Vec, println!, assert_eq!, f32, etc.). "
+            "Copy-paste the function under test from libtensor, add test inputs, verify outputs."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "Complete Rust source code with fn main(). std is available."
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Max seconds for compile+run (default: 30)",
+                    "default": 30
+                }
+            },
+            "required": ["code"]
+        }
+    },
+    {
+        "name": "qmp_memory_dump",
+        "description": (
+            "Read memory from a live QEMU instance via QMP. Pauses the VM, reads N values "
+            "at a virtual or physical address, and resumes. "
+            "Inspect struct fields, tensor data, or any memory without adding debug prints "
+            "and rebuilding the OS. Find global addresses via kernel_symbol_lookup (nm). "
+            "Supports hex, float, decimal, and string output formats. "
+            "QEMU must be running with: -qmp unix:/tmp/folkering-qmp.sock,server,nowait"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "address": {
+                    "type": "string",
+                    "description": "Hex address to read (e.g. '0xffffffff80100000')"
+                },
+                "count": {
+                    "type": "integer",
+                    "description": "Number of elements to read (default: 16)",
+                    "default": 16
+                },
+                "format": {
+                    "type": "string",
+                    "enum": ["hex8", "hex16", "hex32", "hex64", "f32", "i32", "u32", "bytes", "string"],
+                    "description": "Output format: hex8/16/32/64=hex at size, f32=float, i32/u32=signed/unsigned decimal (default: hex64)",
+                    "default": "hex64"
+                },
+                "physical": {
+                    "type": "boolean",
+                    "description": "Use physical addressing (xp) instead of virtual (x). Default: false",
+                    "default": False
+                },
+                "pause": {
+                    "type": "boolean",
+                    "description": "Pause VM before reading, resume after (default: true). Set false if already paused.",
+                    "default": True
+                },
+                "qmp_socket": {
+                    "type": "string",
+                    "description": "Override QMP socket path (default: /tmp/folkering-qmp.sock)"
+                }
+            },
+            "required": ["address"]
         }
     }
 ]
@@ -1662,6 +1776,259 @@ def topo_parity_map(
     return "\n".join(lines)
 
 
+# ── Serial Log Watcher (v4.0) ─────────────────────────────────────────────────
+
+_AWAIT_WATCHER_SCRIPT = '''\
+import re, time, sys, os, json
+
+with open(sys.argv[1]) as f:
+    cfg = json.load(f)
+
+PATTERN = re.compile(cfg["pattern"])
+LOG = cfg["log_path"]
+TIMEOUT = cfg["timeout"]
+CTX = cfg["context_lines"]
+FROM_START = cfg["from_start"]
+
+start = time.time()
+context = []
+
+while not os.path.exists(LOG):
+    if time.time() - start > TIMEOUT:
+        print(f"TIMEOUT: {LOG} never appeared after {TIMEOUT}s")
+        sys.exit(1)
+    time.sleep(0.5)
+
+with open(LOG, "r", errors="replace") as f:
+    if not FROM_START:
+        f.seek(0, 2)
+    while True:
+        if time.time() - start > TIMEOUT:
+            elapsed = time.time() - start
+            print(f"TIMEOUT after {elapsed:.1f}s — pattern not found")
+            if context:
+                print(f"--- Last {len(context)} lines ---")
+                for c in context:
+                    print(c)
+            sys.exit(1)
+        line = f.readline()
+        if not line:
+            time.sleep(0.1)
+            continue
+        line = line.rstrip("\\n")
+        context.append(line)
+        if len(context) > CTX:
+            context.pop(0)
+        if PATTERN.search(line):
+            elapsed = time.time() - start
+            print(f"MATCH at {elapsed:.1f}s")
+            print(f"Matched: {line}")
+            print(f"--- Context ({len(context)} lines) ---")
+            for c in context:
+                print(c)
+            sys.exit(0)
+'''
+
+
+def await_serial_log(pattern: str, timeout: int = 300, context_lines: int = 30,
+                     from_start: bool = False, log_path: str | None = None) -> str:
+    """Watch serial log for regex pattern match. Returns on first hit or timeout."""
+
+    lp = log_path or "/tmp/folkering-serial.log"
+
+    # Write config as JSON (avoids all quoting/escaping issues)
+    config = {
+        "pattern": pattern,
+        "log_path": lp,
+        "timeout": timeout,
+        "context_lines": context_lines,
+        "from_start": from_start,
+    }
+
+    config_path = PROJECT_ROOT / "mcp" / "_await_config.json"
+    config_path.write_text(json.dumps(config))
+
+    watcher_path = PROJECT_ROOT / "mcp" / "_await_watcher.py"
+    watcher_path.write_text(_AWAIT_WATCHER_SCRIPT)
+
+    wsl_watcher = _wsl_path(watcher_path)
+    wsl_config = _wsl_path(config_path)
+
+    try:
+        r = subprocess.run(
+            ["wsl", "-d", "Ubuntu-22.04", "python3", wsl_watcher, wsl_config],
+            capture_output=True, text=True, timeout=timeout + 15
+        )
+
+        output = r.stdout.strip()
+        if not output:
+            output = r.stderr.strip()
+
+        if r.returncode == 0:
+            return f"✓ Pattern matched!\n\n{output}"
+        else:
+            return f"✗ No match\n\n{output}"
+
+    except subprocess.TimeoutExpired:
+        return f"TIMEOUT: Watcher process killed after {timeout + 15}s"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+# ── Host Tensor Test Sandbox (v4.0) ──────────────────────────────────────────
+
+def run_host_tensor_test(code: str, timeout: int = 30) -> str:
+    """Compile and run isolated Rust code on the host via WSL rustc."""
+
+    test_path = PROJECT_ROOT / "mcp" / "_tensor_test.rs"
+    test_path.write_text(code)
+
+    wsl_src = _wsl_path(test_path)
+    wsl_bin = "/tmp/folkering-tensor-test"
+
+    # Compile with rustc (not cargo — avoids workspace/config conflicts)
+    # -O for release-mode optimizations (matches libtensor's release build)
+    cmd = f'rustc -O "{wsl_src}" -o "{wsl_bin}" 2>&1 && "{wsl_bin}" 2>&1'
+
+    try:
+        r = subprocess.run(
+            ["wsl", "-e", "bash", "-c", cmd],
+            capture_output=True, text=True, timeout=timeout
+        )
+
+        output = r.stdout.strip()
+        if not output and r.stderr:
+            output = r.stderr.strip()
+
+        if r.returncode == 0:
+            if output:
+                return f"✓ Test passed (exit 0)\n\n{output}"
+            else:
+                return "✓ Test passed (exit 0, no output)"
+        else:
+            return f"✗ Test failed (exit {r.returncode})\n\n{output}"
+
+    except subprocess.TimeoutExpired:
+        return f"TIMEOUT: Compile+run exceeded {timeout}s"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+# ── QMP Memory Dump (v4.0) ───────────────────────────────────────────────────
+
+def qmp_memory_dump(address: str, count: int = 16, fmt: str = "hex64",
+                    physical: bool = False, pause: bool = True,
+                    qmp_socket: str | None = None) -> str:
+    """Read memory from live QEMU via QMP monitor examine command."""
+
+    sock_path = qmp_socket or "/tmp/folkering-qmp.sock"
+
+    # Map format to QEMU examine command suffix (format + size)
+    fmt_map = {
+        "hex8":   "xb",   # hex bytes
+        "hex16":  "xh",   # hex halfwords
+        "hex32":  "xw",   # hex words (32-bit)
+        "hex64":  "xg",   # hex giant (64-bit)
+        "f32":    "fw",   # float words (32-bit IEEE 754)
+        "i32":    "dw",   # signed decimal words
+        "u32":    "uw",   # unsigned decimal words
+        "bytes":  "xb",   # alias for hex8
+        "string": "cb",   # char bytes
+    }
+
+    qemu_fmt = fmt_map.get(fmt, "xg")
+    cmd_prefix = "xp" if physical else "x"
+    examine_cmd = f"{cmd_prefix} /{count}{qemu_fmt} {address}"
+
+    do_pause = "True" if pause else "False"
+
+    py_script = f"""
+import socket, json, time, sys
+
+sock_path = "{sock_path}"
+do_pause = {do_pause}
+
+try:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(5)
+    s.connect(sock_path)
+except FileNotFoundError:
+    print("QMP_ERROR: socket not found at " + sock_path)
+    sys.exit(1)
+except Exception as e:
+    print("QMP_ERROR: " + str(e))
+    sys.exit(1)
+
+def recv_msg(s):
+    data = b""
+    while True:
+        try:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+            try:
+                json.loads(data.decode())
+                break
+            except:
+                pass
+        except socket.timeout:
+            break
+    return data.decode().strip()
+
+def send_recv(s, cmd):
+    s.sendall((json.dumps(cmd) + "\\n").encode())
+    time.sleep(0.05)
+    return recv_msg(s)
+
+# QMP handshake
+recv_msg(s)
+send_recv(s, {{"execute": "qmp_capabilities"}})
+
+if do_pause:
+    send_recv(s, {{"execute": "stop"}})
+    time.sleep(0.05)
+
+r = send_recv(s, {{"execute": "human-monitor-command", "arguments": {{"command-line": "{examine_cmd}"}}}})
+
+if do_pause:
+    send_recv(s, {{"execute": "cont"}})
+
+s.close()
+try:
+    result = json.loads(r).get("return", r)
+    print(result)
+except:
+    print(r)
+""".strip()
+
+    try:
+        result = subprocess.run(
+            ["wsl", "-d", "Ubuntu-22.04", "python3", "-c", py_script],
+            capture_output=True, text=True, timeout=15
+        )
+        output = result.stdout.strip()
+        if not output:
+            output = result.stderr.strip()
+    except subprocess.TimeoutExpired:
+        return "ERROR: QMP query timed out (is QEMU running with -qmp flag?)"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+    if output.startswith("QMP_ERROR: socket not found"):
+        return (
+            f"ERROR: QMP socket not found at {sock_path}\n\n"
+            "Start QEMU with QMP enabled:\n"
+            "  wsl -e bash -c 'cd /mnt/c/Users/merkn/folkering/folkering-os && ./tools/qemu-debug-live.sh'"
+        )
+
+    if output.startswith("QMP_ERROR:"):
+        return f"ERROR: {output}"
+
+    header = f"Memory at {address} ({fmt}, {'physical' if physical else 'virtual'})"
+    return f"{header}\n{'═' * 60}\n{examine_cmd}\n{'─' * 60}\n{output}"
+
+
 # ── MCP dispatch ───────────────────────────────────────────────────────────────
 
 def handle(req: dict) -> dict:
@@ -1674,7 +2041,7 @@ def handle(req: dict) -> dict:
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "folkering-debug", "version": "3.0.0"}
+                "serverInfo": {"name": "folkering-debug", "version": "4.0.0"}
             }
         }
 
@@ -1755,6 +2122,28 @@ def handle(req: dict) -> dict:
                 )
             elif name == "read_activation_health":
                 result = read_activation_health()
+            elif name == "await_serial_log":
+                result = await_serial_log(
+                    pattern=args["pattern"],
+                    timeout=args.get("timeout", 300),
+                    context_lines=args.get("context_lines", 30),
+                    from_start=args.get("from_start", False),
+                    log_path=args.get("log_path"),
+                )
+            elif name == "run_host_tensor_test":
+                result = run_host_tensor_test(
+                    code=args["code"],
+                    timeout=args.get("timeout", 30),
+                )
+            elif name == "qmp_memory_dump":
+                result = qmp_memory_dump(
+                    address=args["address"],
+                    count=args.get("count", 16),
+                    fmt=args.get("format", "hex64"),
+                    physical=args.get("physical", False),
+                    pause=args.get("pause", True),
+                    qmp_socket=args.get("qmp_socket"),
+                )
             else:
                 result = f"Unknown tool: {name}"
         except Exception as e:

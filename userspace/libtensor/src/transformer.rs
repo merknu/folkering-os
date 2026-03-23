@@ -165,20 +165,22 @@ pub fn forward<'a>(
     let kv_dim = n_kv_heads * head_dim;
 
     // Allocate working buffers from arena
+    let qk_dim = n_heads * head_dim; // may differ from dim (e.g., Qwen3: 2048 vs 1024)
     let x = arena.alloc_f32(dim)?;           // current hidden state
     let xb = arena.alloc_f32(dim)?;          // after RMSNorm
-    let q = arena.alloc_f32(n_heads * head_dim)?;    // queries
+    let q = arena.alloc_f32(qk_dim)?;               // queries
     let k = arena.alloc_f32(kv_dim)?;                // keys
     let v = arena.alloc_f32(kv_dim)?;                // values
-    let attn_out = arena.alloc_f32(dim)?;             // attention output
+    let attn_out = arena.alloc_f32(qk_dim)?;          // attention output (n_heads * head_dim)
     let ffn_buf1 = arena.alloc_f32(config.intermediate_size)?; // gate
     let ffn_buf2 = arena.alloc_f32(config.intermediate_size)?; // up
     let xb2 = arena.alloc_f32(dim)?;         // after FFN norm
     let logits = arena.alloc_f32(config.vocab_size)?; // output logits
 
     // Q8_0 scratch buffer for quantized activations (used by gemm_q4_q8)
-    // Max size needed: intermediate_size (1536) → 48 blocks × 34 bytes = 1632
-    let q8_max_blocks = config.intermediate_size / 32;
+    // Must fit max(qk_dim, intermediate_size) values
+    let q8_max_vals = if qk_dim > config.intermediate_size { qk_dim } else { config.intermediate_size };
+    let q8_max_blocks = q8_max_vals / 32;
     let q8_buf = arena.alloc_slice::<u8>(q8_max_blocks * quantize::Q8_0_BLOCK_SIZE)?;
 
     // Scratch buffers for dequantizing Q8_0 KV-cache entries (one head at a time)
@@ -203,10 +205,10 @@ pub fn forward<'a>(
 
         // 2. Q/K/V projections: quantize xb to Q8_0, then use integer dot product
         // This matches llama.cpp's approach and avoids f32 accumulation drift.
-        for i in 0..n_heads * head_dim { q[i] = 0.0; }
+        for i in 0..qk_dim { q[i] = 0.0; }
         for i in 0..kv_dim { k[i] = 0.0; v[i] = 0.0; }
         quantize::quantize_f32_to_q8_0(xb, q8_buf);
-        gemm::gemm_q4_q8(q, q8_buf, lw.wq, 1, dim, n_heads * head_dim,
+        gemm::gemm_q4_q8(q, q8_buf, lw.wq, 1, dim, qk_dim,
             FuseOp::None, yield_cfg.gemm_yield);
         gemm::gemm_q4_q8(k, q8_buf, lw.wk, 1, dim, kv_dim,
             FuseOp::None, yield_cfg.gemm_yield);
@@ -224,8 +226,8 @@ pub fn forward<'a>(
         let seq_len = kv_cache.layer(layer).active_length();
         let kv_group_size = n_heads / n_kv_heads; // for GQA
 
-        // Zero attention output
-        for i in 0..dim { attn_out[i] = 0.0; }
+        // Zero attention output (qk_dim, may be > dim for GQA models)
+        for i in 0..qk_dim { attn_out[i] = 0.0; }
 
         for h in 0..n_heads {
             let kv_h = h / kv_group_size; // KV head for this Q head
@@ -277,9 +279,10 @@ pub fn forward<'a>(
         }
 
         // 6. Output projection (attn_out × Wo → xb)
+        // Wo: [qk_dim × dim] — projects from attention space back to embed space
         for i in 0..dim { xb[i] = 0.0; }
-        quantize::quantize_f32_to_q8_0(attn_out, q8_buf);
-        gemm::gemm_q4_q8(xb, q8_buf, lw.wo, 1, dim, dim,
+        quantize::quantize_f32_to_q8_0(&attn_out[..qk_dim], q8_buf);
+        gemm::gemm_q4_q8(xb, q8_buf, lw.wo, 1, qk_dim, dim,
             FuseOp::None, yield_cfg.gemm_yield);
 
         // 7. Residual connection
@@ -373,9 +376,11 @@ pub fn forward_prefill_batch(
     let qk_dim = n_heads * head_dim;
     let intermediate = config.intermediate_size;
 
-    // Q8_0 row size for dim-length vectors
+    // Q8_0 row sizes for various vector lengths
     let q8_blocks = dim / 32;
     let q8_row_bytes = q8_blocks * quantize::Q8_0_BLOCK_SIZE;
+    let q8_qk_blocks = qk_dim / 32;
+    let q8_qk_row_bytes = q8_qk_blocks * quantize::Q8_0_BLOCK_SIZE;
     // Q8_0 row size for intermediate-length vectors (FFN down proj)
     let q8_inter_blocks = intermediate / 32;
     let q8_inter_row_bytes = q8_inter_blocks * quantize::Q8_0_BLOCK_SIZE;
@@ -386,9 +391,11 @@ pub fn forward_prefill_batch(
     let q_batch   = arena.alloc_f32(batch * qk_dim)?;
     let k_batch   = arena.alloc_f32(batch * kv_dim)?;
     let v_batch   = arena.alloc_f32(batch * kv_dim)?;
-    let attn_out  = arena.alloc_f32(dim)?;             // per-token (Phase B reuse)
+    let attn_out  = arena.alloc_f32(qk_dim)?;            // per-token (Phase B reuse, n_heads*head_dim)
     let xb_single = arena.alloc_f32(dim)?;             // per-token scratch
-    let q8_batch  = arena.alloc_slice::<u8>(batch * q8_row_bytes)?;
+    // Q8 batch: each token needs max(q8_row_bytes, q8_qk_row_bytes) for Wo projection
+    let q8_per_tok = if q8_qk_row_bytes > q8_row_bytes { q8_qk_row_bytes } else { q8_row_bytes };
+    let q8_batch  = arena.alloc_slice::<u8>(batch * q8_per_tok)?;
 
     // Phase C buffers
     let xb2_batch  = arena.alloc_f32(batch * dim)?;
@@ -428,7 +435,7 @@ pub fn forward_prefill_batch(
             ops::rmsnorm_into(x_row, lw.attn_norm, xb_row, config.rms_norm_eps);
 
             // Quantize per-token (NEVER across token boundaries)
-            let q8_row = &mut q8_batch[i * q8_row_bytes..(i + 1) * q8_row_bytes];
+            let q8_row = &mut q8_batch[i * q8_per_tok..i * q8_per_tok + q8_row_bytes];
             quantize::quantize_f32_to_q8_0(xb_row, q8_row);
 
             // Q/K/V GEMMs — wq/wk/wv stay in L2 from previous iteration
@@ -476,7 +483,7 @@ pub fn forward_prefill_batch(
 
             // Multi-head attention
             let seq_len = kv_cache.layer(layer).active_length();
-            for j in 0..dim { attn_out[j] = 0.0; }
+            for j in 0..qk_dim { attn_out[j] = 0.0; }
 
             for h in 0..n_heads {
                 let kv_h = h / kv_group_size;
@@ -518,11 +525,14 @@ pub fn forward_prefill_batch(
                 }
             }
 
-            // Output projection: attn_out × Wo → xb_single
+            // Output projection: attn_out (qk_dim) × Wo (qk_dim × dim) → xb_single (dim)
             for j in 0..dim { xb_single[j] = 0.0; }
-            let q8_row = &mut q8_batch[i * q8_row_bytes..(i + 1) * q8_row_bytes];
-            quantize::quantize_f32_to_q8_0(attn_out, q8_row);
-            gemm::gemm_q4_q8(xb_single, q8_row, lw.wo, 1, dim, dim,
+            // Need q8 buffer for qk_dim values — use dedicated scratch
+            let q8_wo_blocks = qk_dim / 32;
+            let q8_wo_bytes = q8_wo_blocks * quantize::Q8_0_BLOCK_SIZE;
+            let q8_wo = &mut q8_batch[i * q8_per_tok..i * q8_per_tok + q8_wo_bytes];
+            quantize::quantize_f32_to_q8_0(&attn_out[..qk_dim], q8_wo);
+            gemm::gemm_q4_q8(xb_single, q8_wo, lw.wo, 1, qk_dim, dim,
                 FuseOp::None, yield_cfg.gemm_yield);
 
             // Attention residual
@@ -544,7 +554,7 @@ pub fn forward_prefill_batch(
             ops::rmsnorm_into(x_row, lw.ffn_norm, xb2_row, config.rms_norm_eps);
 
             // Quantize per-token
-            let q8_row = &mut q8_batch[i * q8_row_bytes..(i + 1) * q8_row_bytes];
+            let q8_row = &mut q8_batch[i * q8_per_tok..i * q8_per_tok + q8_row_bytes];
             quantize::quantize_f32_to_q8_0(xb2_row, q8_row);
 
             // Gate projection (with fused SiLU)

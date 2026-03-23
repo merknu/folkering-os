@@ -125,15 +125,15 @@ static CAPACITY_SECTORS: AtomicU64 = AtomicU64::new(0);
 /// Journal write position (circular)
 static JOURNAL_POS: AtomicU64 = AtomicU64::new(0);
 
-/// Maximum sectors per multi-sector DMA burst (ULTRA 36)
-/// 64 sectors × 512 bytes = 32KB per VirtIO request
-pub const MAX_BURST_SECTORS: usize = 64;
+/// Maximum sectors per multi-sector DMA burst
+/// 128 sectors × 512 bytes = 64KB per VirtIO request
+pub const MAX_BURST_SECTORS: usize = 128;
 
-/// Size of the DMA burst buffer in bytes
-const BURST_BUF_SIZE: usize = MAX_BURST_SECTORS * SECTOR_SIZE; // 32KB
+/// Size of the DMA burst buffer in bytes (256KB)
+const BURST_BUF_SIZE: usize = MAX_BURST_SECTORS * SECTOR_SIZE;
 
-/// Number of pages for the burst buffer
-const BURST_BUF_PAGES: usize = BURST_BUF_SIZE / 4096; // 8 pages
+/// Number of pages for the burst buffer (64 pages)
+const BURST_BUF_PAGES: usize = BURST_BUF_SIZE / 4096;
 
 struct VirtioBlkDevice {
     /// BAR0 I/O port base
