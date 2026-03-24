@@ -150,16 +150,13 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
         }
         serial_strln!("[INIT] PIC disabled (all IRQs masked)");
 
-        // Initialize ACPI for CPU topology discovery
-        serial_strln!("[INIT] Parsing ACPI MADT for CPU topology...");
+        // Initialize ACPI (for future use)
         arch::x86_64::acpi_init(boot_info.rsdp_addr);
 
-        // Boot Application Processors for parallel GEMM
-        if arch::x86_64::acpi::AP_COUNT.load(core::sync::atomic::Ordering::Relaxed) > 0 {
-            serial_strln!("[INIT] Installing AP trampoline...");
-            arch::x86_64::smp::install_trampoline();
-            serial_strln!("[INIT] Booting Application Processors...");
-            arch::x86_64::smp::boot_aps();
+        // Boot APs via Limine SMP for parallel GEMM
+        if let Some(smp) = boot_info.smp_response {
+            serial_strln!("[INIT] Booting APs via Limine SMP...");
+            arch::x86_64::smp::boot_aps_limine(smp);
         }
 
         // Initialize PCI bus enumeration
@@ -676,6 +673,8 @@ pub mod boot {
         pub initrd_start: usize,
         /// Size of the initrd in bytes
         pub initrd_size: usize,
+        /// Limine SMP response (if available)
+        pub smp_response: Option<&'static limine::response::SmpResponse>,
     }
 }
 

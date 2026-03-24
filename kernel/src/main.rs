@@ -6,7 +6,8 @@
 use limine::BaseRevision;
 use limine::request::{
     RequestsStartMarker, RequestsEndMarker,
-    FramebufferRequest, MemoryMapRequest, HhdmRequest, RsdpRequest, ModuleRequest
+    FramebufferRequest, MemoryMapRequest, HhdmRequest, RsdpRequest, ModuleRequest,
+    SmpRequest,
 };
 
 // Import kernel library
@@ -41,6 +42,11 @@ static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
 #[used]
 #[link_section = ".requests"]
 static MODULE_REQUEST: ModuleRequest = ModuleRequest::new();
+
+// Request SMP (multi-processor boot)
+#[used]
+#[link_section = ".requests"]
+static SMP_REQUEST: SmpRequest = SmpRequest::new();
 
 // Request markers
 #[used]
@@ -1627,6 +1633,15 @@ unsafe extern "C" fn kmain() -> ! {
         0
     };
 
+    // Get SMP response — Limine handles AP trampoline for us
+    let smp_response = SMP_REQUEST.get_response();
+    if let Some(ref smp) = smp_response {
+        let cpus = smp.cpus();
+        serial_write("[SMP] Limine SMP: CPUs found, BSP LAPIC ID available\n");
+    } else {
+        serial_write("[SMP] No SMP response from Limine\n");
+    }
+
     // Try to get memory map entries directly
     // The Limine crate returns the entries as a slice, which should be accessible
     // since Limine has already set up page tables with HHDM mapping
@@ -1741,6 +1756,7 @@ unsafe extern "C" fn kmain() -> ! {
         memory_map: memory_map_slice,
         initrd_start,
         initrd_size,
+        smp_response,
     };
 
     serial_write("[Folkering OS] Boot info ready, calling kernel_main...\n\n");
