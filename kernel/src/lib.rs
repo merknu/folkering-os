@@ -92,6 +92,23 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
         drivers::serial::write_dec((stats.free_bytes / (1024 * 1024)) as u32);
         serial_strln!(" MB\n");
 
+        // Enable AVX on BSP: set CR4.OSXSAVE, then configure XCR0
+        {
+            let mut cr4: u64;
+            core::arch::asm!("mov {}, cr4", out(reg) cr4);
+            cr4 |= (1 << 9) | (1 << 10) | (1 << 18); // OSFXSR + OSXMMEXCPT + OSXSAVE
+            core::arch::asm!("mov cr4, {}", in(reg) cr4);
+            // Enable x87 + SSE + AVX in XCR0
+            core::arch::asm!(
+                "xor ecx, ecx",
+                "xgetbv",
+                "or eax, 7",
+                "xsetbv",
+                out("eax") _, out("ecx") _, out("edx") _,
+            );
+            serial_strln!("[INIT] AVX/SSE enabled via CR4.OSXSAVE + XCR0");
+        }
+
         // Initialize GDT and TSS
         serial_strln!("[INIT] Initializing GDT and TSS...");
         arch::x86_64::gdt_init();

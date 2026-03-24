@@ -261,6 +261,20 @@ pub unsafe extern "C" fn debug_after_preempt_handler(_ctx: u64) {
 ///   [RSP+8]   cs     (pushed by CPU)
 ///   [RSP+16]  rflags (pushed by CPU)
 #[unsafe(naked)]
+/// AP wake timer handler (vector 48) — just send EOI and return.
+/// APs use this to wake from HLT without triggering task preemption.
+// AP wake timer (vector 48) — EOI + iretq, no task preemption
+core::arch::global_asm!(
+    ".global irq_ap_timer",
+    "irq_ap_timer:",
+    "push rax",
+    "mov dword ptr [0xFFFFFFFFFEE000B0], 0",
+    "pop rax",
+    "iretq",
+);
+extern "C" { fn irq_ap_timer(); }
+
+#[unsafe(naked)]
 extern "C" fn irq_timer() {
     core::arch::naked_asm!(
         // First, check if we came from userspace by looking at CS on stack
@@ -1521,6 +1535,8 @@ unsafe fn init_idt() {
     IDT[44].set_handler(core::mem::transmute(irq_mouse as *const ()));
     // VirtIO block device (vector 45, routed via IOAPIC from PCI IRQ)
     IDT[45].set_handler(core::mem::transmute(irq_virtio_blk as *const ()));
+    // AP wake timer (vector 48) — just sends EOI, no task preemption
+    IDT[48].set_handler(core::mem::transmute(irq_ap_timer as *const ()));
     // Special vectors
     IDT[128].set_handler(core::mem::transmute(vec_128 as *const ())); // INT 0x80
     IDT[254].set_handler(core::mem::transmute(vec_254 as *const ()));

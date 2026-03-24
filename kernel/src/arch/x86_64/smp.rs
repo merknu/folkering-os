@@ -44,8 +44,7 @@ static WORK_DONE: [AtomicU8; MAX_CPUS] = {
     [INIT; MAX_CPUS]
 };
 
-/// Page table (CR3) workers should load to access userspace memory
-static WORKER_CR3: AtomicU64 = AtomicU64::new(0);
+// No WORKER_CR3 — APs keep Limine's page table. Pointers are HHDM-translated.
 
 // --- Limine SMP Boot ---
 
@@ -108,13 +107,33 @@ unsafe extern "C" fn ap_entry_limine(cpu: &limine::mp::Cpu) -> ! {
     write_volatile((apic_virt + 0xF0) as *mut u32,
         read_volatile((apic_virt + 0xF0) as *const u32) | 0x1FF);
     write_volatile((apic_virt + 0x80) as *mut u32, 0);     // TPR = 0
-    write_volatile((apic_virt + 0x320) as *mut u32, 0x10000); // Mask timer
 
-    // Enable SSE/AVX via CR4
+    // Enable timer on AP (1ms interval) to wake from HLT
+    // Use vector 48 (0x30) — NOT 32 which is BSP's preemption timer!
+    // Vector 48 handler just sends EOI, no task preemption
+    write_volatile((apic_virt + 0x3E0) as *mut u32, 0x3);  // Divide by 16
+    write_volatile((apic_virt + 0x320) as *mut u32, 0x20000 | 48); // Periodic, vector 48
+    write_volatile((apic_virt + 0x380) as *mut u32, 62500); // ~1ms at 1GHz/16
+
+    // Enable SSE + AVX via CR4
     let mut cr4: u64;
     core::arch::asm!("mov {}, cr4", out(reg) cr4);
-    cr4 |= (1 << 9) | (1 << 10); // OSFXSR + OSXMMEXCPT
+    cr4 |= (1 << 9)   // OSFXSR — enable FXSAVE/FXRSTOR
+         | (1 << 10)   // OSXMMEXCPT — enable #XM for SIMD exceptions
+         | (1 << 18);  // OSXSAVE — enable XSAVE/XGETBV (required for AVX)
     core::arch::asm!("mov cr4, {}", in(reg) cr4);
+
+    // Enable AVX state in XCR0 (only if OSXSAVE worked)
+    // XCR0 bit 0 = x87, bit 1 = SSE, bit 2 = AVX
+    core::arch::asm!(
+        "xor ecx, ecx",  // XCR0
+        "xgetbv",
+        "or eax, 7",     // Enable x87 + SSE + AVX
+        "xsetbv",
+        out("eax") _,
+        out("ecx") _,
+        out("edx") _,
+    );
 
     // Set MXCSR
     let mxcsr: u32 = 0x1F80;
@@ -134,30 +153,17 @@ fn ap_worker_loop(cpu_index: usize) -> ! {
     crate::drivers::serial::write_dec(cpu_index as u32);
     crate::serial_str!("] Worker loop entered\n");
 
+    // Enable interrupts so APIC timer can wake us from HLT
+    unsafe { core::arch::asm!("sti"); }
+
     loop {
+        // HLT-based wait: timer wakes us every ~1ms, we check flag, then HLT again
         while WORK_READY[cpu_index].load(Ordering::Acquire) == 0 {
-            core::hint::spin_loop();
+            unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
         }
 
-        crate::serial_str!("[AP");
-        crate::drivers::serial::write_dec(cpu_index as u32);
-        crate::serial_str!("] Got work\n");
-
-        let cr3 = WORKER_CR3.load(Ordering::Acquire);
-
-        crate::serial_str!("[AP");
-        crate::drivers::serial::write_dec(cpu_index as u32);
-        crate::serial_str!("] Switching CR3 to ");
-        crate::drivers::serial::write_hex(cr3);
-        crate::drivers::serial::write_newline();
-
-        if cr3 != 0 {
-            unsafe { core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack)); }
-        }
-
-        crate::serial_str!("[AP");
-        crate::drivers::serial::write_dec(cpu_index as u32);
-        crate::serial_str!("] CR3 switched, executing GEMM\n");
+        // NO CR3 swap! Pointers in WORK_ITEMS are already HHDM-translated
+        // by the BSP in dispatch_parallel_gemm.
 
         let work = unsafe { &WORK_ITEMS[cpu_index] };
         unsafe { execute_gemm_work(work); }
@@ -187,12 +193,23 @@ pub fn dispatch_parallel_gemm(
         return -1;
     }
 
+    // Translate userspace pointers to HHDM addresses so APs can access them
+    // without switching CR3. BSP walks the task's page table to find physical
+    // addresses, then adds HHDM offset.
+    let hhdm = crate::memory::paging::hhdm_offset() as u64;
+    let input_hhdm = virt_to_hhdm(task_cr3, input_ptr, hhdm);
+    let weight_hhdm = virt_to_hhdm(task_cr3, weight_ptr, hhdm);
+    let output_hhdm = virt_to_hhdm(task_cr3, output_ptr, hhdm);
+
+    if input_hhdm == 0 || weight_hhdm == 0 || output_hhdm == 0 {
+        crate::serial_str!("[PGEMM] HHDM translation failed!\n");
+        return -1;
+    }
+
     let total_workers = num_aps + 1;
     let n_usize = n as usize;
     let cols_per_worker = n_usize / total_workers;
     let remainder = n_usize % total_workers;
-
-    WORKER_CR3.store(task_cr3, Ordering::Release);
 
     let mut col = 0usize;
     let bsp_cols = cols_per_worker + if 0 < remainder { 1 } else { 0 };
@@ -206,7 +223,9 @@ pub fn dispatch_parallel_gemm(
 
         unsafe {
             WORK_ITEMS[worker_idx] = GemmWork {
-                input_ptr, weight_ptr, output_ptr,
+                input_ptr: input_hhdm,   // HHDM-translated for APs
+                weight_ptr: weight_hhdm,
+                output_ptr: output_hhdm,
                 k, n,
                 col_start: col as u32,
                 col_end: (col + my_cols) as u32,
@@ -228,10 +247,12 @@ pub fn dispatch_parallel_gemm(
         quant_type,
     };
 
-    crate::serial_str!("[PGEMM] BSP start cols ");
+    crate::serial_str!("[PGEMM] BSP cols ");
     crate::drivers::serial::write_dec(bsp_col_start as u32);
     crate::serial_str!("-");
     crate::drivers::serial::write_dec((bsp_col_start + bsp_cols) as u32);
+    crate::serial_str!(" AVX2=");
+    crate::drivers::serial::write_dec(if has_avx2() { 1 } else { 0 });
     crate::drivers::serial::write_newline();
 
     unsafe { execute_gemm_work(&bsp_work); }
@@ -262,6 +283,56 @@ pub fn dispatch_parallel_gemm(
     }
 
     0
+}
+
+// --- Page Table Walk: userspace virt → HHDM virt ---
+
+/// Walk a 4-level page table to translate a userspace virtual address to
+/// an HHDM virtual address. Returns 0 on failure (unmapped).
+fn virt_to_hhdm(cr3: u64, virt: u64, hhdm: u64) -> u64 {
+    let pml4_phys = cr3 & !0xFFF;
+    let pml4_idx = ((virt >> 39) & 0x1FF) as usize;
+    let pdpt_idx = ((virt >> 30) & 0x1FF) as usize;
+    let pd_idx = ((virt >> 21) & 0x1FF) as usize;
+    let pt_idx = ((virt >> 12) & 0x1FF) as usize;
+    let page_off = (virt & 0xFFF) as usize;
+
+    unsafe {
+        // PML4 → PDPT
+        let pml4 = (hhdm + pml4_phys) as *const u64;
+        let pml4e = *pml4.add(pml4_idx);
+        if pml4e & 1 == 0 { return 0; } // Not present
+
+        // PDPT → PD (or 1GB hugepage)
+        let pdpt_phys = pml4e & 0x000F_FFFF_FFFF_F000;
+        let pdpt = (hhdm + pdpt_phys) as *const u64;
+        let pdpte = *pdpt.add(pdpt_idx);
+        if pdpte & 1 == 0 { return 0; }
+        if pdpte & (1 << 7) != 0 {
+            // 1GB hugepage
+            let page_phys = pdpte & 0x000F_FFFF_C000_0000;
+            return hhdm + page_phys + (virt & 0x3FFF_FFFF);
+        }
+
+        // PD → PT (or 2MB hugepage)
+        let pd_phys = pdpte & 0x000F_FFFF_FFFF_F000;
+        let pd = (hhdm + pd_phys) as *const u64;
+        let pde = *pd.add(pd_idx);
+        if pde & 1 == 0 { return 0; }
+        if pde & (1 << 7) != 0 {
+            // 2MB hugepage
+            let page_phys = pde & 0x000F_FFFF_FFE0_0000;
+            return hhdm + page_phys + (virt & 0x1F_FFFF);
+        }
+
+        // PT → Physical page
+        let pt_phys = pde & 0x000F_FFFF_FFFF_F000;
+        let pt = (hhdm + pt_phys) as *const u64;
+        let pte = *pt.add(pt_idx);
+        if pte & 1 == 0 { return 0; }
+        let page_phys = pte & 0x000F_FFFF_FFFF_F000;
+        hhdm + page_phys + page_off as u64
+    }
 }
 
 // --- GEMM Execution ---
