@@ -330,7 +330,7 @@ pub fn gemm_f32_x_q8(
 
 /// f32 input × Q6_K weights → f32 output.
 /// Used for output projection in Qwen3 (token_embd and output are Q6_K).
-/// Dequantizes Q6_K blocks on-the-fly and accumulates dot products.
+/// Dequantizes Q6_K blocks on-the-fly, then AVX2 FMA dot product.
 pub fn gemm_f32_x_q6k(
     c: &mut [f32],
     a_f32: &[f32],
@@ -343,7 +343,6 @@ pub fn gemm_f32_x_q6k(
     let n_blocks = k / Q6_K_BLOCK_VALUES; // 256 values per Q6_K block
     let q6k_row_bytes = n_blocks * Q6_K_BLOCK_SIZE;
 
-    // Temporary buffer for dequantized block values
     let mut dequant_buf = [0.0f32; Q6_K_BLOCK_VALUES];
 
     for row in 0..m {
@@ -357,12 +356,25 @@ pub fn gemm_f32_x_q6k(
                 let blk_start = b_col_offset + blk * Q6_K_BLOCK_SIZE;
                 let block = &b_q6k[blk_start..blk_start + Q6_K_BLOCK_SIZE];
 
-                // Dequantize Q6_K block to f32
                 quantize::dequantize_q6_k_block(block, &mut dequant_buf);
 
-                // Dot product with input
                 let a_base = blk * Q6_K_BLOCK_VALUES;
                 let vals = Q6_K_BLOCK_VALUES.min(k - a_base);
+
+                // AVX2 FMA: 8 f32 per cycle, 32 iterations for 256 values
+                #[cfg(target_arch = "x86_64")]
+                if simd::has_avx2() && vals == 256 {
+                    acc += unsafe {
+                        dot_f32_block_avx2(
+                            a_row.as_ptr().add(a_base),
+                            dequant_buf.as_ptr(),
+                            256,
+                        )
+                    };
+                    continue;
+                }
+
+                // Scalar fallback
                 for i in 0..vals {
                     acc += a_row[a_base + i] * dequant_buf[i];
                 }
@@ -375,6 +387,45 @@ pub fn gemm_f32_x_q6k(
             libfolk::sys::yield_cpu();
         }
     }
+}
+
+/// AVX2 FMA dot product over `count` f32 elements.
+/// count must be a multiple of 8. Pointers must be valid for `count` reads.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn dot_f32_block_avx2(a: *const f32, b: *const f32, count: usize) -> f32 {
+    use core::arch::x86_64::*;
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut acc2 = _mm256_setzero_ps();
+    let mut acc3 = _mm256_setzero_ps();
+    let mut i = 0;
+    // 4-way unroll: process 32 floats per iteration (4 × 8)
+    while i + 32 <= count {
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a.add(i)),      _mm256_loadu_ps(b.add(i)),      acc0);
+        acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(a.add(i + 8)),  _mm256_loadu_ps(b.add(i + 8)),  acc1);
+        acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(a.add(i + 16)), _mm256_loadu_ps(b.add(i + 16)), acc2);
+        acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(a.add(i + 24)), _mm256_loadu_ps(b.add(i + 24)), acc3);
+        i += 32;
+    }
+    // Remaining 8-wide chunks
+    while i + 8 <= count {
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a.add(i)), _mm256_loadu_ps(b.add(i)), acc0);
+        i += 8;
+    }
+    // Combine accumulators
+    acc0 = _mm256_add_ps(acc0, acc1);
+    acc2 = _mm256_add_ps(acc2, acc3);
+    acc0 = _mm256_add_ps(acc0, acc2);
+    // Horizontal sum of 8 f32 values
+    let hi = _mm256_extractf128_ps(acc0, 1);
+    let lo = _mm256_castps256_ps128(acc0);
+    let sum128 = _mm_add_ps(lo, hi);
+    let shuf = _mm_movehdup_ps(sum128);
+    let sums = _mm_add_ps(sum128, shuf);
+    let shuf2 = _mm_movehl_ps(sums, sums);
+    let final_sum = _mm_add_ss(sums, shuf2);
+    _mm_cvtss_f32(final_sum)
 }
 
 /// f32 input × Q4_1 weights → f32 output.
@@ -393,6 +444,7 @@ pub fn gemm_f32_x_q4_1(
 ) {
     let n_blocks = k / 32;
     let q4_1_row_bytes = n_blocks * Q4_1_BLOCK_SIZE;
+    let mut dequant_buf = [0.0f32; 32];
 
     for row in 0..m {
         if yield_every > 0 && row > 0 && row % yield_every == 0 {
@@ -406,27 +458,31 @@ pub fn gemm_f32_x_q4_1(
 
             for blk in 0..n_blocks {
                 let blk_start = b_col_offset + blk * Q4_1_BLOCK_SIZE;
-                let d = quantize::f16_to_f32(u16::from_le_bytes([
-                    b_q4_1[blk_start], b_q4_1[blk_start + 1],
-                ]));
-                let min = quantize::f16_to_f32(u16::from_le_bytes([
-                    b_q4_1[blk_start + 2], b_q4_1[blk_start + 3],
-                ]));
                 let a_base = blk * 32;
 
-                // Q4_1: lo nibbles → first half, hi nibbles → second half
-                // value = nibble * d + m
-                // dot = sum(a[i] * (nib[i] * d + m)) = d * sum(a[i]*nib[i]) + m * sum(a[i])
-                let mut sum_a_nib = 0.0f32;
-                let mut sum_a = 0.0f32;
-                for i in 0..16 {
-                    let byte = b_q4_1[blk_start + 4 + i];
-                    let lo = (byte & 0x0F) as f32;
-                    let hi = ((byte >> 4) & 0x0F) as f32;
-                    sum_a_nib += a_row[a_base + i] * lo + a_row[a_base + 16 + i] * hi;
-                    sum_a += a_row[a_base + i] + a_row[a_base + 16 + i];
+                // Dequantize Q4_1 block to f32
+                quantize::dequantize_q4_1_block(
+                    &b_q4_1[blk_start..blk_start + Q4_1_BLOCK_SIZE],
+                    &mut dequant_buf,
+                );
+
+                // AVX2: 4 iterations of 8 f32 = 32 values
+                #[cfg(target_arch = "x86_64")]
+                if simd::has_avx2() {
+                    acc += unsafe {
+                        dot_f32_block_avx2(
+                            a_row.as_ptr().add(a_base),
+                            dequant_buf.as_ptr(),
+                            32,
+                        )
+                    };
+                    continue;
                 }
-                acc += d * sum_a_nib + min * sum_a;
+
+                // Scalar fallback
+                for i in 0..32 {
+                    acc += a_row[a_base + i] * dequant_buf[i];
+                }
             }
 
             let idx = row * n + col;
