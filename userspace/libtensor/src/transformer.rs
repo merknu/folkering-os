@@ -82,10 +82,11 @@ pub struct ModelWeights<'a> {
     pub output_quant: OutputQuant,
 }
 
-/// Quantization format for the output projection weight
-#[derive(Clone, Copy, PartialEq)]
+/// Quantization format for weight tensors
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum OutputQuant {
     Q4_0,
+    Q4_1,
     Q8_0,
     Q6_K,
 }
@@ -101,6 +102,11 @@ pub struct LayerWeights<'a> {
     pub wk: &'a [u8],
     pub wv: &'a [u8],
 
+    /// QK-norm weights: [head_dim] f32 (Qwen3 — per-head RMSNorm before RoPE)
+    /// Empty slices if model doesn't use QK-norm
+    pub q_norm: &'a [f32],
+    pub k_norm: &'a [f32],
+
     /// Attention output projection: [(n_heads * head_dim) × embed_dim] Q4_0
     pub wo: &'a [u8],
 
@@ -111,8 +117,10 @@ pub struct LayerWeights<'a> {
     pub w_gate: &'a [u8],
     /// FFN up projection: [embed_dim × intermediate_size] Q4_0
     pub w_up: &'a [u8],
-    /// FFN down projection: [intermediate_size × embed_dim] Q4_0
+    /// FFN down projection: [intermediate_size × embed_dim] Q4_0 or Q4_1
     pub w_down: &'a [u8],
+    /// Quantization format of w_down (Q4_0 default, Q4_1 for Qwen3)
+    pub w_down_quant: OutputQuant,
 }
 
 /// Yield frequency configuration (ULTRA 3, 6)
@@ -215,7 +223,21 @@ pub fn forward<'a>(
         gemm::gemm_q4_q8(v, q8_buf, lw.wv, 1, dim, kv_dim,
             FuseOp::None, yield_cfg.gemm_yield);
 
-        // 3. RoPE on Q and K
+        // 3. QK-Norm (Qwen3): per-head RMSNorm on Q and K before RoPE
+        if !lw.q_norm.is_empty() {
+            for h in 0..n_heads {
+                let off = h * head_dim;
+                ops::rmsnorm(&mut q[off..off + head_dim], lw.q_norm, config.rms_norm_eps);
+            }
+        }
+        if !lw.k_norm.is_empty() {
+            for h in 0..n_kv_heads {
+                let off = h * head_dim;
+                ops::rmsnorm(&mut k[off..off + head_dim], lw.k_norm, config.rms_norm_eps);
+            }
+        }
+
+        // 4. RoPE on Q and K
         ops::rope_inplace(q, head_dim, pos, config.rope_base);
         ops::rope_inplace(k, head_dim, pos, config.rope_base);
 
@@ -315,9 +337,19 @@ pub fn forward<'a>(
 
         // 4. Down projection (quantize gate*up, then GEMM)
         for i in 0..dim { xb[i] = 0.0; }
-        quantize::quantize_f32_to_q8_0(ffn_buf1, q8_buf);
-        gemm::gemm_q4_q8(xb, q8_buf, lw.w_down, 1, config.intermediate_size, dim,
-            FuseOp::None, yield_cfg.gemm_yield);
+        match lw.w_down_quant {
+            OutputQuant::Q4_1 => {
+                // Q4_1: use f32 × Q4_1 GEMM directly (no Q8_0 quantization needed)
+                gemm::gemm_f32_x_q4_1(xb, ffn_buf1, lw.w_down, 1, config.intermediate_size, dim,
+                    FuseOp::None, yield_cfg.gemm_yield, arena);
+            }
+            _ => {
+                // Q4_0 (default): quantize activations to Q8_0 first
+                quantize::quantize_f32_to_q8_0(ffn_buf1, q8_buf);
+                gemm::gemm_q4_q8(xb, q8_buf, lw.w_down, 1, config.intermediate_size, dim,
+                    FuseOp::None, yield_cfg.gemm_yield);
+            }
+        }
 
         // 5. Residual connection
         for i in 0..dim { x[i] += xb[i]; }
@@ -340,6 +372,10 @@ pub fn forward<'a>(
         }
         OutputQuant::Q4_0 => {
             gemm::gemm_f32_x_q4(logits, x, weights.output_weight, 1, dim, config.vocab_size,
+                FuseOp::None, yield_cfg.gemm_yield, arena);
+        }
+        OutputQuant::Q4_1 => {
+            gemm::gemm_f32_x_q4_1(logits, x, weights.output_weight, 1, dim, config.vocab_size,
                 FuseOp::None, yield_cfg.gemm_yield, arena);
         }
     }
@@ -466,6 +502,22 @@ pub fn forward_prefill_batch(
         for i in 0..batch {
             let pos = start_pos + i;
 
+            // QK-Norm (Qwen3): per-head RMSNorm on Q and K before RoPE
+            if !lw.q_norm.is_empty() {
+                let q_slice = &mut q_batch[i * qk_dim..(i + 1) * qk_dim];
+                for h in 0..n_heads {
+                    let off = h * head_dim;
+                    ops::rmsnorm(&mut q_slice[off..off + head_dim], lw.q_norm, config.rms_norm_eps);
+                }
+            }
+            if !lw.k_norm.is_empty() {
+                let k_slice = &mut k_batch[i * kv_dim..(i + 1) * kv_dim];
+                for h in 0..n_kv_heads {
+                    let off = h * head_dim;
+                    ops::rmsnorm(&mut k_slice[off..off + head_dim], lw.k_norm, config.rms_norm_eps);
+                }
+            }
+
             // RoPE on Q and K (must be done before immutable borrow for store)
             ops::rope_inplace(
                 &mut q_batch[i * qk_dim..(i + 1) * qk_dim],
@@ -575,9 +627,17 @@ pub fn forward_prefill_batch(
             // Down projection
             let xb_row = &mut xb_batch[i * dim..(i + 1) * dim];
             for j in 0..dim { xb_row[j] = 0.0; }
-            quantize::quantize_f32_to_q8_0(ffn1_row, q8_inter);
-            gemm::gemm_q4_q8(xb_row, q8_inter, lw.w_down, 1, intermediate, dim,
-                FuseOp::None, yield_cfg.gemm_yield);
+            match lw.w_down_quant {
+                OutputQuant::Q4_1 => {
+                    gemm::gemm_f32_x_q4_1(xb_row, ffn1_row, lw.w_down, 1, intermediate, dim,
+                        FuseOp::None, yield_cfg.gemm_yield, arena);
+                }
+                _ => {
+                    quantize::quantize_f32_to_q8_0(ffn1_row, q8_inter);
+                    gemm::gemm_q4_q8(xb_row, q8_inter, lw.w_down, 1, intermediate, dim,
+                        FuseOp::None, yield_cfg.gemm_yield);
+                }
+            }
 
             // FFN residual
             let x_row = &mut x_batch[i * dim..(i + 1) * dim];

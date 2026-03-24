@@ -16,6 +16,13 @@ pub const Q4_0_BLOCK_VALUES: usize = 32;
 pub const Q8_0_BLOCK_SIZE: usize = 34; // 2 + 32
 pub const Q8_0_BLOCK_VALUES: usize = 32;
 
+/// Q4_1 block: 32 4-bit values with f16 scale (d) and f16 minimum (m)
+/// Layout: [f16 d (2 bytes)][f16 m (2 bytes)][16 bytes of nibble pairs]
+/// Total: 20 bytes per 32 values
+/// Dequantized value = nibble * d + m  (unsigned nibbles 0-15, no zero-point subtraction)
+pub const Q4_1_BLOCK_SIZE: usize = 20; // 2 + 2 + 16
+pub const Q4_1_BLOCK_VALUES: usize = 32;
+
 /// Q6_K block: 256 6-bit values with per-sub-block i8 scales + f16 super-scale
 /// Layout: [ql: 128 bytes][qh: 64 bytes][scales: 16 bytes][d: 2 bytes f16]
 /// Total: 210 bytes per 256 values
@@ -64,6 +71,32 @@ pub fn dequantize_q8_0_block(block: &[u8], out: &mut [f32]) {
 
     for i in 0..32 {
         out[i] = (block[2 + i] as i8) as f32 * scale;
+    }
+}
+
+/// Dequantize a single Q4_1 block (32 values) into f32 output.
+///
+/// Q4_1 format per block:
+/// - bytes [0..2]: f16 scale factor `d`
+/// - bytes [2..4]: f16 minimum value `m`
+/// - bytes [4..20]: 16 bytes, each containing two 4-bit unsigned values
+///   - low nibble = first value, high nibble = second value
+///
+/// Dequantized value = nibble * d + m
+#[inline]
+pub fn dequantize_q4_1_block(block: &[u8], out: &mut [f32]) {
+    debug_assert!(block.len() >= Q4_1_BLOCK_SIZE);
+    debug_assert!(out.len() >= Q4_1_BLOCK_VALUES);
+
+    let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+    let m = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+
+    for i in 0..16 {
+        let byte = block[4 + i];
+        let lo = (byte & 0x0F) as f32;
+        let hi = ((byte >> 4) & 0x0F) as f32;
+        out[i] = lo * d + m;       // lo → position i (first half)
+        out[16 + i] = hi * d + m;  // hi → position i+16 (second half)
     }
 }
 

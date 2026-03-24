@@ -542,11 +542,14 @@ struct LayerData {
     wq: &'static [u8],
     wk: &'static [u8],
     wv: &'static [u8],
+    q_norm: &'static [u8],  // QK-norm (Qwen3): [head_dim] f32, empty if absent
+    k_norm: &'static [u8],  // QK-norm (Qwen3): [head_dim] f32, empty if absent
     wo: &'static [u8],
     ffn_norm: &'static [u8],
     w_gate: &'static [u8],
     w_up: &'static [u8],
     w_down: &'static [u8],
+    w_down_quant: libtensor::transformer::OutputQuant,
 }
 
 /// Fixed-capacity Vec for layer data (avoids heap allocation)
@@ -669,6 +672,9 @@ fn build_model_weights(model: &GgufModel)
         let wq = model.tensor(tensor_name(&mut buf, "blk.", i, ".attn_q.weight"))?;
         let wk = model.tensor(tensor_name(&mut buf, "blk.", i, ".attn_k.weight"))?;
         let wv = model.tensor(tensor_name(&mut buf, "blk.", i, ".attn_v.weight"))?;
+        // QK-norm is optional (Qwen3 has it, SmolLM2 doesn't)
+        let q_norm = model.tensor(tensor_name(&mut buf, "blk.", i, ".attn_q_norm.weight"));
+        let k_norm = model.tensor(tensor_name(&mut buf, "blk.", i, ".attn_k_norm.weight"));
         let wo = model.tensor(tensor_name(&mut buf, "blk.", i, ".attn_output.weight"))?;
         let ffn_norm = model.tensor(tensor_name(&mut buf, "blk.", i, ".ffn_norm.weight"))?;
         let w_gate = model.tensor(tensor_name(&mut buf, "blk.", i, ".ffn_gate.weight"))?;
@@ -684,16 +690,30 @@ fn build_model_weights(model: &GgufModel)
 
         // Safety: tensor data points into mmap'd memory (process lifetime)
         unsafe {
+            let empty: &'static [u8] = &[];
+            // Determine w_down quantization from GGUF dtype
+            let w_down_quant = match w_down.dtype {
+                libtensor::gguf::GgufDtype::Q4_1 => libtensor::transformer::OutputQuant::Q4_1,
+                libtensor::gguf::GgufDtype::Q8_0 => libtensor::transformer::OutputQuant::Q8_0,
+                _ => libtensor::transformer::OutputQuant::Q4_0,
+            };
+            if i == 0 {
+                println!("[INFERENCE]   blk.0.ffn_down: {:?} {:?} → {:?}",
+                    w_down.shape, w_down.dtype, w_down_quant);
+            }
             layer_data.push(LayerData {
                 attn_norm: core::mem::transmute::<&[u8], &'static [u8]>(attn_norm.data),
                 wq: core::mem::transmute::<&[u8], &'static [u8]>(wq.data),
                 wk: core::mem::transmute::<&[u8], &'static [u8]>(wk.data),
                 wv: core::mem::transmute::<&[u8], &'static [u8]>(wv.data),
+                q_norm: q_norm.map_or(empty, |t| core::mem::transmute::<&[u8], &'static [u8]>(t.data)),
+                k_norm: k_norm.map_or(empty, |t| core::mem::transmute::<&[u8], &'static [u8]>(t.data)),
                 wo: core::mem::transmute::<&[u8], &'static [u8]>(wo.data),
                 ffn_norm: core::mem::transmute::<&[u8], &'static [u8]>(ffn_norm.data),
                 w_gate: core::mem::transmute::<&[u8], &'static [u8]>(w_gate.data),
                 w_up: core::mem::transmute::<&[u8], &'static [u8]>(w_up.data),
                 w_down: core::mem::transmute::<&[u8], &'static [u8]>(w_down.data),
+                w_down_quant,
             });
         }
     }
@@ -983,11 +1003,14 @@ fn build_weights_for_forward<'a>(
             wq: ld.wq,
             wk: ld.wk,
             wv: ld.wv,
+            q_norm: bytes_as_f32(ld.q_norm),
+            k_norm: bytes_as_f32(ld.k_norm),
             wo: ld.wo,
             ffn_norm: bytes_as_f32(ld.ffn_norm),
             w_gate: ld.w_gate,
             w_up: ld.w_up,
             w_down: ld.w_down,
+            w_down_quant: ld.w_down_quant,
         };
     }
 

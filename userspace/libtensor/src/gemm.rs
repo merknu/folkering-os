@@ -10,7 +10,7 @@
 //! and B = weights (stored as Q4_0 from GGUF).
 
 use crate::arena::BumpArena;
-use crate::quantize::{self, Q4_0_BLOCK_SIZE, Q8_0_BLOCK_SIZE, Q6_K_BLOCK_SIZE, Q6_K_BLOCK_VALUES};
+use crate::quantize::{self, Q4_0_BLOCK_SIZE, Q4_1_BLOCK_SIZE, Q8_0_BLOCK_SIZE, Q6_K_BLOCK_SIZE, Q6_K_BLOCK_VALUES};
 use crate::simd;
 use crate::FuseOp;
 use crate::ops;
@@ -373,6 +373,69 @@ pub fn gemm_f32_x_q6k(
 
         if yield_every > 0 && row > 0 && row % yield_every == 0 {
             libfolk::sys::yield_cpu();
+        }
+    }
+}
+
+/// f32 input × Q4_1 weights → f32 output.
+/// Q4_1: 32 values/block, 20 bytes (f16 scale + f16 min + 16 data bytes).
+/// value = nibble * d + m  (unsigned, no zero-point subtraction)
+pub fn gemm_f32_x_q4_1(
+    c: &mut [f32],
+    a_f32: &[f32],
+    b_q4_1: &[u8],
+    m: usize,
+    k: usize,
+    n: usize,
+    fuse: FuseOp,
+    yield_every: usize,
+    _arena: &BumpArena,
+) {
+    let n_blocks = k / 32;
+    let q4_1_row_bytes = n_blocks * Q4_1_BLOCK_SIZE;
+
+    for row in 0..m {
+        if yield_every > 0 && row > 0 && row % yield_every == 0 {
+            libfolk::sys::yield_cpu();
+        }
+        let a_row = &a_f32[row * k..(row + 1) * k];
+
+        for col in 0..n {
+            let b_col_offset = col * q4_1_row_bytes;
+            let mut acc = 0.0f32;
+
+            for blk in 0..n_blocks {
+                let blk_start = b_col_offset + blk * Q4_1_BLOCK_SIZE;
+                let d = quantize::f16_to_f32(u16::from_le_bytes([
+                    b_q4_1[blk_start], b_q4_1[blk_start + 1],
+                ]));
+                let min = quantize::f16_to_f32(u16::from_le_bytes([
+                    b_q4_1[blk_start + 2], b_q4_1[blk_start + 3],
+                ]));
+                let a_base = blk * 32;
+
+                // Q4_1: lo nibbles → first half, hi nibbles → second half
+                // value = nibble * d + m
+                // dot = sum(a[i] * (nib[i] * d + m)) = d * sum(a[i]*nib[i]) + m * sum(a[i])
+                let mut sum_a_nib = 0.0f32;
+                let mut sum_a = 0.0f32;
+                for i in 0..16 {
+                    let byte = b_q4_1[blk_start + 4 + i];
+                    let lo = (byte & 0x0F) as f32;
+                    let hi = ((byte >> 4) & 0x0F) as f32;
+                    sum_a_nib += a_row[a_base + i] * lo + a_row[a_base + 16 + i] * hi;
+                    sum_a += a_row[a_base + i] + a_row[a_base + 16 + i];
+                }
+                acc += d * sum_a_nib + min * sum_a;
+            }
+
+            let idx = row * n + col;
+            c[idx] += acc;
+
+            match fuse {
+                FuseOp::SiLU => { c[idx] = crate::ops::silu_f32(c[idx]); }
+                FuseOp::None => {}
+            }
         }
     }
 }

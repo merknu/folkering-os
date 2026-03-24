@@ -414,6 +414,9 @@ const MAX_BPE_WORK: usize = 2048;
 /// - byte_tokens[256]: 1KB (persistent)
 /// - merges[merges_count]: merges_count * 16 bytes (persistent)
 /// - hash_table[next_pow2(vocab*1.5)]: temporary, freed after init
+/// Sentinel for "no token found" in byte_tokens (must not collide with valid IDs)
+const BYTE_TOKEN_NONE: u32 = u32::MAX;
+
 pub struct BpeTokenizer<'a> {
     /// Raw GGUF file data (mmap'd)
     data: &'a [u8],
@@ -433,12 +436,16 @@ pub struct BpeTokenizer<'a> {
     merges: &'a [MergeEntry],
     /// Number of valid merge entries (may be < merges.len())
     n_merges: usize,
-    /// Raw byte value (0-255) -> initial character token ID
+    /// Raw byte value (0-255) -> initial character token ID (BYTE_TOKEN_NONE if unmapped)
     byte_tokens: &'a [u32],
     /// Replacement token for invalid UTF-8 bytes (from GGUF unknown_token_id)
     replacement_token: u32,
     /// Token types from GGUF (type 5 = unused/skipped, type 3 = control)
     token_types: &'a [u8], // empty if not available
+    /// Special token IDs resolved from vocab (u32::MAX = not found)
+    im_start_id: u32,
+    im_end_id: u32,
+    endoftext_id: u32,
 }
 
 impl<'a> BpeTokenizer<'a> {
@@ -496,7 +503,7 @@ impl<'a> BpeTokenizer<'a> {
 
         let byte_tokens = arena.alloc_slice::<u32>(256)?;
         for v in byte_tokens.iter_mut() {
-            *v = 0;
+            *v = BYTE_TOKEN_NONE;
         }
 
         // Build token_types from GGUF token_type array (persistent, before arena mark)
@@ -520,8 +527,10 @@ impl<'a> BpeTokenizer<'a> {
             // No merges — build byte_tokens via brute force, return with empty merges
             for byte_val in 0..256u16 {
                 let (gpt2, gpt2_len) = gpt2_encode_byte(byte_val as u8);
-                byte_tokens[byte_val as usize] =
-                    brute_find_token(data, offsets, lengths, vocab_size, &gpt2[..gpt2_len]);
+                let found = brute_find_token(data, offsets, lengths, vocab_size, &gpt2[..gpt2_len]);
+                if found != u32::MAX {
+                    byte_tokens[byte_val as usize] = found;
+                }
             }
             return Some(Self {
                 data,
@@ -536,6 +545,9 @@ impl<'a> BpeTokenizer<'a> {
                 byte_tokens,
                 replacement_token: if unknown_token_id != u32::MAX { unknown_token_id } else { 0 },
                 token_types: &[],
+                im_start_id: u32::MAX,
+                im_end_id: u32::MAX,
+                endoftext_id: u32::MAX,
             });
         };
 
@@ -570,9 +582,15 @@ impl<'a> BpeTokenizer<'a> {
         // Build byte_tokens[256]: each raw byte -> its initial character token ID
         for byte_val in 0..256u16 {
             let (gpt2, gpt2_len) = gpt2_encode_byte(byte_val as u8);
-            byte_tokens[byte_val as usize] =
-                hash_find(hash_table, data, offsets, lengths, &gpt2[..gpt2_len]).unwrap_or(0);
+            if let Some(id) = hash_find(hash_table, data, offsets, lengths, &gpt2[..gpt2_len]) {
+                byte_tokens[byte_val as usize] = id;
+            }
         }
+
+        // Look up special token IDs dynamically from vocab
+        let im_start_id = hash_find(hash_table, data, offsets, lengths, b"<|im_start|>").unwrap_or(u32::MAX);
+        let im_end_id = hash_find(hash_table, data, offsets, lengths, b"<|im_end|>").unwrap_or(u32::MAX);
+        let endoftext_id = hash_find(hash_table, data, offsets, lengths, b"<|endoftext|>").unwrap_or(u32::MAX);
 
         // Parse merge strings from GGUF and build merge table
         let mut merge_pos = merges_offset;
@@ -679,6 +697,9 @@ impl<'a> BpeTokenizer<'a> {
             byte_tokens,
             replacement_token,
             token_types,
+            im_start_id,
+            im_end_id,
+            endoftext_id,
         })
     }
 
@@ -733,12 +754,12 @@ impl<'a> BpeTokenizer<'a> {
             return self.encode_greedy(text, output);
         }
 
-        // Special token patterns and their IDs
-        // These are emitted directly without BPE decomposition
-        const SPECIAL_TOKENS: &[(&[u8], u32)] = &[
-            (b"<|im_start|>", 1), // BOS / im_start
-            (b"<|im_end|>", 2),   // EOS / im_end
-            (b"<|endoftext|>", 0), // endoftext
+        // Special token patterns and their IDs (dynamically resolved from vocab)
+        // Build array of (pattern, id) pairs, skipping any not found in vocab
+        let special_patterns: [(&[u8], u32); 3] = [
+            (b"<|im_start|>", self.im_start_id),
+            (b"<|im_end|>", self.im_end_id),
+            (b"<|endoftext|>", self.endoftext_id),
         ];
 
         let mut n_tokens = 0usize;
@@ -747,7 +768,8 @@ impl<'a> BpeTokenizer<'a> {
         while pos < text.len() && n_tokens < output.len() {
             // Check for special token at current position
             let mut found = false;
-            for &(pattern, token_id) in SPECIAL_TOKENS {
+            for &(pattern, token_id) in &special_patterns {
+                if token_id == u32::MAX { continue; } // not found in vocab
                 if pos + pattern.len() <= text.len()
                     && &text[pos..pos + pattern.len()] == pattern
                 {
@@ -766,7 +788,8 @@ impl<'a> BpeTokenizer<'a> {
             let mut seg_end = text.len();
             for sp in (pos + 1)..text.len() {
                 let mut hit = false;
-                for &(pattern, _) in SPECIAL_TOKENS {
+                for &(pattern, token_id) in &special_patterns {
+                    if token_id == u32::MAX { continue; }
                     if sp + pattern.len() <= text.len()
                         && &text[sp..sp + pattern.len()] == pattern
                     {
@@ -830,14 +853,16 @@ impl<'a> BpeTokenizer<'a> {
         while i < n {
             let b = text[i];
             if b < 0x80 {
-                // ASCII byte: check if its token is unused (type 5) or has no vocab entry
+                // ASCII byte
                 let tok = self.byte_tokens[b as usize];
-                if tok == 0 && b != 0 {
-                    // Token 0 for non-NUL byte = no vocab entry → skip
+                if tok == BYTE_TOKEN_NONE {
+                    // No vocab entry for this byte → use replacement
+                    work[len] = self.replacement_token;
+                    len += 1;
                     i += 1;
                     continue;
                 }
-                work[len] = self.byte_tokens[b as usize];
+                work[len] = tok;
                 len += 1;
                 i += 1;
             } else {
@@ -894,7 +919,7 @@ impl<'a> BpeTokenizer<'a> {
                         if cp < 256 {
                             // Overlong for a byte-range codepoint: emit byte token
                             let tok = self.byte_tokens[cp as usize];
-                            if tok != 0 || cp == 0 {
+                            if tok != BYTE_TOKEN_NONE {
                                 work[len] = tok;
                                 len += 1;
                             }
@@ -906,8 +931,11 @@ impl<'a> BpeTokenizer<'a> {
                     } else {
                         // Normal UTF-8: process each byte via GPT-2 encoding
                         for j in 0..seq_len {
-                            work[len] = self.byte_tokens[text[i + j] as usize];
-                            len += 1;
+                            let tok = self.byte_tokens[text[i + j] as usize];
+                            if tok != BYTE_TOKEN_NONE {
+                                work[len] = tok;
+                                len += 1;
+                            }
                         }
                     }
                     i += seq_len;
@@ -995,7 +1023,8 @@ impl<'a> BpeTokenizer<'a> {
                 pos += best_len;
             } else {
                 // Byte fallback
-                output[n_tokens] = self.byte_tokens[text[pos] as usize];
+                let tok = self.byte_tokens[text[pos] as usize];
+                output[n_tokens] = if tok != BYTE_TOKEN_NONE { tok } else { self.replacement_token };
                 n_tokens += 1;
                 pos += 1;
             }
@@ -1060,7 +1089,7 @@ fn brute_find_token(
             return id as u32;
         }
     }
-    0 // fallback to UNK
+    u32::MAX // not found
 }
 
 /// Try to match a vocab token against text at position `pos` using GPT-2 encoding.

@@ -371,8 +371,8 @@ impl<'a> GgufModel<'a> {
             intermediate_size: 0,
             rope_base: 10000.0,
             rms_norm_eps: 1e-5,
-            bos_token_id: 1,
-            eos_token_id: 2,
+            bos_token_id: u32::MAX, // sentinel: not specified in GGUF
+            eos_token_id: u32::MAX, // sentinel: not specified in GGUF
             vocab_data_offset: 0,
             scores_data_offset: 0,
             merges_data_offset: 0,
