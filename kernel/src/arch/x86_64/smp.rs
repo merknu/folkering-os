@@ -108,12 +108,8 @@ unsafe extern "C" fn ap_entry_limine(cpu: &limine::mp::Cpu) -> ! {
         read_volatile((apic_virt + 0xF0) as *const u32) | 0x1FF);
     write_volatile((apic_virt + 0x80) as *mut u32, 0);     // TPR = 0
 
-    // Enable timer on AP (1ms interval) to wake from HLT
-    // Use vector 48 (0x30) — NOT 32 which is BSP's preemption timer!
-    // Vector 48 handler just sends EOI, no task preemption
-    write_volatile((apic_virt + 0x3E0) as *mut u32, 0x3);  // Divide by 16
-    write_volatile((apic_virt + 0x320) as *mut u32, 0x20000 | 48); // Periodic, vector 48
-    write_volatile((apic_virt + 0x380) as *mut u32, 62500); // ~1ms at 1GHz/16
+    // Mask timer on APs — no preemption needed for compute workers
+    write_volatile((apic_virt + 0x320) as *mut u32, 0x10000); // Masked
 
     // Enable SSE + AVX via CR4
     let mut cr4: u64;
@@ -153,13 +149,11 @@ fn ap_worker_loop(cpu_index: usize) -> ! {
     crate::drivers::serial::write_dec(cpu_index as u32);
     crate::serial_str!("] Worker loop entered\n");
 
-    // Enable interrupts so APIC timer can wake us from HLT
-    unsafe { core::arch::asm!("sti"); }
-
     loop {
-        // HLT-based wait: timer wakes us every ~1ms, we check flag, then HLT again
+        // PAUSE-based spin wait. Under WHPX each vCPU is a real thread —
+        // PAUSE hints to the CPU that we're spin-waiting, reducing power.
         while WORK_READY[cpu_index].load(Ordering::Acquire) == 0 {
-            unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
+            core::hint::spin_loop();
         }
 
         // NO CR3 swap! Pointers in WORK_ITEMS are already HHDM-translated
