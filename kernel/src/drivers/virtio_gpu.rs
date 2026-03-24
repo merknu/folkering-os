@@ -195,10 +195,38 @@ pub fn init() -> Result<(), &'static str> {
     crate::drivers::serial::write_dec(pci_dev.device as u32);
     crate::drivers::serial::write_newline();
 
-    // Decode BAR0 (Legacy I/O)
-    let io_base = match pci::decode_bar(&pci_dev, 0) {
-        BarType::Io { base } => base,
-        _ => return Err("BAR0 not I/O (need disable-modern=on)"),
+    // VirtIO-VGA: BAR0 = VGA framebuffer (MMIO), BAR2 = Legacy I/O transport
+    // Try BAR2 first (VirtIO legacy I/O), then BAR0 as fallback
+    let io_base = if let BarType::Io { base } = pci::decode_bar(&pci_dev, 2) {
+        base
+    } else if let BarType::Io { base } = pci::decode_bar(&pci_dev, 0) {
+        base
+    } else if let BarType::Io { base } = pci::decode_bar(&pci_dev, 4) {
+        base
+    } else {
+        // Log all BARs for debugging
+        for bar_idx in 0usize..6 {
+            crate::serial_str!("[VIRTIO_GPU] BAR");
+            crate::drivers::serial::write_dec(bar_idx as u32);
+            crate::serial_str!(": ");
+            match pci::decode_bar(&pci_dev, bar_idx) {
+                BarType::Io { base } => {
+                    crate::serial_str!("I/O 0x");
+                    crate::drivers::serial::write_hex(base as u64);
+                }
+                BarType::Mmio32 { base, .. } => {
+                    crate::serial_str!("MMIO32 0x");
+                    crate::drivers::serial::write_hex(base as u64);
+                }
+                BarType::Mmio64 { base, .. } => {
+                    crate::serial_str!("MMIO64 0x");
+                    crate::drivers::serial::write_hex(base);
+                }
+                BarType::None => crate::serial_str!("None"),
+            }
+            crate::drivers::serial::write_newline();
+        }
+        return Err("no I/O BAR found for VirtIO-VGA legacy transport");
     };
 
     crate::serial_str!("[VIRTIO_GPU] BAR0 I/O base: 0x");
