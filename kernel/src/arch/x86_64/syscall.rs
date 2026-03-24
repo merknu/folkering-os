@@ -966,6 +966,8 @@ extern "C" fn syscall_handler(
         0x56 => syscall_github_clone(arg1, arg2, arg3, arg4),
         // SMP: Parallel GEMM
         0x60 => syscall_parallel_gemm(arg1, arg2, arg3, arg4, arg5, arg6),
+        // Hybrid AI: Ask Gemini cloud API
+        0x70 => syscall_ask_gemini(arg1, arg2, arg3),
         _ => {
             crate::drivers::serial::write_str("[HANDLER] Invalid syscall!\n");
             u64::MAX // Return error
@@ -2143,6 +2145,60 @@ fn syscall_parallel_gemm(
     );
 
     if result == 0 { 0 } else { u64::MAX }
+}
+
+/// Ask Gemini cloud API via HTTPS POST.
+/// Args: prompt_ptr (userspace), prompt_len, response_buf_ptr (userspace buffer)
+/// Returns: response_len on success (bytes written to buf), u64::MAX on error
+///
+/// The response buffer must be pre-allocated by userspace (recommended 128KB).
+/// Gracefully handles DNS/TLS/HTTP failures — writes error message to buffer.
+fn syscall_ask_gemini(prompt_ptr: u64, prompt_len: u64, response_buf_ptr: u64) -> u64 {
+    let prompt_len = prompt_len as usize;
+
+    if prompt_len == 0 || prompt_len > 8192 {
+        return u64::MAX;
+    }
+
+    // Read prompt from userspace memory
+    let prompt_bytes = unsafe {
+        core::slice::from_raw_parts(prompt_ptr as *const u8, prompt_len)
+    };
+    let prompt = match core::str::from_utf8(prompt_bytes) {
+        Ok(s) => s,
+        Err(_) => return u64::MAX,
+    };
+
+    crate::serial_str!("[SYS_GEMINI] Prompt: ");
+    let preview = &prompt[..prompt.len().min(80)];
+    crate::drivers::serial::write_str(preview);
+    crate::drivers::serial::write_newline();
+
+    // Call Gemini API (DNS + TLS + POST — may take 5-10 seconds)
+    let result = crate::net::gemini::ask_gemini(prompt);
+
+    let response_bytes = match result {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            crate::serial_str!("[SYS_GEMINI] Error: ");
+            crate::drivers::serial::write_str(e);
+            crate::drivers::serial::write_newline();
+            let msg = alloc::format!("Error: {}", e);
+            msg.into_bytes()
+        }
+    };
+
+    // Write response to userspace buffer (max 128KB)
+    let max_write = response_bytes.len().min(131072);
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            response_bytes.as_ptr(),
+            response_buf_ptr as *mut u8,
+            max_write,
+        );
+    }
+
+    max_write as u64
 }
 
 fn syscall_poweroff() -> u64 {

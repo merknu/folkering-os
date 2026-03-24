@@ -2,7 +2,7 @@
 //!
 //! Functions for controlling the current task's execution.
 
-use crate::syscall::{syscall0, syscall1, syscall2, syscall6, SYS_EXIT, SYS_YIELD, SYS_GET_PID, SYS_SPAWN, SYS_PARALLEL_GEMM};
+use crate::syscall::{syscall0, syscall1, syscall2, syscall3, syscall6, SYS_EXIT, SYS_YIELD, SYS_GET_PID, SYS_SPAWN, SYS_PARALLEL_GEMM, SYS_ASK_GEMINI};
 
 /// Exit the current task with the given exit code
 ///
@@ -69,4 +69,18 @@ pub fn parallel_gemm(
         )
     };
     ret == 0
+}
+
+/// Ask Gemini cloud API. Returns number of bytes written to response_buf,
+/// or 0 on error. The response_buf should be at least 128KB.
+pub fn ask_gemini(prompt: &str, response_buf: &mut [u8]) -> usize {
+    let ret = unsafe {
+        syscall3(
+            SYS_ASK_GEMINI,
+            prompt.as_ptr() as u64,
+            prompt.len() as u64,
+            response_buf.as_mut_ptr() as u64,
+        )
+    };
+    if ret == u64::MAX { 0 } else { ret as usize }
 }

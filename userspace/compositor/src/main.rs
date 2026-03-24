@@ -3254,8 +3254,8 @@ fn execute_tool_call(
     const PREFIX: &[u8] = b"\n<|tool_result|>";
     const SUFFIX: &[u8] = b"<|/tool_result|>\n";
 
-    // Stack buffer for tool result content (max 256 bytes)
-    let mut result_buf = [0u8; 256];
+    // Stack buffer for tool result content (8KB — large enough for Gemini responses)
+    let mut result_buf = [0u8; 8192];
     let mut result_len: usize = 0;
 
     match cmd {
@@ -3322,6 +3322,40 @@ fn execute_tool_call(
         }
         "ls" => {
             result_len = copy_str(b"Files: (listing not yet implemented)", &mut result_buf);
+        }
+        "ask_gemini" => {
+            if args.is_empty() {
+                result_len = copy_str(b"Error: ask_gemini requires a prompt", &mut result_buf);
+            } else {
+                // Large response buffer for cloud AI responses (128KB via mmap)
+                const GEMINI_BUF_SIZE: usize = 131072;
+                const GEMINI_BUF_VADDR: usize = 0x32000000;
+
+                // Allocate anonymous memory for response
+                if libfolk::sys::mmap_at(GEMINI_BUF_VADDR, GEMINI_BUF_SIZE, 3).is_ok() {
+                    let gemini_buf = unsafe {
+                        core::slice::from_raw_parts_mut(GEMINI_BUF_VADDR as *mut u8, GEMINI_BUF_SIZE)
+                    };
+
+                    win.push_line("[tool] Asking Gemini...");
+
+                    let response_len = libfolk::sys::ask_gemini(args, gemini_buf);
+
+                    if response_len > 0 {
+                        // Truncate to fit in ring buffer (max 8KB for tool result)
+                        let usable = response_len.min(8000);
+                        result_len = usable.min(result_buf.len());
+                        result_buf[..result_len].copy_from_slice(&gemini_buf[..result_len]);
+                    } else {
+                        result_len = copy_str(b"Error: Cloud API unreachable", &mut result_buf);
+                    }
+
+                    // Free the buffer
+                    let _ = libfolk::sys::munmap(GEMINI_BUF_VADDR as *mut u8, GEMINI_BUF_SIZE);
+                } else {
+                    result_len = copy_str(b"Error: memory allocation failed", &mut result_buf);
+                }
+            }
         }
         _ => {
             result_len = copy_str(b"Error: Unknown tool command", &mut result_buf);

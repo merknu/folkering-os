@@ -70,6 +70,9 @@ pub const SYS_GITHUB_CLONE: u64 = 0x56; // 86 - Clone repo JSON to shmem
 // SMP: Parallel GEMM
 pub const SYS_PARALLEL_GEMM: u64 = 0x60; // 96 - Distribute GEMM across AP cores
 
+// Hybrid AI: Ask Gemini cloud API
+pub const SYS_ASK_GEMINI: u64 = 0x70; // 112 - HTTPS POST to Gemini API
+
 /// Execute a syscall with no arguments
 #[inline(always)]
 pub unsafe fn syscall0(nr: u64) -> u64 {

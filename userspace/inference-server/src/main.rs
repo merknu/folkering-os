@@ -1190,7 +1190,7 @@ const RING_DATA_MAX: usize = 16368;
 fn wrap_chat_template(query: &[u8], output: &mut [u8]) -> usize {
     // NOTE: Newline before <|im_end|> ensures greedy tokenizer doesn't merge
     // the last text char with '<' (e.g. ".<" as a single token breaking <|im_end|>).
-    let sys = b"<|im_start|>system\nYou are Folkering, a helpful AI on Folkering OS.\nKeep your <think> reasoning very brief (under 20 words). Give direct, concise answers.\nTools: <|tool|>read FILENAME<|/tool|>, <|tool|>write FILENAME CONTENT<|/tool|>, <|tool|>ls<|/tool|>.\n<|im_end|>\n";
+    let sys = b"<|im_start|>system\nYou are Folkering, a helpful AI on Folkering OS.\nKeep your <think> reasoning very brief (under 20 words). Give direct, concise answers.\nTools: <|tool|>read FILENAME<|/tool|>, <|tool|>write FILENAME CONTENT<|/tool|>, <|tool|>ls<|/tool|>, <|tool|>ask_gemini PROMPT<|/tool|>.\nUse ask_gemini for complex coding, math, or detailed explanations.\n<|im_end|>\n";
     let user_pre = b"<|im_start|>user\n";
     let user_suf = b"\n<|im_end|>\n<|im_start|>assistant\n";
 
