@@ -206,6 +206,17 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
             Err(_) => { serial_strln!("[INIT] No VirtIO network device (running without networking)"); }
         }
 
+        // Initialize VirtIO GPU (2D scanout — fallback to Limine FB on failure)
+        serial_strln!("[INIT] Looking for VirtIO GPU device...");
+        match drivers::virtio_gpu::init() {
+            Ok(()) => { serial_strln!("[INIT] VirtIO GPU active!"); }
+            Err(e) => {
+                serial_str!("[INIT] VirtIO GPU: ");
+                serial_strln!(e);
+                serial_strln!("[INIT] Using Limine framebuffer (fallback)");
+            }
+        }
+
         // Initialize keyboard driver (uses IRQ1 via IOAPIC)
         // NOTE: keyboard::init() will try to enable PIC IRQ1, but it's masked
         serial_strln!("[INIT] Initializing PS/2 keyboard driver...");

@@ -340,3 +340,25 @@ pub fn find_virtio_net() -> Option<PciDevice> {
     }
     find_device(VIRTIO_VENDOR_ID, VIRTIO_NET_DEVICE_TRANSITIONAL)
 }
+
+/// VirtIO GPU device IDs
+const VIRTIO_GPU_DEVICE_TRANSITIONAL: u16 = 0x1050;
+const VIRTIO_GPU_DEVICE_MODERN: u16 = 0x1040 + 16; // 0x1050
+
+/// Find VirtIO GPU device
+pub fn find_virtio_gpu() -> Option<PciDevice> {
+    // VirtIO GPU transitional ID
+    if let Some(dev) = find_device(VIRTIO_VENDOR_ID, VIRTIO_GPU_DEVICE_TRANSITIONAL) {
+        return Some(dev);
+    }
+    // Also check display class (0x03) with VirtIO vendor
+    let list = PCI_DEVICES.lock();
+    for i in 0..list.count {
+        if let Some(ref dev) = list.devices[i] {
+            if dev.vendor_id == VIRTIO_VENDOR_ID && dev.class_code == 0x03 {
+                return Some(dev.clone());
+            }
+        }
+    }
+    None
+}
