@@ -11,7 +11,7 @@ use super::json;
 use super::tls;
 
 /// Gemini API key — replace with your actual key
-const API_KEY: &str = "YOUR_API_KEY_HERE";
+const API_KEY: &str = "***REDACTED***";
 
 /// Gemini API host
 const GEMINI_HOST: &str = "generativelanguage.googleapis.com";
