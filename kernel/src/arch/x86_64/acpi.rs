@@ -81,8 +81,26 @@ pub fn init(rsdp_addr: usize) {
 
     let hhdm = crate::memory::paging::hhdm_offset();
 
+    // Map RSDP page into kernel address space first (RSDP is in ACPI-reclaimable memory
+    // which may not be mapped in HHDM). Map 2 pages around the address to be safe.
+    let rsdp_phys_page = rsdp_addr & !0xFFF;
+    let rsdp_virt_base = hhdm + rsdp_phys_page;
+    use x86_64::structures::paging::PageTableFlags;
+    let flags = PageTableFlags::PRESENT | PageTableFlags::NO_EXECUTE;
+    // Map the RSDP page (and next page in case it spans a boundary)
+    let _ = crate::memory::paging::map_page(rsdp_virt_base, rsdp_phys_page, flags);
+    let _ = crate::memory::paging::map_page(rsdp_virt_base + 0x1000, rsdp_phys_page + 0x1000, flags);
+
+    let rsdp_virt = hhdm + rsdp_addr;
+
+    crate::serial_str!("[ACPI] RSDP at phys=");
+    crate::drivers::serial::write_hex(rsdp_addr as u64);
+    crate::serial_str!(" virt=");
+    crate::drivers::serial::write_hex(rsdp_virt as u64);
+    crate::drivers::serial::write_newline();
+
     // Read RSDP
-    let rsdp = unsafe { &*((hhdm + rsdp_addr) as *const Rsdp) };
+    let rsdp = unsafe { &*(rsdp_virt as *const Rsdp) };
     let sig = &rsdp.signature;
     if sig != b"RSD PTR " {
         crate::serial_str!("[ACPI] Invalid RSDP signature\n");
@@ -113,9 +131,12 @@ pub fn init(rsdp_addr: usize) {
         }
     };
 
-    // Parse MADT entries
+    // Parse MADT entries — ensure full table is mapped
     let madt = unsafe { &*(madt_virt as *const MadtHeader) };
     let madt_length = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!(madt.header.length)) } as usize;
+    // Map additional pages if MADT spans more than the initial page
+    let madt_phys = madt_virt - hhdm;
+    ensure_mapped(hhdm, madt_phys, madt_length);
     let bsp_apic_id = super::apic::get_apic_id();
 
     crate::serial_str!("[ACPI] MADT found, length=");
@@ -165,15 +186,31 @@ pub fn init(rsdp_addr: usize) {
     crate::serial_str!(" APs)\n");
 }
 
+/// Ensure a physical address range is accessible via HHDM by mapping the page(s)
+fn ensure_mapped(hhdm: usize, phys_addr: usize, size: usize) {
+    use x86_64::structures::paging::PageTableFlags;
+    let flags = PageTableFlags::PRESENT | PageTableFlags::NO_EXECUTE;
+    let start_page = phys_addr & !0xFFF;
+    let end_page = (phys_addr + size + 0xFFF) & !0xFFF;
+    let mut page = start_page;
+    while page < end_page {
+        let _ = crate::memory::paging::map_page(hhdm + page, page, flags);
+        page += 0x1000;
+    }
+}
+
 fn find_table_in_rsdt(hhdm: usize, rsdt_phys: usize, sig: &[u8; 4]) -> Option<usize> {
+    ensure_mapped(hhdm, rsdt_phys, 0x1000);
     let rsdt_virt = hhdm + rsdt_phys;
     let header = unsafe { &*(rsdt_virt as *const SdtHeader) };
     let length = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!(header.length)) } as usize;
+    ensure_mapped(hhdm, rsdt_phys, length);
     let entry_count = (length - core::mem::size_of::<SdtHeader>()) / 4;
     let entries = (rsdt_virt + core::mem::size_of::<SdtHeader>()) as *const u32;
 
     for i in 0..entry_count {
         let table_phys = unsafe { core::ptr::read_unaligned(entries.add(i)) } as usize;
+        ensure_mapped(hhdm, table_phys, 0x1000);
         let table_virt = hhdm + table_phys;
         let table_sig = unsafe { &*(table_virt as *const [u8; 4]) };
         if table_sig == sig {
@@ -184,14 +221,17 @@ fn find_table_in_rsdt(hhdm: usize, rsdt_phys: usize, sig: &[u8; 4]) -> Option<us
 }
 
 fn find_table_in_xsdt(hhdm: usize, xsdt_phys: usize, sig: &[u8; 4]) -> Option<usize> {
+    ensure_mapped(hhdm, xsdt_phys, 0x1000);
     let xsdt_virt = hhdm + xsdt_phys;
     let header = unsafe { &*(xsdt_virt as *const SdtHeader) };
     let length = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!(header.length)) } as usize;
+    ensure_mapped(hhdm, xsdt_phys, length);
     let entry_count = (length - core::mem::size_of::<SdtHeader>()) / 8;
     let entries = (xsdt_virt + core::mem::size_of::<SdtHeader>()) as *const u64;
 
     for i in 0..entry_count {
         let table_phys = unsafe { core::ptr::read_unaligned(entries.add(i)) } as usize;
+        ensure_mapped(hhdm, table_phys, 0x1000);
         let table_virt = hhdm + table_phys;
         let table_sig = unsafe { &*(table_virt as *const [u8; 4]) };
         if table_sig == sig {
