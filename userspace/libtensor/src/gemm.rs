@@ -329,13 +329,8 @@ pub fn gemm_f32_x_q8(
 }
 
 /// f32 input × Q6_K weights → f32 output.
-/// Used for output projection in Qwen3 (token_embd and output are Q6_K).
-/// Dequantizes Q6_K blocks on-the-fly, then AVX2 FMA dot product.
-/// f32 input × Q6_K weights → f32 output.
-/// Used for output projection in Qwen3 (token_embd and output are Q6_K).
-/// Dequant Q6_K blocks → AVX2 FMA dot product.
-/// Column-tiled: processes TILE_COLS columns at a time, dequantizing each
-/// block once and reusing input vector from L1 cache.
+/// Uses SYS_PARALLEL_GEMM to distribute across AP compute workers when m=1.
+/// Falls back to single-core AVX2 if no APs are available.
 pub fn gemm_f32_x_q6k(
     c: &mut [f32],
     a_f32: &[f32],
@@ -345,6 +340,20 @@ pub fn gemm_f32_x_q6k(
     n: usize,
     yield_every: usize,
 ) {
+    // For output projection (m=1, large n), try parallel GEMM across cores
+    if m == 1 && n >= 1024 {
+        if libfolk::sys::parallel_gemm(
+            a_f32.as_ptr(),
+            b_q6k.as_ptr(),
+            c.as_mut_ptr(),
+            k,
+            n,
+            0, // Q6_K
+        ) {
+            return;
+        }
+    }
+
     let n_blocks = k / Q6_K_BLOCK_VALUES;
     let q6k_row_bytes = n_blocks * Q6_K_BLOCK_SIZE;
 

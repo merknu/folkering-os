@@ -2,7 +2,7 @@
 //!
 //! Functions for controlling the current task's execution.
 
-use crate::syscall::{syscall0, syscall1, syscall2, SYS_EXIT, SYS_YIELD, SYS_GET_PID, SYS_SPAWN};
+use crate::syscall::{syscall0, syscall1, syscall2, syscall6, SYS_EXIT, SYS_YIELD, SYS_GET_PID, SYS_SPAWN, SYS_PARALLEL_GEMM};
 
 /// Exit the current task with the given exit code
 ///
@@ -45,4 +45,28 @@ pub fn spawn(binary: &[u8]) -> Option<u32> {
     } else {
         Some(ret as u32)
     }
+}
+
+/// Dispatch parallel GEMM across AP compute workers.
+/// Returns true on success (APs available), false on failure (fallback to sequential).
+pub fn parallel_gemm(
+    input: *const f32,
+    weights: *const u8,
+    output: *mut f32,
+    k: usize,
+    n: usize,
+    quant_type: u8,
+) -> bool {
+    let ret = unsafe {
+        syscall6(
+            SYS_PARALLEL_GEMM,
+            input as u64,
+            weights as u64,
+            output as u64,
+            k as u64,
+            n as u64,
+            quant_type as u64,
+        )
+    };
+    ret == 0
 }

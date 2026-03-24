@@ -150,6 +150,18 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
         }
         serial_strln!("[INIT] PIC disabled (all IRQs masked)");
 
+        // Initialize ACPI for CPU topology discovery
+        serial_strln!("[INIT] Parsing ACPI MADT for CPU topology...");
+        arch::x86_64::acpi_init(boot_info.rsdp_addr);
+
+        // Boot Application Processors for parallel GEMM
+        if arch::x86_64::acpi::AP_COUNT.load(core::sync::atomic::Ordering::Relaxed) > 0 {
+            serial_strln!("[INIT] Installing AP trampoline...");
+            arch::x86_64::smp::install_trampoline();
+            serial_strln!("[INIT] Booting Application Processors...");
+            arch::x86_64::smp::boot_aps();
+        }
+
         // Initialize PCI bus enumeration
         serial_strln!("[INIT] Enumerating PCI bus...");
         drivers::pci::init();

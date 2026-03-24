@@ -964,6 +964,8 @@ extern "C" fn syscall_handler(
         0x54 => syscall_https_test(),
         0x55 => syscall_github_fetch(arg1, arg2, arg3, arg4),
         0x56 => syscall_github_clone(arg1, arg2, arg3, arg4),
+        // SMP: Parallel GEMM
+        0x60 => syscall_parallel_gemm(arg1, arg2, arg3, arg4, arg5, arg6),
         _ => {
             crate::drivers::serial::write_str("[HANDLER] Invalid syscall!\n");
             u64::MAX // Return error
@@ -2101,6 +2103,36 @@ fn syscall_fs_read_file(name_ptr: u64, buf_ptr: u64, buf_size: u64) -> u64 {
 
 /// Power off the system (exits QEMU)
 /// Uses QEMU's debug exit port to terminate the emulator.
+/// Parallel GEMM: distribute output projection across AP compute workers
+/// Args: input_ptr, weight_ptr, output_ptr, k, n, quant_type
+fn syscall_parallel_gemm(
+    input_ptr: u64,
+    weight_ptr: u64,
+    output_ptr: u64,
+    k: u64,
+    n: u64,
+    quant_type: u64,
+) -> u64 {
+    // Get current task's page table for AP workers
+    let task_id = crate::task::task::get_current_task();
+    let cr3 = match crate::task::task::get_task(task_id) {
+        Some(t) => t.lock().page_table_phys,
+        None => return u64::MAX, // error
+    };
+
+    let result = super::smp::dispatch_parallel_gemm(
+        input_ptr,
+        weight_ptr,
+        output_ptr,
+        k as u32,
+        n as u32,
+        quant_type as u8,
+        cr3,
+    );
+
+    if result == 0 { 0 } else { u64::MAX }
+}
+
 fn syscall_poweroff() -> u64 {
     crate::serial_println!("\n[KERNEL] System poweroff requested");
     crate::serial_println!("[KERNEL] Goodbye!");

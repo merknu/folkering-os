@@ -67,6 +67,9 @@ pub const SYS_HTTPS_TEST: u64 = 0x54;   // 84 - Test HTTPS GET to Google
 pub const SYS_GITHUB_FETCH: u64 = 0x55; // 85 - Fetch GitHub repo info
 pub const SYS_GITHUB_CLONE: u64 = 0x56; // 86 - Clone repo JSON to shmem
 
+// SMP: Parallel GEMM
+pub const SYS_PARALLEL_GEMM: u64 = 0x60; // 96 - Distribute GEMM across AP cores
+
 /// Execute a syscall with no arguments
 #[inline(always)]
 pub unsafe fn syscall0(nr: u64) -> u64 {

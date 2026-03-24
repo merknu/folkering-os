@@ -17,6 +17,11 @@ use x86_64::{PhysAddr, VirtAddr};
 /// Page size (4 KiB)
 const PAGE_SIZE: usize = 4096;
 
+/// Get the HHDM (Higher Half Direct Map) offset
+pub fn hhdm_offset() -> usize {
+    HHDM_OFFSET.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Kernel page table mapper
 static MAPPER: Mutex<Option<OffsetPageTable<'static>>> = Mutex::new(None);
 

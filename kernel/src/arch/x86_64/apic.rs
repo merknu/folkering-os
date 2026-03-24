@@ -204,6 +204,11 @@ pub fn enable_timer() {
     }
 }
 
+/// Get the LAPIC virtual address (for SMP module)
+pub fn lapic_virt_addr() -> usize {
+    APIC_VIRT_ADDR.load(Ordering::Relaxed)
+}
+
 /// Disable the APIC timer (mask)
 pub fn disable_timer() {
     let apic_virt = APIC_VIRT_ADDR.load(Ordering::Relaxed);
