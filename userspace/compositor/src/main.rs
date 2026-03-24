@@ -711,6 +711,14 @@ fn main() -> ! {
     const THINK_OPEN: &[u8] = b"<think>";    // 7 bytes
     const THINK_CLOSE: &[u8] = b"</think>";  // 8 bytes
 
+    // ===== Tool Result Filter =====
+    // Hides <|tool_result|>...<|/tool_result|> from display (injected by compositor for AI context)
+    let mut result_state: u8 = 0;
+    let mut result_open_match: usize = 0;
+    let mut result_close_match: usize = 0;
+    const RESULT_OPEN: &[u8] = b"<|tool_result|>";   // 15 bytes
+    const RESULT_CLOSE: &[u8] = b"<|/tool_result|>"; // 16 bytes
+
     // Blinking caret state (toggles every ~500ms using uptime syscall)
     let mut caret_visible: bool = true;
     let mut last_caret_flip_ms: u64 = 0;
@@ -3067,6 +3075,37 @@ fn main() -> ! {
                         continue; // Drop ALL bytes inside think block
                     }
 
+                    // ── Layer 1.5: Tool result filter ──
+                    // Hides <|tool_result|>...<|/tool_result|> from display
+                    if result_state == 0 {
+                        if byte == RESULT_OPEN[result_open_match] {
+                            result_open_match += 1;
+                            if result_open_match == RESULT_OPEN.len() {
+                                result_state = 1;
+                                result_open_match = 0;
+                            }
+                            continue;
+                        } else if result_open_match > 0 {
+                            // Partial match failed — these bytes were '<|tool_r...' which
+                            // isn't a real result tag. They fall through to tool/visible.
+                            // For simplicity, just reset and let the current byte through.
+                            result_open_match = 0;
+                            // Fall through to process current byte
+                        }
+                    } else {
+                        // result_state == 1: Inside result block — scan for close tag
+                        if byte == RESULT_CLOSE[result_close_match] {
+                            result_close_match += 1;
+                            if result_close_match == RESULT_CLOSE.len() {
+                                result_state = 0;
+                                result_close_match = 0;
+                            }
+                        } else {
+                            result_close_match = 0;
+                        }
+                        continue; // Drop bytes inside result block
+                    }
+
                     // ── Layer 2: Tool tag filter + visible output ──
                     match tool_state {
                         0 => {
@@ -3139,11 +3178,14 @@ fn main() -> ! {
                     }
                 }
 
-                // Execute completed tool call
+                // Execute completed tool call + write result back to ring
                 if tool_state == 3 {
                     let tool_content = core::str::from_utf8(&tool_buf[..tool_buf_len]).unwrap_or("");
+                    // Pass ring info so result can be written back for AI feedback
+                    let ring_va = if inference_ring_handle != 0 { RING_VADDR } else { 0 };
+                    let ring_write = new_write; // current write position in ring
                     if let Some(win) = wm.get_window_mut(inference_win_id) {
-                        execute_tool_call(tool_content, win);
+                        execute_tool_call(tool_content, win, ring_va, ring_write);
                     }
                     tool_state = 0;
                     tool_buf_len = 0;
@@ -3190,10 +3232,16 @@ fn main() -> ! {
 
 /// Clamp focused_widget index after widget tree update
 
-/// Execute a tool call parsed from the AI stream and display results in window.
-/// Called by the compositor when <|tool|>COMMAND args<|/tool|> is detected.
-fn execute_tool_call(tool_content: &str, win: &mut compositor::window_manager::Window) {
+/// Execute a tool call and write result back to TokenRing for AI feedback.
+/// Shows brief status in window; full result goes to ring for KV-cache injection.
+fn execute_tool_call(
+    tool_content: &str,
+    win: &mut compositor::window_manager::Window,
+    ring_vaddr: usize,
+    write_idx: usize,
+) {
     use libfolk::sys::{shmem_map, shmem_unmap, shmem_destroy};
+    use core::sync::atomic::{AtomicU32, Ordering};
 
     let trimmed = tool_content.trim();
     let (cmd, args) = if let Some(pos) = trimmed.find(' ') {
@@ -3202,8 +3250,13 @@ fn execute_tool_call(tool_content: &str, win: &mut compositor::window_manager::W
         (trimmed, "")
     };
 
-    // Temporary VADDR for tool shmem (safe to reuse — tool calls are synchronous)
     const TOOL_SHMEM_VADDR: usize = 0x30000000;
+    const PREFIX: &[u8] = b"\n<|tool_result|>";
+    const SUFFIX: &[u8] = b"<|/tool_result|>\n";
+
+    // Stack buffer for tool result content (max 256 bytes)
+    let mut result_buf = [0u8; 256];
+    let mut result_len: usize = 0;
 
     match cmd {
         "write" => {
@@ -3211,65 +3264,107 @@ fn execute_tool_call(tool_content: &str, win: &mut compositor::window_manager::W
                 let filename = args[..pos].trim();
                 let content = args[pos + 1..].trim();
                 if filename.is_empty() || content.is_empty() {
-                    win.push_line("[tool] write requires FILENAME CONTENT");
-                    return;
-                }
-                if filename.contains("..") || content.len() > 4096 {
-                    win.push_line("[tool] write denied (security)");
-                    return;
-                }
-                match libfolk::sys::synapse::write_file(filename, content.as_bytes()) {
-                    Ok(()) => {
-                        win.push_line("[tool] Wrote ");
-                        win.append_text(filename.as_bytes());
+                    result_len = copy_str(b"Error: write requires FILENAME CONTENT", &mut result_buf);
+                } else if filename.contains("..") || content.len() > 4096 {
+                    result_len = copy_str(b"Error: write denied (security)", &mut result_buf);
+                } else {
+                    match libfolk::sys::synapse::write_file(filename, content.as_bytes()) {
+                        Ok(()) => {
+                            result_len = copy_str(b"OK: File written: ", &mut result_buf);
+                            let fname_bytes = filename.as_bytes();
+                            let add = fname_bytes.len().min(result_buf.len() - result_len);
+                            result_buf[result_len..result_len + add].copy_from_slice(&fname_bytes[..add]);
+                            result_len += add;
+                        }
+                        Err(_) => result_len = copy_str(b"Error: Write failed", &mut result_buf),
                     }
-                    Err(_) => win.push_line("[tool] Write failed"),
                 }
             } else {
-                win.push_line("[tool] write requires FILENAME CONTENT");
+                result_len = copy_str(b"Error: write requires FILENAME CONTENT", &mut result_buf);
             }
         }
         "read" => {
             if args.is_empty() {
-                win.push_line("[tool] read requires FILENAME");
-                return;
-            }
-            match libfolk::sys::synapse::read_file_shmem(args) {
-                Ok(resp) => {
-                    if shmem_map(resp.shmem_handle, TOOL_SHMEM_VADDR).is_ok() {
-                        let data = unsafe {
-                            core::slice::from_raw_parts(
-                                TOOL_SHMEM_VADDR as *const u8,
-                                (resp.size as usize).min(4096),
-                            )
-                        };
-                        // Safe UTF-8: parse whole slice, display first few lines
-                        if let Ok(text) = core::str::from_utf8(data) {
-                            win.push_line("[tool] Contents:");
-                            for line in text.lines().take(8) {
-                                win.push_line(line);
+                result_len = copy_str(b"Error: read requires FILENAME", &mut result_buf);
+            } else {
+                match libfolk::sys::synapse::read_file_shmem(args) {
+                    Ok(resp) => {
+                        if shmem_map(resp.shmem_handle, TOOL_SHMEM_VADDR).is_ok() {
+                            let data = unsafe {
+                                core::slice::from_raw_parts(
+                                    TOOL_SHMEM_VADDR as *const u8,
+                                    (resp.size as usize).min(4096),
+                                )
+                            };
+                            // Copy file content (safe UTF-8 truncation by lines)
+                            if let Ok(text) = core::str::from_utf8(data) {
+                                for line in text.lines().take(8) {
+                                    let lb = line.as_bytes();
+                                    let add = lb.len().min(result_buf.len() - result_len);
+                                    if add == 0 { break; }
+                                    result_buf[result_len..result_len + add].copy_from_slice(&lb[..add]);
+                                    result_len += add;
+                                    if result_len < result_buf.len() {
+                                        result_buf[result_len] = b'\n';
+                                        result_len += 1;
+                                    }
+                                }
+                            } else {
+                                result_len = copy_str(b"(binary data)", &mut result_buf);
                             }
-                        } else {
-                            win.push_line("[tool] (binary data)");
+                            let _ = shmem_unmap(resp.shmem_handle, TOOL_SHMEM_VADDR);
                         }
-                        let _ = shmem_unmap(resp.shmem_handle, TOOL_SHMEM_VADDR);
+                        let _ = shmem_destroy(resp.shmem_handle);
                     }
-                    let _ = shmem_destroy(resp.shmem_handle);
+                    Err(_) => result_len = copy_str(b"Error: File not found", &mut result_buf),
                 }
-                Err(_) => win.push_line("[tool] File not found"),
             }
         }
         "ls" => {
-            match libfolk::sys::shell::list_files() {
-                Ok(_) => win.push_line("[tool] Files listed"),
-                Err(_) => win.push_line("[tool] List failed"),
-            }
+            result_len = copy_str(b"Files: (listing not yet implemented)", &mut result_buf);
         }
         _ => {
-            win.push_line("[tool] Unknown: ");
-            win.append_text(cmd.as_bytes());
+            result_len = copy_str(b"Error: Unknown tool command", &mut result_buf);
         }
     }
+
+    // Show brief status in window
+    win.push_line("[tool] Executed: ");
+    win.append_text(cmd.as_bytes());
+
+    // Write result back to ring for inference-server to consume
+    let total_len = PREFIX.len() + result_len + SUFFIX.len();
+    let available = RING_DATA_MAX.saturating_sub(write_idx);
+
+    if total_len <= available && ring_vaddr != 0 {
+        unsafe {
+            let base = (ring_vaddr as *mut u8).add(RING_HEADER_SIZE).add(write_idx);
+            core::ptr::copy_nonoverlapping(PREFIX.as_ptr(), base, PREFIX.len());
+            core::ptr::copy_nonoverlapping(
+                result_buf.as_ptr(),
+                base.add(PREFIX.len()),
+                result_len,
+            );
+            core::ptr::copy_nonoverlapping(
+                SUFFIX.as_ptr(),
+                base.add(PREFIX.len() + result_len),
+                SUFFIX.len(),
+            );
+        }
+
+        // Signal inference-server: result ready
+        let tool_result_len = unsafe { &*((ring_vaddr + 12) as *const AtomicU32) };
+        let tool_state = unsafe { &*((ring_vaddr + 8) as *const AtomicU32) };
+        tool_result_len.store(total_len as u32, Ordering::Release);
+        tool_state.store(2, Ordering::Release); // 2 = result_ready
+    }
+}
+
+/// Helper: copy bytes into buffer, return length copied
+fn copy_str(src: &[u8], dst: &mut [u8]) -> usize {
+    let n = src.len().min(dst.len());
+    dst[..n].copy_from_slice(&src[..n]);
+    n
 }
 
 fn clamp_focus(wm: &mut WindowManager, win_id: u32) {

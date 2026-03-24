@@ -1170,7 +1170,10 @@ struct TokenRing {
     write_idx: core::sync::atomic::AtomicU32,
     /// 0 = generating, 1 = done, 2 = error
     status: core::sync::atomic::AtomicU32,
-    _pad: [u32; 2],
+    /// Tool feedback: 0=none, 1=paused(waiting), 2=result_ready
+    tool_state: core::sync::atomic::AtomicU32,
+    /// Byte length of tool result written to data[write_idx..]
+    tool_result_len: core::sync::atomic::AtomicU32,
     /// UTF-8 text data, linear (no wrapping)
     data: [u8; 16368],
 }
@@ -1188,7 +1191,7 @@ const RING_DATA_MAX: usize = 16368;
 fn wrap_chat_template(query: &[u8], output: &mut [u8]) -> usize {
     // NOTE: Newline before <|im_end|> ensures greedy tokenizer doesn't merge
     // the last text char with '<' (e.g. ".<" as a single token breaking <|im_end|>).
-    let sys = b"<|im_start|>system\nYou are Folkering OS, a helpful AI assistant.\nYou can use tools: <|tool|>write filename content<|/tool|> to create files, <|tool|>read filename<|/tool|> to read files, <|tool|>ls<|/tool|> to list files.\n<|im_end|>\n";
+    let sys = b"<|im_start|>system\nYou are Folkering, a helpful AI on Folkering OS.\nTools: <|tool|>read FILENAME<|/tool|>, <|tool|>write FILENAME CONTENT<|/tool|>, <|tool|>ls<|/tool|>.\nAfter a tool call, the result appears as <|tool_result|>...<|/tool_result|>. Use tools when asked about files.\n<|im_end|>\n";
     let user_pre = b"<|im_start|>user\n";
     let user_suf = b"\n<|im_end|>\n<|im_start|>assistant\n";
 
@@ -1468,6 +1471,11 @@ fn handle_async_inference(
     let mut health_gen_count: u32 = 0;
     let arena_mark_gen = arena.used();   // mark AFTER prev_logits
 
+    // Tool close-tag detection: tail-buffer tracks last 9 bytes written
+    const TOOL_CLOSE_TAG: [u8; 9] = *b"<|/tool|>";
+    let mut tail_buf = [0u8; 9];
+    let mut tail_pos: usize = 0;
+
     // Generation with streaming to TokenRing
     let mut pos = total_prompt;
     let mut write_idx: usize = 0;
@@ -1586,6 +1594,96 @@ fn handle_async_inference(
             write_idx += tok_len;
             // ULTRA 37: Release ordering so compositor sees data before updated index
             ring.write_idx.store(write_idx as u32, Ordering::Release);
+
+            // Track last 9 bytes for <|/tool|> detection
+            for &b in &tok_buf[..tok_len] {
+                if tail_pos < 9 {
+                    tail_buf[tail_pos] = b;
+                    tail_pos += 1;
+                } else {
+                    tail_buf.copy_within(1..9, 0);
+                    tail_buf[8] = b;
+                }
+            }
+
+            // Check if we just completed a tool close tag
+            if tail_pos >= 9 && tail_buf == TOOL_CLOSE_TAG {
+                println!("[INFERENCE] Tool call detected at pos={}, pausing...", pos);
+                ring.tool_state.store(1, Ordering::Release); // 1 = paused
+
+                // Wait for compositor to execute tool and provide result
+                let mut wait = 0u32;
+                loop {
+                    if ring.tool_state.load(Ordering::Acquire) == 2 { break; }
+                    yield_cpu();
+                    wait += 1;
+                    if wait > 500_000 {
+                        println!("[INFERENCE] Tool result timeout after ~10s");
+                        ring.tool_state.store(0, Ordering::Release);
+                        break;
+                    }
+                }
+
+                if ring.tool_state.load(Ordering::Acquire) == 2 {
+                    // Read tool result from ring
+                    let result_len = ring.tool_result_len.load(Ordering::Acquire) as usize;
+                    let available = RING_DATA_MAX.saturating_sub(write_idx);
+                    let safe_len = result_len.min(available);
+
+                    if safe_len > 0 {
+                        let result_bytes = unsafe {
+                            core::slice::from_raw_parts(
+                                (RING_SHMEM_VADDR as *const u8).add(16).add(write_idx),
+                                safe_len,
+                            )
+                        };
+
+                        // Tokenize result for KV-cache injection
+                        let mut result_tokens = [0u32; 256];
+                        let n_result = tokenizer.encode(result_bytes, &mut result_tokens);
+
+                        if n_result > 0 {
+                            // Prefill all but last token
+                            if n_result > 1 {
+                                arena.reset_to(arena_mark_gen);
+                                if let Some((weights, _)) = build_weights_for_forward(eng, arena) {
+                                    use libtensor::transformer::forward_prefill_batch;
+                                    let _ = forward_prefill_batch(
+                                        &result_tokens[..n_result - 1], pos, config, &weights,
+                                        &mut eng.kv_cache, arena, &yield_cfg,
+                                    );
+                                    pos += n_result - 1;
+                                }
+                            }
+
+                            // Forward last token for fresh logits
+                            arena.reset_to(arena_mark_gen);
+                            if let Some((weights, _)) = build_weights_for_forward(eng, arena) {
+                                if let Some(logits) = forward(
+                                    result_tokens[n_result - 1], pos, config, &weights,
+                                    &mut eng.kv_cache, arena, &yield_cfg, None,
+                                ) {
+                                    pos += 1;
+                                    last_logits_token = sample_with_penalties(
+                                        logits, &gen_tokens[..gen_count], arena, &cfg,
+                                    );
+                                    println!("[INFERENCE] Tool result injected: {} tokens, pos={}", n_result, pos);
+                                }
+                            }
+                        }
+
+                        // Advance write_idx past the result so compositor sees it
+                        write_idx += safe_len;
+                        ring.write_idx.store(write_idx as u32, Ordering::Release);
+                    }
+
+                    ring.tool_state.store(0, Ordering::Release);
+                }
+                tail_pos = 0;
+                // Skip normal forward — we already have fresh logits from tool injection
+                // The `continue` jumps to next gen_idx where last_logits_token is used
+                continue;
+            }
         }
 
         pos += 1;
