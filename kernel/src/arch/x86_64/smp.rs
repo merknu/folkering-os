@@ -130,18 +130,41 @@ unsafe extern "C" fn ap_entry_limine(cpu: &limine::mp::Cpu) -> ! {
 // --- Worker Loop ---
 
 fn ap_worker_loop(cpu_index: usize) -> ! {
+    crate::serial_str!("[AP");
+    crate::drivers::serial::write_dec(cpu_index as u32);
+    crate::serial_str!("] Worker loop entered\n");
+
     loop {
         while WORK_READY[cpu_index].load(Ordering::Acquire) == 0 {
             core::hint::spin_loop();
         }
 
+        crate::serial_str!("[AP");
+        crate::drivers::serial::write_dec(cpu_index as u32);
+        crate::serial_str!("] Got work\n");
+
         let cr3 = WORKER_CR3.load(Ordering::Acquire);
+
+        crate::serial_str!("[AP");
+        crate::drivers::serial::write_dec(cpu_index as u32);
+        crate::serial_str!("] Switching CR3 to ");
+        crate::drivers::serial::write_hex(cr3);
+        crate::drivers::serial::write_newline();
+
         if cr3 != 0 {
             unsafe { core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack)); }
         }
 
+        crate::serial_str!("[AP");
+        crate::drivers::serial::write_dec(cpu_index as u32);
+        crate::serial_str!("] CR3 switched, executing GEMM\n");
+
         let work = unsafe { &WORK_ITEMS[cpu_index] };
         unsafe { execute_gemm_work(work); }
+
+        crate::serial_str!("[AP");
+        crate::drivers::serial::write_dec(cpu_index as u32);
+        crate::serial_str!("] Work done\n");
 
         WORK_DONE[cpu_index].store(1, Ordering::Release);
         WORK_READY[cpu_index].store(0, Ordering::Release);
@@ -204,13 +227,38 @@ pub fn dispatch_parallel_gemm(
         col_end: (bsp_col_start + bsp_cols) as u32,
         quant_type,
     };
+
+    crate::serial_str!("[PGEMM] BSP start cols ");
+    crate::drivers::serial::write_dec(bsp_col_start as u32);
+    crate::serial_str!("-");
+    crate::drivers::serial::write_dec((bsp_col_start + bsp_cols) as u32);
+    crate::drivers::serial::write_newline();
+
     unsafe { execute_gemm_work(&bsp_work); }
 
-    // Wait for APs
+    crate::serial_str!("[PGEMM] BSP done, waiting APs...\n");
+
+    // Wait for APs (with timeout)
+    let mut all_done = true;
     for i in 0..num_aps {
-        while WORK_DONE[i + 1].load(Ordering::Acquire) == 0 {
+        let mut done = false;
+        for _ in 0..500_000_000u64 {
+            if WORK_DONE[i + 1].load(Ordering::Acquire) != 0 {
+                done = true;
+                break;
+            }
             core::hint::spin_loop();
         }
+        if !done {
+            crate::serial_str!("[PGEMM] AP ");
+            crate::drivers::serial::write_dec((i + 1) as u32);
+            crate::serial_str!(" TIMEOUT\n");
+            all_done = false;
+        }
+    }
+
+    if all_done {
+        crate::serial_str!("[PGEMM] All workers done\n");
     }
 
     0
@@ -221,8 +269,36 @@ pub fn dispatch_parallel_gemm(
 const Q6_K_BLOCK_SIZE: usize = 210;
 const Q6_K_BLOCK_VALUES: usize = 256;
 
-#[target_feature(enable = "avx2", enable = "fma")]
+/// Check if AVX2 is supported via CPUID
+fn has_avx2() -> bool {
+    let result: u32;
+    unsafe {
+        core::arch::asm!(
+            "push rbx",
+            "mov eax, 7",
+            "xor ecx, ecx",
+            "cpuid",
+            "mov {0:e}, ebx",
+            "pop rbx",
+            out(reg) result,
+            out("eax") _,
+            out("ecx") _,
+            out("edx") _,
+        );
+    }
+    result & (1 << 5) != 0
+}
+
 unsafe fn execute_gemm_work(work: &GemmWork) {
+    if has_avx2() {
+        execute_gemm_work_avx2(work);
+    } else {
+        execute_gemm_work_scalar(work);
+    }
+}
+
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn execute_gemm_work_avx2(work: &GemmWork) {
     let k = work.k as usize;
     let n = work.n as usize;
     let col_start = work.col_start as usize;
@@ -280,6 +356,36 @@ unsafe fn dot_f32_avx2(a: *const f32, b: *const f32, count: usize) -> f32 {
     let shuf2 = _mm_movehl_ps(sums, sums);
     let final_sum = _mm_add_ss(sums, shuf2);
     _mm_cvtss_f32(final_sum)
+}
+
+/// Scalar GEMM fallback (no AVX2)
+unsafe fn execute_gemm_work_scalar(work: &GemmWork) {
+    let k = work.k as usize;
+    let n = work.n as usize;
+    let col_start = work.col_start as usize;
+    let col_end = work.col_end as usize;
+    let n_blocks = k / Q6_K_BLOCK_VALUES;
+    let q6k_row_bytes = n_blocks * Q6_K_BLOCK_SIZE;
+
+    let a_f32 = core::slice::from_raw_parts(work.input_ptr as *const f32, k);
+    let b_q6k = core::slice::from_raw_parts(work.weight_ptr as *const u8, n * q6k_row_bytes);
+    let c = core::slice::from_raw_parts_mut(work.output_ptr as *mut f32, n);
+
+    let mut dequant_buf = [0.0f32; Q6_K_BLOCK_VALUES];
+
+    for col in col_start..col_end {
+        let b_col_offset = col * q6k_row_bytes;
+        let mut acc = 0.0f32;
+        for blk in 0..n_blocks {
+            let blk_start = b_col_offset + blk * Q6_K_BLOCK_SIZE;
+            dequantize_q6_k_block(&b_q6k[blk_start..blk_start + Q6_K_BLOCK_SIZE], &mut dequant_buf);
+            let a_base = blk * Q6_K_BLOCK_VALUES;
+            for i in 0..Q6_K_BLOCK_VALUES {
+                acc += a_f32[a_base + i] * dequant_buf[i];
+            }
+        }
+        c[col] = acc;
+    }
 }
 
 fn dequantize_q6_k_block(block: &[u8], out: &mut [f32; 256]) {

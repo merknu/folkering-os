@@ -2113,12 +2113,24 @@ fn syscall_parallel_gemm(
     n: u64,
     quant_type: u64,
 ) -> u64 {
+    crate::serial_str!("[PGEMM] syscall entry k=");
+    crate::drivers::serial::write_dec(k as u32);
+    crate::serial_str!(" n=");
+    crate::drivers::serial::write_dec(n as u32);
+    crate::drivers::serial::write_newline();
+
     // Get current task's page table for AP workers
     let task_id = crate::task::task::get_current_task();
     let cr3 = match crate::task::task::get_task(task_id) {
         Some(t) => t.lock().page_table_phys,
-        None => return u64::MAX, // error
+        None => return u64::MAX,
     };
+
+    crate::serial_str!("[PGEMM] task CR3=");
+    crate::drivers::serial::write_hex(cr3);
+    crate::serial_str!(" APs=");
+    crate::drivers::serial::write_dec(super::smp::ap_count() as u32);
+    crate::drivers::serial::write_newline();
 
     let result = super::smp::dispatch_parallel_gemm(
         input_ptr,
