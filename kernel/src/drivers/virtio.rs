@@ -212,6 +212,27 @@ impl Virtqueue {
         unsafe { core::ptr::read_volatile(elem_ptr) }
     }
 
+    /// Set descriptor fields (for GPU driver)
+    pub fn set_desc(&mut self, idx: u16, addr: u64, len: u32, flags: u16, next: u16) {
+        unsafe {
+            let d = &mut *self.desc(idx);
+            d.addr = addr;
+            d.len = len;
+            d.flags = flags;
+            d.next = next;
+        }
+    }
+
+    /// Get next descriptor index (follows chain)
+    pub fn desc_next(&self, idx: u16) -> u16 {
+        unsafe { (*self.desc(idx)).next }
+    }
+
+    /// Check if descriptor has NEXT flag
+    pub fn desc_has_next(&self, idx: u16) -> bool {
+        unsafe { (*self.desc(idx)).flags & VRING_DESC_F_NEXT != 0 }
+    }
+
     /// Allocate a descriptor from the free list
     pub fn alloc_desc(&mut self) -> Option<u16> {
         if self.num_free == 0 {
