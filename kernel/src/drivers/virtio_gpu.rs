@@ -35,9 +35,12 @@ const VIRTIO_PCI_QUEUE_NOTIFY: u16 = 0x10;
 const VIRTIO_PCI_DEVICE_STATUS: u16 = 0x12;
 const VIRTIO_PCI_ISR_STATUS: u16 = 0x13;
 
+// ── VirtIO Device Status Bits ────────────────────────────────────────────────
+
 const STATUS_ACKNOWLEDGE: u8 = 1;
 const STATUS_DRIVER: u8 = 2;
 const STATUS_DRIVER_OK: u8 = 4;
+const STATUS_FEATURES_OK: u8 = 8;
 const STATUS_FAILED: u8 = 128;
 
 // ── VirtIO GPU Feature Bits ─────────────────────────────────────────────────
@@ -162,8 +165,63 @@ struct GpuRespHdr {
 
 // ── Driver State ────────────────────────────────────────────────────────────
 
+/// VirtIO Modern MMIO register access
+struct MmioTransport {
+    common_base: usize,   // Virtual address of common config MMIO region
+    notify_base: usize,   // Virtual address of notify MMIO region
+    notify_mul: u32,      // Notify offset multiplier
+    isr_base: usize,      // Virtual address of ISR region
+    device_base: usize,   // Virtual address of device-specific config
+}
+
+impl MmioTransport {
+    fn read_common32(&self, off: usize) -> u32 {
+        unsafe { core::ptr::read_volatile((self.common_base + off) as *const u32) }
+    }
+    fn write_common32(&self, off: usize, val: u32) {
+        unsafe { core::ptr::write_volatile((self.common_base + off) as *mut u32, val) }
+    }
+    fn read_common16(&self, off: usize) -> u16 {
+        unsafe { core::ptr::read_volatile((self.common_base + off) as *const u16) }
+    }
+    fn write_common16(&self, off: usize, val: u16) {
+        unsafe { core::ptr::write_volatile((self.common_base + off) as *mut u16, val) }
+    }
+    fn read_common8(&self, off: usize) -> u8 {
+        unsafe { core::ptr::read_volatile((self.common_base + off) as *const u8) }
+    }
+    fn write_common8(&self, off: usize, val: u8) {
+        unsafe { core::ptr::write_volatile((self.common_base + off) as *mut u8, val) }
+    }
+    fn notify_queue(&self, queue_idx: u16) {
+        let off = queue_idx as usize * self.notify_mul as usize;
+        unsafe { core::ptr::write_volatile((self.notify_base + off) as *mut u16, queue_idx) }
+    }
+}
+
+// Modern VirtIO Common Config register offsets
+const VIRTIO_PCI_COMMON_DFSELECT: usize = 0x00;
+const VIRTIO_PCI_COMMON_DF: usize = 0x04;
+const VIRTIO_PCI_COMMON_GFSELECT: usize = 0x08;
+const VIRTIO_PCI_COMMON_GF: usize = 0x0C;
+const VIRTIO_PCI_COMMON_MSIX: usize = 0x10;
+const VIRTIO_PCI_COMMON_NUMQ: usize = 0x14;
+const VIRTIO_PCI_COMMON_STATUS: usize = 0x16;
+const VIRTIO_PCI_COMMON_CFGGEN: usize = 0x18;
+const VIRTIO_PCI_COMMON_Q_SELECT: usize = 0x1C;
+const VIRTIO_PCI_COMMON_Q_SIZE: usize = 0x1E;
+const VIRTIO_PCI_COMMON_Q_MSIX: usize = 0x20;
+const VIRTIO_PCI_COMMON_Q_ENABLE: usize = 0x22;
+const VIRTIO_PCI_COMMON_Q_NOFF: usize = 0x24;
+const VIRTIO_PCI_COMMON_Q_DESCLO: usize = 0x28;
+const VIRTIO_PCI_COMMON_Q_DESCHI: usize = 0x2C;
+const VIRTIO_PCI_COMMON_Q_AVAILLO: usize = 0x30;
+const VIRTIO_PCI_COMMON_Q_AVAILHI: usize = 0x34;
+const VIRTIO_PCI_COMMON_Q_USEDLO: usize = 0x38;
+const VIRTIO_PCI_COMMON_Q_USEDHI: usize = 0x3C;
+
 struct GpuState {
-    io_base: u16,
+    transport: MmioTransport,
     controlq: Virtqueue,
     width: u32,
     height: u32,
@@ -195,56 +253,23 @@ pub fn init() -> Result<(), &'static str> {
     crate::drivers::serial::write_dec(pci_dev.device as u32);
     crate::drivers::serial::write_newline();
 
-    // VirtIO-VGA: BAR0 = VGA framebuffer (MMIO), BAR2 = Legacy I/O transport
-    // Try BAR2 first (VirtIO legacy I/O), then BAR0 as fallback
-    let io_base = if let BarType::Io { base } = pci::decode_bar(&pci_dev, 2) {
-        base
-    } else if let BarType::Io { base } = pci::decode_bar(&pci_dev, 0) {
-        base
-    } else if let BarType::Io { base } = pci::decode_bar(&pci_dev, 4) {
-        base
-    } else {
-        // Log all BARs for debugging
-        for bar_idx in 0usize..6 {
-            crate::serial_str!("[VIRTIO_GPU] BAR");
-            crate::drivers::serial::write_dec(bar_idx as u32);
-            crate::serial_str!(": ");
-            match pci::decode_bar(&pci_dev, bar_idx) {
-                BarType::Io { base } => {
-                    crate::serial_str!("I/O 0x");
-                    crate::drivers::serial::write_hex(base as u64);
-                }
-                BarType::Mmio32 { base, .. } => {
-                    crate::serial_str!("MMIO32 0x");
-                    crate::drivers::serial::write_hex(base as u64);
-                }
-                BarType::Mmio64 { base, .. } => {
-                    crate::serial_str!("MMIO64 0x");
-                    crate::drivers::serial::write_hex(base);
-                }
-                BarType::None => crate::serial_str!("None"),
-            }
-            crate::drivers::serial::write_newline();
-        }
-        return Err("no I/O BAR found for VirtIO-VGA legacy transport");
-    };
-
-    crate::serial_str!("[VIRTIO_GPU] BAR0 I/O base: 0x");
-    crate::drivers::serial::write_hex(io_base as u64);
-    crate::drivers::serial::write_newline();
-
     // Enable bus mastering for DMA
     pci::enable_bus_master(pci_dev.bus, pci_dev.device, pci_dev.function);
 
-    // ── VirtIO Handshake ────────────────────────────────────────────────
+    // ── Parse PCI Capabilities for Modern VirtIO MMIO transport ─────────
+    let transport = parse_virtio_capabilities(&pci_dev)?;
+    crate::serial_strln!("[VIRTIO_GPU] Modern MMIO transport initialized");
+
+    // ── VirtIO Modern Handshake ─────────────────────────────────────────
 
     // Reset
-    write_io8(io_base, VIRTIO_PCI_DEVICE_STATUS, 0);
-    write_io8(io_base, VIRTIO_PCI_DEVICE_STATUS, STATUS_ACKNOWLEDGE);
-    write_io8(io_base, VIRTIO_PCI_DEVICE_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
+    transport.write_common8(VIRTIO_PCI_COMMON_STATUS, 0);
+    transport.write_common8(VIRTIO_PCI_COMMON_STATUS, STATUS_ACKNOWLEDGE);
+    transport.write_common8(VIRTIO_PCI_COMMON_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
 
-    // Read and log feature bits (critical for future 3D/Vulkan detection)
-    let features = read_io32(io_base, VIRTIO_PCI_DEVICE_FEATURES);
+    // Read feature bits (select page 0)
+    transport.write_common32(VIRTIO_PCI_COMMON_DFSELECT, 0);
+    let features = transport.read_common32(VIRTIO_PCI_COMMON_DF);
     let has_virgl = features & VIRTIO_GPU_F_VIRGL != 0;
     let has_edid = features & VIRTIO_GPU_F_EDID != 0;
 
@@ -257,11 +282,16 @@ pub fn init() -> Result<(), &'static str> {
     crate::drivers::serial::write_newline();
 
     // Accept no features (2D only)
-    write_io32(io_base, VIRTIO_PCI_DRIVER_FEATURES, 0);
+    transport.write_common32(VIRTIO_PCI_COMMON_GFSELECT, 0);
+    transport.write_common32(VIRTIO_PCI_COMMON_GF, 0);
+
+    // FEATURES_OK
+    transport.write_common8(VIRTIO_PCI_COMMON_STATUS,
+        STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK);
 
     // Setup control queue (queue 0)
-    write_io16(io_base, VIRTIO_PCI_QUEUE_SEL, 0);
-    let queue_size = read_io16(io_base, VIRTIO_PCI_QUEUE_SIZE);
+    transport.write_common16(VIRTIO_PCI_COMMON_Q_SELECT, 0);
+    let queue_size = transport.read_common16(VIRTIO_PCI_COMMON_Q_SIZE);
     if queue_size == 0 {
         return Err("controlq size is 0");
     }
@@ -271,14 +301,23 @@ pub fn init() -> Result<(), &'static str> {
     crate::drivers::serial::write_newline();
 
     let controlq = Virtqueue::new(queue_size).ok_or("failed to alloc controlq")?;
-    let pfn = (controlq.queue_phys / 4096) as u32;
-    write_io32(io_base, VIRTIO_PCI_QUEUE_PFN, pfn);
+
+    // Modern: write descriptor/available/used ring addresses directly
+    transport.write_common32(VIRTIO_PCI_COMMON_Q_DESCLO, controlq.desc_phys() as u32);
+    transport.write_common32(VIRTIO_PCI_COMMON_Q_DESCHI, (controlq.desc_phys() >> 32) as u32);
+    transport.write_common32(VIRTIO_PCI_COMMON_Q_AVAILLO, controlq.avail_phys() as u32);
+    transport.write_common32(VIRTIO_PCI_COMMON_Q_AVAILHI, (controlq.avail_phys() >> 32) as u32);
+    transport.write_common32(VIRTIO_PCI_COMMON_Q_USEDLO, controlq.used_phys() as u32);
+    transport.write_common32(VIRTIO_PCI_COMMON_Q_USEDHI, (controlq.used_phys() >> 32) as u32);
+
+    // Enable the queue
+    transport.write_common16(VIRTIO_PCI_COMMON_Q_ENABLE, 1);
 
     // DRIVER_OK
-    write_io8(io_base, VIRTIO_PCI_DEVICE_STATUS,
-        STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_DRIVER_OK);
+    transport.write_common8(VIRTIO_PCI_COMMON_STATUS,
+        STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK);
 
-    let status = read_io8(io_base, VIRTIO_PCI_DEVICE_STATUS);
+    let status = transport.read_common8(VIRTIO_PCI_COMMON_STATUS);
     if status & STATUS_FAILED != 0 {
         return Err("device set FAILED");
     }
@@ -287,7 +326,7 @@ pub fn init() -> Result<(), &'static str> {
 
     // Store state
     let mut state = GpuState {
-        io_base,
+        transport,
         controlq,
         width: 0,
         height: 0,
@@ -397,7 +436,7 @@ pub fn flush_rect(x: u32, y: u32, w: u32, h: u32) {
                     q.submit(d2);
 
                     // Ring doorbell (async — don't wait)
-                    write_io16(state.io_base, VIRTIO_PCI_QUEUE_NOTIFY, 0);
+                    state.transport.notify_queue(0);
                 } else { q.free_desc(d2); q.free_desc(d1); q.free_desc(d0); }
             } else { q.free_desc(d1); q.free_desc(d0); }
         } else { q.free_desc(d0); }
@@ -414,6 +453,111 @@ pub fn framebuffer_phys() -> Option<usize> {
 pub fn display_size() -> Option<(u32, u32)> {
     let guard = GPU_STATE.lock();
     guard.as_ref().map(|s| (s.width, s.height))
+}
+
+// ── PCI Capabilities Parsing ────────────────────────────────────────────────
+
+/// Parse VirtIO Modern PCI Capabilities to find MMIO register regions.
+fn parse_virtio_capabilities(dev: &PciDevice) -> Result<MmioTransport, &'static str> {
+    let hhdm = crate::memory::paging::hhdm_offset();
+
+    // Check if device has capabilities list
+    let status = pci::pci_read16(dev.bus, dev.device, dev.function, 0x06);
+    if status & (1 << 4) == 0 {
+        return Err("no PCI capabilities");
+    }
+
+    let mut cap_ptr = pci::pci_read8(dev.bus, dev.device, dev.function, 0x34) as u8;
+    cap_ptr &= 0xFC; // Align to 4 bytes
+
+    let mut common_bar: Option<(u8, u32, u32)> = None; // (bar, offset, length)
+    let mut notify_bar: Option<(u8, u32, u32, u32)> = None; // (bar, offset, length, multiplier)
+    let mut isr_bar: Option<(u8, u32, u32)> = None;
+    let mut device_bar: Option<(u8, u32, u32)> = None;
+
+    let mut iterations = 0;
+    while cap_ptr != 0 && iterations < 32 {
+        iterations += 1;
+        let cap_id = pci::pci_read8(dev.bus, dev.device, dev.function, cap_ptr as u8);
+        let cap_next = pci::pci_read8(dev.bus, dev.device, dev.function, cap_ptr + 1);
+
+        if cap_id == 0x09 { // VirtIO vendor capability
+            let cfg_type = pci::pci_read8(dev.bus, dev.device, dev.function, cap_ptr + 3);
+            let bar = pci::pci_read8(dev.bus, dev.device, dev.function, cap_ptr + 4);
+            let offset = pci::pci_read32(dev.bus, dev.device, dev.function, cap_ptr + 8);
+            let length = pci::pci_read32(dev.bus, dev.device, dev.function, cap_ptr + 12);
+
+            crate::serial_str!("[VIRTIO_GPU] Cap type=");
+            crate::drivers::serial::write_dec(cfg_type as u32);
+            crate::serial_str!(" bar=");
+            crate::drivers::serial::write_dec(bar as u32);
+            crate::serial_str!(" off=0x");
+            crate::drivers::serial::write_hex(offset as u64);
+            crate::serial_str!(" len=");
+            crate::drivers::serial::write_dec(length);
+            crate::drivers::serial::write_newline();
+
+            match cfg_type {
+                1 => common_bar = Some((bar, offset, length)),  // Common config
+                2 => {
+                    let mul = pci::pci_read32(dev.bus, dev.device, dev.function, cap_ptr + 16);
+                    notify_bar = Some((bar, offset, length, mul));
+                }
+                3 => isr_bar = Some((bar, offset, length)),     // ISR
+                4 => device_bar = Some((bar, offset, length)),  // Device config
+                _ => {}
+            }
+        }
+
+        cap_ptr = cap_next & 0xFC;
+    }
+
+    let (common_b, common_off, _) = common_bar.ok_or("no common config cap")?;
+    let (notify_b, notify_off, _, notify_mul) = notify_bar.ok_or("no notify cap")?;
+    let (isr_b, isr_off, _) = isr_bar.ok_or("no ISR cap")?;
+
+    // Resolve BAR physical addresses and map to virtual
+    let common_phys = resolve_bar_phys(dev, common_b)? + common_off as usize;
+    let notify_phys = resolve_bar_phys(dev, notify_b)? + notify_off as usize;
+    let isr_phys = resolve_bar_phys(dev, isr_b)? + isr_off as usize;
+
+    // Map MMIO pages (uncacheable)
+    use x86_64::structures::paging::PageTableFlags;
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE
+        | PageTableFlags::NO_EXECUTE | PageTableFlags::NO_CACHE;
+    for &phys in &[common_phys & !0xFFF, notify_phys & !0xFFF, isr_phys & !0xFFF] {
+        let _ = crate::memory::paging::map_page(hhdm + phys, phys, flags);
+    }
+
+    let common_base = hhdm + common_phys;
+    let notify_base = hhdm + notify_phys;
+    let isr_base = hhdm + isr_phys;
+
+    let device_base = if let Some((db, doff, _)) = device_bar {
+        let dp = resolve_bar_phys(dev, db)? + doff as usize;
+        let _ = crate::memory::paging::map_page(hhdm + (dp & !0xFFF), dp & !0xFFF, flags);
+        hhdm + dp
+    } else {
+        0
+    };
+
+    Ok(MmioTransport {
+        common_base,
+        notify_base,
+        notify_mul,
+        isr_base,
+        device_base,
+    })
+}
+
+/// Resolve a BAR index to its physical base address
+fn resolve_bar_phys(dev: &PciDevice, bar_idx: u8) -> Result<usize, &'static str> {
+    match pci::decode_bar(dev, bar_idx as usize) {
+        BarType::Mmio32 { base, .. } => Ok(base as usize),
+        BarType::Mmio64 { base, .. } => Ok(base as usize),
+        BarType::Io { .. } => Err("unexpected I/O BAR for MMIO transport"),
+        BarType::None => Err("BAR not present"),
+    }
 }
 
 // ── Internal: GPU Commands ──────────────────────────────────────────────────
@@ -594,7 +738,7 @@ fn submit_and_wait(
     q.set_desc(d1, resp_phys as u64, resp_size as u32, VRING_DESC_F_WRITE, 0);
 
     q.submit(d0);
-    write_io16(state.io_base, VIRTIO_PCI_QUEUE_NOTIFY, 0);
+    state.transport.notify_queue(0);
 
     // Wait for completion (init only — blocking OK)
     for _ in 0..10_000_000u64 {

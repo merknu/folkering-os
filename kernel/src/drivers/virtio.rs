@@ -212,6 +212,22 @@ impl Virtqueue {
         unsafe { core::ptr::read_volatile(elem_ptr) }
     }
 
+    /// Physical address of descriptor table
+    pub fn desc_phys(&self) -> u64 {
+        let hhdm = crate::HHDM_OFFSET.load(core::sync::atomic::Ordering::Relaxed);
+        (self.desc_virt - hhdm) as u64
+    }
+    /// Physical address of available ring
+    pub fn avail_phys(&self) -> u64 {
+        let hhdm = crate::HHDM_OFFSET.load(core::sync::atomic::Ordering::Relaxed);
+        (self.avail_virt - hhdm) as u64
+    }
+    /// Physical address of used ring
+    pub fn used_phys(&self) -> u64 {
+        let hhdm = crate::HHDM_OFFSET.load(core::sync::atomic::Ordering::Relaxed);
+        (self.used_virt - hhdm) as u64
+    }
+
     /// Set descriptor fields (for GPU driver)
     pub fn set_desc(&mut self, idx: u16, addr: u64, len: u32, flags: u16, next: u16) {
         unsafe {
