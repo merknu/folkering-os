@@ -3142,9 +3142,8 @@ fn main() -> ! {
                 // Execute completed tool call
                 if tool_state == 3 {
                     let tool_content = core::str::from_utf8(&tool_buf[..tool_buf_len]).unwrap_or("");
-                    let result = execute_tool_call(tool_content);
                     if let Some(win) = wm.get_window_mut(inference_win_id) {
-                        win.push_line(result);
+                        execute_tool_call(tool_content, win);
                     }
                     tool_state = 0;
                     tool_buf_len = 0;
@@ -3190,9 +3189,12 @@ fn main() -> ! {
 }
 
 /// Clamp focused_widget index after widget tree update
-/// Execute a tool call parsed from the AI stream.
+
+/// Execute a tool call parsed from the AI stream and display results in window.
 /// Called by the compositor when <|tool|>COMMAND args<|/tool|> is detected.
-fn execute_tool_call(tool_content: &str) -> &'static str {
+fn execute_tool_call(tool_content: &str, win: &mut compositor::window_manager::Window) {
+    use libfolk::sys::{shmem_map, shmem_unmap, shmem_destroy};
+
     let trimmed = tool_content.trim();
     let (cmd, args) = if let Some(pos) = trimmed.find(' ') {
         (&trimmed[..pos], trimmed[pos + 1..].trim())
@@ -3200,42 +3202,73 @@ fn execute_tool_call(tool_content: &str) -> &'static str {
         (trimmed, "")
     };
 
+    // Temporary VADDR for tool shmem (safe to reuse — tool calls are synchronous)
+    const TOOL_SHMEM_VADDR: usize = 0x30000000;
+
     match cmd {
         "write" => {
             if let Some(pos) = args.find(' ') {
                 let filename = args[..pos].trim();
                 let content = args[pos + 1..].trim();
                 if filename.is_empty() || content.is_empty() {
-                    return "[Tool: write requires FILENAME CONTENT]";
+                    win.push_line("[tool] write requires FILENAME CONTENT");
+                    return;
                 }
-                // Security: no path traversal, max 4KB
                 if filename.contains("..") || content.len() > 4096 {
-                    return "[Tool: write denied (security)]";
+                    win.push_line("[tool] write denied (security)");
+                    return;
                 }
                 match libfolk::sys::synapse::write_file(filename, content.as_bytes()) {
-                    Ok(()) => "[Tool: File written]",
-                    Err(_) => "[Tool: Write failed]",
+                    Ok(()) => {
+                        win.push_line("[tool] Wrote ");
+                        win.append_text(filename.as_bytes());
+                    }
+                    Err(_) => win.push_line("[tool] Write failed"),
                 }
             } else {
-                "[Tool: write requires FILENAME CONTENT]"
+                win.push_line("[tool] write requires FILENAME CONTENT");
             }
         }
         "read" => {
             if args.is_empty() {
-                return "[Tool: read requires FILENAME]";
+                win.push_line("[tool] read requires FILENAME");
+                return;
             }
             match libfolk::sys::synapse::read_file_shmem(args) {
-                Ok(_resp) => "[Tool: File read]",
-                Err(_) => "[Tool: File not found]",
+                Ok(resp) => {
+                    if shmem_map(resp.shmem_handle, TOOL_SHMEM_VADDR).is_ok() {
+                        let data = unsafe {
+                            core::slice::from_raw_parts(
+                                TOOL_SHMEM_VADDR as *const u8,
+                                (resp.size as usize).min(4096),
+                            )
+                        };
+                        // Safe UTF-8: parse whole slice, display first few lines
+                        if let Ok(text) = core::str::from_utf8(data) {
+                            win.push_line("[tool] Contents:");
+                            for line in text.lines().take(8) {
+                                win.push_line(line);
+                            }
+                        } else {
+                            win.push_line("[tool] (binary data)");
+                        }
+                        let _ = shmem_unmap(resp.shmem_handle, TOOL_SHMEM_VADDR);
+                    }
+                    let _ = shmem_destroy(resp.shmem_handle);
+                }
+                Err(_) => win.push_line("[tool] File not found"),
             }
         }
         "ls" => {
             match libfolk::sys::shell::list_files() {
-                Ok(_) => "[Tool: Files listed]",
-                Err(_) => "[Tool: List failed]",
+                Ok(_) => win.push_line("[tool] Files listed"),
+                Err(_) => win.push_line("[tool] List failed"),
             }
         }
-        _ => "[Tool: Unknown command]",
+        _ => {
+            win.push_line("[tool] Unknown: ");
+            win.append_text(cmd.as_bytes());
+        }
     }
 }
 
