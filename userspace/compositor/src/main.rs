@@ -700,6 +700,17 @@ fn main() -> ! {
     const TOOL_OPEN: &[u8] = b"<|tool|>";    // 8 bytes
     const TOOL_CLOSE: &[u8] = b"<|/tool|>";  // 9 bytes
 
+    // ===== Think Tag Filter =====
+    // Hides <think>...</think> reasoning from display (Qwen3 thinking mode)
+    let mut think_state: u8 = 0;     // 0=scanning open, 1=inside think block (hidden)
+    let mut think_open_match: usize = 0;
+    let mut think_close_match: usize = 0;
+    let mut think_pending: [u8; 8] = [0; 8]; // max tag length for flush
+    let mut think_pending_len: usize = 0;
+
+    const THINK_OPEN: &[u8] = b"<think>";    // 7 bytes
+    const THINK_CLOSE: &[u8] = b"</think>";  // 8 bytes
+
     // Blinking caret state (toggles every ~500ms using uptime syscall)
     let mut caret_visible: bool = true;
     let mut last_caret_flip_ms: u64 = 0;
@@ -2980,6 +2991,83 @@ fn main() -> ! {
                 let mut vis_len: usize = 0;
 
                 for &byte in new_data.iter() {
+                    // ── Layer 1: Think tag filter ──
+                    // Intercepts <think>...</think> blocks and drops them entirely.
+                    // Bytes inside a think block never reach the tool/visible layer.
+                    if think_state == 0 {
+                        // Scanning for THINK_OPEN
+                        if byte == THINK_OPEN[think_open_match] {
+                            think_pending[think_pending_len] = byte;
+                            think_pending_len += 1;
+                            think_open_match += 1;
+                            if think_open_match == THINK_OPEN.len() {
+                                // Entered think block — drop all content
+                                think_state = 1;
+                                think_open_match = 0;
+                                think_pending_len = 0;
+                            }
+                            continue; // Don't pass to tool/visible layer yet
+                        } else if think_open_match > 0 {
+                            // Partial match failed — flush pending to tool/visible layer below
+                            // (fall through with pending bytes + current byte)
+                            // We need to process each pending byte through tool layer
+                            let pending_count = think_pending_len;
+                            think_open_match = 0;
+                            think_pending_len = 0;
+                            // Process each pending byte through tool/visible layer
+                            for j in 0..pending_count {
+                                let pb = think_pending[j];
+                                // (inline the tool/visible logic for flushed bytes)
+                                match tool_state {
+                                    0 => {
+                                        if pb == TOOL_OPEN[tool_open_match] {
+                                            tool_pending[tool_pending_len] = pb;
+                                            tool_pending_len += 1;
+                                            tool_open_match += 1;
+                                            if tool_open_match == TOOL_OPEN.len() {
+                                                tool_state = 1; tool_open_match = 0;
+                                                tool_pending_len = 0; tool_buf_len = 0;
+                                            }
+                                        } else if tool_open_match > 0 {
+                                            for k in 0..tool_pending_len {
+                                                if vis_len < visible_buf.len() { visible_buf[vis_len] = tool_pending[k]; vis_len += 1; }
+                                            }
+                                            tool_open_match = 0; tool_pending_len = 0;
+                                            if vis_len < visible_buf.len() { visible_buf[vis_len] = pb; vis_len += 1; }
+                                        } else if vis_len < visible_buf.len() { visible_buf[vis_len] = pb; vis_len += 1; }
+                                    }
+                                    1 => {
+                                        if pb == TOOL_CLOSE[tool_close_match] {
+                                            tool_close_match += 1;
+                                            if tool_close_match == TOOL_CLOSE.len() { tool_state = 3; tool_close_match = 0; }
+                                        } else {
+                                            for k in 0..tool_close_match { if tool_buf_len < tool_buf.len() { tool_buf[tool_buf_len] = TOOL_CLOSE[k]; tool_buf_len += 1; } }
+                                            tool_close_match = 0;
+                                            if tool_buf_len < tool_buf.len() { tool_buf[tool_buf_len] = pb; tool_buf_len += 1; }
+                                        }
+                                    }
+                                    _ => { if vis_len < visible_buf.len() { visible_buf[vis_len] = pb; vis_len += 1; } }
+                                }
+                            }
+                            // Now fall through to process current byte normally
+                        }
+                        // else: no partial match, byte falls through to tool/visible
+                    } else {
+                        // think_state == 1: Inside <think> block — scan for </think>
+                        if byte == THINK_CLOSE[think_close_match] {
+                            think_close_match += 1;
+                            if think_close_match == THINK_CLOSE.len() {
+                                // Exited think block — resume normal display
+                                think_state = 0;
+                                think_close_match = 0;
+                            }
+                        } else {
+                            think_close_match = 0;
+                        }
+                        continue; // Drop ALL bytes inside think block
+                    }
+
+                    // ── Layer 2: Tool tag filter + visible output ──
                     match tool_state {
                         0 => {
                             // Scanning for TOOL_OPEN tag
@@ -2988,14 +3076,12 @@ fn main() -> ! {
                                 tool_pending_len += 1;
                                 tool_open_match += 1;
                                 if tool_open_match == TOOL_OPEN.len() {
-                                    // Full open tag — start buffering body
                                     tool_state = 1;
                                     tool_open_match = 0;
                                     tool_pending_len = 0;
                                     tool_buf_len = 0;
                                 }
                             } else if tool_open_match > 0 {
-                                // Partial match failed — flush pending bytes to visible
                                 for j in 0..tool_pending_len {
                                     if vis_len < visible_buf.len() {
                                         visible_buf[vis_len] = tool_pending[j];
@@ -3009,7 +3095,6 @@ fn main() -> ! {
                                     vis_len += 1;
                                 }
                             } else {
-                                // Normal visible byte
                                 if vis_len < visible_buf.len() {
                                     visible_buf[vis_len] = byte;
                                     vis_len += 1;
@@ -3021,12 +3106,10 @@ fn main() -> ! {
                             if byte == TOOL_CLOSE[tool_close_match] {
                                 tool_close_match += 1;
                                 if tool_close_match == TOOL_CLOSE.len() {
-                                    // Tool call complete
                                     tool_state = 3;
                                     tool_close_match = 0;
                                 }
                             } else {
-                                // Flush partial close match into tool buffer
                                 for j in 0..tool_close_match {
                                     if tool_buf_len < tool_buf.len() {
                                         tool_buf[tool_buf_len] = TOOL_CLOSE[j];
@@ -3041,7 +3124,6 @@ fn main() -> ! {
                             }
                         }
                         _ => {
-                            // After completion, pass through
                             if vis_len < visible_buf.len() {
                                 visible_buf[vis_len] = byte;
                                 vis_len += 1;
