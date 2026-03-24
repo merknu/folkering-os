@@ -331,6 +331,11 @@ pub fn gemm_f32_x_q8(
 /// f32 input × Q6_K weights → f32 output.
 /// Used for output projection in Qwen3 (token_embd and output are Q6_K).
 /// Dequantizes Q6_K blocks on-the-fly, then AVX2 FMA dot product.
+/// f32 input × Q6_K weights → f32 output.
+/// Used for output projection in Qwen3 (token_embd and output are Q6_K).
+/// Dequant Q6_K blocks → AVX2 FMA dot product.
+/// Column-tiled: processes TILE_COLS columns at a time, dequantizing each
+/// block once and reusing input vector from L1 cache.
 pub fn gemm_f32_x_q6k(
     c: &mut [f32],
     a_f32: &[f32],
@@ -340,47 +345,94 @@ pub fn gemm_f32_x_q6k(
     n: usize,
     yield_every: usize,
 ) {
-    let n_blocks = k / Q6_K_BLOCK_VALUES; // 256 values per Q6_K block
+    let n_blocks = k / Q6_K_BLOCK_VALUES;
     let q6k_row_bytes = n_blocks * Q6_K_BLOCK_SIZE;
 
-    let mut dequant_buf = [0.0f32; Q6_K_BLOCK_VALUES];
+    // Tile size: process 4 columns at a time to amortize dequant overhead
+    // Each col = n_blocks dequant calls. With 4 cols, we read 4 weight blocks
+    // but reuse the same input vector segment from L1.
+    const TILE_COLS: usize = 4;
+    let mut dequant_bufs = [[0.0f32; Q6_K_BLOCK_VALUES]; TILE_COLS];
 
     for row in 0..m {
         let a_row = &a_f32[row * k..(row + 1) * k];
 
-        for col in 0..n {
+        // Process columns in tiles of TILE_COLS
+        let mut col = 0;
+        while col + TILE_COLS <= n {
+            let mut accs = [0.0f32; TILE_COLS];
+
+            for blk in 0..n_blocks {
+                let a_base = blk * Q6_K_BLOCK_VALUES;
+
+                // Dequantize same block position for all TILE_COLS columns
+                for t in 0..TILE_COLS {
+                    let b_off = (col + t) * q6k_row_bytes + blk * Q6_K_BLOCK_SIZE;
+                    quantize::dequantize_q6_k_block(
+                        &b_q6k[b_off..b_off + Q6_K_BLOCK_SIZE],
+                        &mut dequant_bufs[t],
+                    );
+                }
+
+                // AVX2 dot product: input × each dequantized column
+                #[cfg(target_arch = "x86_64")]
+                if simd::has_avx2() {
+                    for t in 0..TILE_COLS {
+                        accs[t] += unsafe {
+                            dot_f32_block_avx2(
+                                a_row.as_ptr().add(a_base),
+                                dequant_bufs[t].as_ptr(),
+                                256,
+                            )
+                        };
+                    }
+                    continue;
+                }
+
+                // Scalar fallback
+                let vals = Q6_K_BLOCK_VALUES.min(k - a_base);
+                for t in 0..TILE_COLS {
+                    for i in 0..vals {
+                        accs[t] += a_row[a_base + i] * dequant_bufs[t][i];
+                    }
+                }
+            }
+
+            for t in 0..TILE_COLS {
+                c[row * n + col + t] += accs[t];
+            }
+            col += TILE_COLS;
+        }
+
+        // Remainder columns (< TILE_COLS)
+        let mut dequant_buf = [0.0f32; Q6_K_BLOCK_VALUES];
+        while col < n {
             let b_col_offset = col * q6k_row_bytes;
             let mut acc = 0.0f32;
 
             for blk in 0..n_blocks {
                 let blk_start = b_col_offset + blk * Q6_K_BLOCK_SIZE;
-                let block = &b_q6k[blk_start..blk_start + Q6_K_BLOCK_SIZE];
-
-                quantize::dequantize_q6_k_block(block, &mut dequant_buf);
-
+                quantize::dequantize_q6_k_block(
+                    &b_q6k[blk_start..blk_start + Q6_K_BLOCK_SIZE],
+                    &mut dequant_buf,
+                );
                 let a_base = blk * Q6_K_BLOCK_VALUES;
-                let vals = Q6_K_BLOCK_VALUES.min(k - a_base);
 
-                // AVX2 FMA: 8 f32 per cycle, 32 iterations for 256 values
                 #[cfg(target_arch = "x86_64")]
-                if simd::has_avx2() && vals == 256 {
+                if simd::has_avx2() {
                     acc += unsafe {
-                        dot_f32_block_avx2(
-                            a_row.as_ptr().add(a_base),
-                            dequant_buf.as_ptr(),
-                            256,
-                        )
+                        dot_f32_block_avx2(a_row.as_ptr().add(a_base), dequant_buf.as_ptr(), 256)
                     };
                     continue;
                 }
 
-                // Scalar fallback
+                let vals = Q6_K_BLOCK_VALUES.min(k - a_base);
                 for i in 0..vals {
                     acc += a_row[a_base + i] * dequant_buf[i];
                 }
             }
-
             c[row * n + col] += acc;
+            col += 1;
         }
 
         if yield_every > 0 && row > 0 && row % yield_every == 0 {

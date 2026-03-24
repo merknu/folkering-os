@@ -192,9 +192,8 @@ const INFER_SHMEM_VADDR: usize = 0x20000000;
 /// Virtual address for mapping TokenRing shmem (ULTRA 43: isolated from I/O shmem)
 const RING_SHMEM_VADDR: usize = 0x22000000;
 
-/// Maximum tokens to generate per request
-/// Maximum tokens to generate per request (expanded with 1024-token context)
-const MAX_GEN_TOKENS: usize = 256;
+/// Maximum tokens to generate per request (512 to allow <think> + visible response)
+const MAX_GEN_TOKENS: usize = 512;
 
 /// KV-cache window size (power of 2).
 /// With Q8_0 quantization, 1024 tokens uses ~3.1MB (same as 256 with f32).
@@ -842,7 +841,7 @@ fn handle_inference_request(
     let mut response_len = 0usize;
 
     // Track generated tokens for repetition penalty (ULTRA 33)
-    let mut gen_tokens = [0u32; 128];
+    let mut gen_tokens = [0u32; 512];
     let mut gen_count = 0usize;
 
     // === Prefill Phase ===
@@ -1191,7 +1190,7 @@ const RING_DATA_MAX: usize = 16368;
 fn wrap_chat_template(query: &[u8], output: &mut [u8]) -> usize {
     // NOTE: Newline before <|im_end|> ensures greedy tokenizer doesn't merge
     // the last text char with '<' (e.g. ".<" as a single token breaking <|im_end|>).
-    let sys = b"<|im_start|>system\nYou are Folkering, a helpful AI on Folkering OS.\nTools: <|tool|>read FILENAME<|/tool|>, <|tool|>write FILENAME CONTENT<|/tool|>, <|tool|>ls<|/tool|>.\nAfter a tool call, the result appears as <|tool_result|>...<|/tool_result|>. Use tools when asked about files.\n<|im_end|>\n";
+    let sys = b"<|im_start|>system\nYou are Folkering, a helpful AI on Folkering OS.\nKeep your <think> reasoning very brief (under 20 words). Give direct, concise answers.\nTools: <|tool|>read FILENAME<|/tool|>, <|tool|>write FILENAME CONTENT<|/tool|>, <|tool|>ls<|/tool|>.\n<|im_end|>\n";
     let user_pre = b"<|im_start|>user\n";
     let user_suf = b"\n<|im_end|>\n<|im_start|>assistant\n";
 
@@ -1354,7 +1353,7 @@ fn handle_async_inference(
     let config = &eng.config;
     let yield_cfg = YieldConfig::foreground();
 
-    let mut gen_tokens = [0u32; 128];
+    let mut gen_tokens = [0u32; 512];
     let mut gen_count = 0usize;
     let mut last_logits_token: u32 = 0;
 
