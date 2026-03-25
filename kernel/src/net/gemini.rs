@@ -171,13 +171,29 @@ fn http_post_raw(ip: [u8; 4], port: u16, request: &[u8]) -> Result<Vec<u8>, &'st
 
     crate::serial_str!("[GEMINI] TX flushed, reading response...\n");
 
-    // Read response
+    // Read response with aggressive polling
     let mut response = Vec::new();
     let read_start = tls::tsc_ms();
+    let mut poll_count = 0u32;
     loop {
         let now = Instant::from_millis(tls::tsc_ms());
         let mut device = FolkeringDevice;
         state.iface.poll(now, &mut device, &mut state.sockets);
+        poll_count += 1;
+
+        // Log progress every 1000 polls
+        if poll_count % 5000 == 0 {
+            let socket = state.sockets.get_mut::<tcp::Socket>(tcp_handle);
+            crate::serial_str!("[GEMINI] Poll ");
+            crate::drivers::serial::write_dec(poll_count);
+            crate::serial_str!(" active=");
+            crate::drivers::serial::write_dec(if socket.is_active() { 1 } else { 0 });
+            crate::serial_str!(" can_recv=");
+            crate::drivers::serial::write_dec(if socket.can_recv() { 1 } else { 0 });
+            crate::serial_str!(" recv_q=");
+            crate::drivers::serial::write_dec(socket.recv_queue() as u32);
+            crate::drivers::serial::write_newline();
+        }
 
         let socket = state.sockets.get_mut::<tcp::Socket>(tcp_handle);
         if socket.can_recv() {
