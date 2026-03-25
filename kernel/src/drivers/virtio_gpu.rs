@@ -360,17 +360,39 @@ pub fn init() -> Result<(), &'static str> {
     crate::drivers::serial::write_dec((up % 4) as u32);
     crate::serial_str!(")\n");
 
-    // Write ring addresses as atomic 64-bit MMIO writes.
-    // Some QEMU/WHPX builds silently drop split 32-bit lo/hi writes.
-    transport.write_common64(VIRTIO_PCI_COMMON_Q_DESCLO, dp);
-    transport.write_common64(VIRTIO_PCI_COMMON_Q_AVAILLO, ap);
+    // Write ring addresses as two 32-bit MMIO writes (lo then hi)
+    transport.write_common32(VIRTIO_PCI_COMMON_Q_DESCLO, dp as u32);
+    transport.write_common32(VIRTIO_PCI_COMMON_Q_DESCHI, (dp >> 32) as u32);
+    transport.write_common32(VIRTIO_PCI_COMMON_Q_AVAILLO, ap as u32);
+    transport.write_common32(VIRTIO_PCI_COMMON_Q_AVAILHI, (ap >> 32) as u32);
     // Re-select queue 0 before USED write (Q_SELECT may have been cleared)
     transport.write_common16(VIRTIO_PCI_COMMON_Q_SELECT, 0);
 
-    // Write USED ring address as atomic 64-bit MMIO write
-    transport.write_common64(VIRTIO_PCI_COMMON_Q_USEDLO, up);
-    // Readback
-    let rb_used = transport.read_common64(VIRTIO_PCI_COMMON_Q_USEDLO);
+    // BRUTAL TEST: write USED via raw pointer and verify
+    let used_mmio = (transport.common_base + 0x38) as *mut u32;
+    let desc_mmio = (transport.common_base + 0x28) as *mut u32;
+
+    // Test 1: Write 0xDEAD to DESCLO, read back
+    unsafe { core::ptr::write_volatile(desc_mmio, 0xDEADBEEF); }
+    let rb_test_desc = unsafe { core::ptr::read_volatile(desc_mmio) };
+    crate::serial_str!("[VIRTIO_GPU] TEST desc write 0xDEADBEEF readback=");
+    crate::drivers::serial::write_hex(rb_test_desc as u64);
+    crate::drivers::serial::write_newline();
+
+    // Restore DESC
+    unsafe { core::ptr::write_volatile(desc_mmio, dp as u32); }
+
+    // Test 2: Write 0xBEEF to USEDLO, read back
+    unsafe { core::ptr::write_volatile(used_mmio, 0xBEEFCAFE); }
+    let rb_test_used = unsafe { core::ptr::read_volatile(used_mmio) };
+    crate::serial_str!("[VIRTIO_GPU] TEST used write 0xBEEFCAFE readback=");
+    crate::drivers::serial::write_hex(rb_test_used as u64);
+    crate::drivers::serial::write_newline();
+
+    // Now write actual USED address
+    unsafe { core::ptr::write_volatile(used_mmio, up as u32); }
+    unsafe { core::ptr::write_volatile((transport.common_base + 0x3C) as *mut u32, (up >> 32) as u32); }
+    let rb_used = unsafe { core::ptr::read_volatile(used_mmio) } as u64;
     crate::serial_str!("[VIRTIO_GPU] USED write=");
     crate::drivers::serial::write_hex(up);
     crate::serial_str!(" readback=");
@@ -636,7 +658,10 @@ fn parse_virtio_capabilities(dev: &PciDevice) -> Result<MmioTransport, &'static 
     use x86_64::structures::paging::PageTableFlags;
     let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE
         | PageTableFlags::NO_EXECUTE | PageTableFlags::NO_CACHE;
-    let mmio_pages = [common_phys & !0xFFF, notify_phys & !0xFFF, isr_phys & !0xFFF];
+    // Map ALL pages of the BAR that contains common config (typically 4 pages = 16KB)
+    let bar_base = common_phys & !0xFFF;
+    let bar_size = 16384usize; // 4 pages covers all cap regions
+    let mmio_pages: alloc::vec::Vec<usize> = (0..bar_size).step_by(4096).map(|off| bar_base + off).collect();
     for &phys in &mmio_pages {
         crate::serial_str!("[VIRTIO_GPU] Mapping MMIO phys=");
         crate::drivers::serial::write_hex(phys as u64);
