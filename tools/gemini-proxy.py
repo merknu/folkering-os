@@ -17,7 +17,7 @@ import sys
 
 API_KEY = "***REDACTED***"
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={API_KEY}"
-PORT = 8080
+PORT = 8080  # Default; override with command line arg
 
 
 class GeminiHandler(http.server.BaseHTTPRequestHandler):
