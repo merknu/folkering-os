@@ -104,10 +104,11 @@ pub fn ask_gemini(prompt: &str) -> Result<Vec<u8>, &'static str> {
 fn resolve_gemini_ip() -> Result<[u8; 4], &'static str> {
     let packed = super::dns_lookup(GEMINI_HOST);
     if packed != 0 {
-        let a = ((packed >> 24) & 0xFF) as u8;
-        let b = ((packed >> 16) & 0xFF) as u8;
-        let c = ((packed >> 8) & 0xFF) as u8;
-        let d = (packed & 0xFF) as u8;
+        // dns_lookup returns: a | (b<<8) | (c<<16) | (d<<24) (little-endian)
+        let a = (packed & 0xFF) as u8;
+        let b = ((packed >> 8) & 0xFF) as u8;
+        let c = ((packed >> 16) & 0xFF) as u8;
+        let d = ((packed >> 24) & 0xFF) as u8;
         Ok([a, b, c, d])
     } else {
         // Fallback: generativelanguage.googleapis.com often resolves to
