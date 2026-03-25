@@ -564,9 +564,43 @@ fn main() -> ! {
         }
     }
 
-    // Step 5: Create FramebufferView
-    let mut fb = unsafe {
-        FramebufferView::new(FRAMEBUFFER_VADDR as *mut u8, fb_config)
+    // Step 5: Try VirtIO-GPU first, fall back to Limine framebuffer
+    const GPU_FB_VADDR: usize = 0x0000_0002_0000_0000; // 8GB mark for GPU FB
+    let mut use_gpu = false;
+
+    if let Some((gpu_w, gpu_h)) = libfolk::sys::gpu_info(GPU_FB_VADDR) {
+        write_str("[COMPOSITOR] VirtIO-GPU: ");
+        if gpu_w >= 1000 { write_char(b'0' + ((gpu_w / 1000) % 10) as u8); }
+        if gpu_w >= 100 { write_char(b'0' + ((gpu_w / 100) % 10) as u8); }
+        write_char(b'0' + ((gpu_w / 10) % 10) as u8);
+        write_char(b'0' + (gpu_w % 10) as u8);
+        write_str("x");
+        if gpu_h >= 100 { write_char(b'0' + ((gpu_h / 100) % 10) as u8); }
+        write_char(b'0' + ((gpu_h / 10) % 10) as u8);
+        write_char(b'0' + (gpu_h % 10) as u8);
+        write_str(" mapped at GPU_FB_VADDR\n");
+        use_gpu = true;
+    }
+
+    // Create FramebufferView — use GPU backing buffer if available, else Limine FB
+    let mut fb = if use_gpu {
+        // Build GPU framebuffer config (BGRX format, same as VirtIO-GPU RESOURCE_CREATE_2D)
+        let (gw, gh) = libfolk::sys::gpu_info(GPU_FB_VADDR).unwrap_or((0, 0));
+        let gpu_config = libfolk::sys::boot_info::FramebufferConfig {
+            physical_address: 0,
+            width: gw,
+            height: gh,
+            pitch: gw * 4,
+            bpp: 32,
+            memory_model: 0,
+            red_mask_size: 8, red_mask_shift: 16,
+            green_mask_size: 8, green_mask_shift: 8,
+            blue_mask_size: 8, blue_mask_shift: 0,
+            _reserved: [0; 3],
+        };
+        unsafe { FramebufferView::new(GPU_FB_VADDR as *mut u8, &gpu_config) }
+    } else {
+        unsafe { FramebufferView::new(FRAMEBUFFER_VADDR as *mut u8, fb_config) }
     };
 
     // ===== NEURAL DESKTOP =====
@@ -3253,6 +3287,11 @@ fn main() -> ! {
                 }
                 need_redraw = true;
             }
+        }
+
+        // Flush GPU framebuffer if using VirtIO-GPU
+        if use_gpu {
+            libfolk::sys::gpu_flush(0, 0, fb.width as u32, fb.height as u32);
         }
 
         // Only yield CPU if we did no work this iteration (ULTRA 46)
