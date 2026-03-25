@@ -206,7 +206,8 @@ impl MmioTransport {
         crate::serial_str!(" off=");
         crate::drivers::serial::write_dec(off as u32);
         crate::serial_str!(")\n");
-        unsafe { core::ptr::write_volatile(addr as *mut u16, 0) }
+        // Modern VirtIO: notify register is le32 (NOT le16 like Legacy!)
+        unsafe { core::ptr::write_volatile(addr as *mut u32, 0) }
         crate::serial_str!("[VIRTIO_GPU] notify_write done\n");
     }
 }
@@ -335,18 +336,53 @@ pub fn init() -> Result<(), &'static str> {
     let controlq = Virtqueue::new(queue_size).ok_or("failed to alloc controlq")?;
 
     // Modern: write descriptor/available/used ring addresses directly
-    transport.write_common32(VIRTIO_PCI_COMMON_Q_DESCLO, controlq.desc_phys() as u32);
-    transport.write_common32(VIRTIO_PCI_COMMON_Q_DESCHI, (controlq.desc_phys() >> 32) as u32);
-    transport.write_common32(VIRTIO_PCI_COMMON_Q_AVAILLO, controlq.avail_phys() as u32);
-    transport.write_common32(VIRTIO_PCI_COMMON_Q_AVAILHI, (controlq.avail_phys() >> 32) as u32);
-    transport.write_common32(VIRTIO_PCI_COMMON_Q_USEDLO, controlq.used_phys() as u32);
-    transport.write_common32(VIRTIO_PCI_COMMON_Q_USEDHI, (controlq.used_phys() >> 32) as u32);
+    let dp = controlq.desc_phys();
+    let ap = controlq.avail_phys();
+    let up = controlq.used_phys();
 
-    // Disable MSI-X for this queue (use polling, not interrupts)
-    // Writing 0xFFFF means "no MSI-X vector" = use ISR polling
-    transport.write_common16(VIRTIO_PCI_COMMON_Q_MSIX, 0xFFFF);
-    // Also disable config MSI-X
-    transport.write_common16(VIRTIO_PCI_COMMON_MSIX, 0xFFFF);
+    crate::serial_str!("[VIRTIO_GPU] Ring addrs: desc=");
+    crate::drivers::serial::write_hex(dp);
+    crate::serial_str!(" avail=");
+    crate::drivers::serial::write_hex(ap);
+    crate::serial_str!(" used=");
+    crate::drivers::serial::write_hex(up);
+    crate::serial_str!(" (align: desc%16=");
+    crate::drivers::serial::write_dec((dp % 16) as u32);
+    crate::serial_str!(" avail%2=");
+    crate::drivers::serial::write_dec((ap % 2) as u32);
+    crate::serial_str!(" used%4=");
+    crate::drivers::serial::write_dec((up % 4) as u32);
+    crate::serial_str!(")\n");
+
+    transport.write_common32(VIRTIO_PCI_COMMON_Q_DESCLO, dp as u32);
+    transport.write_common32(VIRTIO_PCI_COMMON_Q_DESCHI, (dp >> 32) as u32);
+    transport.write_common32(VIRTIO_PCI_COMMON_Q_AVAILLO, ap as u32);
+    transport.write_common32(VIRTIO_PCI_COMMON_Q_AVAILHI, (ap >> 32) as u32);
+    // Re-select queue 0 before USED write (Q_SELECT may have been cleared)
+    transport.write_common16(VIRTIO_PCI_COMMON_Q_SELECT, 0);
+
+    // Write USED ring address — log everything for debugging
+    crate::serial_str!("[VIRTIO_GPU] Writing USED: lo=");
+    crate::drivers::serial::write_hex(up as u32 as u64);
+    crate::serial_str!(" hi=");
+    crate::drivers::serial::write_hex((up >> 32) as u32 as u64);
+    crate::serial_str!(" at mmio+0x38=");
+    crate::drivers::serial::write_hex((transport.common_base + 0x38) as u64);
+    crate::drivers::serial::write_newline();
+    transport.write_common32(VIRTIO_PCI_COMMON_Q_USEDLO, up as u32);
+    transport.write_common32(VIRTIO_PCI_COMMON_Q_USEDHI, (up >> 32) as u32);
+    // Immediate readback
+    let rb_used_lo = transport.read_common32(VIRTIO_PCI_COMMON_Q_USEDLO);
+    crate::serial_str!("[VIRTIO_GPU] USED readback lo=");
+    crate::drivers::serial::write_hex(rb_used_lo as u64);
+    crate::drivers::serial::write_newline();
+
+    // Read back to verify
+    let d_rb = transport.read_common32(VIRTIO_PCI_COMMON_Q_DESCLO) as u64
+             | ((transport.read_common32(VIRTIO_PCI_COMMON_Q_DESCHI) as u64) << 32);
+    crate::serial_str!("[VIRTIO_GPU] Readback desc=");
+    crate::drivers::serial::write_hex(d_rb);
+    crate::drivers::serial::write_newline();
 
     // Read queue notify offset (needed for correct notify address)
     let q_notify_off = transport.read_common16(VIRTIO_PCI_COMMON_Q_NOFF);
@@ -357,8 +393,39 @@ pub fn init() -> Result<(), &'static str> {
     crate::drivers::serial::write_dec(transport.notify_mul);
     crate::drivers::serial::write_newline();
 
-    // Enable the queue
-    transport.write_common16(VIRTIO_PCI_COMMON_Q_ENABLE, 1);
+    // Readback ALL queue registers before enabling
+    let rb_desc = transport.read_common32(VIRTIO_PCI_COMMON_Q_DESCLO) as u64
+                | ((transport.read_common32(VIRTIO_PCI_COMMON_Q_DESCHI) as u64) << 32);
+    let rb_avail = transport.read_common32(VIRTIO_PCI_COMMON_Q_AVAILLO) as u64
+                 | ((transport.read_common32(VIRTIO_PCI_COMMON_Q_AVAILHI) as u64) << 32);
+    let rb_used = transport.read_common32(VIRTIO_PCI_COMMON_Q_USEDLO) as u64
+                | ((transport.read_common32(VIRTIO_PCI_COMMON_Q_USEDHI) as u64) << 32);
+    let rb_size = transport.read_common16(VIRTIO_PCI_COMMON_Q_SIZE);
+    let rb_sel = transport.read_common16(VIRTIO_PCI_COMMON_Q_SELECT);
+
+    crate::serial_str!("[VIRTIO_GPU] Pre-enable: sel=");
+    crate::drivers::serial::write_dec(rb_sel as u32);
+    crate::serial_str!(" size=");
+    crate::drivers::serial::write_dec(rb_size as u32);
+    crate::serial_str!(" desc=");
+    crate::drivers::serial::write_hex(rb_desc);
+    crate::serial_str!(" avail=");
+    crate::drivers::serial::write_hex(rb_avail);
+    crate::serial_str!(" used=");
+    crate::drivers::serial::write_hex(rb_used);
+    crate::drivers::serial::write_newline();
+    // Try writing as both u16 and u32 to handle potential alignment issues
+    unsafe {
+        core::ptr::write_volatile(
+            (transport.common_base + VIRTIO_PCI_COMMON_Q_ENABLE) as *mut u16, 1
+        );
+    }
+    // Force a small delay for device to process
+    for _ in 0..10000 { core::hint::spin_loop(); }
+    let q_enabled = transport.read_common16(VIRTIO_PCI_COMMON_Q_ENABLE);
+    crate::serial_str!("[VIRTIO_GPU] Q_ENABLE readback: ");
+    crate::drivers::serial::write_dec(q_enabled as u32);
+    crate::drivers::serial::write_newline();
 
     // DRIVER_OK
     transport.write_common8(VIRTIO_PCI_COMMON_STATUS,
