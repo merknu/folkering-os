@@ -194,6 +194,12 @@ impl MmioTransport {
     fn write_common8(&self, off: usize, val: u8) {
         unsafe { core::ptr::write_volatile((self.common_base + off) as *mut u8, val) }
     }
+    fn write_common64(&self, off: usize, val: u64) {
+        unsafe { core::ptr::write_volatile((self.common_base + off) as *mut u64, val) }
+    }
+    fn read_common64(&self, off: usize) -> u64 {
+        unsafe { core::ptr::read_volatile((self.common_base + off) as *const u64) }
+    }
     fn notify_queue(&self, _queue_idx: u16) {
         // Modern VirtIO: notify address = notify_base + Q_NOFF * notify_off_multiplier
         let off = self.notify_off as usize * self.notify_mul as usize;
@@ -354,27 +360,21 @@ pub fn init() -> Result<(), &'static str> {
     crate::drivers::serial::write_dec((up % 4) as u32);
     crate::serial_str!(")\n");
 
-    transport.write_common32(VIRTIO_PCI_COMMON_Q_DESCLO, dp as u32);
-    transport.write_common32(VIRTIO_PCI_COMMON_Q_DESCHI, (dp >> 32) as u32);
-    transport.write_common32(VIRTIO_PCI_COMMON_Q_AVAILLO, ap as u32);
-    transport.write_common32(VIRTIO_PCI_COMMON_Q_AVAILHI, (ap >> 32) as u32);
+    // Write ring addresses as atomic 64-bit MMIO writes.
+    // Some QEMU/WHPX builds silently drop split 32-bit lo/hi writes.
+    transport.write_common64(VIRTIO_PCI_COMMON_Q_DESCLO, dp);
+    transport.write_common64(VIRTIO_PCI_COMMON_Q_AVAILLO, ap);
     // Re-select queue 0 before USED write (Q_SELECT may have been cleared)
     transport.write_common16(VIRTIO_PCI_COMMON_Q_SELECT, 0);
 
-    // Write USED ring address — log everything for debugging
-    crate::serial_str!("[VIRTIO_GPU] Writing USED: lo=");
-    crate::drivers::serial::write_hex(up as u32 as u64);
-    crate::serial_str!(" hi=");
-    crate::drivers::serial::write_hex((up >> 32) as u32 as u64);
-    crate::serial_str!(" at mmio+0x38=");
-    crate::drivers::serial::write_hex((transport.common_base + 0x38) as u64);
-    crate::drivers::serial::write_newline();
-    transport.write_common32(VIRTIO_PCI_COMMON_Q_USEDLO, up as u32);
-    transport.write_common32(VIRTIO_PCI_COMMON_Q_USEDHI, (up >> 32) as u32);
-    // Immediate readback
-    let rb_used_lo = transport.read_common32(VIRTIO_PCI_COMMON_Q_USEDLO);
-    crate::serial_str!("[VIRTIO_GPU] USED readback lo=");
-    crate::drivers::serial::write_hex(rb_used_lo as u64);
+    // Write USED ring address as atomic 64-bit MMIO write
+    transport.write_common64(VIRTIO_PCI_COMMON_Q_USEDLO, up);
+    // Readback
+    let rb_used = transport.read_common64(VIRTIO_PCI_COMMON_Q_USEDLO);
+    crate::serial_str!("[VIRTIO_GPU] USED write=");
+    crate::drivers::serial::write_hex(up);
+    crate::serial_str!(" readback=");
+    crate::drivers::serial::write_hex(rb_used);
     crate::drivers::serial::write_newline();
 
     // Read back to verify
@@ -393,13 +393,10 @@ pub fn init() -> Result<(), &'static str> {
     crate::drivers::serial::write_dec(transport.notify_mul);
     crate::drivers::serial::write_newline();
 
-    // Readback ALL queue registers before enabling
-    let rb_desc = transport.read_common32(VIRTIO_PCI_COMMON_Q_DESCLO) as u64
-                | ((transport.read_common32(VIRTIO_PCI_COMMON_Q_DESCHI) as u64) << 32);
-    let rb_avail = transport.read_common32(VIRTIO_PCI_COMMON_Q_AVAILLO) as u64
-                 | ((transport.read_common32(VIRTIO_PCI_COMMON_Q_AVAILHI) as u64) << 32);
-    let rb_used = transport.read_common32(VIRTIO_PCI_COMMON_Q_USEDLO) as u64
-                | ((transport.read_common32(VIRTIO_PCI_COMMON_Q_USEDHI) as u64) << 32);
+    // Readback ALL queue registers before enabling (64-bit reads)
+    let rb_desc = transport.read_common64(VIRTIO_PCI_COMMON_Q_DESCLO);
+    let rb_avail = transport.read_common64(VIRTIO_PCI_COMMON_Q_AVAILLO);
+    let rb_used = transport.read_common64(VIRTIO_PCI_COMMON_Q_USEDLO);
     let rb_size = transport.read_common16(VIRTIO_PCI_COMMON_Q_SIZE);
     let rb_sel = transport.read_common16(VIRTIO_PCI_COMMON_Q_SELECT);
 
