@@ -219,25 +219,27 @@ impl MmioTransport {
 }
 
 // Modern VirtIO Common Config register offsets
-const VIRTIO_PCI_COMMON_DFSELECT: usize = 0x00;
-const VIRTIO_PCI_COMMON_DF: usize = 0x04;
-const VIRTIO_PCI_COMMON_GFSELECT: usize = 0x08;
-const VIRTIO_PCI_COMMON_GF: usize = 0x0C;
-const VIRTIO_PCI_COMMON_MSIX: usize = 0x10;
-const VIRTIO_PCI_COMMON_NUMQ: usize = 0x14;
-const VIRTIO_PCI_COMMON_STATUS: usize = 0x16;
-const VIRTIO_PCI_COMMON_CFGGEN: usize = 0x18;
-const VIRTIO_PCI_COMMON_Q_SELECT: usize = 0x1C;
-const VIRTIO_PCI_COMMON_Q_SIZE: usize = 0x1E;
-const VIRTIO_PCI_COMMON_Q_MSIX: usize = 0x20;
-const VIRTIO_PCI_COMMON_Q_ENABLE: usize = 0x22;
-const VIRTIO_PCI_COMMON_Q_NOFF: usize = 0x24;
-const VIRTIO_PCI_COMMON_Q_DESCLO: usize = 0x28;
-const VIRTIO_PCI_COMMON_Q_DESCHI: usize = 0x2C;
-const VIRTIO_PCI_COMMON_Q_AVAILLO: usize = 0x30;
-const VIRTIO_PCI_COMMON_Q_AVAILHI: usize = 0x34;
-const VIRTIO_PCI_COMMON_Q_USEDLO: usize = 0x38;
-const VIRTIO_PCI_COMMON_Q_USEDHI: usize = 0x3C;
+// Modern VirtIO Common Config — OASIS VirtIO v1.0 spec offsets
+// Note: device_status (0x14) is u8, config_generation (0x15) is u8
+const VIRTIO_PCI_COMMON_DFSELECT: usize = 0x00;  // u32
+const VIRTIO_PCI_COMMON_DF: usize = 0x04;        // u32
+const VIRTIO_PCI_COMMON_GFSELECT: usize = 0x08;  // u32
+const VIRTIO_PCI_COMMON_GF: usize = 0x0C;        // u32
+const VIRTIO_PCI_COMMON_MSIX: usize = 0x10;      // u16
+const VIRTIO_PCI_COMMON_NUMQ: usize = 0x12;      // u16
+const VIRTIO_PCI_COMMON_STATUS: usize = 0x14;     // u8
+const VIRTIO_PCI_COMMON_CFGGEN: usize = 0x15;     // u8
+const VIRTIO_PCI_COMMON_Q_SELECT: usize = 0x16;   // u16
+const VIRTIO_PCI_COMMON_Q_SIZE: usize = 0x18;     // u16
+const VIRTIO_PCI_COMMON_Q_MSIX: usize = 0x1A;     // u16
+const VIRTIO_PCI_COMMON_Q_ENABLE: usize = 0x1C;   // u16
+const VIRTIO_PCI_COMMON_Q_NOFF: usize = 0x1E;     // u16
+const VIRTIO_PCI_COMMON_Q_DESCLO: usize = 0x20;   // u32
+const VIRTIO_PCI_COMMON_Q_DESCHI: usize = 0x24;   // u32
+const VIRTIO_PCI_COMMON_Q_AVAILLO: usize = 0x28;  // u32
+const VIRTIO_PCI_COMMON_Q_AVAILHI: usize = 0x2C;  // u32
+const VIRTIO_PCI_COMMON_Q_USEDLO: usize = 0x30;   // u32
+const VIRTIO_PCI_COMMON_Q_USEDHI: usize = 0x34;   // u32
 
 struct GpuState {
     transport: MmioTransport,
@@ -360,51 +362,13 @@ pub fn init() -> Result<(), &'static str> {
     crate::drivers::serial::write_dec((up % 4) as u32);
     crate::serial_str!(")\n");
 
-    // Write ring addresses as two 32-bit MMIO writes (lo then hi)
+    // Write ring addresses (standard 32-bit lo/hi per OASIS spec)
     transport.write_common32(VIRTIO_PCI_COMMON_Q_DESCLO, dp as u32);
     transport.write_common32(VIRTIO_PCI_COMMON_Q_DESCHI, (dp >> 32) as u32);
     transport.write_common32(VIRTIO_PCI_COMMON_Q_AVAILLO, ap as u32);
     transport.write_common32(VIRTIO_PCI_COMMON_Q_AVAILHI, (ap >> 32) as u32);
-    // Re-select queue 0 before USED write (Q_SELECT may have been cleared)
-    transport.write_common16(VIRTIO_PCI_COMMON_Q_SELECT, 0);
-
-    // BRUTAL TEST: write USED via raw pointer and verify
-    let used_mmio = (transport.common_base + 0x38) as *mut u32;
-    let desc_mmio = (transport.common_base + 0x28) as *mut u32;
-
-    // Test 1: Write 0xDEAD to DESCLO, read back
-    unsafe { core::ptr::write_volatile(desc_mmio, 0xDEADBEEF); }
-    let rb_test_desc = unsafe { core::ptr::read_volatile(desc_mmio) };
-    crate::serial_str!("[VIRTIO_GPU] TEST desc write 0xDEADBEEF readback=");
-    crate::drivers::serial::write_hex(rb_test_desc as u64);
-    crate::drivers::serial::write_newline();
-
-    // Restore DESC
-    unsafe { core::ptr::write_volatile(desc_mmio, dp as u32); }
-
-    // Test 2: Write 0xBEEF to USEDLO, read back
-    unsafe { core::ptr::write_volatile(used_mmio, 0xBEEFCAFE); }
-    let rb_test_used = unsafe { core::ptr::read_volatile(used_mmio) };
-    crate::serial_str!("[VIRTIO_GPU] TEST used write 0xBEEFCAFE readback=");
-    crate::drivers::serial::write_hex(rb_test_used as u64);
-    crate::drivers::serial::write_newline();
-
-    // Now write actual USED address
-    unsafe { core::ptr::write_volatile(used_mmio, up as u32); }
-    unsafe { core::ptr::write_volatile((transport.common_base + 0x3C) as *mut u32, (up >> 32) as u32); }
-    let rb_used = unsafe { core::ptr::read_volatile(used_mmio) } as u64;
-    crate::serial_str!("[VIRTIO_GPU] USED write=");
-    crate::drivers::serial::write_hex(up);
-    crate::serial_str!(" readback=");
-    crate::drivers::serial::write_hex(rb_used);
-    crate::drivers::serial::write_newline();
-
-    // Read back to verify
-    let d_rb = transport.read_common32(VIRTIO_PCI_COMMON_Q_DESCLO) as u64
-             | ((transport.read_common32(VIRTIO_PCI_COMMON_Q_DESCHI) as u64) << 32);
-    crate::serial_str!("[VIRTIO_GPU] Readback desc=");
-    crate::drivers::serial::write_hex(d_rb);
-    crate::drivers::serial::write_newline();
+    transport.write_common32(VIRTIO_PCI_COMMON_Q_USEDLO, up as u32);
+    transport.write_common32(VIRTIO_PCI_COMMON_Q_USEDHI, (up >> 32) as u32);
 
     // Read queue notify offset (needed for correct notify address)
     let q_notify_off = transport.read_common16(VIRTIO_PCI_COMMON_Q_NOFF);
@@ -415,23 +379,10 @@ pub fn init() -> Result<(), &'static str> {
     crate::drivers::serial::write_dec(transport.notify_mul);
     crate::drivers::serial::write_newline();
 
-    // Readback ALL queue registers before enabling (64-bit reads)
-    let rb_desc = transport.read_common64(VIRTIO_PCI_COMMON_Q_DESCLO);
-    let rb_avail = transport.read_common64(VIRTIO_PCI_COMMON_Q_AVAILLO);
-    let rb_used = transport.read_common64(VIRTIO_PCI_COMMON_Q_USEDLO);
-    let rb_size = transport.read_common16(VIRTIO_PCI_COMMON_Q_SIZE);
-    let rb_sel = transport.read_common16(VIRTIO_PCI_COMMON_Q_SELECT);
-
-    crate::serial_str!("[VIRTIO_GPU] Pre-enable: sel=");
-    crate::drivers::serial::write_dec(rb_sel as u32);
-    crate::serial_str!(" size=");
-    crate::drivers::serial::write_dec(rb_size as u32);
-    crate::serial_str!(" desc=");
-    crate::drivers::serial::write_hex(rb_desc);
-    crate::serial_str!(" avail=");
-    crate::drivers::serial::write_hex(rb_avail);
-    crate::serial_str!(" used=");
-    crate::drivers::serial::write_hex(rb_used);
+    // Verify USED readback
+    let rb_used = transport.read_common32(VIRTIO_PCI_COMMON_Q_USEDLO);
+    crate::serial_str!("[VIRTIO_GPU] USED readback=");
+    crate::drivers::serial::write_hex(rb_used as u64);
     crate::drivers::serial::write_newline();
     // Try writing as both u16 and u32 to handle potential alignment issues
     unsafe {
