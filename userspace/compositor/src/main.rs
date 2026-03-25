@@ -582,25 +582,10 @@ fn main() -> ! {
         use_gpu = true;
     }
 
-    // Create FramebufferView — use GPU backing buffer if available, else Limine FB
-    let mut fb = if use_gpu {
-        // Build GPU framebuffer config (BGRX format, same as VirtIO-GPU RESOURCE_CREATE_2D)
-        let (gw, gh) = libfolk::sys::gpu_info(GPU_FB_VADDR).unwrap_or((0, 0));
-        let gpu_config = libfolk::sys::boot_info::FramebufferConfig {
-            physical_address: 0,
-            width: gw,
-            height: gh,
-            pitch: gw * 4,
-            bpp: 32,
-            memory_model: 0,
-            red_mask_size: 8, red_mask_shift: 16,
-            green_mask_size: 8, green_mask_shift: 8,
-            blue_mask_size: 8, blue_mask_shift: 0,
-            _reserved: [0; 3],
-        };
-        unsafe { FramebufferView::new(GPU_FB_VADDR as *mut u8, &gpu_config) }
-    } else {
-        unsafe { FramebufferView::new(FRAMEBUFFER_VADDR as *mut u8, fb_config) }
+    // Use Limine framebuffer for rendering (always visible via VNC).
+    // GPU backing buffer is used for VirtIO-GPU scanout when available.
+    let mut fb = unsafe {
+        FramebufferView::new(FRAMEBUFFER_VADDR as *mut u8, fb_config)
     };
 
     // ===== NEURAL DESKTOP =====

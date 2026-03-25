@@ -443,6 +443,49 @@ pub fn init() -> Result<(), &'static str> {
     set_scanout(&mut state)?;
     crate::serial_strln!("[VIRTIO_GPU] Scanout active!");
 
+    // TEST: Fill backing buffer with bright red pixels before declaring active
+    let hhdm_off = crate::memory::paging::hhdm_offset();
+    for &page_phys in &state.fb_phys_pages {
+        let page_virt = (hhdm_off + page_phys) as *mut u32;
+        for i in 0..1024 { // 4096 bytes / 4 bytes per pixel = 1024 pixels
+            unsafe { page_virt.add(i).write_volatile(0x00FF0000); } // Red in BGRX
+        }
+    }
+    crate::serial_str!("[VIRTIO_GPU] Test pattern: filled backing with RED\n");
+
+    // Do a sync transfer+flush to verify display works
+    {
+        let cmd_phys = physical::alloc_page().unwrap();
+        let cmd_virt = (hhdm_off + cmd_phys) as *mut u8;
+        unsafe {
+            let transfer = cmd_virt as *mut GpuTransferToHost2D;
+            (*transfer).hdr = make_hdr(VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D);
+            (*transfer).r = GpuRect { x: 0, y: 0, width: state.width, height: state.height };
+            (*transfer).offset = 0;
+            (*transfer).resource_id = 1;
+            (*transfer).padding = 0;
+        }
+        submit_and_wait(&mut state, cmd_phys,
+            core::mem::size_of::<GpuTransferToHost2D>(),
+            cmd_phys + core::mem::size_of::<GpuTransferToHost2D>(), 24)?;
+        crate::serial_str!("[VIRTIO_GPU] TRANSFER_TO_HOST_2D OK\n");
+
+        let cmd_phys2 = physical::alloc_page().unwrap();
+        let cmd_virt2 = (hhdm_off + cmd_phys2) as *mut u8;
+        unsafe {
+            let flush_cmd = cmd_virt2 as *mut GpuResourceFlush;
+            (*flush_cmd).hdr = make_hdr(VIRTIO_GPU_CMD_RESOURCE_FLUSH);
+            (*flush_cmd).r = GpuRect { x: 0, y: 0, width: state.width, height: state.height };
+            (*flush_cmd).resource_id = 1;
+            (*flush_cmd).padding = 0;
+            core::ptr::write_bytes(cmd_virt2.add(core::mem::size_of::<GpuResourceFlush>()), 0, 24);
+        }
+        submit_and_wait(&mut state, cmd_phys2,
+            core::mem::size_of::<GpuResourceFlush>(),
+            cmd_phys2 + core::mem::size_of::<GpuResourceFlush>(), 24)?;
+        crate::serial_str!("[VIRTIO_GPU] RESOURCE_FLUSH OK — screen should be RED!\n");
+    }
+
     state.active = true;
     GPU_ACTIVE.store(true, Ordering::Release);
     *GPU_STATE.lock() = Some(state);
