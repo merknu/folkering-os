@@ -76,7 +76,7 @@ impl ErrorType for TcpStream<'_> {
 static NEXT_EPHEMERAL_PORT: core::sync::atomic::AtomicU16 =
     core::sync::atomic::AtomicU16::new(49200);
 
-fn next_port() -> u16 {
+pub fn next_port() -> u16 {
     let port = NEXT_EPHEMERAL_PORT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     if port > 65000 {
         NEXT_EPHEMERAL_PORT.store(49200, core::sync::atomic::Ordering::Relaxed);
@@ -86,7 +86,7 @@ fn next_port() -> u16 {
 
 /// Read TSC and convert to approximate milliseconds.
 /// Uses RDTSC which always works, even with interrupts disabled.
-fn tsc_ms() -> i64 {
+pub fn tsc_ms() -> i64 {
     let tsc: u64;
     unsafe { core::arch::asm!("rdtsc", "shl rdx, 32", "or rax, rdx", out("rax") tsc, out("rdx") _); }
     // Approximate: assume ~2-3 GHz → ~2M cycles/ms. Use 2M as conservative estimate.
