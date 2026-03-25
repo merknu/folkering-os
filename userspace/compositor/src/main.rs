@@ -2318,47 +2318,33 @@ fn main() -> ! {
                     } else if cmd_str.starts_with("gemini ") {
                         // Direct Gemini cloud API query — bypasses local AI
                         let prompt = cmd_str[7..].trim();
+                        write_str("[COMPOSITOR] gemini command: ");
+                        write_str(prompt);
+                        write_str("\n");
                         if prompt.is_empty() {
                             win.push_line("Usage: gemini <prompt>");
                         } else {
                             win.push_line(&alloc::format!("> gemini {}", &prompt[..prompt.len().min(60)]));
                             win.push_line("[cloud] Contacting Gemini...");
 
-                            // Allocate response buffer (128KB)
-                            const GEMINI_BUF_SIZE: usize = 131072;
-                            const GEMINI_BUF_VADDR: usize = 0x32000000;
+                            // Use heap-allocated Vec instead of mmap (simpler, no syscall needed)
+                            let mut gemini_buf = alloc::vec![0u8; 16384]; // 16KB buffer
 
-                            if libfolk::sys::mmap_at(GEMINI_BUF_VADDR, GEMINI_BUF_SIZE, 3).is_ok() {
-                                let gemini_buf = unsafe {
-                                    core::slice::from_raw_parts_mut(
-                                        GEMINI_BUF_VADDR as *mut u8, GEMINI_BUF_SIZE
-                                    )
-                                };
+                            let response_len = libfolk::sys::ask_gemini(prompt, &mut gemini_buf);
 
-                                let response_len = libfolk::sys::ask_gemini(prompt, gemini_buf);
-
-                                if response_len > 0 {
-                                    // Display response in chat window (line by line)
-                                    if let Ok(text) = core::str::from_utf8(&gemini_buf[..response_len]) {
-                                        win.push_line("[Gemini]:");
-                                        // Split by newlines and push each line
-                                        for line in text.split('\n') {
-                                            if !line.is_empty() {
-                                                win.push_line(line);
-                                            }
+                            if response_len > 0 {
+                                if let Ok(text) = core::str::from_utf8(&gemini_buf[..response_len]) {
+                                    win.push_line("[Gemini]:");
+                                    for line in text.split('\n') {
+                                        if !line.is_empty() {
+                                            win.push_line(line);
                                         }
-                                    } else {
-                                        win.push_line("[cloud] Response not valid UTF-8");
                                     }
                                 } else {
-                                    win.push_line("[cloud] Error: no response from Gemini API");
+                                    win.push_line("[cloud] Response not valid UTF-8");
                                 }
-
-                                let _ = libfolk::sys::munmap(
-                                    GEMINI_BUF_VADDR as *mut u8, GEMINI_BUF_SIZE
-                                );
                             } else {
-                                win.push_line("[cloud] Error: memory allocation failed");
+                                win.push_line("[cloud] Error: no response from Gemini API");
                             }
                         }
                     } else {
