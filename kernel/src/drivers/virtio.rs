@@ -75,7 +75,7 @@ pub struct Virtqueue {
     /// Last seen used index (for detecting new completions)
     pub last_used_idx: u16,
     /// Next available ring index (driver side)
-    next_avail: u16,
+    pub next_avail: u16,
 }
 
 impl Virtqueue {
@@ -84,9 +84,11 @@ impl Virtqueue {
     /// `queue_size` must be a power of 2 (as required by VirtIO spec).
     /// Returns the queue and its physical base address (for Queue PFN register).
     pub fn new(queue_size: u16) -> Option<Self> {
+        // Modern VirtIO allows non-power-of-two queue sizes.
+        // Use the device's size directly — do NOT round up.
         let qs = queue_size as usize;
 
-        // Calculate memory layout (legacy VirtIO):
+        // Calculate memory layout:
         // Descriptors: 16 * queue_size bytes
         // Available ring: 6 + 2 * queue_size bytes
         // Padding to next page boundary
@@ -200,7 +202,7 @@ impl Virtqueue {
     }
 
     /// Get the used ring's `idx` field
-    fn used_idx(&self) -> u16 {
+    pub fn used_idx(&self) -> u16 {
         unsafe { core::ptr::read_volatile((self.used_virt as *const u16).add(1)) }
     }
 
