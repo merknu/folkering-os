@@ -5,6 +5,7 @@
 
 extern crate alloc;
 
+use alloc::vec;
 use alloc::vec::Vec;
 
 use super::json;
@@ -27,84 +28,186 @@ const MAX_RESPONSE: usize = 131072;
 /// 3. Makes an HTTPS POST with TLS 1.3
 /// 4. Parses the response JSON to extract the generated text
 /// 5. Returns unescaped text ready for display
+/// Host proxy IP: 10.0.2.2 (QEMU SLIRP gateway = Windows host)
+const PROXY_IP: [u8; 4] = [10, 0, 2, 2];
+const PROXY_PORT: u16 = 8080;
+
 pub fn ask_gemini(prompt: &str) -> Result<Vec<u8>, &'static str> {
-    crate::serial_str!("[GEMINI] Sending prompt (");
+    crate::serial_str!("[GEMINI] Sending via host proxy (");
     crate::drivers::serial::write_dec(prompt.len() as u32);
     crate::serial_str!(" bytes)...\n");
 
-    // 1. Resolve IP via DNS (with fallback)
-    let ip = resolve_gemini_ip()?;
+    // Build JSON body: {"prompt":"..."}
+    let mut body = Vec::with_capacity(prompt.len() + 32);
+    body.extend_from_slice(b"{\"prompt\":\"");
+    json_escape_into(prompt, &mut body);
+    body.extend_from_slice(b"\"}");
 
-    crate::serial_str!("[GEMINI] Resolved IP: ");
-    crate::drivers::serial::write_dec(ip[0] as u32);
-    crate::serial_str!(".");
-    crate::drivers::serial::write_dec(ip[1] as u32);
-    crate::serial_str!(".");
-    crate::drivers::serial::write_dec(ip[2] as u32);
-    crate::serial_str!(".");
-    crate::drivers::serial::write_dec(ip[3] as u32);
-    crate::drivers::serial::write_newline();
+    // Build HTTP POST to local proxy (plain HTTP, no TLS needed!)
+    let mut request = Vec::with_capacity(256 + body.len());
+    request.extend_from_slice(b"POST /generate HTTP/1.1\r\n");
+    request.extend_from_slice(b"Host: 10.0.2.2:8080\r\n");
+    request.extend_from_slice(b"Content-Type: application/json\r\n");
+    request.extend_from_slice(b"Content-Length: ");
+    let mut len_buf = [0u8; 10];
+    let len_str = format_decimal(body.len(), &mut len_buf);
+    request.extend_from_slice(len_str);
+    request.extend_from_slice(b"\r\nConnection: close\r\n\r\n");
+    request.extend_from_slice(&body);
 
-    // 2. Build JSON body with escaped prompt
-    let body = build_request_json(prompt);
-
-    // 3. Build full HTTP POST request
-    let request = build_https_post(&body);
-
-    crate::serial_str!("[GEMINI] POST request: ");
+    crate::serial_str!("[GEMINI] HTTP POST to proxy: ");
     crate::drivers::serial::write_dec(request.len() as u32);
     crate::serial_str!(" bytes\n");
 
-    // 4. Send via TLS
-    let response = tls::https_get_raw(ip, GEMINI_HOST, &request)?;
+    // Send via plain TCP (no TLS — proxy handles HTTPS to Google)
+    let response = http_post_raw(PROXY_IP, PROXY_PORT, &request)?;
 
-    crate::serial_str!("[GEMINI] Response: ");
+    crate::serial_str!("[GEMINI] Proxy response: ");
     crate::drivers::serial::write_dec(response.len() as u32);
     crate::serial_str!(" bytes\n");
 
-    // 5. Parse HTTP status
+    // Parse HTTP status
     let status = parse_http_status(&response);
     if status != 200 {
-        crate::serial_str!("[GEMINI] HTTP error: ");
+        crate::serial_str!("[GEMINI] Proxy HTTP ");
         crate::drivers::serial::write_dec(status as u32);
         crate::drivers::serial::write_newline();
-
-        // Log first 200 bytes of response for debugging
-        let preview_len = response.len().min(200);
-        if let Ok(preview) = core::str::from_utf8(&response[..preview_len]) {
-            crate::drivers::serial::write_str(preview);
-            crate::drivers::serial::write_newline();
-        }
-
-        return match status {
-            400 => Err("Gemini: bad request (JSON error)"),
-            401 | 403 => Err("Gemini: invalid API key"),
-            429 => Err("Gemini: rate limited"),
-            500..=599 => Err("Gemini: server error"),
-            _ => Err("Gemini: unexpected HTTP status"),
-        };
+        return Err("Gemini proxy error");
     }
 
-    // 6. Extract body (after \r\n\r\n)
+    // Extract body (after \r\n\r\n) — proxy returns plain text directly
     let body_start = find_body_start(&response).ok_or("no HTTP body")?;
-    let body_bytes = &response[body_start..];
+    let text = response[body_start..].to_vec();
 
-    // 7. Extract generated text from JSON
-    // Response format: {"candidates":[{"content":{"parts":[{"text":"..."}]}}]}
-    let text = extract_gemini_text(body_bytes)?;
-
-    crate::serial_str!("[GEMINI] Generated ");
+    crate::serial_str!("[GEMINI] Got ");
     crate::drivers::serial::write_dec(text.len() as u32);
     crate::serial_str!(" bytes of text\n");
 
     Ok(text)
 }
 
+/// Plain HTTP POST (no TLS). For local proxy on QEMU gateway.
+fn http_post_raw(ip: [u8; 4], port: u16, request: &[u8]) -> Result<Vec<u8>, &'static str> {
+    use smoltcp::socket::tcp;
+    use smoltcp::time::Instant;
+    use super::{FolkeringDevice, NET_STATE};
+
+    let mut guard = NET_STATE.lock();
+    let state = guard.as_mut().ok_or("no network")?;
+    if !state.has_ip {
+        return Err("no IP address");
+    }
+
+    // Enable interrupts for packet delivery
+    unsafe { core::arch::asm!("sti"); }
+
+    let tcp_rx = tcp::SocketBuffer::new(vec![0u8; 32768]);
+    let tcp_tx = tcp::SocketBuffer::new(vec![0u8; 8192]);
+    let tcp_socket = tcp::Socket::new(tcp_rx, tcp_tx);
+    let tcp_handle = state.sockets.add(tcp_socket);
+
+    let remote = smoltcp::wire::IpAddress::Ipv4(
+        smoltcp::wire::Ipv4Address::new(ip[0], ip[1], ip[2], ip[3])
+    );
+
+    {
+        let socket = state.sockets.get_mut::<tcp::Socket>(tcp_handle);
+        socket.connect(state.iface.context(), (remote, port), tls::next_port())
+            .map_err(|_| "TCP connect failed")?;
+    }
+
+    // Wait for TCP connect
+    let start = tls::tsc_ms();
+    loop {
+        let now = Instant::from_millis(tls::tsc_ms());
+        let mut device = FolkeringDevice;
+        state.iface.poll(now, &mut device, &mut state.sockets);
+
+        let socket = state.sockets.get_mut::<tcp::Socket>(tcp_handle);
+        if socket.may_send() { break; }
+        if !socket.is_active() {
+            state.sockets.remove(tcp_handle);
+            return Err("TCP refused");
+        }
+        if tls::tsc_ms() - start > 10_000 {
+            state.sockets.remove(tcp_handle);
+            return Err("TCP timeout");
+        }
+        for _ in 0..1000 { core::hint::spin_loop(); }
+    }
+
+    crate::serial_str!("[GEMINI] Proxy TCP connected\n");
+
+    // Send request
+    {
+        let socket = state.sockets.get_mut::<tcp::Socket>(tcp_handle);
+        match socket.send_slice(request) {
+            Ok(n) => {
+                crate::serial_str!("[GEMINI] TCP sent ");
+                crate::drivers::serial::write_dec(n as u32);
+                crate::serial_str!(" bytes\n");
+            }
+            Err(_) => {
+                crate::serial_str!("[GEMINI] TCP send failed!\n");
+            }
+        }
+    }
+
+    // Poll aggressively to flush TX buffers to wire
+    for _ in 0..500 {
+        let now = Instant::from_millis(tls::tsc_ms());
+        let mut device = FolkeringDevice;
+        state.iface.poll(now, &mut device, &mut state.sockets);
+        for _ in 0..2000 { core::hint::spin_loop(); }
+    }
+
+    crate::serial_str!("[GEMINI] TX flushed, reading response...\n");
+
+    // Read response
+    let mut response = Vec::new();
+    let read_start = tls::tsc_ms();
+    loop {
+        let now = Instant::from_millis(tls::tsc_ms());
+        let mut device = FolkeringDevice;
+        state.iface.poll(now, &mut device, &mut state.sockets);
+
+        let socket = state.sockets.get_mut::<tcp::Socket>(tcp_handle);
+        if socket.can_recv() {
+            let mut buf = [0u8; 4096];
+            match socket.recv_slice(&mut buf) {
+                Ok(n) if n > 0 => {
+                    response.extend_from_slice(&buf[..n]);
+                    if response.len() > 65536 { break; }
+                }
+                _ => {}
+            }
+        }
+
+        // Check for connection close (server sent all data)
+        if !socket.is_active() && response.len() > 0 { break; }
+
+        // Timeout
+        if tls::tsc_ms() - read_start > 30_000 {
+            if response.len() > 0 { break; } // Got some data, use it
+            state.sockets.remove(tcp_handle);
+            return Err("read timeout");
+        }
+
+        for _ in 0..500 { core::hint::spin_loop(); }
+    }
+
+    state.sockets.remove(tcp_handle);
+    Ok(response)
+}
+
 /// Resolve Gemini API IP via DNS with hardcoded fallback
 fn resolve_gemini_ip() -> Result<[u8; 4], &'static str> {
-    let packed = super::dns_lookup(GEMINI_HOST);
+    // Use hardcoded IP for reliability — some Google frontend IPs have
+    // TLS compatibility issues with embedded-tls Aes128GcmSha256.
+    // 216.58.201.234 is a known-working Google frontend.
+    let use_hardcoded = true;
+    let packed = if use_hardcoded { 0 } else { super::dns_lookup(GEMINI_HOST) };
     if packed != 0 {
-        // dns_lookup returns: a | (b<<8) | (c<<16) | (d<<24) (little-endian)
         let a = (packed & 0xFF) as u8;
         let b = ((packed >> 8) & 0xFF) as u8;
         let c = ((packed >> 16) & 0xFF) as u8;
@@ -114,7 +217,7 @@ fn resolve_gemini_ip() -> Result<[u8; 4], &'static str> {
         // Fallback: generativelanguage.googleapis.com often resolves to
         // a Google front-end IP. This may need updating.
         crate::serial_str!("[GEMINI] DNS failed, using fallback IP\n");
-        Ok([142, 250, 74, 106]) // One of Google's IPs
+        Ok([216, 58, 201, 234]) // Known-working Google frontend for TLS
     }
 }
 
