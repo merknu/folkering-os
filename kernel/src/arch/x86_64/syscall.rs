@@ -968,6 +968,9 @@ extern "C" fn syscall_handler(
         0x60 => syscall_parallel_gemm(arg1, arg2, arg3, arg4, arg5, arg6),
         // Hybrid AI: Ask Gemini cloud API
         0x70 => syscall_ask_gemini(arg1, arg2, arg3),
+        // VirtIO GPU
+        0x80 => syscall_gpu_flush(arg1, arg2, arg3, arg4),
+        0x81 => syscall_gpu_info(arg1),
         _ => {
             crate::drivers::serial::write_str("[HANDLER] Invalid syscall!\n");
             u64::MAX // Return error
@@ -2199,6 +2202,54 @@ fn syscall_ask_gemini(prompt_ptr: u64, prompt_len: u64, response_buf_ptr: u64) -
     }
 
     max_write as u64
+}
+
+/// Flush GPU framebuffer region to display.
+/// Args: x, y, width, height (dirty rectangle)
+fn syscall_gpu_flush(x: u64, y: u64, w: u64, h: u64) -> u64 {
+    crate::drivers::virtio_gpu::flush_rect(x as u32, y as u32, w as u32, h as u32);
+    0
+}
+
+/// Get GPU info and map framebuffer pages into task address space.
+/// arg1 = userspace virtual address to map framebuffer at.
+/// Returns: packed (width << 32 | height) on success, u64::MAX on error.
+fn syscall_gpu_info(virt_addr: u64) -> u64 {
+    use crate::drivers::virtio_gpu;
+
+    if !virtio_gpu::GPU_ACTIVE.load(core::sync::atomic::Ordering::Relaxed) {
+        return u64::MAX;
+    }
+
+    let (width, height) = match virtio_gpu::display_size() {
+        Some(wh) => wh,
+        None => return u64::MAX,
+    };
+
+    let pages = match virtio_gpu::framebuffer_pages() {
+        Some(p) => p,
+        None => return u64::MAX,
+    };
+
+    // Map each physical page into the calling task's address space
+    let task_id = crate::task::task::get_current_task();
+    if let Some(task_arc) = crate::task::task::get_task(task_id) {
+        let pml4_phys = task_arc.lock().page_table_phys;
+        let flags = x86_64::structures::paging::PageTableFlags::PRESENT
+            | x86_64::structures::paging::PageTableFlags::WRITABLE
+            | x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE
+            | x86_64::structures::paging::PageTableFlags::NO_EXECUTE
+            | x86_64::structures::paging::PageTableFlags::WRITE_THROUGH;
+
+        for (i, &phys_page) in pages.iter().enumerate() {
+            let virt = virt_addr as usize + i * 4096;
+            let _ = crate::memory::paging::map_page_in_table(
+                pml4_phys, virt, phys_page, flags
+            );
+        }
+    }
+
+    ((width as u64) << 32) | (height as u64)
 }
 
 fn syscall_poweroff() -> u64 {

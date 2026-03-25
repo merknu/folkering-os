@@ -73,6 +73,10 @@ pub const SYS_PARALLEL_GEMM: u64 = 0x60; // 96 - Distribute GEMM across AP cores
 // Hybrid AI: Ask Gemini cloud API
 pub const SYS_ASK_GEMINI: u64 = 0x70; // 112 - HTTPS POST to Gemini API
 
+// VirtIO GPU
+pub const SYS_GPU_FLUSH: u64 = 0x80; // 128 - Flush dirty rect to display
+pub const SYS_GPU_INFO: u64 = 0x81;  // 129 - Get GPU info + map framebuffer
+
 /// Execute a syscall with no arguments
 #[inline(always)]
 pub unsafe fn syscall0(nr: u64) -> u64 {

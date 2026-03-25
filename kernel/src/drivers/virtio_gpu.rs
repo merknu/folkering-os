@@ -16,7 +16,7 @@
 //! - Async controlq with lazy descriptor recycling (no BSP blocking)
 //! - Limine framebuffer fallback if GPU init fails
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering, fence};
 use spin::Mutex;
 use x86_64::instructions::port::Port;
 
@@ -454,6 +454,18 @@ pub fn init() -> Result<(), &'static str> {
 /// Non-blocking: submits TRANSFER_TO_HOST_2D + RESOURCE_FLUSH, returns immediately.
 /// Called from SYS_GPU_FLUSH syscall.
 pub fn flush_rect(x: u32, y: u32, w: u32, h: u32) {
+    static FLUSH_COUNT: AtomicU32 = AtomicU32::new(0);
+    let count = FLUSH_COUNT.fetch_add(1, Ordering::Relaxed);
+    if count < 3 || count % 100 == 0 {
+        crate::serial_str!("[VIRTIO_GPU] flush_rect #");
+        crate::drivers::serial::write_dec(count);
+        crate::serial_str!(" ");
+        crate::drivers::serial::write_dec(w);
+        crate::serial_str!("x");
+        crate::drivers::serial::write_dec(h);
+        crate::drivers::serial::write_newline();
+    }
+
     let mut guard = GPU_STATE.lock();
     let state = match guard.as_mut() {
         Some(s) if s.active => s,
@@ -537,6 +549,12 @@ pub fn framebuffer_phys() -> Option<usize> {
 pub fn display_size() -> Option<(u32, u32)> {
     let guard = GPU_STATE.lock();
     guard.as_ref().map(|s| (s.width, s.height))
+}
+
+/// Get all framebuffer physical pages (for userspace mapping).
+pub fn framebuffer_pages() -> Option<alloc::vec::Vec<usize>> {
+    let guard = GPU_STATE.lock();
+    guard.as_ref().map(|s| s.fb_phys_pages.clone())
 }
 
 // ── PCI Capabilities Parsing ────────────────────────────────────────────────
