@@ -28,8 +28,8 @@ const MAX_RESPONSE: usize = 131072;
 /// 3. Makes an HTTPS POST with TLS 1.3
 /// 4. Parses the response JSON to extract the generated text
 /// 5. Returns unescaped text ready for display
-/// Host proxy IP: 10.0.2.2 (QEMU SLIRP gateway = Windows host)
-const PROXY_IP: [u8; 4] = [10, 0, 2, 2];
+/// Host proxy IP: 10.0.2.100 via QEMU guestfwd → host localhost:8080
+const PROXY_IP: [u8; 4] = [10, 0, 2, 100];
 const PROXY_PORT: u16 = 8080;
 
 pub fn ask_gemini(prompt: &str) -> Result<Vec<u8>, &'static str> {
@@ -138,27 +138,35 @@ fn http_post_raw(ip: [u8; 4], port: u16, request: &[u8]) -> Result<Vec<u8>, &'st
 
     crate::serial_str!("[GEMINI] Proxy TCP connected\n");
 
-    // Send request
-    {
-        let socket = state.sockets.get_mut::<tcp::Socket>(tcp_handle);
-        match socket.send_slice(request) {
-            Ok(n) => {
-                crate::serial_str!("[GEMINI] TCP sent ");
-                crate::drivers::serial::write_dec(n as u32);
-                crate::serial_str!(" bytes\n");
-            }
-            Err(_) => {
-                crate::serial_str!("[GEMINI] TCP send failed!\n");
+    // Send request with interleaved polling (smoltcp needs poll to actually TX)
+    let mut sent = 0;
+    while sent < request.len() {
+        {
+            let socket = state.sockets.get_mut::<tcp::Socket>(tcp_handle);
+            if socket.can_send() {
+                match socket.send_slice(&request[sent..]) {
+                    Ok(n) => sent += n,
+                    Err(_) => break,
+                }
             }
         }
-    }
-
-    // Poll aggressively to flush TX buffers to wire
-    for _ in 0..500 {
+        // Poll to push TX data to wire
         let now = Instant::from_millis(tls::tsc_ms());
         let mut device = FolkeringDevice;
         state.iface.poll(now, &mut device, &mut state.sockets);
-        for _ in 0..2000 { core::hint::spin_loop(); }
+        for _ in 0..500 { core::hint::spin_loop(); }
+    }
+
+    crate::serial_str!("[GEMINI] TCP sent ");
+    crate::drivers::serial::write_dec(sent as u32);
+    crate::serial_str!(" bytes\n");
+
+    // Extra polls to ensure all segments are transmitted
+    for _ in 0..200 {
+        let now = Instant::from_millis(tls::tsc_ms());
+        let mut device = FolkeringDevice;
+        state.iface.poll(now, &mut device, &mut state.sockets);
+        for _ in 0..1000 { core::hint::spin_loop(); }
     }
 
     crate::serial_str!("[GEMINI] TX flushed, reading response...\n");
