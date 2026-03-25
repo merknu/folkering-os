@@ -496,19 +496,10 @@ pub fn init() -> Result<(), &'static str> {
 /// Flush a dirty rectangle to the display (hot path).
 /// Non-blocking: submits TRANSFER_TO_HOST_2D + RESOURCE_FLUSH, returns immediately.
 /// Called from SYS_GPU_FLUSH syscall.
-pub fn flush_rect(x: u32, y: u32, w: u32, h: u32) {
-    static FLUSH_COUNT: AtomicU32 = AtomicU32::new(0);
-    let count = FLUSH_COUNT.fetch_add(1, Ordering::Relaxed);
-    if count < 3 || count % 100 == 0 {
-        crate::serial_str!("[VIRTIO_GPU] flush_rect #");
-        crate::drivers::serial::write_dec(count);
-        crate::serial_str!(" ");
-        crate::drivers::serial::write_dec(w);
-        crate::serial_str!("x");
-        crate::drivers::serial::write_dec(h);
-        crate::drivers::serial::write_newline();
-    }
+/// Static command page for flush operations (avoids alloc_page per flush)
+static FLUSH_CMD_PAGE: spin::Mutex<Option<usize>> = spin::Mutex::new(None);
 
+pub fn flush_rect(x: u32, y: u32, w: u32, h: u32) {
     let mut guard = GPU_STATE.lock();
     let state = match guard.as_mut() {
         Some(s) if s.active => s,
@@ -518,10 +509,16 @@ pub fn flush_rect(x: u32, y: u32, w: u32, h: u32) {
     // Recycle used descriptors before submitting new ones
     recycle_used(&mut state.controlq);
 
-    // Allocate a command page for both commands + response
-    let cmd_phys = match physical::alloc_page() {
-        Some(p) => p,
-        None => return,
+    // Reuse static command page (allocate once, reuse forever)
+    let cmd_phys = {
+        let mut page_guard = FLUSH_CMD_PAGE.lock();
+        if page_guard.is_none() {
+            *page_guard = physical::alloc_page();
+        }
+        match *page_guard {
+            Some(p) => p,
+            None => return,
+        }
     };
     let hhdm = crate::memory::paging::hhdm_offset();
     let cmd_virt = (hhdm + cmd_phys) as *mut u8;

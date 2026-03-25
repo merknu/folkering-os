@@ -583,10 +583,14 @@ fn main() -> ! {
     }
 
     // Use Limine framebuffer for rendering (always visible via VNC).
-    // GPU backing buffer is used for VirtIO-GPU scanout when available.
     let mut fb = unsafe {
         FramebufferView::new(FRAMEBUFFER_VADDR as *mut u8, fb_config)
     };
+
+    // Initialize damage tracker for dirty rectangle optimization
+    let mut damage = compositor::damage::DamageTracker::new(fb.width as u32, fb.height as u32);
+    // First frame: mark everything dirty
+    damage.damage_full();
 
     // ===== NEURAL DESKTOP =====
     // AI-native interface with Omnibar at center
@@ -3274,9 +3278,14 @@ fn main() -> ! {
             }
         }
 
-        // Flush GPU framebuffer if using VirtIO-GPU
-        if use_gpu {
-            libfolk::sys::gpu_flush(0, 0, fb.width as u32, fb.height as u32);
+        // Flush only dirty regions to VirtIO-GPU (or mark frame complete)
+        if use_gpu && damage.has_damage() {
+            for rect in damage.regions() {
+                libfolk::sys::gpu_flush(rect.x, rect.y, rect.w, rect.h);
+            }
+            damage.clear();
+        } else {
+            damage.clear();
         }
 
         // Only yield CPU if we did no work this iteration (ULTRA 46)
