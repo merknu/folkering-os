@@ -72,6 +72,18 @@ impl ErrorType for TcpStream<'_> {
     type Error = TcpError;
 }
 
+/// Atomic ephemeral port counter (avoids reusing TIME_WAIT ports)
+static NEXT_EPHEMERAL_PORT: core::sync::atomic::AtomicU16 =
+    core::sync::atomic::AtomicU16::new(49200);
+
+fn next_port() -> u16 {
+    let port = NEXT_EPHEMERAL_PORT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if port > 65000 {
+        NEXT_EPHEMERAL_PORT.store(49200, core::sync::atomic::Ordering::Relaxed);
+    }
+    port
+}
+
 /// Read TSC and convert to approximate milliseconds.
 /// Uses RDTSC which always works, even with interrupts disabled.
 fn tsc_ms() -> i64 {
@@ -85,9 +97,13 @@ impl TcpStream<'_> {
     fn poll_once(&mut self) {
         // Use TSC-based time so smoltcp retransmission timers work even when
         // APIC timer interrupt doesn't fire (e.g., during syscall with IF=0).
+        // Poll multiple times to drain VirtIO-Net RX queue before it drops segments.
         let now = Instant::from_millis(tsc_ms());
         let mut device = FolkeringDevice;
         self.state.iface.poll(now, &mut device, &mut self.state.sockets);
+        // Second poll to process any packets that arrived during the first poll
+        let now2 = Instant::from_millis(tsc_ms());
+        self.state.iface.poll(now2, &mut device, &mut self.state.sockets);
     }
 }
 
@@ -154,9 +170,11 @@ pub fn https_get_raw(ip: [u8; 4], host: &str, request: &[u8]) -> Result<alloc::v
         return Err("no IP address");
     }
 
-    // Create TCP socket
-    let tcp_rx = smoltcp::socket::tcp::SocketBuffer::new(vec![0u8; 8192]);
-    let tcp_tx = smoltcp::socket::tcp::SocketBuffer::new(vec![0u8; 4096]);
+    // Create TCP socket with large buffers for TLS.
+    // Google's TLS ServerHello + cert chain spans 4-6KB across multiple TCP segments.
+    // A TLS record can be up to 16KB. 64KB RX ensures no packet drops.
+    let tcp_rx = smoltcp::socket::tcp::SocketBuffer::new(vec![0u8; 65536]);
+    let tcp_tx = smoltcp::socket::tcp::SocketBuffer::new(vec![0u8; 16384]);
     let tcp_socket = smoltcp::socket::tcp::Socket::new(tcp_rx, tcp_tx);
     let tcp_handle = state.sockets.add(tcp_socket);
 
@@ -178,7 +196,7 @@ pub fn https_get_raw(ip: [u8; 4], host: &str, request: &[u8]) -> Result<alloc::v
 
     {
         let socket = state.sockets.get_mut::<smoltcp::socket::tcp::Socket>(tcp_handle);
-        socket.connect(state.iface.context(), (remote_addr, 443u16), 49153)
+        socket.connect(state.iface.context(), (remote_addr, 443u16), next_port())
             .map_err(|_| "TCP connect failed")?;
     }
 
@@ -208,8 +226,9 @@ pub fn https_get_raw(ip: [u8; 4], host: &str, request: &[u8]) -> Result<alloc::v
     crate::serial_str!("[TLS] TCP connected! Starting TLS handshake...\n");
 
     // TLS handshake
-    let mut tls_read_buf = vec![0u8; 16640];
-    let mut tls_write_buf = vec![0u8; 4096];
+    // TLS record buffers: 32KB read (Google cert chain ~6KB + headroom), 8KB write
+    let mut tls_read_buf = vec![0u8; 32768];
+    let mut tls_write_buf = vec![0u8; 8192];
     let config = TlsConfig::new().with_server_name(host);
 
     let stream = TcpStream { state, handle: tcp_handle };
@@ -231,22 +250,46 @@ pub fn https_get_raw(ip: [u8; 4], host: &str, request: &[u8]) -> Result<alloc::v
     while written < request.len() {
         match tls.write(&request[written..]) {
             Ok(n) => written += n,
-            Err(_) => break,
+            Err(_) => {
+                crate::serial_str!("[TLS] Write error!\n");
+                break;
+            }
         }
     }
     let _ = tls.flush();
 
-    // Read response
+    crate::serial_str!("[TLS] Request sent (");
+    crate::drivers::serial::write_dec(written as u32);
+    crate::serial_str!(" bytes). Reading response...\n");
+
+    // Read response — with per-read logging
     let mut response = alloc::vec::Vec::new();
-    let mut buf = [0u8; 1024];
+    let mut buf = [0u8; 4096];
+    let read_start = tsc_ms();
     loop {
         match tls.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                response.extend_from_slice(&buf[..n]);
-                if response.len() > 65536 { break; } // Cap at 64KB
+            Ok(0) => {
+                crate::serial_str!("[TLS] Read: EOF\n");
+                break;
             }
-            Err(_) => break,
+            Ok(n) => {
+                crate::serial_str!("[TLS] Read: ");
+                crate::drivers::serial::write_dec(n as u32);
+                crate::serial_str!(" bytes (total ");
+                crate::drivers::serial::write_dec((response.len() + n) as u32);
+                crate::serial_str!(")\n");
+                response.extend_from_slice(&buf[..n]);
+                if response.len() > 65536 { break; }
+            }
+            Err(_) => {
+                crate::serial_str!("[TLS] Read: error/timeout\n");
+                break;
+            }
+        }
+        // Overall read timeout: 60 seconds
+        if tsc_ms() - read_start > 60_000 {
+            crate::serial_str!("[TLS] Read: overall timeout\n");
+            break;
         }
     }
 
@@ -341,8 +384,9 @@ pub fn https_get(ip: [u8; 4], host: &str, path: &str) -> Result<(), &'static str
     crate::serial_strln!("[TLS] Starting TLS 1.3 handshake...");
 
     // Allocate TLS record buffers (16640 for read, 4096 for write)
-    let mut tls_read_buf = vec![0u8; 16640];
-    let mut tls_write_buf = vec![0u8; 4096];
+    // TLS record buffers: 32KB read (Google cert chain ~6KB + headroom), 8KB write
+    let mut tls_read_buf = vec![0u8; 32768];
+    let mut tls_write_buf = vec![0u8; 8192];
 
     // Create TLS config with server name (for SNI)
     let config = TlsConfig::new().with_server_name(host);
