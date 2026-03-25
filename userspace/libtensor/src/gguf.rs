@@ -82,8 +82,13 @@ impl GgufDtype {
             Self::F16 => 2,
             Self::Q4_0 => 18,   // 32 values per block
             Self::Q4_1 => 20,
-            Self::Q8_0 => 36,   // 32 values per block
+            Self::Q8_0 => 34,   // 32 values per block (f16 scale + 32 i8)
             Self::Q8_1 => 40,
+            Self::Q2K => 84,    // 256 values per block
+            Self::Q3K => 110,
+            Self::Q4K => 144,
+            Self::Q5K => 176,
+            Self::Q6K => 210,   // 256 values per block (ql[128]+qh[64]+sc[16]+d[2])
             _ => 0, // unsupported
         }
     }
@@ -95,6 +100,7 @@ impl GgufDtype {
             Self::F16 => 1,
             Self::Q4_0 | Self::Q4_1 => 32,
             Self::Q8_0 | Self::Q8_1 => 32,
+            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K => 256,
             _ => 1,
         }
     }
@@ -151,6 +157,18 @@ pub struct GgufMetadata {
     pub vocab_data_offset: usize,
     /// Byte offset in GGUF data where the scores float array starts
     pub scores_data_offset: usize,
+    /// Byte offset in GGUF data where the merges string array starts
+    pub merges_data_offset: usize,
+    /// Number of BPE merge rules
+    pub merges_count: u32,
+    /// Unknown/replacement token ID (U+FFFD fallback for invalid bytes)
+    pub unknown_token_id: u32,
+    /// Byte offset to tokenizer.ggml.token_type array (i32 per token)
+    pub token_type_offset: usize,
+    /// Tokenizer model type string (e.g. "gpt2", "llama")
+    pub tokenizer_model: GgufString,
+    /// Whether to add BOS token automatically
+    pub add_bos_token: bool,
 }
 
 /// Small inline string for metadata (avoids String allocation)
@@ -353,10 +371,16 @@ impl<'a> GgufModel<'a> {
             intermediate_size: 0,
             rope_base: 10000.0,
             rms_norm_eps: 1e-5,
-            bos_token_id: 1,
-            eos_token_id: 2,
+            bos_token_id: u32::MAX, // sentinel: not specified in GGUF
+            eos_token_id: u32::MAX, // sentinel: not specified in GGUF
             vocab_data_offset: 0,
             scores_data_offset: 0,
+            merges_data_offset: 0,
+            merges_count: 0,
+            unknown_token_id: u32::MAX, // MAX = not specified
+            token_type_offset: 0,
+            tokenizer_model: GgufString::new(),
+            add_bos_token: false,
         };
 
         for _ in 0..metadata_kv_count {
@@ -416,6 +440,12 @@ impl<'a> GgufModel<'a> {
                     if vtype == 6 { metadata.rms_norm_eps = cursor.read_f32()?; }
                     else { cursor.skip_value(vtype)?; }
                 }
+                k if k.ends_with(".attention.key_length") => {
+                    // Explicit head_dim from GGUF (overrides dim/n_heads default)
+                    if vtype == 4 { metadata.head_dim = cursor.read_u32()?; }
+                    else if vtype == 5 { metadata.head_dim = cursor.read_i32()? as u32; }
+                    else { cursor.skip_value(vtype)?; }
+                }
                 "tokenizer.ggml.bos_token_id" => {
                     if vtype == 4 { metadata.bos_token_id = cursor.read_u32()?; }
                     else if vtype == 5 { metadata.bos_token_id = cursor.read_i32()? as u32; }
@@ -427,12 +457,15 @@ impl<'a> GgufModel<'a> {
                     else { cursor.skip_value(vtype)?; }
                 }
                 "tokenizer.ggml.tokens" => {
-                    // Array of strings — record offset before skipping
+                    // Array of strings — record offset AND set vocab_size if not yet set
                     if vtype == 9 {
-                        // Array header: elem_type(u32) + count(u64)
                         let elem_type = cursor.read_u32()?;
                         let count = cursor.read_u64()? as usize;
                         metadata.vocab_data_offset = cursor.pos;
+                        // Set vocab_size from token array if not already set by arch key
+                        if metadata.vocab_size == 0 {
+                            metadata.vocab_size = count as u32;
+                        }
                         // Skip all string elements
                         for _ in 0..count {
                             cursor.skip_value(elem_type)?;
@@ -451,6 +484,53 @@ impl<'a> GgufModel<'a> {
                         cursor.pos += count * 4;
                         if cursor.pos > cursor.data.len() {
                             return Err(GgufError::TruncatedData);
+                        }
+                    } else {
+                        cursor.skip_value(vtype)?;
+                    }
+                }
+                "tokenizer.ggml.unknown_token_id" => {
+                    if vtype == 4 { metadata.unknown_token_id = cursor.read_u32()?; }
+                    else if vtype == 5 { metadata.unknown_token_id = cursor.read_i32()? as u32; }
+                    else { cursor.skip_value(vtype)?; }
+                }
+                "tokenizer.ggml.token_type" => {
+                    // Array of i32 — token type per vocab entry
+                    // 1=normal, 2=unknown, 3=control, 4=user_defined, 5=unused, 6=byte
+                    if vtype == 9 {
+                        let _elem_type = cursor.read_u32()?;
+                        let count = cursor.read_u64()? as usize;
+                        metadata.token_type_offset = cursor.pos;
+                        cursor.pos += count * 4;
+                        if cursor.pos > cursor.data.len() {
+                            return Err(GgufError::TruncatedData);
+                        }
+                    } else {
+                        cursor.skip_value(vtype)?;
+                    }
+                }
+                "tokenizer.ggml.model" => {
+                    if vtype == 8 {
+                        let s = cursor.read_string()?;
+                        metadata.tokenizer_model = GgufString::from_bytes(s.as_bytes());
+                    } else {
+                        cursor.skip_value(vtype)?;
+                    }
+                }
+                "tokenizer.ggml.add_bos_token" => {
+                    if vtype == 7 { metadata.add_bos_token = cursor.read_u8()? != 0; }
+                    else { cursor.skip_value(vtype)?; }
+                }
+                "tokenizer.ggml.merges" => {
+                    // Array of strings — BPE merge rules (e.g. "Ġ t", "i n")
+                    // Index = merge rank (lower = higher priority)
+                    if vtype == 9 {
+                        let elem_type = cursor.read_u32()?;
+                        let count = cursor.read_u64()? as usize;
+                        metadata.merges_count = count as u32;
+                        metadata.merges_data_offset = cursor.pos;
+                        for _ in 0..count {
+                            cursor.skip_value(elem_type)?;
                         }
                     } else {
                         cursor.skip_value(vtype)?;

@@ -16,6 +16,37 @@ use crate::kv_cache::KvCacheManager;
 use crate::quantize;
 use crate::FuseOp;
 
+/// Attention dump buffer for capturing post-softmax attention weights.
+///
+/// During prefill, the caller allocates a buffer of `n_heads * max_seq * max_seq` f32
+/// and passes it to forward(). After softmax, each head's attention weights are copied
+/// into the buffer at `[head * max_seq * max_seq + pos * max_seq]`.
+///
+/// The resulting buffer contains the full causal attention matrix for one layer,
+/// ready for writing to the disk mailbox and visualization via MCP attention_heatmap.
+pub struct AttnDump<'a> {
+    pub buffer: &'a mut [f32],
+    pub dump_layer: usize,
+    pub n_heads: usize,
+    pub max_seq: usize,
+}
+
+impl<'a> AttnDump<'a> {
+    /// Store post-softmax attention weights for one head at one position.
+    #[inline]
+    pub fn store(&mut self, layer: usize, head: usize, pos: usize, att: &[f32], seq_len: usize) {
+        if layer != self.dump_layer {
+            return;
+        }
+        // Layout: [head, query_pos, key_pos] in row-major
+        let offset = head * self.max_seq * self.max_seq + pos * self.max_seq;
+        let end = offset + seq_len;
+        if end <= self.buffer.len() {
+            self.buffer[offset..end].copy_from_slice(&att[..seq_len]);
+        }
+    }
+}
+
 /// Model configuration (parsed from GGUF metadata)
 #[derive(Clone, Copy)]
 pub struct ModelConfig {
@@ -47,8 +78,17 @@ pub struct ModelWeights<'a> {
     /// Often shares weights with token_embed (tied embeddings)
     pub output_weight: &'a [u8],
 
-    /// True if output_weight is Q8_0 (otherwise Q4_0)
-    pub output_is_q8: bool,
+    /// Quantization format of output_weight
+    pub output_quant: OutputQuant,
+}
+
+/// Quantization format for weight tensors
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum OutputQuant {
+    Q4_0,
+    Q4_1,
+    Q8_0,
+    Q6_K,
 }
 
 /// Weights for a single transformer layer
@@ -62,6 +102,11 @@ pub struct LayerWeights<'a> {
     pub wk: &'a [u8],
     pub wv: &'a [u8],
 
+    /// QK-norm weights: [head_dim] f32 (Qwen3 — per-head RMSNorm before RoPE)
+    /// Empty slices if model doesn't use QK-norm
+    pub q_norm: &'a [f32],
+    pub k_norm: &'a [f32],
+
     /// Attention output projection: [(n_heads * head_dim) × embed_dim] Q4_0
     pub wo: &'a [u8],
 
@@ -72,8 +117,10 @@ pub struct LayerWeights<'a> {
     pub w_gate: &'a [u8],
     /// FFN up projection: [embed_dim × intermediate_size] Q4_0
     pub w_up: &'a [u8],
-    /// FFN down projection: [intermediate_size × embed_dim] Q4_0
+    /// FFN down projection: [intermediate_size × embed_dim] Q4_0 or Q4_1
     pub w_down: &'a [u8],
+    /// Quantization format of w_down (Q4_0 default, Q4_1 for Qwen3)
+    pub w_down_quant: OutputQuant,
 }
 
 /// Yield frequency configuration (ULTRA 3, 6)
@@ -117,6 +164,7 @@ pub fn forward<'a>(
     kv_cache: &mut KvCacheManager,
     arena: &'a BumpArena,
     yield_cfg: &YieldConfig,
+    mut attn_dump: Option<&mut AttnDump>,
 ) -> Option<&'a [f32]> {
     let dim = config.embed_dim;
     let head_dim = config.head_dim;
@@ -125,16 +173,27 @@ pub fn forward<'a>(
     let kv_dim = n_kv_heads * head_dim;
 
     // Allocate working buffers from arena
+    let qk_dim = n_heads * head_dim; // may differ from dim (e.g., Qwen3: 2048 vs 1024)
     let x = arena.alloc_f32(dim)?;           // current hidden state
     let xb = arena.alloc_f32(dim)?;          // after RMSNorm
-    let q = arena.alloc_f32(n_heads * head_dim)?;    // queries
+    let q = arena.alloc_f32(qk_dim)?;               // queries
     let k = arena.alloc_f32(kv_dim)?;                // keys
     let v = arena.alloc_f32(kv_dim)?;                // values
-    let attn_out = arena.alloc_f32(dim)?;             // attention output
+    let attn_out = arena.alloc_f32(qk_dim)?;          // attention output (n_heads * head_dim)
     let ffn_buf1 = arena.alloc_f32(config.intermediate_size)?; // gate
     let ffn_buf2 = arena.alloc_f32(config.intermediate_size)?; // up
     let xb2 = arena.alloc_f32(dim)?;         // after FFN norm
     let logits = arena.alloc_f32(config.vocab_size)?; // output logits
+
+    // Q8_0 scratch buffer for quantized activations (used by gemm_q4_q8)
+    // Must fit max(qk_dim, intermediate_size) values
+    let q8_max_vals = if qk_dim > config.intermediate_size { qk_dim } else { config.intermediate_size };
+    let q8_max_blocks = q8_max_vals / 32;
+    let q8_buf = arena.alloc_slice::<u8>(q8_max_blocks * quantize::Q8_0_BLOCK_SIZE)?;
+
+    // Scratch buffers for dequantizing Q8_0 KV-cache entries (one head at a time)
+    let k_dequant = arena.alloc_f32(head_dim)?;
+    let v_dequant = arena.alloc_f32(head_dim)?;
 
     // Attention scores buffer (per-head, reused across heads)
     let max_ctx = kv_cache.layer(0).active_length() + 1;
@@ -152,61 +211,101 @@ pub fn forward<'a>(
         // 1. RMSNorm
         ops::rmsnorm_into(x, lw.attn_norm, xb, config.rms_norm_eps);
 
-        // 2. Q/K/V projections (f32 activations × Q4_0 weights)
-        gemm::gemm_f32_x_q4(q, xb, lw.wq, 1, dim, n_heads * head_dim,
-            FuseOp::None, yield_cfg.gemm_yield, arena);
-        gemm::gemm_f32_x_q4(k, xb, lw.wk, 1, dim, kv_dim,
-            FuseOp::None, yield_cfg.gemm_yield, arena);
-        gemm::gemm_f32_x_q4(v, xb, lw.wv, 1, dim, kv_dim,
-            FuseOp::None, yield_cfg.gemm_yield, arena);
+        // 2. Q/K/V projections: quantize xb to Q8_0, then use integer dot product
+        // This matches llama.cpp's approach and avoids f32 accumulation drift.
+        for i in 0..qk_dim { q[i] = 0.0; }
+        for i in 0..kv_dim { k[i] = 0.0; v[i] = 0.0; }
+        quantize::quantize_f32_to_q8_0(xb, q8_buf);
+        gemm::gemm_q4_q8(q, q8_buf, lw.wq, 1, dim, qk_dim,
+            FuseOp::None, yield_cfg.gemm_yield);
+        gemm::gemm_q4_q8(k, q8_buf, lw.wk, 1, dim, kv_dim,
+            FuseOp::None, yield_cfg.gemm_yield);
+        gemm::gemm_q4_q8(v, q8_buf, lw.wv, 1, dim, kv_dim,
+            FuseOp::None, yield_cfg.gemm_yield);
 
-        // 3. RoPE on Q and K
+        // 3. QK-Norm (Qwen3): per-head RMSNorm on Q and K before RoPE
+        if !lw.q_norm.is_empty() {
+            for h in 0..n_heads {
+                let off = h * head_dim;
+                ops::rmsnorm(&mut q[off..off + head_dim], lw.q_norm, config.rms_norm_eps);
+            }
+        }
+        if !lw.k_norm.is_empty() {
+            for h in 0..n_kv_heads {
+                let off = h * head_dim;
+                ops::rmsnorm(&mut k[off..off + head_dim], lw.k_norm, config.rms_norm_eps);
+            }
+        }
+
+        // 4. RoPE on Q and K
         ops::rope_inplace(q, head_dim, pos, config.rope_base);
         ops::rope_inplace(k, head_dim, pos, config.rope_base);
 
-        // 4. Store K,V in cache
-        kv_cache.layer_mut(layer).store(k, v);
+        // 4. Store K,V in cache with absolute position (for RoPE alignment)
+        kv_cache.layer_mut(layer).store(k, v, pos);
 
         // 5. Multi-head attention with KV-cache
         let seq_len = kv_cache.layer(layer).active_length();
         let kv_group_size = n_heads / n_kv_heads; // for GQA
 
-        // Zero attention output
-        for i in 0..dim { attn_out[i] = 0.0; }
+        // Zero attention output (qk_dim, may be > dim for GQA models)
+        for i in 0..qk_dim { attn_out[i] = 0.0; }
 
         for h in 0..n_heads {
             let kv_h = h / kv_group_size; // KV head for this Q head
             let q_offset = h * head_dim;
 
             // Compute attention scores: Q · K^T / sqrt(head_dim)
+            // AVX2-accelerated dot product for 4-8x speedup over scalar
             let scale = crate::ops::fast_rsqrt(head_dim as f32);
+            let q_slice = &q[q_offset..q_offset + head_dim];
             for t in 0..seq_len {
-                let k_vec = kv_cache.layer(layer).get_key(t, kv_h);
-                let mut score = 0.0f32;
-                for d in 0..head_dim {
-                    score += q[q_offset + d] * k_vec[d];
-                }
+                kv_cache.layer(layer).get_key(t, kv_h, k_dequant);
+                let score = if crate::simd::has_avx2() {
+                    unsafe { crate::simd::avx2::dot_f32_avx2(q_slice, k_dequant, head_dim) }
+                } else {
+                    crate::simd::dot_f32_scalar(q_slice, k_dequant, head_dim)
+                };
                 att[t] = score * scale;
             }
 
             // Softmax over attention scores
             ops::softmax(&mut att[..seq_len]);
 
-            // Weighted sum of values
+            // Capture post-softmax attention for visualization
+            if let Some(ref mut dump) = attn_dump {
+                dump.store(layer, h, pos, att, seq_len);
+            }
+
+            // Weighted sum of values (AVX2 AXPY: out += w * V)
             let out_offset = h * head_dim;
             for t in 0..seq_len {
-                let v_vec = kv_cache.layer(layer).get_value(t, kv_h);
+                kv_cache.layer(layer).get_value(t, kv_h, v_dequant);
                 let w = att[t];
-                for d in 0..head_dim {
-                    attn_out[out_offset + d] += w * v_vec[d];
+                if crate::simd::has_avx2() {
+                    unsafe {
+                        crate::simd::axpy_f32_avx2(
+                            w, v_dequant,
+                            &mut attn_out[out_offset..out_offset + head_dim],
+                            head_dim,
+                        );
+                    }
+                } else {
+                    crate::simd::axpy_f32_scalar(
+                        w, v_dequant,
+                        &mut attn_out[out_offset..out_offset + head_dim],
+                        head_dim,
+                    );
                 }
             }
         }
 
         // 6. Output projection (attn_out × Wo → xb)
+        // Wo: [qk_dim × dim] — projects from attention space back to embed space
         for i in 0..dim { xb[i] = 0.0; }
-        gemm::gemm_f32_x_q4(xb, attn_out, lw.wo, 1, dim, dim,
-            FuseOp::None, yield_cfg.gemm_yield, arena);
+        quantize::quantize_f32_to_q8_0(&attn_out[..qk_dim], q8_buf);
+        gemm::gemm_q4_q8(xb, q8_buf, lw.wo, 1, qk_dim, dim,
+            FuseOp::None, yield_cfg.gemm_yield);
 
         // 7. Residual connection
         for i in 0..dim { x[i] += xb[i]; }
@@ -218,30 +317,43 @@ pub fn forward<'a>(
         // 1. RMSNorm
         ops::rmsnorm_into(x, lw.ffn_norm, xb2, config.rms_norm_eps);
 
-        // 2. Gate + Up projections
+        // 2. Gate + Up projections (quantize xb2 once, reuse for both)
         for i in 0..config.intermediate_size { ffn_buf1[i] = 0.0; }
         for i in 0..config.intermediate_size { ffn_buf2[i] = 0.0; }
+        quantize::quantize_f32_to_q8_0(xb2, q8_buf);
 
         // gate = xb2 × W_gate (with fused SiLU)
-        gemm::gemm_f32_x_q4(ffn_buf1, xb2, lw.w_gate, 1, dim, config.intermediate_size,
-            FuseOp::SiLU, yield_cfg.gemm_yield, arena);
+        gemm::gemm_q4_q8(ffn_buf1, q8_buf, lw.w_gate, 1, dim, config.intermediate_size,
+            FuseOp::SiLU, yield_cfg.gemm_yield);
 
         // up = xb2 × W_up
-        gemm::gemm_f32_x_q4(ffn_buf2, xb2, lw.w_up, 1, dim, config.intermediate_size,
-            FuseOp::None, yield_cfg.gemm_yield, arena);
+        gemm::gemm_q4_q8(ffn_buf2, q8_buf, lw.w_up, 1, dim, config.intermediate_size,
+            FuseOp::None, yield_cfg.gemm_yield);
 
         // 3. Element-wise gate * up
         for i in 0..config.intermediate_size {
             ffn_buf1[i] *= ffn_buf2[i];
         }
 
-        // 4. Down projection
+        // 4. Down projection (quantize gate*up, then GEMM)
         for i in 0..dim { xb[i] = 0.0; }
-        gemm::gemm_f32_x_q4(xb, ffn_buf1, lw.w_down, 1, config.intermediate_size, dim,
-            FuseOp::None, yield_cfg.gemm_yield, arena);
+        match lw.w_down_quant {
+            OutputQuant::Q4_1 => {
+                // Q4_1: use f32 × Q4_1 GEMM directly (no Q8_0 quantization needed)
+                gemm::gemm_f32_x_q4_1(xb, ffn_buf1, lw.w_down, 1, config.intermediate_size, dim,
+                    FuseOp::None, yield_cfg.gemm_yield, arena);
+            }
+            _ => {
+                // Q4_0 (default): quantize activations to Q8_0 first
+                quantize::quantize_f32_to_q8_0(ffn_buf1, q8_buf);
+                gemm::gemm_q4_q8(xb, q8_buf, lw.w_down, 1, config.intermediate_size, dim,
+                    FuseOp::None, yield_cfg.gemm_yield);
+            }
+        }
 
         // 5. Residual connection
         for i in 0..dim { x[i] += xb[i]; }
+
     }
 
     // === Final norm + LM head ===
@@ -249,15 +361,291 @@ pub fn forward<'a>(
 
     // Output projection: x × W_output → logits
     for i in 0..config.vocab_size { logits[i] = 0.0; }
-    if weights.output_is_q8 {
-        gemm::gemm_f32_x_q8(logits, x, weights.output_weight, 1, dim, config.vocab_size,
-            FuseOp::None, yield_cfg.gemm_yield, arena);
-    } else {
-        gemm::gemm_f32_x_q4(logits, x, weights.output_weight, 1, dim, config.vocab_size,
-            FuseOp::None, yield_cfg.gemm_yield, arena);
+    match weights.output_quant {
+        OutputQuant::Q8_0 => {
+            gemm::gemm_f32_x_q8(logits, x, weights.output_weight, 1, dim, config.vocab_size,
+                FuseOp::None, yield_cfg.gemm_yield, arena);
+        }
+        OutputQuant::Q6_K => {
+            gemm::gemm_f32_x_q6k(logits, x, weights.output_weight, 1, dim, config.vocab_size,
+                yield_cfg.gemm_yield);
+        }
+        OutputQuant::Q4_0 => {
+            gemm::gemm_f32_x_q4(logits, x, weights.output_weight, 1, dim, config.vocab_size,
+                FuseOp::None, yield_cfg.gemm_yield, arena);
+        }
+        OutputQuant::Q4_1 => {
+            gemm::gemm_f32_x_q4_1(logits, x, weights.output_weight, 1, dim, config.vocab_size,
+                FuseOp::None, yield_cfg.gemm_yield, arena);
+        }
     }
 
     Some(logits)
+}
+
+/// Batched prefill forward pass — 3-Phase Architecture.
+///
+/// Processes a batch of prompt tokens with improved L2 cache utilization:
+/// - Phase A (Batched): RMSNorm + Q/K/V GEMMs — weight matrices stay in L2
+/// - Phase B (Sequential): Per-token RoPE, KV-store, Attention, Output Proj
+/// - Phase C (Batched): FFN GEMMs — weight matrices stay in L2
+///
+/// Only processes transformer layers. Does NOT compute final logits (caller
+/// should use single-token `forward()` for the last prompt token to get logits).
+pub fn forward_prefill_batch(
+    tokens: &[u32],
+    start_pos: usize,
+    config: &ModelConfig,
+    weights: &ModelWeights,
+    kv_cache: &mut KvCacheManager,
+    arena: &BumpArena,
+    yield_cfg: &YieldConfig,
+) -> Option<()> {
+    let batch = tokens.len();
+    if batch == 0 { return Some(()); }
+
+    let dim = config.embed_dim;
+    let head_dim = config.head_dim;
+    let n_heads = config.n_heads;
+    let n_kv_heads = config.n_kv_heads;
+    let kv_dim = n_kv_heads * head_dim;
+    let qk_dim = n_heads * head_dim;
+    let intermediate = config.intermediate_size;
+
+    // Q8_0 row sizes for various vector lengths
+    let q8_blocks = dim / 32;
+    let q8_row_bytes = q8_blocks * quantize::Q8_0_BLOCK_SIZE;
+    let q8_qk_blocks = qk_dim / 32;
+    let q8_qk_row_bytes = q8_qk_blocks * quantize::Q8_0_BLOCK_SIZE;
+    // Q8_0 row size for intermediate-length vectors (FFN down proj)
+    let q8_inter_blocks = intermediate / 32;
+    let q8_inter_row_bytes = q8_inter_blocks * quantize::Q8_0_BLOCK_SIZE;
+
+    // === Allocate ALL batched buffers (batch × per_token_size) ===
+    let x_batch   = arena.alloc_f32(batch * dim)?;
+    let xb_batch  = arena.alloc_f32(batch * dim)?;
+    let q_batch   = arena.alloc_f32(batch * qk_dim)?;
+    let k_batch   = arena.alloc_f32(batch * kv_dim)?;
+    let v_batch   = arena.alloc_f32(batch * kv_dim)?;
+    let attn_out  = arena.alloc_f32(qk_dim)?;            // per-token (Phase B reuse, n_heads*head_dim)
+    let xb_single = arena.alloc_f32(dim)?;             // per-token scratch
+    // Q8 batch: each token needs max(q8_row_bytes, q8_qk_row_bytes) for Wo projection
+    let q8_per_tok = if q8_qk_row_bytes > q8_row_bytes { q8_qk_row_bytes } else { q8_row_bytes };
+    let q8_batch  = arena.alloc_slice::<u8>(batch * q8_per_tok)?;
+
+    // Phase C buffers
+    let xb2_batch  = arena.alloc_f32(batch * dim)?;
+    let ffn1_batch = arena.alloc_f32(batch * intermediate)?;
+    let ffn2_batch = arena.alloc_f32(batch * intermediate)?;
+    let q8_inter   = arena.alloc_slice::<u8>(q8_inter_row_bytes)?; // per-token for down proj
+
+    // Attention scratch (per-token, reused in Phase B)
+    let max_ctx = kv_cache.layer(0).active_length() + batch;
+    let att = arena.alloc_f32(max_ctx)?;
+
+    // KV dequant scratch (per-head, reused in Phase B)
+    let k_dequant = arena.alloc_f32(head_dim)?;
+    let v_dequant = arena.alloc_f32(head_dim)?;
+
+    // === Step 1: Batched Embedding ===
+    for i in 0..batch {
+        embed_token(
+            tokens[i] as usize, config.vocab_size, dim,
+            weights.token_embed,
+            &mut x_batch[i * dim..(i + 1) * dim],
+        );
+    }
+
+    // === Step 2: For each layer ===
+    for layer in 0..config.n_layers {
+        let lw = &weights.layers[layer];
+
+        // ============================================================
+        // PHASE A (Batched): RMSNorm + Q/K/V GEMMs
+        // Weight matrices wq/wk/wv stay hot in L2 across batch iterations
+        // ============================================================
+
+        for i in 0..batch {
+            let x_row = &x_batch[i * dim..(i + 1) * dim];
+            let xb_row = &mut xb_batch[i * dim..(i + 1) * dim];
+            ops::rmsnorm_into(x_row, lw.attn_norm, xb_row, config.rms_norm_eps);
+
+            // Quantize per-token (NEVER across token boundaries)
+            let q8_row = &mut q8_batch[i * q8_per_tok..i * q8_per_tok + q8_row_bytes];
+            quantize::quantize_f32_to_q8_0(xb_row, q8_row);
+
+            // Q/K/V GEMMs — wq/wk/wv stay in L2 from previous iteration
+            let q_row = &mut q_batch[i * qk_dim..(i + 1) * qk_dim];
+            let k_row = &mut k_batch[i * kv_dim..(i + 1) * kv_dim];
+            let v_row = &mut v_batch[i * kv_dim..(i + 1) * kv_dim];
+            for j in 0..qk_dim { q_row[j] = 0.0; }
+            for j in 0..kv_dim { k_row[j] = 0.0; v_row[j] = 0.0; }
+
+            gemm::gemm_q4_q8(q_row, q8_row, lw.wq, 1, dim, qk_dim,
+                FuseOp::None, yield_cfg.gemm_yield);
+            gemm::gemm_q4_q8(k_row, q8_row, lw.wk, 1, dim, kv_dim,
+                FuseOp::None, yield_cfg.gemm_yield);
+            gemm::gemm_q4_q8(v_row, q8_row, lw.wv, 1, dim, kv_dim,
+                FuseOp::None, yield_cfg.gemm_yield);
+        }
+
+        // Yield between Phase A and B
+        libfolk::sys::yield_cpu();
+
+        // ============================================================
+        // PHASE B (Sequential): Per-token Attention
+        // Must be sequential due to causal dependency in KV-cache
+        // ============================================================
+
+        let kv_group_size = n_heads / n_kv_heads;
+
+        for i in 0..batch {
+            let pos = start_pos + i;
+
+            // QK-Norm (Qwen3): per-head RMSNorm on Q and K before RoPE
+            if !lw.q_norm.is_empty() {
+                let q_slice = &mut q_batch[i * qk_dim..(i + 1) * qk_dim];
+                for h in 0..n_heads {
+                    let off = h * head_dim;
+                    ops::rmsnorm(&mut q_slice[off..off + head_dim], lw.q_norm, config.rms_norm_eps);
+                }
+            }
+            if !lw.k_norm.is_empty() {
+                let k_slice = &mut k_batch[i * kv_dim..(i + 1) * kv_dim];
+                for h in 0..n_kv_heads {
+                    let off = h * head_dim;
+                    ops::rmsnorm(&mut k_slice[off..off + head_dim], lw.k_norm, config.rms_norm_eps);
+                }
+            }
+
+            // RoPE on Q and K (must be done before immutable borrow for store)
+            ops::rope_inplace(
+                &mut q_batch[i * qk_dim..(i + 1) * qk_dim],
+                head_dim, pos, config.rope_base,
+            );
+            ops::rope_inplace(
+                &mut k_batch[i * kv_dim..(i + 1) * kv_dim],
+                head_dim, pos, config.rope_base,
+            );
+
+            // Store K,V in cache (immutable borrows after RoPE mutation)
+            let k_row = &k_batch[i * kv_dim..(i + 1) * kv_dim];
+            let v_row = &v_batch[i * kv_dim..(i + 1) * kv_dim];
+            kv_cache.layer_mut(layer).store(k_row, v_row, pos);
+
+            // Multi-head attention
+            let seq_len = kv_cache.layer(layer).active_length();
+            for j in 0..qk_dim { attn_out[j] = 0.0; }
+
+            for h in 0..n_heads {
+                let kv_h = h / kv_group_size;
+                let q_offset = i * qk_dim + h * head_dim;
+                let q_slice = &q_batch[q_offset..q_offset + head_dim];
+
+                let scale = crate::ops::fast_rsqrt(head_dim as f32);
+                for t in 0..seq_len {
+                    kv_cache.layer(layer).get_key(t, kv_h, k_dequant);
+                    let score = if crate::simd::has_avx2() {
+                        unsafe { crate::simd::avx2::dot_f32_avx2(q_slice, k_dequant, head_dim) }
+                    } else {
+                        crate::simd::dot_f32_scalar(q_slice, k_dequant, head_dim)
+                    };
+                    att[t] = score * scale;
+                }
+
+                ops::softmax(&mut att[..seq_len]);
+
+                let out_offset = h * head_dim;
+                for t in 0..seq_len {
+                    kv_cache.layer(layer).get_value(t, kv_h, v_dequant);
+                    let w = att[t];
+                    if crate::simd::has_avx2() {
+                        unsafe {
+                            crate::simd::axpy_f32_avx2(
+                                w, v_dequant,
+                                &mut attn_out[out_offset..out_offset + head_dim],
+                                head_dim,
+                            );
+                        }
+                    } else {
+                        crate::simd::axpy_f32_scalar(
+                            w, v_dequant,
+                            &mut attn_out[out_offset..out_offset + head_dim],
+                            head_dim,
+                        );
+                    }
+                }
+            }
+
+            // Output projection: attn_out (qk_dim) × Wo (qk_dim × dim) → xb_single (dim)
+            for j in 0..dim { xb_single[j] = 0.0; }
+            // Need q8 buffer for qk_dim values — use dedicated scratch
+            let q8_wo_blocks = qk_dim / 32;
+            let q8_wo_bytes = q8_wo_blocks * quantize::Q8_0_BLOCK_SIZE;
+            let q8_wo = &mut q8_batch[i * q8_per_tok..i * q8_per_tok + q8_wo_bytes];
+            quantize::quantize_f32_to_q8_0(&attn_out[..qk_dim], q8_wo);
+            gemm::gemm_q4_q8(xb_single, q8_wo, lw.wo, 1, qk_dim, dim,
+                FuseOp::None, yield_cfg.gemm_yield);
+
+            // Attention residual
+            let x_row = &mut x_batch[i * dim..(i + 1) * dim];
+            for j in 0..dim { x_row[j] += xb_single[j]; }
+        }
+
+        // Yield between Phase B and C
+        libfolk::sys::yield_cpu();
+
+        // ============================================================
+        // PHASE C (Batched): FFN GEMMs
+        // Weight matrices w_gate/w_up/w_down stay hot in L2
+        // ============================================================
+
+        for i in 0..batch {
+            let x_row = &x_batch[i * dim..(i + 1) * dim];
+            let xb2_row = &mut xb2_batch[i * dim..(i + 1) * dim];
+            ops::rmsnorm_into(x_row, lw.ffn_norm, xb2_row, config.rms_norm_eps);
+
+            // Quantize per-token
+            let q8_row = &mut q8_batch[i * q8_per_tok..i * q8_per_tok + q8_row_bytes];
+            quantize::quantize_f32_to_q8_0(xb2_row, q8_row);
+
+            // Gate projection (with fused SiLU)
+            let ffn1_row = &mut ffn1_batch[i * intermediate..(i + 1) * intermediate];
+            for j in 0..intermediate { ffn1_row[j] = 0.0; }
+            gemm::gemm_q4_q8(ffn1_row, q8_row, lw.w_gate, 1, dim, intermediate,
+                FuseOp::SiLU, yield_cfg.gemm_yield);
+
+            // Up projection
+            let ffn2_row = &mut ffn2_batch[i * intermediate..(i + 1) * intermediate];
+            for j in 0..intermediate { ffn2_row[j] = 0.0; }
+            gemm::gemm_q4_q8(ffn2_row, q8_row, lw.w_up, 1, dim, intermediate,
+                FuseOp::None, yield_cfg.gemm_yield);
+
+            // Element-wise gate * up
+            for j in 0..intermediate { ffn1_row[j] *= ffn2_row[j]; }
+
+            // Down projection
+            let xb_row = &mut xb_batch[i * dim..(i + 1) * dim];
+            for j in 0..dim { xb_row[j] = 0.0; }
+            match lw.w_down_quant {
+                OutputQuant::Q4_1 => {
+                    gemm::gemm_f32_x_q4_1(xb_row, ffn1_row, lw.w_down, 1, intermediate, dim,
+                        FuseOp::None, yield_cfg.gemm_yield, arena);
+                }
+                _ => {
+                    quantize::quantize_f32_to_q8_0(ffn1_row, q8_inter);
+                    gemm::gemm_q4_q8(xb_row, q8_inter, lw.w_down, 1, intermediate, dim,
+                        FuseOp::None, yield_cfg.gemm_yield);
+                }
+            }
+
+            // FFN residual
+            let x_row = &mut x_batch[i * dim..(i + 1) * dim];
+            for j in 0..dim { x_row[j] += xb_row[j]; }
+        }
+    }
+
+    Some(())
 }
 
 /// Dequantize a token embedding from quantized weight table.
@@ -268,31 +656,57 @@ pub fn forward<'a>(
 fn embed_token(token_id: usize, vocab_size: usize, dim: usize, embed_data: &[u8], output: &mut [f32]) {
     debug_assert!(token_id < vocab_size);
 
-    let blocks_per_row = dim / 32;
+    let blocks_per_row = dim / 32; // for Q4_0/Q8_0
 
-    // Detect format: check total data size to determine block size
-    let expected_q4 = vocab_size * blocks_per_row * quantize::Q4_0_BLOCK_SIZE;
-    let expected_q8 = vocab_size * blocks_per_row * quantize::Q8_0_BLOCK_SIZE;
+    // Detect format from total data size
+    // Debug: log on first call only
+    static EMBED_LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if !EMBED_LOGGED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        let blocks_q6k = dim / quantize::Q6_K_BLOCK_VALUES;
+        let expected_q6k = vocab_size * blocks_q6k * quantize::Q6_K_BLOCK_SIZE;
+        libfolk::println!("[EMBED] data_len={} expected_q6k={} blocks_q6k={} dim={} vocab={}",
+            embed_data.len(), expected_q6k, blocks_q6k, dim, vocab_size);
+    }
+    // Q6_K: 256 values/block, 210 bytes/block
+    // Q8_0: 32 values/block, 34 bytes/block
+    // Q4_0: 32 values/block, 18 bytes/block
+    let blocks_q6k = dim / quantize::Q6_K_BLOCK_VALUES; // 256 values per block
+    let expected_q6k = vocab_size * blocks_q6k * quantize::Q6_K_BLOCK_SIZE;
 
-    let (block_size, is_q8) = if embed_data.len() >= expected_q8 {
-        (quantize::Q8_0_BLOCK_SIZE, true)
-    } else {
-        (quantize::Q4_0_BLOCK_SIZE, false)
-    };
-
-    let row_bytes = blocks_per_row * block_size;
-    let row_start = token_id * row_bytes;
-
-    let mut out_idx = 0;
-    for blk in 0..blocks_per_row {
-        let block_start = row_start + blk * block_size;
-        let block = &embed_data[block_start..block_start + block_size];
-        if is_q8 {
-            quantize::dequantize_q8_0_block(block, &mut output[out_idx..out_idx + 32]);
-        } else {
-            quantize::dequantize_q4_0_block(block, &mut output[out_idx..out_idx + 32]);
+    if embed_data.len() >= expected_q6k && blocks_q6k > 0 {
+        // Q6_K format (Qwen3 embeddings)
+        let row_bytes = blocks_q6k * quantize::Q6_K_BLOCK_SIZE;
+        let row_start = token_id * row_bytes;
+        let mut out_idx = 0;
+        for blk in 0..blocks_q6k {
+            let block_start = row_start + blk * quantize::Q6_K_BLOCK_SIZE;
+            let block = &embed_data[block_start..block_start + quantize::Q6_K_BLOCK_SIZE];
+            let vals = quantize::Q6_K_BLOCK_VALUES.min(dim - out_idx);
+            quantize::dequantize_q6_k_block(block, &mut output[out_idx..out_idx + vals]);
+            out_idx += vals;
         }
-        out_idx += 32;
+    } else {
+        // Q4_0 or Q8_0 format (SmolLM2 embeddings)
+        let expected_q8 = vocab_size * blocks_per_row * quantize::Q8_0_BLOCK_SIZE;
+        let (block_size, is_q8) = if embed_data.len() >= expected_q8 {
+            (quantize::Q8_0_BLOCK_SIZE, true)
+        } else {
+            (quantize::Q4_0_BLOCK_SIZE, false)
+        };
+
+        let row_bytes = blocks_per_row * block_size;
+        let row_start = token_id * row_bytes;
+        let mut out_idx = 0;
+        for blk in 0..blocks_per_row {
+            let block_start = row_start + blk * block_size;
+            let block = &embed_data[block_start..block_start + block_size];
+            if is_q8 {
+                quantize::dequantize_q8_0_block(block, &mut output[out_idx..out_idx + 32]);
+            } else {
+                quantize::dequantize_q4_0_block(block, &mut output[out_idx..out_idx + 32]);
+            }
+            out_idx += 32;
+        }
     }
 }
 

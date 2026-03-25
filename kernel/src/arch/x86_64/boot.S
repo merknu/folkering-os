@@ -61,6 +61,7 @@ _start:
 .align 4096
 boot_stack_bottom:
     .skip 16384
+.global boot_stack_top
 boot_stack_top:
 
 /* Additional stacks for SMP (16 CPUs max, 16KB each) */

@@ -10,7 +10,7 @@
 //! and B = weights (stored as Q4_0 from GGUF).
 
 use crate::arena::BumpArena;
-use crate::quantize::{self, Q4_0_BLOCK_SIZE, Q8_0_BLOCK_SIZE};
+use crate::quantize::{self, Q4_0_BLOCK_SIZE, Q4_1_BLOCK_SIZE, Q8_0_BLOCK_SIZE, Q6_K_BLOCK_SIZE, Q6_K_BLOCK_VALUES};
 use crate::simd;
 use crate::FuseOp;
 use crate::ops;
@@ -134,7 +134,7 @@ unsafe fn gemm_dot_avx2(a_q8: &[u8], b_q4: &[u8], n_blocks: usize) -> f32 {
 
         // Load expanded Q4_0 as u8 and Q8_0 as i8 into AVX2 registers
         let va = _mm256_loadu_si256(q4_expanded.as_ptr() as *const __m256i);
-        let vb = _mm256_loadu_si256(a_q8[a_off + 4..].as_ptr() as *const __m256i);
+        let vb = _mm256_loadu_si256(a_q8[a_off + 2..].as_ptr() as *const __m256i);
 
         // u8 × i8 → i16 pairs with adjacent addition
         let prod16 = _mm256_maddubs_epi16(va, vb);
@@ -156,7 +156,7 @@ unsafe fn gemm_dot_avx2(a_q8: &[u8], b_q4: &[u8], n_blocks: usize) -> f32 {
         // Zero-point correction: subtract 8 * sum(q8_values)
         // Sum Q8_0 values
         let mut sum_q8 = 0i32;
-        let q8_vals = &a_q8[a_off + 4..a_off + 36];
+        let q8_vals = &a_q8[a_off + 2..a_off + 34];
         for i in 0..32 {
             sum_q8 += (q8_vals[i] as i8) as i32;
         }
@@ -231,26 +231,46 @@ pub fn gemm_f32_x_q4(
     n: usize,
     fuse: FuseOp,
     yield_every: usize,
-    arena: &BumpArena,
+    _arena: &BumpArena,
 ) {
-    let n_blocks_per_row = k / 32;
-    let q8_row_size = n_blocks_per_row * Q8_0_BLOCK_SIZE;
-    let total_q8_size = m * q8_row_size;
+    // Direct f32 × dequant(Q4_0) — no Q8_0 quantization of activations.
+    let n_blocks = k / 32;
+    let q4_row_bytes = n_blocks * Q4_0_BLOCK_SIZE;
 
-    // Allocate Q8_0 buffer from arena
-    let q8_buf = match arena.alloc_slice::<u8>(total_q8_size) {
-        Some(buf) => buf,
-        None => return, // arena exhausted
-    };
-
-    // Quantize each row of activations
     for row in 0..m {
-        let src = &a_f32[row * k..(row + 1) * k];
-        let dst = &mut q8_buf[row * q8_row_size..(row + 1) * q8_row_size];
-        quantize::quantize_f32_to_q8_0(src, dst);
-    }
+        if yield_every > 0 && row > 0 && row % yield_every == 0 {
+            libfolk::sys::yield_cpu();
+        }
+        let a_row = &a_f32[row * k..(row + 1) * k];
 
-    gemm_q4_q8(c, q8_buf, b_q4, m, k, n, fuse, yield_every);
+        for col in 0..n {
+            let b_col_offset = col * q4_row_bytes;
+            let mut acc = 0.0f32;
+
+            for blk in 0..n_blocks {
+                let blk_start = b_col_offset + blk * Q4_0_BLOCK_SIZE;
+                let scale = quantize::q4_0_block_scale(&b_q4[blk_start..]);
+                let a_base = blk * 32;
+
+                // GGML Q4_0 layout: lo nibbles → positions 0-15, hi nibbles → positions 16-31
+                for i in 0..16 {
+                    let byte = b_q4[blk_start + 2 + i];
+                    let lo = ((byte & 0x0F) as i8 - 8) as f32;
+                    let hi = (((byte >> 4) & 0x0F) as i8 - 8) as f32;
+                    acc += a_row[a_base + i] * lo * scale;       // lo → first half
+                    acc += a_row[a_base + 16 + i] * hi * scale;  // hi → second half
+                }
+            }
+
+            let idx = row * n + col;
+            c[idx] += acc;
+
+            match fuse {
+                FuseOp::SiLU => { c[idx] = crate::ops::silu_f32(c[idx]); }
+                FuseOp::None => {}
+            }
+        }
+    }
 }
 
 /// GEMM: f32 activations × Q8_0 weights → f32 output
@@ -280,14 +300,11 @@ pub fn gemm_f32_x_q8(
 
             for blk in 0..n_blocks {
                 let blk_offset = b_col_offset + blk * Q8_0_BLOCK_SIZE;
-                let scale = f32::from_le_bytes([
-                    b_q8[blk_offset], b_q8[blk_offset + 1],
-                    b_q8[blk_offset + 2], b_q8[blk_offset + 3],
-                ]);
+                let scale = quantize::q8_0_block_scale(&b_q8[blk_offset..]);
 
                 let a_base = blk * 32;
                 for i in 0..32 {
-                    let q_val = b_q8[blk_offset + 4 + i] as i8;
+                    let q_val = b_q8[blk_offset + 2 + i] as i8;
                     acc += a_row[a_base + i] * (q_val as f32) * scale;
                 }
             }
@@ -307,6 +324,235 @@ pub fn gemm_f32_x_q8(
 
         if yield_every > 0 && row > 0 && row % yield_every == 0 {
             libfolk::sys::yield_cpu();
+        }
+    }
+}
+
+/// f32 input × Q6_K weights → f32 output.
+/// Uses SYS_PARALLEL_GEMM to distribute across AP compute workers when m=1.
+/// Falls back to single-core AVX2 if no APs are available.
+pub fn gemm_f32_x_q6k(
+    c: &mut [f32],
+    a_f32: &[f32],
+    b_q6k: &[u8],
+    m: usize,
+    k: usize,
+    n: usize,
+    yield_every: usize,
+) {
+    // For output projection (m=1, large n), try parallel GEMM across cores
+    if m == 1 && n >= 1024 {
+        if libfolk::sys::parallel_gemm(
+            a_f32.as_ptr(),
+            b_q6k.as_ptr(),
+            c.as_mut_ptr(),
+            k,
+            n,
+            0, // Q6_K
+        ) {
+            return;
+        }
+    }
+
+    let n_blocks = k / Q6_K_BLOCK_VALUES;
+    let q6k_row_bytes = n_blocks * Q6_K_BLOCK_SIZE;
+
+    // Tile size: process 4 columns at a time to amortize dequant overhead
+    // Each col = n_blocks dequant calls. With 4 cols, we read 4 weight blocks
+    // but reuse the same input vector segment from L1.
+    const TILE_COLS: usize = 4;
+    let mut dequant_bufs = [[0.0f32; Q6_K_BLOCK_VALUES]; TILE_COLS];
+
+    for row in 0..m {
+        let a_row = &a_f32[row * k..(row + 1) * k];
+
+        // Process columns in tiles of TILE_COLS
+        let mut col = 0;
+        while col + TILE_COLS <= n {
+            let mut accs = [0.0f32; TILE_COLS];
+
+            for blk in 0..n_blocks {
+                let a_base = blk * Q6_K_BLOCK_VALUES;
+
+                // Dequantize same block position for all TILE_COLS columns
+                for t in 0..TILE_COLS {
+                    let b_off = (col + t) * q6k_row_bytes + blk * Q6_K_BLOCK_SIZE;
+                    quantize::dequantize_q6_k_block(
+                        &b_q6k[b_off..b_off + Q6_K_BLOCK_SIZE],
+                        &mut dequant_bufs[t],
+                    );
+                }
+
+                // AVX2 dot product: input × each dequantized column
+                #[cfg(target_arch = "x86_64")]
+                if simd::has_avx2() {
+                    for t in 0..TILE_COLS {
+                        accs[t] += unsafe {
+                            dot_f32_block_avx2(
+                                a_row.as_ptr().add(a_base),
+                                dequant_bufs[t].as_ptr(),
+                                256,
+                            )
+                        };
+                    }
+                    continue;
+                }
+
+                // Scalar fallback
+                let vals = Q6_K_BLOCK_VALUES.min(k - a_base);
+                for t in 0..TILE_COLS {
+                    for i in 0..vals {
+                        accs[t] += a_row[a_base + i] * dequant_bufs[t][i];
+                    }
+                }
+            }
+
+            for t in 0..TILE_COLS {
+                c[row * n + col + t] += accs[t];
+            }
+            col += TILE_COLS;
+        }
+
+        // Remainder columns (< TILE_COLS)
+        let mut dequant_buf = [0.0f32; Q6_K_BLOCK_VALUES];
+        while col < n {
+            let b_col_offset = col * q6k_row_bytes;
+            let mut acc = 0.0f32;
+
+            for blk in 0..n_blocks {
+                let blk_start = b_col_offset + blk * Q6_K_BLOCK_SIZE;
+                quantize::dequantize_q6_k_block(
+                    &b_q6k[blk_start..blk_start + Q6_K_BLOCK_SIZE],
+                    &mut dequant_buf,
+                );
+                let a_base = blk * Q6_K_BLOCK_VALUES;
+
+                #[cfg(target_arch = "x86_64")]
+                if simd::has_avx2() {
+                    acc += unsafe {
+                        dot_f32_block_avx2(a_row.as_ptr().add(a_base), dequant_buf.as_ptr(), 256)
+                    };
+                    continue;
+                }
+
+                let vals = Q6_K_BLOCK_VALUES.min(k - a_base);
+                for i in 0..vals {
+                    acc += a_row[a_base + i] * dequant_buf[i];
+                }
+            }
+            c[row * n + col] += acc;
+            col += 1;
+        }
+
+        if yield_every > 0 && row > 0 && row % yield_every == 0 {
+            libfolk::sys::yield_cpu();
+        }
+    }
+}
+
+/// AVX2 FMA dot product over `count` f32 elements.
+/// count must be a multiple of 8. Pointers must be valid for `count` reads.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn dot_f32_block_avx2(a: *const f32, b: *const f32, count: usize) -> f32 {
+    use core::arch::x86_64::*;
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut acc2 = _mm256_setzero_ps();
+    let mut acc3 = _mm256_setzero_ps();
+    let mut i = 0;
+    // 4-way unroll: process 32 floats per iteration (4 × 8)
+    while i + 32 <= count {
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a.add(i)),      _mm256_loadu_ps(b.add(i)),      acc0);
+        acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(a.add(i + 8)),  _mm256_loadu_ps(b.add(i + 8)),  acc1);
+        acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(a.add(i + 16)), _mm256_loadu_ps(b.add(i + 16)), acc2);
+        acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(a.add(i + 24)), _mm256_loadu_ps(b.add(i + 24)), acc3);
+        i += 32;
+    }
+    // Remaining 8-wide chunks
+    while i + 8 <= count {
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a.add(i)), _mm256_loadu_ps(b.add(i)), acc0);
+        i += 8;
+    }
+    // Combine accumulators
+    acc0 = _mm256_add_ps(acc0, acc1);
+    acc2 = _mm256_add_ps(acc2, acc3);
+    acc0 = _mm256_add_ps(acc0, acc2);
+    // Horizontal sum of 8 f32 values
+    let hi = _mm256_extractf128_ps(acc0, 1);
+    let lo = _mm256_castps256_ps128(acc0);
+    let sum128 = _mm_add_ps(lo, hi);
+    let shuf = _mm_movehdup_ps(sum128);
+    let sums = _mm_add_ps(sum128, shuf);
+    let shuf2 = _mm_movehl_ps(sums, sums);
+    let final_sum = _mm_add_ss(sums, shuf2);
+    _mm_cvtss_f32(final_sum)
+}
+
+/// f32 input × Q4_1 weights → f32 output.
+/// Q4_1: 32 values/block, 20 bytes (f16 scale + f16 min + 16 data bytes).
+/// value = nibble * d + m  (unsigned, no zero-point subtraction)
+pub fn gemm_f32_x_q4_1(
+    c: &mut [f32],
+    a_f32: &[f32],
+    b_q4_1: &[u8],
+    m: usize,
+    k: usize,
+    n: usize,
+    fuse: FuseOp,
+    yield_every: usize,
+    _arena: &BumpArena,
+) {
+    let n_blocks = k / 32;
+    let q4_1_row_bytes = n_blocks * Q4_1_BLOCK_SIZE;
+    let mut dequant_buf = [0.0f32; 32];
+
+    for row in 0..m {
+        if yield_every > 0 && row > 0 && row % yield_every == 0 {
+            libfolk::sys::yield_cpu();
+        }
+        let a_row = &a_f32[row * k..(row + 1) * k];
+
+        for col in 0..n {
+            let b_col_offset = col * q4_1_row_bytes;
+            let mut acc = 0.0f32;
+
+            for blk in 0..n_blocks {
+                let blk_start = b_col_offset + blk * Q4_1_BLOCK_SIZE;
+                let a_base = blk * 32;
+
+                // Dequantize Q4_1 block to f32
+                quantize::dequantize_q4_1_block(
+                    &b_q4_1[blk_start..blk_start + Q4_1_BLOCK_SIZE],
+                    &mut dequant_buf,
+                );
+
+                // AVX2: 4 iterations of 8 f32 = 32 values
+                #[cfg(target_arch = "x86_64")]
+                if simd::has_avx2() {
+                    acc += unsafe {
+                        dot_f32_block_avx2(
+                            a_row.as_ptr().add(a_base),
+                            dequant_buf.as_ptr(),
+                            32,
+                        )
+                    };
+                    continue;
+                }
+
+                // Scalar fallback
+                for i in 0..32 {
+                    acc += a_row[a_base + i] * dequant_buf[i];
+                }
+            }
+
+            let idx = row * n + col;
+            c[idx] += acc;
+
+            match fuse {
+                FuseOp::SiLU => { c[idx] = crate::ops::silu_f32(c[idx]); }
+                FuseOp::None => {}
+            }
         }
     }
 }

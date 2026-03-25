@@ -38,8 +38,10 @@ impl TextLine {
     pub const fn empty() -> Self {
         Self { buf: [0; 128], len: 0 }
     }
+    /// ULTRA 45: Safe UTF-8 conversion — returns empty string for partial sequences
+    /// rather than panicking or producing garbage.
     pub fn as_str(&self) -> &str {
-        unsafe { core::str::from_utf8_unchecked(&self.buf[..self.len]) }
+        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
     }
 }
 
@@ -162,6 +164,10 @@ pub struct Window {
     pub input_cursor: usize,
     // Keyboard focus: index among all buttons (flattened), None = no focus
     pub focused_widget: Option<usize>,
+    /// ULTRA 38: Dirty flag — set when content changes, cleared after redraw
+    pub dirty: bool,
+    /// True while AI is streaming tokens to this window (shows typing cursor)
+    pub typing: bool,
 }
 
 impl Window {
@@ -194,6 +200,38 @@ impl Window {
             self.lines.remove(0);
         }
         self.lines.push(line);
+        self.dirty = true;
+    }
+
+    /// Append raw bytes to window text, handling newlines and line wrapping.
+    /// ULTRA 44: Scrolling buffer — remove oldest line when MAX_LINES exceeded.
+    /// ULTRA 45: Caller must ensure data is valid UTF-8 (inference server validates).
+    pub fn append_text(&mut self, data: &[u8]) {
+        const MAX_LINES: usize = 30;
+        for &byte in data {
+            if byte == b'\n' {
+                self.push_line("");
+                continue;
+            }
+            // Ensure we have a line to append to
+            if self.lines.is_empty() {
+                self.push_line("");
+            }
+            let last_idx = self.lines.len() - 1;
+            let last = &mut self.lines[last_idx];
+            if last.len >= 127 {
+                // ULTRA 44: Line full → auto-wrap
+                self.push_line("");
+                let last_idx2 = self.lines.len() - 1;
+                let last2 = &mut self.lines[last_idx2];
+                last2.buf[last2.len] = byte;
+                last2.len += 1;
+            } else {
+                last.buf[last.len] = byte;
+                last.len += 1;
+            }
+        }
+        self.dirty = true;
     }
 }
 
@@ -247,6 +285,8 @@ impl WindowManager {
             input_len: 0,
             input_cursor: 0,
             focused_widget: None,
+            dirty: true,
+            typing: false,
         };
         self.windows.push(win);
         self.focused_id = Some(id);
@@ -470,6 +510,17 @@ fn draw_window(fb: &mut FramebufferView, win: &Window, focused: bool) {
         }
         draw_str_small(fb, text_x, text_y, line.as_str(), text_fg, win_bg);
         text_y += line_h;
+    }
+
+    // Typewriter cursor: solid block at end of last line while AI is streaming
+    if win.typing {
+        let visible_lines = win.lines.len().saturating_sub(skip);
+        let cursor_col = win.lines.last().map(|l| l.len).unwrap_or(0);
+        let cursor_x = text_x + cursor_col * 8;
+        let cursor_y = content_y + 6 + visible_lines.saturating_sub(1) * line_h;
+        if cursor_x + 8 <= content_x + content_w && cursor_y + 8 <= content_y + content_h {
+            fb.fill_rect(cursor_x, cursor_y, 8, 8, text_fg);
+        }
     }
 
     // Draw input prompt for interactive windows

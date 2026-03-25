@@ -13,6 +13,7 @@ pub mod interrupt_frame;
 pub mod pat;
 pub mod pic;
 pub mod ioapic;
+pub mod smp;
 
 // Re-export with module-specific names
 pub use gdt::init as gdt_init;

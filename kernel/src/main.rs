@@ -6,7 +6,8 @@
 use limine::BaseRevision;
 use limine::request::{
     RequestsStartMarker, RequestsEndMarker,
-    FramebufferRequest, MemoryMapRequest, HhdmRequest, RsdpRequest, ModuleRequest
+    FramebufferRequest, MemoryMapRequest, HhdmRequest, RsdpRequest, ModuleRequest,
+    SmpRequest,
 };
 
 // Import kernel library
@@ -41,6 +42,11 @@ static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
 #[used]
 #[link_section = ".requests"]
 static MODULE_REQUEST: ModuleRequest = ModuleRequest::new();
+
+// Request SMP (multi-processor boot)
+#[used]
+#[link_section = ".requests"]
+static SMP_REQUEST: SmpRequest = SmpRequest::new();
 
 // Request markers
 #[used]
@@ -254,6 +260,20 @@ pub unsafe extern "C" fn debug_after_preempt_handler(_ctx: u64) {
 ///   [RSP+0]   rip    (pushed by CPU)
 ///   [RSP+8]   cs     (pushed by CPU)
 ///   [RSP+16]  rflags (pushed by CPU)
+#[unsafe(naked)]
+/// AP wake timer handler (vector 48) — just send EOI and return.
+/// APs use this to wake from HLT without triggering task preemption.
+// AP wake timer (vector 48) — EOI + iretq, no task preemption
+core::arch::global_asm!(
+    ".global irq_ap_timer",
+    "irq_ap_timer:",
+    "push rax",
+    "mov dword ptr [0xFFFFFFFFFEE000B0], 0",
+    "pop rax",
+    "iretq",
+);
+extern "C" { fn irq_ap_timer(); }
+
 #[unsafe(naked)]
 extern "C" fn irq_timer() {
     core::arch::naked_asm!(
@@ -1515,6 +1535,8 @@ unsafe fn init_idt() {
     IDT[44].set_handler(core::mem::transmute(irq_mouse as *const ()));
     // VirtIO block device (vector 45, routed via IOAPIC from PCI IRQ)
     IDT[45].set_handler(core::mem::transmute(irq_virtio_blk as *const ()));
+    // AP wake timer (vector 48) — just sends EOI, no task preemption
+    IDT[48].set_handler(core::mem::transmute(irq_ap_timer as *const ()));
     // Special vectors
     IDT[128].set_handler(core::mem::transmute(vec_128 as *const ())); // INT 0x80
     IDT[254].set_handler(core::mem::transmute(vec_254 as *const ()));
@@ -1626,6 +1648,15 @@ unsafe extern "C" fn kmain() -> ! {
     } else {
         0
     };
+
+    // Get SMP response — Limine handles AP trampoline for us
+    let smp_response = SMP_REQUEST.get_response();
+    if let Some(ref smp) = smp_response {
+        let cpus = smp.cpus();
+        serial_write("[SMP] Limine SMP: CPUs found, BSP LAPIC ID available\n");
+    } else {
+        serial_write("[SMP] No SMP response from Limine\n");
+    }
 
     // Try to get memory map entries directly
     // The Limine crate returns the entries as a slice, which should be accessible
@@ -1741,6 +1772,7 @@ unsafe extern "C" fn kmain() -> ! {
         memory_map: memory_map_slice,
         initrd_start,
         initrd_size,
+        smp_response,
     };
 
     serial_write("[Folkering OS] Boot info ready, calling kernel_main...\n\n");

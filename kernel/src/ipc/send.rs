@@ -114,33 +114,43 @@ pub fn ipc_send(target: TaskId, msg: &IpcMessage) -> Result<IpcMessage, Errno> {
         transfer_capability(&current, &target_task, cap_id.get())?;
     }
 
-    // 6. Enqueue message to target's receive queue
-    {
-        let mut target_lock = target_task.lock();
-        if !target_lock.recv_queue.push(kernel_msg) {
-            return Err(Errno::ENOBUFS);
+    // 6-9: Enqueue, block, wake, yield — all within interrupt-disabled section.
+    // CRITICAL: Prevents timer preemption from seeing inconsistent state
+    // (e.g., task marked BlockedOnSend but still running). The closure
+    // ensures IF is restored on ALL exit paths including early Err returns.
+    let enqueue_result = x86_64::instructions::interrupts::without_interrupts(|| {
+        // 6. Enqueue message to target's receive queue
+        {
+            let mut target_lock = target_task.lock();
+            if !target_lock.recv_queue.push(kernel_msg) {
+                return Err(Errno::ENOBUFS);
+            }
         }
-    }
 
-    // 7. Block current task (wait for reply)
-    {
-        let mut current_lock = current.lock();
-        current_lock.state = TaskState::BlockedOnSend(target);
-        current_lock.ipc_reply = None; // Clear previous reply
-    }
-
-    // 8. Wake target if it's waiting on receive
-    {
-        let mut target_lock = target_task.lock();
-        if target_lock.state == TaskState::BlockedOnReceive {
-            target_lock.state = TaskState::Runnable;
-            // Add to scheduler runqueue
-            crate::task::scheduler::enqueue(target);
+        // 7. Block current task (wait for reply)
+        {
+            let mut current_lock = current.lock();
+            current_lock.state = TaskState::BlockedOnSend(target);
+            current_lock.ipc_reply = None;
         }
-    }
+
+        // 8. Wake target if it's waiting on receive
+        {
+            let mut target_lock = target_task.lock();
+            if target_lock.state == TaskState::BlockedOnReceive {
+                target_lock.state = TaskState::Runnable;
+                crate::task::scheduler::enqueue(target);
+            }
+        }
+
+        Ok(())
+    });
+
+    // Propagate ENOBUFS if enqueue failed (interrupts already restored)
+    enqueue_result?;
 
     // 9. Context switch (yield CPU to scheduler)
-    // This will block until target calls ipc_reply()
+    // Interrupts are re-enabled here — scheduler will preempt when ready
     crate::task::scheduler::yield_cpu();
 
     // 10. (Resumed after reply) Return reply message

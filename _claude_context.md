@@ -3,133 +3,211 @@
 ## Project Overview
 Rust bare-metal x86-64 AI-native microkernel OS. Limine bootloader, QEMU for emulation, WSL build.
 
-**Current milestone**: 4.5 (App Weaver + interactive buttons)
+**Current milestone**: Epoch 1, M42 — First AI-generated tokens
 
-## What Works (as of 2026-03-18)
-- Graphical desktop (Neural Desktop) with draggable windows
-- Interactive terminal: `ls`, `ps`, `cat`, `find`, `uptime`, `app`, `help`
-- SQLite VFS via Synapse (custom no_std B-tree reader)
-- App Weaver: Shell builds declarative UI → shmem → Compositor renders
-- Clickable buttons with action_id IPC events back to owner task
-- SYS_MMAP/MUNMAP for dynamic anonymous memory
-- Full microkernel IPC: Compositor → Intent Service → Shell → Synapse
+## What Works (as of 2026-03-21)
+- **On-device SLM inference**: SmolLM2-135M generates tokens via omnibar `ask` command
+- Graphical desktop (Neural Desktop) with draggable terminal windows
+- BPE tokenizer (Greedy Prefix Match), 30-layer transformer forward pass
+- Top-P nucleus sampling with repetition penalty, KV-cache with sink eviction
+- VirtIO block with multi-sector DMA bursting (ULTRA 36: 87MB in 45s)
+- VirtIO network: DHCP, ICMP ping, DNS resolution
+- SQLite VFS via Synapse on persistent VirtIO disk
+- App Weaver: declarative UI → shmem → Compositor renders
+- Full microkernel IPC: Compositor → Intent → Shell → Synapse → Inference
 
-## 5 Userspace Tasks
+## 6 Userspace Tasks
 | Task | Name | Purpose |
 |------|------|---------|
 | 1 | idle | Idle loop |
-| 2 | synapse | SQLite, file cache, search |
-| 3 | shell | Commands, app builder |
-| 4 | compositor | GUI, windows, widgets |
+| 2 | synapse | SQLite, VFS, file cache |
+| 3 | shell | Commands, WASM apps |
+| 4 | compositor | GUI, windows, omnibar, terminal |
 | 5 | intent-service | Capability-based IPC routing |
+| 6 | inference | SLM inference (libtensor + GGUF) |
 
-## Critical Lessons (from this session)
+## Critical Lessons
 1. **shmem_map MUST use task PML4** — `map_page_in_table(task.page_table_phys, ...)` NOT global MAPPER
-2. **receive() truncates to 32 bits** — use recv_async() for full 64-bit payloads
-3. **B-tree right_pointer: follow exactly once** — check `next_cell == cell_count`
-4. **Avoid IPC deadlocks** — Shell can't send IPC to Compositor while Compositor waits for Shell
+2. **GGUF magic is 0x46554747** (not 0x46475547) — "GGUF" as LE u32
+3. **Kernel mmap limit = 16MB/call** — inference server mmaps in 16MB chunks
+4. **INFER_SHMEM_VADDR must not collide with MMAP_BASE** — use 0x20000000
+5. **SmolLM2-135M Q4_0 uses Q8_0 for embeddings/output** — need dtype-aware GEMM
+6. **VirtIO DMA: sector-by-sector = kernel DDoS** — multi-sector bursts essential
+7. **Compositor omnibar catches all keyboard** — commands must be handled in compositor code
 
 ## Build
-- Kernel: `kernel/` → `target/x86_64-folkering/release/kernel` (ELF)
-- Userspace: `userspace/` → `target/x86_64-folkering-userspace/release/{compositor,shell,synapse}` (ELF)
-- Build runs in WSL (Ubuntu-22.04), outputs to Windows filesystem via `/mnt/c/`
+- Kernel: `kernel/` → `target/x86_64-folkering/release/kernel`
+- Userspace: `userspace/` → `target/x86_64-folkering-userspace/release/{compositor,shell,synapse,intent-service,inference}`
+- folk-pack: `tools/folk-pack/` — creates FPK initrd + packs GGUF models
+- MCP build server: `C:\Users\merkn\folkering-mcp\server.py` (folkering_rebuild_run)
+- MCP debug server: `mcp/server.py` v3.0 — see "ML Inspection Studio" section below
 
-## Debug Session
-Start QEMU with full debug flags (QMP + GDB stub):
-```bash
-wsl -e bash -c "cd /mnt/c/Users/merkn/folkering/folkering-os && ./tools/qemu-debug-live.sh"
+## FOLKDISK Header Layout (sector 0 of virtio-data.img)
 ```
-- QMP socket: `/tmp/folkering-qmp.sock` (WSL-native)
-- Serial log:  `/tmp/folkering-serial.log`
-- GDB stub:    `localhost:1234` (QEMU starts halted — `continue` in GDB or use GDB bridge)
-
-## MCP Debug Server — `mcp/server.py`
-Registered in `~/.claude.json` as `folkering-debug`, invoked with `py -3.12`.
-
-### Tool: `kernel_symbol_lookup`
-Resolves hex addresses → function name + source location using the kernel/userspace ELF symbols.
-
-**Parameters:**
-- `addresses` (required): `["0x205AD5", "0xffffffff80000004"]`
-- `elf_path` (optional): Override ELF path (auto-detected from address range by default)
-
-**Auto-detection logic:**
-- `0xffffffff80000000–0xffffffffffffffff` → kernel ELF
-- `0x200000–0x4fffff` → compositor/shell/synapse (userspace)
-- CS=0x08 = kernel mode, CS=0x23 = user mode
-
-**Notes:**
-- Release builds have `.symtab` but NO DWARF — `addr2line` returns `??`, `nm` finds nearest symbol
-- ELF is copied to `/tmp/folkering-{name}` in WSL for native filesystem speed (avoids slow 9P `/mnt/c/`)
-
-**Example output:**
-```
-────────────────────────────────────────────────────────────
-Address  : 0x205AD5  [compositor]
-Symbol   : compositor::main  +0xc46
-Source   : (no DWARF — build with debug_assertions or use debug profile)
+[0..8]   "FOLKDISK" magic
+[8..12]  version (u32)
+[12..16] pad
+[16..24] journal_start (u64)
+[24..32] journal_size (u64)
+[32..40] data_start (u64)
+[40..48] data_size (u64)
+[48..56] synapse_db_sector (u64)
+[56..64] synapse_db_size (u64)
+[64..72] model_sector (u64) — 4KB-aligned
+[72..80] model_size (u64) — bytes
 ```
 
-### Tool: `serial_throttle_analyzer`
-Reads a serial/QEMU log and collapses repeated loop patterns. Turns millions of repetitive lines into `[LOOP xN]` summaries so anomalies (faults, panics) are immediately visible.
-
-**Parameters:**
-- `log_path` (required): Path to log file (e.g. `/tmp/folkering-serial.log`)
-- `window` (default: 5): Lines per pattern unit
-- `threshold` (default: 10): Repeats before collapsing
-- `max_output_lines` (default: 200): Output line cap
-
-**Example usage:** `serial_throttle_analyzer "/tmp/folkering-serial.log"`
-
-### Tool: `qemu_inspect_registers`
-Queries live QEMU CPU state via QMP. Returns GPR (RAX–R15, RIP, RSP, RBP, RFLAGS) and segment registers. Optionally includes XMM0–XMM15.
-
-**Parameters:**
-- `include_xmm` (default: false): Include SSE registers
-- `qmp_socket` (default: `/tmp/folkering-qmp.sock`): Override QMP socket path
-
-**Requires:** QEMU running with `-qmp unix:/tmp/folkering-qmp.sock,server,nowait`
-
-**Implementation note:** QMP socket is WSL-native, so tool embeds a Python client script and runs it via `wsl -d Ubuntu-22.04 python3 -c "..."` (NOT `wsl -e python3` — that fails with E_UNEXPECTED).
-
-**Example output:**
-```
-QEMU CPU Register State
-════════════════════════════════════════════════════════════
-RAX=0000000000000000 RBX=0000000000000000 RCX=0000000000000000
-RDX=0000000000000663 RSI=0000000000000000 RDI=0000000000000000
-...
-```
-
-## Skill: ABI Auditor (`/abi-audit`)
-Saved at `~/.claude/skills/abi-audit.md`. Activates on:
-- Shared `naked_asm!` / `global_asm!` / `.asm` blocks
-- "check my abi" / "audit this asm" / `/abi-audit`
-
-Performs SysV AMD64 ABI compliance check:
-1. Stack map diagram (RSP offset at each push/pop)
-2. 16-byte RSP alignment check before every `call`
-3. Callee-saved register clobber detection (RBX, RBP, R12–R15, XMM8–15)
-4. Argument register verification (RDI, RSI, RDX, RCX, R8, R9 order)
-5. Red zone warning (no red zone in kernel interrupt handlers)
-
-## WSL Invocation Quirks
-- `wsl -e bash -c "..."` — works for bash commands (cp, nm, addr2line)
-- `wsl -d Ubuntu-22.04 python3 -c "..."` — required for Python; `-e python3` fails with `E_UNEXPECTED`
-- ELF operations use `wsl -e bash -c` (bash + binutils)
-- QMP client uses `wsl -d Ubuntu-22.04 python3 -c` (Python socket)
+## Key Directories
+| Path | Purpose |
+|------|---------|
+| `kernel/src/drivers/virtio_blk.rs` | VirtIO block + DMA burst |
+| `userspace/libtensor/src/` | GEMM, GGUF, tokenizer, transformer, KV-cache |
+| `userspace/inference-server/src/main.rs` | Model loading, forward pass, IPC |
+| `userspace/compositor/src/main.rs` | GUI, omnibar, ask command handler |
+| `tools/folk-pack/src/main.rs` | FPK + pack-model subcommand |
+| `mcp/server.py` | Debug MCP v3.0 (symbols, registers, tensor_dump, python_ref_runner, **attention_heatmap**, **topo_parity_map**) |
 
 ## Memory Layout
 | Range | Owner |
 |-------|-------|
-| `0xffffffff80000000–0xffffffffffffffff` | Kernel (high-half) |
-| `0x200000–0x4fffff` | Userspace processes |
+| `0xffffffff80000000+` | Kernel (high-half) |
+| `0x1_0000_0000` | Model mmap (87MB) |
+| `0x4000_0000+` | Arena, KV-cache (mmap region) |
+| `0x2000_0000` | Inference shmem IPC |
+| `0x200000–0x4fffff` | Userspace code/data |
 
-## Key Files
-| File | Purpose |
-|------|---------|
-| `mcp/server.py` | MCP debug server (3 tools) |
-| `tools/qemu-debug-live.sh` | QEMU launch script with QMP+GDB |
-| `~/.claude/skills/abi-audit.md` | ABI Auditor skill |
-| `kernel/target/x86_64-folkering/release/kernel` | Kernel ELF |
-| `userspace/target/x86_64-folkering-userspace/release/compositor` | Compositor ELF |
+## ML Inspection Studio (MCP Debug Server v2.0)
+
+`mcp/server.py` registered as `folkering-debug` (py -3.12). Five tools:
+
+### Original tools
+- `kernel_symbol_lookup(addresses, elf_path?)` — resolve hex addr → function name
+- `serial_throttle_analyzer(log_path, ...)` — collapse loop patterns in serial logs
+- `qemu_inspect_registers(include_xmm?, qmp_socket?)` — CPU register dump via QMP
+
+### Tool: `tensor_dump` — Read Tensor Data from Inference Server
+
+The Rust inference-server writes tensor stats + raw f32 data to VirtIO disk sectors 1-7 after each forward pass. This tool reads them directly from the host disk image file.
+
+**When to use:** After running inference in QEMU, to inspect logits, hidden states, or any tensor the inference-server dumped.
+
+**Rust-side dump points (in inference-server/src/main.rs):**
+- `bos_logits` — after processing BOS token (token 0)
+- `prefill_final_logits` — after last prefill token (used for sampling)
+- Add custom: `debug_dump_logits(logits, "my_name")` or `debug_dump_hidden(data, "my_name")`
+
+**Usage patterns:**
+```
+# Quick stats check (no raw data)
+tensor_dump()
+
+# Get raw float values + top-20 logits
+tensor_dump(return_data=true, top_k=20)
+
+# Specific slice of tensor data
+tensor_dump(return_data=true, slice_start=100, slice_end=200)
+
+# Parse from serial log instead of disk
+tensor_dump(serial_log="/tmp/folkering-serial.log", name_filter="prefill_final_logits")
+```
+
+**Disk mailbox layout:** Sector 1 = header (magic "TDMP", seq, shape, stats, name, first 100 f32), Sectors 2-7 = raw f32 data (max 768 values).
+
+### Tool: `python_ref_runner` — PyTorch Ground-Truth Oracle (ULTRA 50)
+
+Loads SmolLM2-135M via HuggingFace `transformers` + PyTorch. Model stays in memory after first load. Use as ground truth for comparing Rust inference output.
+
+**When to use:** When debugging transformer divergence, GQA bugs, or precision issues. Compare layer-by-layer with Rust output.
+
+**Modes:**
+- `logits` — top-K logits at last token position (default, most common)
+- `generate` — generate N tokens
+- `tokens` — show tokenization
+- `compare` — auto-reads Rust tensor_dump from disk and computes element-wise diff
+
+**Usage patterns:**
+```
+# Reference logits (greedy, deterministic)
+python_ref_runner(prompt="Hello", mode="logits", top_k=20)
+
+# Compare with Rust (reads disk mailbox automatically)
+python_ref_runner(prompt="<|im_start|>system\n...", mode="compare")
+
+# Capture layer 0 Q projection (forward hook)
+python_ref_runner(prompt="Hello", layer=0, module_name="self_attn.q_proj")
+
+# Capture multiple activations at once
+python_ref_runner(prompt="Hello", capture_layers=[
+    "model.layers.0.self_attn.q_proj",
+    "model.layers.0.self_attn.k_proj",
+    "model.layers.0.self_attn.v_proj",
+    "model.layers.0.self_attn",
+    "model.layers.1.self_attn"
+])
+```
+
+**Available module names for `capture_layers` / `module_name`:**
+- Attention: `self_attn.q_proj`, `self_attn.k_proj`, `self_attn.v_proj`, `self_attn.o_proj`, `self_attn`
+- FFN: `mlp.gate_proj`, `mlp.up_proj`, `mlp.down_proj`, `mlp`
+- Norms: `input_layernorm`, `post_attention_layernorm`
+
+**SmolLM2-135M architecture (for reference):**
+- 30 layers, embed_dim=576, n_heads=9, n_kv_heads=3 (GQA 3:1), head_dim=64
+- intermediate_size=1536, vocab=49152, context=2048
+- Q shape: [1, seq, 576], K/V shape: [1, seq, 192]
+
+### Debugging workflow for transformer divergence
+
+1. Run inference in QEMU → generates `[TDMP]` serial lines + disk mailbox
+2. `tensor_dump(top_k=20)` — see Rust top logits
+3. `python_ref_runner(prompt=SAME_PROMPT, mode="compare")` — auto-diff
+4. If argmax diverges: narrow down the layer
+5. For each layer L: `python_ref_runner(prompt=X, layer=L, module_name="self_attn.q_proj")` — get Python Q
+6. Compare with Rust serial output for layer L
+7. When divergence layer found: check GEMM, RoPE, attention score computation
+
+### Tool: `attention_heatmap` — Visual Attention Pattern Inspector (v3.0)
+
+Generates PNG heatmap of attention weights. Returns MCP image content (renders in chat).
+
+**When to use:** Diagnose attention collapse (uniform/BOS-dominated) or compare Python vs Rust patterns.
+
+**Usage:**
+```
+# All 9 heads + average for layer 0
+attention_heatmap(prompt="Hello world", layer=0, head="all")
+
+# Single head
+attention_heatmap(prompt="Hello world", layer=5, head=3)
+```
+
+**Features:**
+- Causal mask applied (upper triangle = NaN, won't distort colors)
+- If Rust data in disk mailbox matches attention shape: shows DRIFT heatmap (`|python - rust|`)
+- If no Rust data: shows BASELINE ONLY (clearly labeled)
+- Auto-detects BOS attention collapse (>80%) and low entropy warnings
+- Model loaded with `attn_implementation="eager"` for `output_attentions=True`
+
+### Tool: `topo_parity_map` — Automated Drift Analysis (v3.0)
+
+Compares ONE Python activation vs ONE Rust tensor from disk mailbox. Computes MSE, cosine similarity, max/mean abs error, divergence counts.
+
+**When to use:** Pin down exactly WHERE in the transformer the Rust inference diverges from Python ground truth.
+
+**Usage:**
+```
+# Compare layer 0 Q projection
+topo_parity_map(prompt="Hello", layer=0, module="self_attn.q_proj")
+
+# Compare layer 15 FFN output
+topo_parity_map(prompt="Hello", layer=15, module="mlp")
+```
+
+**Features:**
+- Truncation warning if mailbox holds fewer floats than full tensor
+- Verdicts: EXCELLENT (cosine>0.999), GOOD (>0.99), CONCERNING (>0.95), CRITICAL (<0.95)
+- Top-5 worst divergent indices shown with both values
+- 256-sector mailbox reader (supports up to 32768 floats when Rust side expands)
+
+### Dependencies (py -3.12)
+torch 2.10.0+cpu, transformers 5.3.0, numpy 2.4.3, matplotlib 3.10.8, llama-cpp-python 0.3.16

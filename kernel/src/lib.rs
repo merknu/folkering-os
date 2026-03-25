@@ -92,6 +92,23 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
         drivers::serial::write_dec((stats.free_bytes / (1024 * 1024)) as u32);
         serial_strln!(" MB\n");
 
+        // Enable AVX on BSP: set CR4.OSXSAVE, then configure XCR0
+        {
+            let mut cr4: u64;
+            core::arch::asm!("mov {}, cr4", out(reg) cr4);
+            cr4 |= (1 << 9) | (1 << 10) | (1 << 18); // OSFXSR + OSXMMEXCPT + OSXSAVE
+            core::arch::asm!("mov cr4, {}", in(reg) cr4);
+            // Enable x87 + SSE + AVX in XCR0
+            core::arch::asm!(
+                "xor ecx, ecx",
+                "xgetbv",
+                "or eax, 7",
+                "xsetbv",
+                out("eax") _, out("ecx") _, out("edx") _,
+            );
+            serial_strln!("[INIT] AVX/SSE enabled via CR4.OSXSAVE + XCR0");
+        }
+
         // Initialize GDT and TSS
         serial_strln!("[INIT] Initializing GDT and TSS...");
         arch::x86_64::gdt_init();
@@ -150,6 +167,15 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
         }
         serial_strln!("[INIT] PIC disabled (all IRQs masked)");
 
+        // Initialize ACPI (for future use)
+        arch::x86_64::acpi_init(boot_info.rsdp_addr);
+
+        // Boot APs via Limine SMP for parallel GEMM
+        if let Some(smp) = boot_info.smp_response {
+            serial_strln!("[INIT] Booting APs via Limine SMP...");
+            arch::x86_64::smp::boot_aps_limine(smp);
+        }
+
         // Initialize PCI bus enumeration
         serial_strln!("[INIT] Enumerating PCI bus...");
         drivers::pci::init();
@@ -178,6 +204,17 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
                 net::init();
             }
             Err(_) => { serial_strln!("[INIT] No VirtIO network device (running without networking)"); }
+        }
+
+        // VirtIO GPU (2D scanout — Limine framebuffer fallback on failure)
+        serial_strln!("[INIT] Looking for VirtIO GPU device...");
+        match drivers::virtio_gpu::init() {
+            Ok(()) => { serial_strln!("[INIT] VirtIO GPU active!"); }
+            Err(e) => {
+                serial_str!("[INIT] VirtIO GPU: ");
+                serial_strln!(e);
+                serial_strln!("[INIT] Using Limine framebuffer (fallback)");
+            }
         }
 
         // Initialize keyboard driver (uses IRQ1 via IOAPIC)
@@ -664,6 +701,8 @@ pub mod boot {
         pub initrd_start: usize,
         /// Size of the initrd in bytes
         pub initrd_size: usize,
+        /// Limine SMP response (if available)
+        pub smp_response: Option<&'static limine::response::SmpResponse>,
     }
 }
 

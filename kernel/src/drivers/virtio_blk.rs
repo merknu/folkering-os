@@ -125,15 +125,15 @@ static CAPACITY_SECTORS: AtomicU64 = AtomicU64::new(0);
 /// Journal write position (circular)
 static JOURNAL_POS: AtomicU64 = AtomicU64::new(0);
 
-/// Maximum sectors per multi-sector DMA burst (ULTRA 36)
-/// 64 sectors × 512 bytes = 32KB per VirtIO request
-pub const MAX_BURST_SECTORS: usize = 64;
+/// Maximum sectors per multi-sector DMA burst
+/// 128 sectors × 512 bytes = 64KB per VirtIO request
+pub const MAX_BURST_SECTORS: usize = 128;
 
-/// Size of the DMA burst buffer in bytes
-const BURST_BUF_SIZE: usize = MAX_BURST_SECTORS * SECTOR_SIZE; // 32KB
+/// Size of the DMA burst buffer in bytes (256KB)
+const BURST_BUF_SIZE: usize = MAX_BURST_SECTORS * SECTOR_SIZE;
 
-/// Number of pages for the burst buffer
-const BURST_BUF_PAGES: usize = BURST_BUF_SIZE / 4096; // 8 pages
+/// Number of pages for the burst buffer (64 pages)
+const BURST_BUF_PAGES: usize = BURST_BUF_SIZE / 4096;
 
 struct VirtioBlkDevice {
     /// BAR0 I/O port base
@@ -531,23 +531,26 @@ fn do_io(req_type: u32, sector: u64, data: &mut [u8; SECTOR_SIZE]) -> Result<(),
 
     // Wait for completion (interrupt-driven with timeout)
     let io_base = blk.io_base;
-    drop(dev); // Release lock while waiting
+    drop(dev); // Release lock BEFORE sleep loop (IRQ handler needs it)
 
-    // Enable interrupts so the IRQ can fire (may be disabled during early boot)
+    // Hybrid wait: hlt (sleep until ANY interrupt) + ISR poll after each wakeup.
+    // - TCG: VirtIO interrupt wakes hlt → IO_COMPLETE true → instant break
+    // - WHPX: Timer wakes hlt every ~10ms → ISR poll catches completion
+    // Pure ISR polling in tight loop causes VM-exit storm under WHPX.
     unsafe { core::arch::asm!("sti"); }
 
-    let mut timeout = 1_000_000u32;
+    let mut timeout = 100_000u32; // ~1000s at 10ms/tick
     while !IO_COMPLETE.load(Ordering::Acquire) {
-        // HLT: sleep until next interrupt — saves CPU vs spin loop
         unsafe { core::arch::asm!("hlt"); }
+        // After ANY interrupt wakes us, check both paths:
+        if IO_COMPLETE.load(Ordering::Acquire) { break; }
+        let isr = read_io8(io_base, VIRTIO_PCI_ISR_STATUS);
+        if isr != 0 {
+            IO_COMPLETE.store(true, Ordering::Release);
+            break;
+        }
         timeout -= 1;
         if timeout == 0 {
-            // Fallback: poll ISR directly (handles case where IRQ routing fails)
-            let isr = read_io8(io_base, VIRTIO_PCI_ISR_STATUS);
-            if isr != 0 {
-                IO_COMPLETE.store(true, Ordering::Release);
-                break;
-            }
             crate::serial_strln!("[VIRTIO_BLK] I/O timeout!");
             return Err(BlockError::Timeout);
         }
@@ -679,21 +682,22 @@ pub fn block_read_multi(sector: u64, buf: &mut [u8], count: usize) -> Result<(),
     write_io16(blk.io_base, VIRTIO_PCI_QUEUE_NOTIFY, 0);
 
     let io_base = blk.io_base;
-    drop(dev); // Release lock while waiting
+    drop(dev); // Release lock BEFORE sleep loop (IRQ handler needs it)
 
-    // Wait for completion
+    // Hybrid wait: hlt + ISR poll after each wakeup
     unsafe { core::arch::asm!("sti"); }
 
-    let mut timeout = 10_000_000u32; // Longer timeout for multi-sector
+    let mut timeout = 100_000u32;
     while !IO_COMPLETE.load(Ordering::Acquire) {
         unsafe { core::arch::asm!("hlt"); }
+        if IO_COMPLETE.load(Ordering::Acquire) { break; }
+        let isr = read_io8(io_base, VIRTIO_PCI_ISR_STATUS);
+        if isr != 0 {
+            IO_COMPLETE.store(true, Ordering::Release);
+            break;
+        }
         timeout -= 1;
         if timeout == 0 {
-            let isr = read_io8(io_base, VIRTIO_PCI_ISR_STATUS);
-            if isr != 0 {
-                IO_COMPLETE.store(true, Ordering::Release);
-                break;
-            }
             crate::serial_strln!("[VIRTIO_BLK] Multi-sector I/O timeout!");
             return Err(BlockError::Timeout);
         }

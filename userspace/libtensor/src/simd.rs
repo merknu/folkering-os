@@ -224,3 +224,43 @@ pub fn dot_i8_scalar(a_u8: &[u8], b_i8: &[i8], len: usize) -> i32 {
     }
     sum
 }
+
+// =============================================================================
+// AXPY: out[i] += alpha * x[i] (scalar × vector accumulated into output)
+// =============================================================================
+
+/// AXPY with AVX2+FMA: out[i] += alpha * x[i].
+/// Uses unaligned loads/stores (safe for BumpArena sub-slices).
+///
+/// # Safety
+/// Caller must ensure AVX2+FMA is available.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2", enable = "fma")]
+pub unsafe fn axpy_f32_avx2(alpha: f32, x: &[f32], out: &mut [f32], len: usize) {
+    use core::arch::x86_64::*;
+    let alpha_vec = _mm256_set1_ps(alpha);
+    let mut i = 0;
+
+    while i + 8 <= len {
+        let vx = _mm256_loadu_ps(x.as_ptr().add(i));
+        let vo = _mm256_loadu_ps(out.as_ptr().add(i));
+        let result = _mm256_fmadd_ps(alpha_vec, vx, vo);
+        _mm256_storeu_ps(out.as_mut_ptr().add(i), result);
+        i += 8;
+    }
+
+    // Scalar remainder
+    while i < len {
+        out[i] += alpha * x[i];
+        i += 1;
+    }
+}
+
+/// Scalar AXPY fallback.
+#[inline]
+pub fn axpy_f32_scalar(alpha: f32, x: &[f32], out: &mut [f32], len: usize) {
+    for i in 0..len {
+        out[i] += alpha * x[i];
+    }
+}

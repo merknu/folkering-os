@@ -40,42 +40,262 @@ entry!(main);
 /// Inference server task ID (must match kernel spawn order)
 pub const INFERENCE_TASK_ID: u32 = 6;
 
+// ============================================================================
+// Debug Tensor Dump — ULTRA 49: lightweight println! + VirtIO disk mailbox
+//
+// Two extraction paths for the host-side MCP tool:
+//   1. Serial log: [TDMP] lines with stats (always available)
+//   2. Disk mailbox: sectors 1-257 with raw f32 data (128KB, for attention/logits)
+//
+// The MCP tool reads the disk image directly on the host — no QEMU interaction.
+// ============================================================================
+
+/// Debug mailbox: sector 1 = header, sectors 2-257 = data (max 32768 f32, 128KB)
+const DUMP_HEADER_SECTOR: u64 = 1;
+const DUMP_DATA_SECTOR: u64 = 2;
+const DUMP_MAX_SECTORS: usize = 256;  // sectors 2-257 (128KB)
+const DUMP_MAX_FLOATS: usize = DUMP_MAX_SECTORS * SECTOR_SIZE / 4;  // 32768
+
+/// Monotonic sequence counter
+static mut DUMP_SEQ: u32 = 0;
+
+/// Dump a named f32 tensor: print stats to serial AND write to disk mailbox.
+///
+/// Disk mailbox layout:
+///   Sector 1 (header): magic, seq, shape, stats, name, first 100 f32 summary
+///   Sectors 2-257 (data): raw f32 values, up to 32768 floats (128KB)
+fn debug_dump_tensor(name: &str, data: &[f32], shape0: u32, shape1: u32) {
+    let n = data.len();
+    if n == 0 { return; }
+
+    // Compute stats
+    let mut min_val = data[0];
+    let mut max_val = data[0];
+    let mut sum = 0.0f64;
+    let mut argmax_idx = 0u32;
+    let mut argmax_val = data[0];
+
+    for i in 0..n {
+        let v = data[i];
+        if v < min_val { min_val = v; }
+        if v > max_val { max_val = v; argmax_idx = i as u32; argmax_val = v; }
+        sum += v as f64;
+    }
+    let mean = (sum / n as f64) as f32;
+
+    let seq = unsafe {
+        DUMP_SEQ += 1;
+        DUMP_SEQ
+    };
+
+    // Print to serial (always available — MCP tool parses this)
+    println!("[TDMP] seq={} name={} shape=[{},{}] n={} argmax={}({:.6}) min={:.6} max={:.6} mean={:.6}",
+        seq, name, shape0, shape1, n, argmax_idx, argmax_val, min_val, max_val, mean);
+
+    // Write to disk mailbox for full float data extraction
+    let n_dumped = n.min(DUMP_MAX_FLOATS) as u32;
+
+    // Build header sector (512 bytes)
+    let mut hdr = [0u8; SECTOR_SIZE];
+    hdr[0..4].copy_from_slice(b"TDMP");
+    hdr[4..8].copy_from_slice(&seq.to_le_bytes());
+    hdr[8..12].copy_from_slice(&(n as u32).to_le_bytes());
+    hdr[12..16].copy_from_slice(&n_dumped.to_le_bytes());
+    hdr[16..20].copy_from_slice(&shape0.to_le_bytes());
+    hdr[20..24].copy_from_slice(&shape1.to_le_bytes());
+    hdr[24..28].copy_from_slice(&argmax_idx.to_le_bytes());
+    hdr[32..36].copy_from_slice(&min_val.to_le_bytes());
+    hdr[36..40].copy_from_slice(&max_val.to_le_bytes());
+    hdr[40..44].copy_from_slice(&mean.to_le_bytes());
+    hdr[44..48].copy_from_slice(&argmax_val.to_le_bytes());
+    let name_bytes = name.as_bytes();
+    let copy_len = name_bytes.len().min(63);
+    hdr[48..48 + copy_len].copy_from_slice(&name_bytes[..copy_len]);
+    let summary_count = n.min(100);
+    for i in 0..summary_count {
+        let off = 112 + i * 4;
+        if off + 4 <= SECTOR_SIZE {
+            hdr[off..off + 4].copy_from_slice(&data[i].to_le_bytes());
+        }
+    }
+
+    let _ = libfolk::sys::block::write_sector(DUMP_HEADER_SECTOR, &hdr);
+
+    // Write data sectors (2-7)
+    let mut buf = [0u8; SECTOR_SIZE];
+    let data_sectors = ((n_dumped as usize * 4) + SECTOR_SIZE - 1) / SECTOR_SIZE;
+    let data_sectors = data_sectors.min(DUMP_MAX_SECTORS);
+    for s in 0..data_sectors {
+        let float_start = s * (SECTOR_SIZE / 4);
+        let float_end = ((s + 1) * (SECTOR_SIZE / 4)).min(n_dumped as usize);
+        for b in buf.iter_mut() { *b = 0; }
+        for i in float_start..float_end {
+            let off = (i - float_start) * 4;
+            buf[off..off + 4].copy_from_slice(&data[i].to_le_bytes());
+        }
+        let _ = libfolk::sys::block::write_sector(DUMP_DATA_SECTOR + s as u64, &buf);
+    }
+}
+
+/// Convenience: dump logits after forward pass
+#[allow(dead_code)]
+fn debug_dump_logits(logits: &[f32], label: &str) {
+    debug_dump_tensor(label, logits, logits.len() as u32, 0);
+}
+
+/// Convenience: dump a 1D hidden state
+#[allow(dead_code)]
+fn debug_dump_hidden(data: &[f32], label: &str) {
+    debug_dump_tensor(label, data, data.len() as u32, 0);
+}
+
+/// Write health telemetry to sector 259.
+/// Layout: HLTH(4) + gen_step(u32) + token_id(u32) + mse(f32) + threshold(f32)
+///       + min_mse(f32) + min_mse_step(u32) + total_steps(u32)
+fn write_health_sector(
+    gen_step: u32, token_id: u32, mse: f32, threshold: f32,
+    min_mse: f32, min_mse_step: u32, total_steps: u32,
+) {
+    let mut buf = [0u8; SECTOR_SIZE];
+    buf[0..4].copy_from_slice(b"HLTH");
+    buf[4..8].copy_from_slice(&gen_step.to_le_bytes());
+    buf[8..12].copy_from_slice(&token_id.to_le_bytes());
+    buf[12..16].copy_from_slice(&mse.to_le_bytes());
+    buf[16..20].copy_from_slice(&threshold.to_le_bytes());
+    // "Check Engine" light: lowest MSE seen this run (worst collapse point)
+    buf[20..24].copy_from_slice(&min_mse.to_le_bytes());
+    buf[24..28].copy_from_slice(&min_mse_step.to_le_bytes());
+    buf[28..32].copy_from_slice(&total_steps.to_le_bytes());
+    let _ = libfolk::sys::block::write_sector(HEALTH_SECTOR, &buf);
+}
+
 /// IPC opcodes for inference requests (must match libfolk::sys::inference)
 pub const INFER_OP_PING: u64 = 0;
 pub const INFER_OP_GENERATE: u64 = 1;
 pub const INFER_OP_STATUS: u64 = 2;
 pub const INFER_OP_ASK: u64 = 3;
+pub const INFER_OP_ASK_ASYNC: u64 = 4;
 
-/// Bump arena size: 8MB for intermediate computation buffers
-const ARENA_SIZE: usize = 8 * 1024 * 1024;
+/// Bump arena size: 16MB for tokenizer tables (152K vocab) + inference buffers
+const ARENA_SIZE: usize = 16 * 1024 * 1024;
 
-/// Maximum GGUF model size we'll attempt to load (128MB)
-const MAX_MODEL_SIZE: usize = 128 * 1024 * 1024;
+/// Maximum GGUF model size we'll attempt to load (512MB for SmolLM2-360M+)
+const MAX_MODEL_SIZE: usize = 512 * 1024 * 1024;
 
 /// Virtual address for model mmap region
 const MODEL_MMAP_BASE: usize = 0x1_0000_0000;
 
-/// Virtual address for mapping request/response shmem
+/// Virtual address for mapping request/response shmem (ULTRA 43)
 /// Must not overlap with MMAP_BASE (0x4000_0000) region used by arena/KV-cache
 const INFER_SHMEM_VADDR: usize = 0x20000000;
 
-/// Maximum tokens to generate per request
-const MAX_GEN_TOKENS: usize = 64;
+/// Virtual address for mapping TokenRing shmem (ULTRA 43: isolated from I/O shmem)
+const RING_SHMEM_VADDR: usize = 0x22000000;
 
-/// KV-cache window size (power of 2)
-const KV_WINDOW_SIZE: usize = 256;
+/// Maximum tokens to generate per request (512 to allow <think> + visible response)
+const MAX_GEN_TOKENS: usize = 512;
 
-/// Temperature for sampling (ULTRA 33)
-const TEMPERATURE: f32 = 0.8;
+/// KV-cache window size (power of 2).
+/// With Q8_0 quantization, 1024 tokens uses ~3.1MB (same as 256 with f32).
+const KV_WINDOW_SIZE: usize = 1024;
 
-/// Repetition penalty factor (ULTRA 33)
-const REP_PENALTY: f32 = 1.15;
+// === Default sampling parameters (overridable via control sector 258) ===
+const DEFAULT_TEMPERATURE: f32 = 0.8;
+const DEFAULT_REP_PENALTY: f32 = 1.15;
+const DEFAULT_TOP_P: f32 = 0.9;
+const DEFAULT_TOP_K: u32 = 0;       // 0 = disabled (use Top-P only)
+const DEFAULT_REP_WINDOW: usize = 32;
 
-/// Top-P nucleus sampling threshold (ULTRA 33)
-const TOP_P: f32 = 0.9;
+/// Control sector number — MCP tools write config here, inference server reads
+const CONTROL_SECTOR: u64 = 258;
 
-/// Number of recent tokens to apply repetition penalty to
-const REP_WINDOW: usize = 32;
+/// Health telemetry sector — MSE between consecutive logits
+const HEALTH_SECTOR: u64 = 259;
+
+/// Default MSE threshold for logit collapse detection
+const DEFAULT_DRIFT_THRESHOLD: f32 = 0.001;
+
+/// Sampling configuration — populated from control sector or defaults
+#[derive(Clone, Copy)]
+struct SamplingConfig {
+    temperature: f32,
+    top_p: f32,
+    top_k: u32,
+    rep_penalty: f32,
+    rep_window: usize,
+    dump_layer: usize,
+    drift_threshold: f32,
+    telemetry_mode: u32, // 0=off, 1=anomalies_only, 2=continuous
+}
+
+impl SamplingConfig {
+    fn defaults() -> Self {
+        Self {
+            temperature: DEFAULT_TEMPERATURE,
+            top_p: DEFAULT_TOP_P,
+            top_k: DEFAULT_TOP_K,
+            rep_penalty: DEFAULT_REP_PENALTY,
+            rep_window: DEFAULT_REP_WINDOW,
+            dump_layer: 0,
+            drift_threshold: DEFAULT_DRIFT_THRESHOLD,
+            telemetry_mode: 0,
+        }
+    }
+}
+
+/// Read control sector (258) and return config. Falls back to defaults if not present.
+fn read_control_sector() -> SamplingConfig {
+    let mut buf = [0u8; SECTOR_SIZE];
+    let mut cfg = SamplingConfig::defaults();
+
+    if libfolk::sys::block::read_sector(CONTROL_SECTOR, &mut buf).is_err() {
+        return cfg;
+    }
+
+    // Check magic "FCTL"
+    if &buf[0..4] != b"FCTL" {
+        return cfg;
+    }
+
+    // Parse fields (all little-endian, 0 = use default)
+    let dump_layer = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+    if dump_layer <= 29 {
+        cfg.dump_layer = dump_layer as usize;
+    }
+
+    let temp = f32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]);
+    if temp > 0.0 {
+        cfg.temperature = temp;
+    }
+
+    let top_p = f32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]);
+    if top_p > 0.0 {
+        cfg.top_p = top_p;
+    }
+
+    let top_k = u32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]]);
+    cfg.top_k = top_k; // 0 = disabled is valid
+
+    let rep_pen = f32::from_le_bytes([buf[28], buf[29], buf[30], buf[31]]);
+    if rep_pen > 0.0 {
+        cfg.rep_penalty = rep_pen;
+    }
+
+    let rep_win = u32::from_le_bytes([buf[32], buf[33], buf[34], buf[35]]);
+    if rep_win > 0 {
+        cfg.rep_window = rep_win as usize;
+    }
+
+    let drift_thresh = f32::from_le_bytes([buf[40], buf[41], buf[42], buf[43]]);
+    if drift_thresh > 0.0 {
+        cfg.drift_threshold = drift_thresh;
+    }
+
+    let telem_mode = u32::from_le_bytes([buf[44], buf[45], buf[46], buf[47]]);
+    cfg.telemetry_mode = telem_mode;
+
+    cfg
+}
 
 fn main() -> ! {
     println!("[INFERENCE] === ENTRY ===");
@@ -126,21 +346,27 @@ fn main() -> ! {
                         meta.context_length,
                         model.tensors.len(),
                     );
-                    println!("[INFERENCE] BOS={}, EOS={}, vocab_offset={}",
-                        meta.bos_token_id, meta.eos_token_id, meta.vocab_data_offset);
+                    println!("[INFERENCE] head_dim={}, kv_heads={}, rope_base={}, inter={}",
+                        meta.head_dim, meta.n_kv_heads, meta.rope_base as u32, meta.intermediate_size);
+                    println!("[INFERENCE] BOS={}, EOS={}, vocab_offset={}, merges={}",
+                        meta.bos_token_id, meta.eos_token_id, meta.vocab_data_offset, meta.merges_count);
 
                     // Step 5: Build ModelWeights
                     match build_model_weights(&model) {
                         Some((config, weights_data, layer_data)) => {
                             println!("[INFERENCE] ModelWeights built: {} layers mapped", config.n_layers);
 
-                            // Step 6: Build tokenizer (uses arena for offset table)
+                            // Step 6: Build tokenizer (uses arena for offset+merge tables)
                             let tokenizer = BpeTokenizer::new(
                                 model_slice,
                                 meta.vocab_data_offset,
                                 meta.vocab_size as usize,
                                 meta.bos_token_id,
                                 meta.eos_token_id,
+                                meta.merges_data_offset,
+                                meta.merges_count as usize,
+                                meta.unknown_token_id,
+                                meta.token_type_offset,
                                 &arena,
                             );
 
@@ -168,6 +394,11 @@ fn main() -> ! {
 
                                             has_model = true;
 
+                                            // ULTRA 39: Find ChatML stop token IDs
+                                            let im_end_id = find_token_id(&tok, b"<|im_end|>");
+                                            let im_start_id = find_token_id(&tok, b"<|im_start|>");
+                                            println!("[INFERENCE] ChatML tokens: im_end={}, im_start={}", im_end_id, im_start_id);
+
                                             // Store engine state — we transmute lifetimes to 'static
                                             // since the mmap'd data lives for the entire process
                                             engine = Some(InferenceEngine {
@@ -180,6 +411,13 @@ fn main() -> ! {
                                                 vocab_size: meta.vocab_size as usize,
                                                 bos_id: meta.bos_token_id,
                                                 eos_id: meta.eos_token_id,
+                                                merges_offset: meta.merges_data_offset,
+                                                merges_count: meta.merges_count as usize,
+                                                unknown_token_id: meta.unknown_token_id,
+                                                token_type_offset: meta.token_type_offset,
+                                                im_end_id,
+                                                im_start_id,
+                                                is_generating: false,
                                             });
 
                                             println!("[INFERENCE] Model loaded successfully! Ready for inference.");
@@ -235,6 +473,16 @@ fn main() -> ! {
                             opcode == INFER_OP_ASK, &mut engine, &arena,
                         );
                     }
+                    INFER_OP_ASK_ASYNC => {
+                        // ULTRA 42 + async streaming: decode packed payload
+                        let query_shmem = ((msg.payload0 >> 16) & 0xFFFF) as u32;
+                        let query_len = ((msg.payload0 >> 32) & 0xFFFF) as usize;
+                        let ring_shmem = ((msg.payload0 >> 48) & 0xFFFF) as u32;
+                        handle_async_inference(
+                            msg.token, query_shmem, query_len, ring_shmem,
+                            &mut engine, &arena,
+                        );
+                    }
                     _ => {
                         let _ = reply_with_token(msg.token, u64::MAX, 0);
                     }
@@ -266,6 +514,15 @@ struct InferenceEngine {
     vocab_size: usize,
     bos_id: u32,
     eos_id: u32,
+    merges_offset: usize,
+    merges_count: usize,
+    unknown_token_id: u32,
+    token_type_offset: usize,
+    /// ULTRA 39: ChatML stop token IDs (u32::MAX = not found)
+    im_end_id: u32,
+    im_start_id: u32,
+    /// ULTRA 42: Reentrancy guard — true while generating
+    is_generating: bool,
 }
 
 /// Non-layer weight data extracted from GGUF.
@@ -274,8 +531,8 @@ struct WeightsData {
     token_embed: &'static [u8],
     final_norm: &'static [u8],
     output_weight: &'static [u8],
-    /// True if output_weight is Q8_0 (otherwise Q4_0)
-    output_is_q8: bool,
+    /// Quantization format of output_weight
+    output_quant: libtensor::transformer::OutputQuant,
 }
 
 /// Per-layer weight data. All slices point into mmap'd data.
@@ -284,11 +541,14 @@ struct LayerData {
     wq: &'static [u8],
     wk: &'static [u8],
     wv: &'static [u8],
+    q_norm: &'static [u8],  // QK-norm (Qwen3): [head_dim] f32, empty if absent
+    k_norm: &'static [u8],  // QK-norm (Qwen3): [head_dim] f32, empty if absent
     wo: &'static [u8],
     ffn_norm: &'static [u8],
     w_gate: &'static [u8],
     w_up: &'static [u8],
     w_down: &'static [u8],
+    w_down_quant: libtensor::transformer::OutputQuant,
 }
 
 /// Fixed-capacity Vec for layer data (avoids heap allocation)
@@ -386,15 +646,20 @@ fn build_model_weights(model: &GgufModel)
     println!("[INFERENCE]   output: {:?} {:?} {}", output_weight.shape, output_weight.dtype,
         if model.tensor("output.weight").is_none() { "(tied)" } else { "" });
 
-    // Detect output weight dtype
-    let output_is_q8 = output_weight.dtype == libtensor::gguf::GgufDtype::Q8_0;
+    // Detect output weight quantization format
+    use libtensor::transformer::OutputQuant;
+    let output_quant = match output_weight.dtype {
+        libtensor::gguf::GgufDtype::Q8_0 => OutputQuant::Q8_0,
+        libtensor::gguf::GgufDtype::Q6K => OutputQuant::Q6_K,
+        _ => OutputQuant::Q4_0,
+    };
 
     // Safety: tensor data points into mmap'd memory that lives for the entire process
     let weights_data = WeightsData {
         token_embed: unsafe { core::mem::transmute::<&[u8], &'static [u8]>(token_embed.data) },
         final_norm: unsafe { core::mem::transmute::<&[u8], &'static [u8]>(final_norm.data) },
         output_weight: unsafe { core::mem::transmute::<&[u8], &'static [u8]>(output_weight.data) },
-        output_is_q8,
+        output_quant,
     };
 
     // Build per-layer weights
@@ -406,29 +671,48 @@ fn build_model_weights(model: &GgufModel)
         let wq = model.tensor(tensor_name(&mut buf, "blk.", i, ".attn_q.weight"))?;
         let wk = model.tensor(tensor_name(&mut buf, "blk.", i, ".attn_k.weight"))?;
         let wv = model.tensor(tensor_name(&mut buf, "blk.", i, ".attn_v.weight"))?;
+        // QK-norm is optional (Qwen3 has it, SmolLM2 doesn't)
+        let q_norm = model.tensor(tensor_name(&mut buf, "blk.", i, ".attn_q_norm.weight"));
+        let k_norm = model.tensor(tensor_name(&mut buf, "blk.", i, ".attn_k_norm.weight"));
         let wo = model.tensor(tensor_name(&mut buf, "blk.", i, ".attn_output.weight"))?;
         let ffn_norm = model.tensor(tensor_name(&mut buf, "blk.", i, ".ffn_norm.weight"))?;
         let w_gate = model.tensor(tensor_name(&mut buf, "blk.", i, ".ffn_gate.weight"))?;
         let w_up = model.tensor(tensor_name(&mut buf, "blk.", i, ".ffn_up.weight"))?;
         let w_down = model.tensor(tensor_name(&mut buf, "blk.", i, ".ffn_down.weight"))?;
 
-        if i == 0 {
-            println!("[INFERENCE]   blk.0.attn_q: {:?} {:?}", wq.shape, wq.dtype);
-            println!("[INFERENCE]   blk.0.ffn_gate: {:?} {:?}", w_gate.shape, w_gate.dtype);
+        if i <= 1 {
+            // Log first 4 bytes of wq data (Q4_0 scale + first nibble)
+            let d = wq.data;
+            println!("[INFERENCE]   blk.{}.attn_q: {:?} {:?} len={} first=[{:02X},{:02X},{:02X},{:02X}]",
+                i, wq.shape, wq.dtype, d.len(), d[0], d[1], d[2], d[3]);
         }
 
         // Safety: tensor data points into mmap'd memory (process lifetime)
         unsafe {
+            let empty: &'static [u8] = &[];
+            // Determine w_down quantization from GGUF dtype
+            let w_down_quant = match w_down.dtype {
+                libtensor::gguf::GgufDtype::Q4_1 => libtensor::transformer::OutputQuant::Q4_1,
+                libtensor::gguf::GgufDtype::Q8_0 => libtensor::transformer::OutputQuant::Q8_0,
+                _ => libtensor::transformer::OutputQuant::Q4_0,
+            };
+            if i == 0 {
+                println!("[INFERENCE]   blk.0.ffn_down: {:?} {:?} → {:?}",
+                    w_down.shape, w_down.dtype, w_down_quant);
+            }
             layer_data.push(LayerData {
                 attn_norm: core::mem::transmute::<&[u8], &'static [u8]>(attn_norm.data),
                 wq: core::mem::transmute::<&[u8], &'static [u8]>(wq.data),
                 wk: core::mem::transmute::<&[u8], &'static [u8]>(wk.data),
                 wv: core::mem::transmute::<&[u8], &'static [u8]>(wv.data),
+                q_norm: q_norm.map_or(empty, |t| core::mem::transmute::<&[u8], &'static [u8]>(t.data)),
+                k_norm: k_norm.map_or(empty, |t| core::mem::transmute::<&[u8], &'static [u8]>(t.data)),
                 wo: core::mem::transmute::<&[u8], &'static [u8]>(wo.data),
                 ffn_norm: core::mem::transmute::<&[u8], &'static [u8]>(ffn_norm.data),
                 w_gate: core::mem::transmute::<&[u8], &'static [u8]>(w_gate.data),
                 w_up: core::mem::transmute::<&[u8], &'static [u8]>(w_up.data),
                 w_down: core::mem::transmute::<&[u8], &'static [u8]>(w_down.data),
+                w_down_quant,
             });
         }
     }
@@ -500,6 +784,15 @@ fn handle_inference_request(
         println!("[INFERENCE] Query: ({} raw bytes)", prompt_len);
     }
 
+    // Wrap in ChatML template (ULTRA 41: system prompt injection)
+    let mut template_buf = [0u8; 2048];
+    let template_len = wrap_chat_template(&prompt_buf[..prompt_len], &mut template_buf);
+    if template_len > 0 {
+        println!("[INFERENCE] Chat template wrapped: {} bytes", template_len);
+        prompt_buf[..template_len].copy_from_slice(&template_buf[..template_len]);
+        prompt_len = template_len;
+    }
+
     let eng = engine.as_mut().unwrap();
     println!("[INFERENCE] Resetting KV-cache, building tokenizer...");
 
@@ -515,6 +808,10 @@ fn handle_inference_request(
         eng.vocab_size,
         eng.bos_id,
         eng.eos_id,
+        eng.merges_offset,
+        eng.merges_count,
+        eng.unknown_token_id,
+        eng.token_type_offset,
         arena,
     ) {
         Some(t) => t,
@@ -528,27 +825,23 @@ fn handle_inference_request(
     // so tokenizer offset/length tables are preserved across forward passes
     let arena_mark = arena.used();
 
-    // Tokenize the prompt
+    // Tokenize the prompt (starts with <|im_start|> = BOS, no extra prepend needed)
     let mut input_tokens = [0u32; 512];
-    let n_prompt = tokenizer.encode(&prompt_buf[..prompt_len], &mut input_tokens[1..]);
+    let total_prompt = tokenizer.encode(&prompt_buf[..prompt_len], &mut input_tokens);
 
-    // Prepend BOS token
-    input_tokens[0] = eng.bos_id;
-    let total_prompt = n_prompt + 1;
-
-    println!("[INFERENCE] Tokenized: {} tokens (+ BOS = {} total)", n_prompt, total_prompt);
+    println!("[INFERENCE] Tokenized: {} tokens", total_prompt);
 
     // Build LayerWeights slice for transformer::forward
-    // We need to reconstruct LayerWeights from LayerData
     let config = &eng.config;
     let yield_cfg = YieldConfig::foreground();
+    let cfg = read_control_sector();
 
     // Allocate response buffer (in a separate region)
     let mut response_buf = [0u8; 4096];
     let mut response_len = 0usize;
 
     // Track generated tokens for repetition penalty (ULTRA 33)
-    let mut gen_tokens = [0u32; 128];
+    let mut gen_tokens = [0u32; 512];
     let mut gen_count = 0usize;
 
     // === Prefill Phase ===
@@ -571,6 +864,7 @@ fn handle_inference_request(
 
         let logits = match forward(
             input_tokens[i], i, config, &weights, &mut eng.kv_cache, arena, &yield_cfg,
+            None,
         ) {
             Some(l) => l,
             None => {
@@ -582,8 +876,14 @@ fn handle_inference_request(
 
         // On the last prefill token, we need the logits for generation
         if i == total_prompt - 1 {
+            debug_dump_logits(logits, "prefill_final_logits");
+
             // Sample next token from these logits
-            last_logits_token = sample_with_penalties(logits, &gen_tokens[..gen_count], arena);
+            last_logits_token = sample_with_penalties(logits, &gen_tokens[..gen_count], arena, &cfg);
+        }
+
+        if i == 0 {
+            debug_dump_logits(logits, "bos_logits");
         }
 
         // ULTRA 28: yield periodically during prefill
@@ -604,7 +904,12 @@ fn handle_inference_request(
         let next_token = if gen_idx == 0 {
             last_logits_token
         } else {
-            // Forward pass for the previously generated token
+            // KV-cache overflow guard
+            if pos >= KV_WINDOW_SIZE {
+                println!("[INFERENCE] Context limit: pos={} >= KV={}", pos, KV_WINDOW_SIZE);
+                break;
+            }
+
             arena.reset_to(arena_mark);
 
             let (weights, _) = match build_weights_for_forward(eng, arena) {
@@ -614,6 +919,7 @@ fn handle_inference_request(
 
             let logits = match forward(
                 gen_tokens[gen_count - 1], pos - 1, config, &weights, &mut eng.kv_cache, arena, &yield_cfg,
+                None,
             ) {
                 Some(l) => l,
                 None => {
@@ -622,12 +928,15 @@ fn handle_inference_request(
                 }
             };
 
-            sample_with_penalties(logits, &gen_tokens[..gen_count], arena)
+            sample_with_penalties(logits, &gen_tokens[..gen_count], arena, &cfg)
         };
 
-        // Check for EOS
-        if next_token == eng.eos_id {
-            println!("[INFERENCE] EOS at token {}", gen_idx);
+        // Check for EOS or ChatML stop tokens (ULTRA 39)
+        if next_token == eng.eos_id
+            || (eng.im_end_id != u32::MAX && next_token == eng.im_end_id)
+            || (eng.im_start_id != u32::MAX && next_token == eng.im_start_id)
+        {
+            println!("[INFERENCE] Stop token {} at gen {}", next_token, gen_idx);
             break;
         }
 
@@ -693,11 +1002,14 @@ fn build_weights_for_forward<'a>(
             wq: ld.wq,
             wk: ld.wk,
             wv: ld.wv,
+            q_norm: bytes_as_f32(ld.q_norm),
+            k_norm: bytes_as_f32(ld.k_norm),
             wo: ld.wo,
             ffn_norm: bytes_as_f32(ld.ffn_norm),
             w_gate: ld.w_gate,
             w_up: ld.w_up,
             w_down: ld.w_down,
+            w_down_quant: ld.w_down_quant,
         };
     }
 
@@ -706,7 +1018,7 @@ fn build_weights_for_forward<'a>(
         layers: layer_weights,
         final_norm: bytes_as_f32(eng.weights_data.final_norm),
         output_weight: eng.weights_data.output_weight,
-        output_is_q8: eng.weights_data.output_is_q8,
+        output_quant: eng.weights_data.output_quant,
     };
 
     Some((weights, layer_weights))
@@ -721,7 +1033,7 @@ fn bytes_as_f32(data: &[u8]) -> &[f32] {
 }
 
 /// Sample next token with repetition penalty and top-P (ULTRA 33, 31)
-fn sample_with_penalties(logits: &[f32], recent_tokens: &[u32], arena: &BumpArena) -> u32 {
+fn sample_with_penalties(logits: &[f32], recent_tokens: &[u32], arena: &BumpArena, cfg: &SamplingConfig) -> u32 {
     let vocab_size = logits.len();
 
     // Allocate a mutable copy of logits for manipulation
@@ -742,24 +1054,24 @@ fn sample_with_penalties(logits: &[f32], recent_tokens: &[u32], arena: &BumpAren
         }
     }
 
-    // ULTRA 33: Repetition penalty
-    let penalty_window = recent_tokens.len().min(REP_WINDOW);
-    if penalty_window > 0 {
-        let start = recent_tokens.len().saturating_sub(REP_WINDOW);
+    // Repetition penalty
+    let penalty_window = recent_tokens.len().min(cfg.rep_window);
+    if penalty_window > 0 && cfg.rep_penalty != 1.0 {
+        let start = recent_tokens.len().saturating_sub(cfg.rep_window);
         for &tok in &recent_tokens[start..] {
             if (tok as usize) < vocab_size {
                 if logits_copy[tok as usize] > 0.0 {
-                    logits_copy[tok as usize] /= REP_PENALTY;
+                    logits_copy[tok as usize] /= cfg.rep_penalty;
                 } else {
-                    logits_copy[tok as usize] *= REP_PENALTY;
+                    logits_copy[tok as usize] *= cfg.rep_penalty;
                 }
             }
         }
     }
 
     // Apply temperature
-    if TEMPERATURE > 0.0 && TEMPERATURE != 1.0 {
-        let inv_t = 1.0 / TEMPERATURE;
+    if cfg.temperature > 0.0 && cfg.temperature != 1.0 {
+        let inv_t = 1.0 / cfg.temperature;
         for v in logits_copy.iter_mut() {
             *v *= inv_t;
         }
@@ -769,17 +1081,17 @@ fn sample_with_penalties(logits: &[f32], recent_tokens: &[u32], arena: &BumpAren
     // 1. Softmax
     libtensor::ops::softmax(logits_copy);
 
-    // 2. Sort indices by probability (descending) — use simple selection
-    //    For efficiency, we only need to find the nucleus set (cumsum >= TOP_P)
+    // 2. Top-K + Top-P nucleus sampling
     let mut cumsum = 0.0f32;
     let mut nucleus_count = 0usize;
-
-    // Find top probs by iteratively finding max
-    // Use a small buffer for the nucleus set
     let mut nucleus_ids = [0u32; 128];
     let mut nucleus_probs = [0.0f32; 128];
-    // Mark picked probs as -1 in logits_copy after picking
-    let max_nucleus = 128;
+    // Top-K limits the nucleus size (0 = no limit, use all 128 slots)
+    let max_nucleus = if cfg.top_k > 0 {
+        (cfg.top_k as usize).min(128)
+    } else {
+        128
+    };
 
     for n in 0..max_nucleus {
         // Find max remaining prob
@@ -802,7 +1114,7 @@ fn sample_with_penalties(logits: &[f32], recent_tokens: &[u32], arena: &BumpAren
         logits_copy[best_idx] = -1.0; // mark as used
 
         cumsum += best_prob;
-        if cumsum >= TOP_P {
+        if cumsum >= cfg.top_p {
             break;
         }
     }
@@ -842,6 +1154,576 @@ fn tcg_breathe() {
     for _ in 0..1000 {
         core::hint::spin_loop();
     }
+}
+
+// ============================================================================
+// TokenRing — shared memory streaming buffer (ULTRA 37, 40)
+// ============================================================================
+
+/// Token streaming ring buffer shared between inference server and compositor.
+/// ULTRA 37: AtomicU32 for write_idx and status (cross-task shared memory).
+/// ULTRA 40: LINEAR 16KB buffer — no wrapping, write_idx grows monotonically.
+#[repr(C)]
+struct TokenRing {
+    /// Bytes written so far (inference: Release, compositor: Acquire)
+    write_idx: core::sync::atomic::AtomicU32,
+    /// 0 = generating, 1 = done, 2 = error
+    status: core::sync::atomic::AtomicU32,
+    /// Tool feedback: 0=none, 1=paused(waiting), 2=result_ready
+    tool_state: core::sync::atomic::AtomicU32,
+    /// Byte length of tool result written to data[write_idx..]
+    tool_result_len: core::sync::atomic::AtomicU32,
+    /// UTF-8 text data, linear (no wrapping)
+    data: [u8; 16368],
+}
+// Total: 16 + 16368 = 16384 bytes = 4 pages
+
+/// Maximum writable data in TokenRing (ULTRA 48: prevent overflow)
+const RING_DATA_MAX: usize = 16368;
+
+// ============================================================================
+// Chat Template (ULTRA 39, 41)
+// ============================================================================
+
+/// Wrap a user query in ChatML format with system prompt (ULTRA 41).
+/// Returns number of bytes written to output.
+fn wrap_chat_template(query: &[u8], output: &mut [u8]) -> usize {
+    // NOTE: Newline before <|im_end|> ensures greedy tokenizer doesn't merge
+    // the last text char with '<' (e.g. ".<" as a single token breaking <|im_end|>).
+    let sys = b"<|im_start|>system\nYou are Folkering, a helpful AI on Folkering OS (bare-metal Rust, WASM apps).\nKeep <think> brief. Give direct answers.\nTools: <|tool|>read FILENAME<|/tool|>, <|tool|>write FILENAME CONTENT<|/tool|>, <|tool|>ask_gemini PROMPT<|/tool|>.\nUse ask_gemini for coding tasks. Apps must target WASM (no_std Rust or C compiled to .wasm).\n<|im_end|>\n";
+    let user_pre = b"<|im_start|>user\n";
+    let user_suf = b"\n<|im_end|>\n<|im_start|>assistant\n";
+
+    let total = sys.len() + user_pre.len() + query.len() + user_suf.len();
+    if total > output.len() {
+        return 0;
+    }
+
+    let mut pos = 0;
+    output[pos..pos + sys.len()].copy_from_slice(sys);
+    pos += sys.len();
+    output[pos..pos + user_pre.len()].copy_from_slice(user_pre);
+    pos += user_pre.len();
+    output[pos..pos + query.len()].copy_from_slice(query);
+    pos += query.len();
+    output[pos..pos + user_suf.len()].copy_from_slice(user_suf);
+    pos += user_suf.len();
+    pos
+}
+
+/// Find token ID for a specific string in the vocabulary (ULTRA 39).
+/// Returns u32::MAX if not found.
+fn find_token_id(tokenizer: &BpeTokenizer, needle: &[u8]) -> u32 {
+    for id in 0..tokenizer.vocab_size() {
+        if tokenizer.token_bytes(id as u32) == needle {
+            return id as u32;
+        }
+    }
+    u32::MAX
+}
+
+// ============================================================================
+// Async Inference Handler (Steg 3C)
+// ============================================================================
+
+/// Handle async inference request with token streaming via TokenRing.
+/// ULTRA 42: Rejects if already generating.
+/// ULTRA 37: Atomic writes to TokenRing.
+/// ULTRA 47: Only writes valid UTF-8 to ring.
+/// ULTRA 48: Graceful truncation at ring buffer limit.
+fn handle_async_inference(
+    token: CallerToken,
+    query_shmem: u32,
+    query_len: usize,
+    ring_shmem: u32,
+    engine: &mut Option<InferenceEngine>,
+    arena: &BumpArena,
+) {
+    use core::sync::atomic::Ordering;
+
+    // ULTRA 42: Reentrancy guard
+    if let Some(eng) = engine.as_ref() {
+        if eng.is_generating {
+            println!("[INFERENCE] BUSY — rejecting async request");
+            let _ = reply_with_token(token, u64::MAX, 0);
+            return;
+        }
+    }
+
+    if engine.is_none() {
+        let _ = reply_with_token(token, u64::MAX, 0);
+        return;
+    }
+
+    // Reply immediately to free compositor (0 = OK)
+    let _ = reply_with_token(token, 0, 0);
+
+    let eng = engine.as_mut().unwrap();
+    eng.is_generating = true;
+
+    // Read query from shmem
+    let mut prompt_buf = [0u8; 1024];
+    let mut prompt_len = 0usize;
+
+    if query_shmem > 0 && query_len > 0 {
+        match shmem_map(query_shmem, INFER_SHMEM_VADDR) {
+            Ok(()) => {
+                let copy_len = query_len.min(prompt_buf.len());
+                unsafe {
+                    let src = INFER_SHMEM_VADDR as *const u8;
+                    core::ptr::copy_nonoverlapping(src, prompt_buf.as_mut_ptr(), copy_len);
+                }
+                prompt_len = copy_len;
+                let _ = shmem_unmap(query_shmem, INFER_SHMEM_VADDR);
+            }
+            Err(_) => {
+                println!("[INFERENCE] async: shmem_map FAILED for query");
+            }
+        }
+    }
+
+    if prompt_len == 0 {
+        eng.is_generating = false;
+        return;
+    }
+
+    if let Ok(text) = core::str::from_utf8(&prompt_buf[..prompt_len]) {
+        println!("[INFERENCE] Async query: {}", text);
+    }
+
+    // Wrap in ChatML template (ULTRA 41)
+    let mut template_buf = [0u8; 2048];
+    let template_len = wrap_chat_template(&prompt_buf[..prompt_len], &mut template_buf);
+    if template_len > 0 {
+        prompt_buf[..template_len].copy_from_slice(&template_buf[..template_len]);
+        prompt_len = template_len;
+    }
+
+    // Map TokenRing shmem (ULTRA 43: at 0x22000000)
+    if shmem_map(ring_shmem, RING_SHMEM_VADDR).is_err() {
+        println!("[INFERENCE] async: ring shmem_map FAILED");
+        eng.is_generating = false;
+        return;
+    }
+
+    let ring = unsafe { &*(RING_SHMEM_VADDR as *mut TokenRing) };
+    // Initialize ring
+    ring.write_idx.store(0, Ordering::Release);
+    ring.status.store(0, Ordering::Release);
+
+    // Reset KV-cache and rebuild tokenizer
+    eng.kv_cache.reset();
+    arena.reset();
+
+    let tokenizer = match BpeTokenizer::new(
+        eng.model_data, eng.vocab_offset, eng.vocab_size,
+        eng.bos_id, eng.eos_id, eng.merges_offset, eng.merges_count,
+        eng.unknown_token_id, eng.token_type_offset, arena,
+    ) {
+        Some(t) => t,
+        None => {
+            ring.status.store(2, Ordering::Release);
+            let _ = shmem_unmap(ring_shmem, RING_SHMEM_VADDR);
+            eng.is_generating = false;
+            return;
+        }
+    };
+
+    let arena_mark = arena.used();
+
+    // Read control sector for sampling params + dump layer
+    let cfg = read_control_sector();
+    println!("[INFERENCE] Config: temp={:.2} top_p={:.2} top_k={} rep={:.2} dump_layer={}",
+        cfg.temperature, cfg.top_p, cfg.top_k, cfg.rep_penalty, cfg.dump_layer);
+
+    // Tokenize prompt with chat template
+    // Tokenize prompt (special tokens like <|im_start|> are handled as BPE subwords,
+    // NOT collapsed to single special token IDs — see tokenizer fix)
+    let mut input_tokens = [0u32; 512];
+    let total_prompt = tokenizer.encode(&prompt_buf[..prompt_len], &mut input_tokens);
+    println!("[INFERENCE] Async tokenized: {} tokens", total_prompt);
+    // Debug: print first 10 input token IDs
+    if total_prompt >= 10 {
+        println!("[TOKENS] {} {} {} {} {} {} {} {} {} {}",
+            input_tokens[0], input_tokens[1], input_tokens[2], input_tokens[3],
+            input_tokens[4], input_tokens[5], input_tokens[6], input_tokens[7],
+            input_tokens[8], input_tokens[9]);
+    }
+
+    let config = &eng.config;
+    let yield_cfg = YieldConfig::foreground();
+
+    let mut gen_tokens = [0u32; 512];
+    let mut gen_count = 0usize;
+    let mut last_logits_token: u32 = 0;
+
+    // Attention dump: capture layer 0 attention weights during prefill
+    // Buffer layout: [n_heads, total_prompt, total_prompt] = n_heads * seq^2 floats
+    // Dump layer comes from control sector (cfg.dump_layer, default 0)
+    let attn_buf_size = config.n_heads * total_prompt * total_prompt;
+    let attn_buf_fits = attn_buf_size <= DUMP_MAX_FLOATS; // fits in 128KB mailbox?
+    // Allocate from arena BEFORE arena_mark so it persists across forward calls
+    let mut attn_buf = if attn_buf_fits {
+        arena.alloc_f32(attn_buf_size)
+    } else {
+        None
+    };
+    let arena_mark2 = arena.used(); // new mark after attn buffer
+
+    // Prefill — 3-Phase Batched Architecture
+    // Process prompt in batches of 8 for L2 cache reuse, then single-token
+    // forward for the last token to get logits for sampling.
+    const PREFILL_BATCH: usize = 8;
+
+    if total_prompt > 1 {
+        // Batched prefill for all tokens except the last
+        let batch_end = total_prompt - 1; // last token needs logits
+        let mut pos = 0;
+        while pos < batch_end {
+            arena.reset_to(arena_mark2);
+            let (weights, _) = match build_weights_for_forward(eng, arena) {
+                Some(w) => w,
+                None => {
+                    ring.status.store(2, Ordering::Release);
+                    let _ = shmem_unmap(ring_shmem, RING_SHMEM_VADDR);
+                    eng.is_generating = false;
+                    return;
+                }
+            };
+
+            let chunk_end = (pos + PREFILL_BATCH).min(batch_end);
+            let chunk = &input_tokens[pos..chunk_end];
+
+            use libtensor::transformer::forward_prefill_batch;
+            if forward_prefill_batch(chunk, pos, config, &weights, &mut eng.kv_cache, arena, &yield_cfg).is_none() {
+                ring.status.store(2, Ordering::Release);
+                let _ = shmem_unmap(ring_shmem, RING_SHMEM_VADDR);
+                eng.is_generating = false;
+                return;
+            }
+            pos = chunk_end;
+            tcg_breathe();
+        }
+    }
+
+    // Final token: single-token forward to get logits for sampling
+    {
+        arena.reset_to(arena_mark2);
+        let (weights, _) = match build_weights_for_forward(eng, arena) {
+            Some(w) => w,
+            None => {
+                ring.status.store(2, Ordering::Release);
+                let _ = shmem_unmap(ring_shmem, RING_SHMEM_VADDR);
+                eng.is_generating = false;
+                return;
+            }
+        };
+
+        let last_idx = total_prompt - 1;
+        let mut attn_dump_obj = attn_buf.as_deref_mut().map(|buf| {
+            use libtensor::transformer::AttnDump;
+            AttnDump {
+                buffer: buf,
+                dump_layer: cfg.dump_layer,
+                n_heads: config.n_heads,
+                max_seq: total_prompt,
+            }
+        });
+
+        let logits = match forward(
+            input_tokens[last_idx], last_idx, config, &weights, &mut eng.kv_cache, arena, &yield_cfg,
+            attn_dump_obj.as_mut(),
+        ) {
+            Some(l) => l,
+            None => {
+                ring.status.store(2, Ordering::Release);
+                let _ = shmem_unmap(ring_shmem, RING_SHMEM_VADDR);
+                eng.is_generating = false;
+                return;
+            }
+        };
+        last_logits_token = sample_with_penalties(logits, &gen_tokens[..gen_count], arena, &cfg);
+    }
+
+    // Dump attention weights to disk mailbox
+    if let Some(ref buf) = attn_buf {
+        debug_dump_tensor(
+            "attn_layer0",
+            &buf[..attn_buf_size],
+            (config.n_heads * total_prompt) as u32,
+            total_prompt as u32,
+        );
+        println!("[INFERENCE] Attention dumped: layer {} ({} heads, {} seq)", cfg.dump_layer, config.n_heads, total_prompt);
+    }
+
+    println!("[INFERENCE] Async prefill done, streaming tokens...");
+
+    // Allocate prev_logits for MSE health monitoring (persists across gen loop)
+    let mut prev_logits = if cfg.telemetry_mode > 0 {
+        arena.alloc_f32(config.vocab_size)
+    } else {
+        None
+    };
+    let mut has_prev_logits = false;
+    let mut min_mse: f32 = f32::MAX;    // "Check Engine" light: worst (lowest) MSE
+    let mut min_mse_step: u32 = 0;
+    let mut health_gen_count: u32 = 0;
+    let arena_mark_gen = arena.used();   // mark AFTER prev_logits
+
+    // Tool close-tag detection: tail-buffer tracks last 9 bytes written
+    const TOOL_CLOSE_TAG: [u8; 9] = *b"<|/tool|>";
+    let mut tail_buf = [0u8; 9];
+    let mut tail_pos: usize = 0;
+
+    // Generation with streaming to TokenRing
+    let mut pos = total_prompt;
+    let mut write_idx: usize = 0;
+
+    for gen_idx in 0..MAX_GEN_TOKENS {
+        let next_token = if gen_idx == 0 {
+            last_logits_token
+        } else {
+            // KV-cache overflow guard: prevent OOB in attention forward pass
+            if pos >= KV_WINDOW_SIZE {
+                let msg = b"\n[Context Limit Reached]";
+                if write_idx + msg.len() < RING_DATA_MAX {
+                    unsafe {
+                        let dst = (RING_SHMEM_VADDR as *mut u8).add(16).add(write_idx);
+                        core::ptr::copy_nonoverlapping(msg.as_ptr(), dst, msg.len());
+                    }
+                    write_idx += msg.len();
+                    ring.write_idx.store(write_idx as u32, Ordering::Release);
+                }
+                println!("[INFERENCE] Context limit: pos={} >= KV={}", pos, KV_WINDOW_SIZE);
+                break;
+            }
+
+            arena.reset_to(arena_mark_gen);
+            let (weights, _) = match build_weights_for_forward(eng, arena) {
+                Some(w) => w,
+                None => break,
+            };
+            let logits = match forward(
+                gen_tokens[gen_count - 1], pos - 1, config, &weights, &mut eng.kv_cache, arena, &yield_cfg,
+                None,
+            ) {
+                Some(l) => l,
+                None => break,
+            };
+
+            // Health monitoring: MSE between consecutive logits
+            if let Some(ref mut prev) = prev_logits {
+                if has_prev_logits {
+                    let mut mse_sum = 0.0f64;
+                    for j in 0..config.vocab_size {
+                        let d = (logits[j] - prev[j]) as f64;
+                        mse_sum += d * d;
+                    }
+                    let mse = (mse_sum / config.vocab_size as f64) as f32;
+                    health_gen_count = gen_idx as u32;
+
+                    // Track minimum MSE (worst collapse point)
+                    if mse < min_mse {
+                        min_mse = mse;
+                        min_mse_step = gen_idx as u32;
+                    }
+
+                    // Serial warning on collapse (both modes)
+                    if mse < cfg.drift_threshold {
+                        println!("[HEALTH] Logit collapse! MSE={:.6} gen={}", mse, gen_idx);
+                    }
+
+                    // Disk write depends on mode
+                    match cfg.telemetry_mode {
+                        1 => {
+                            // Anomalies only: write only if below threshold
+                            if mse < cfg.drift_threshold {
+                                write_health_sector(gen_idx as u32, gen_tokens[gen_count - 1], mse,
+                                    cfg.drift_threshold, min_mse, min_mse_step, health_gen_count);
+                            }
+                        }
+                        _ => {
+                            // Continuous: always write
+                            write_health_sector(gen_idx as u32, gen_tokens[gen_count - 1], mse,
+                                cfg.drift_threshold, min_mse, min_mse_step, health_gen_count);
+                        }
+                    }
+                }
+                prev[..config.vocab_size].copy_from_slice(logits);
+                has_prev_logits = true;
+            }
+
+            sample_with_penalties(logits, &gen_tokens[..gen_count], arena, &cfg)
+        };
+
+        // Check for stop tokens (ULTRA 39)
+        if next_token == eng.eos_id
+            || (eng.im_end_id != u32::MAX && next_token == eng.im_end_id)
+            || (eng.im_start_id != u32::MAX && next_token == eng.im_start_id)
+        {
+            println!("[INFERENCE] Async stop token {} at gen {}", next_token, gen_idx);
+            break;
+        }
+
+        if gen_count < gen_tokens.len() {
+            gen_tokens[gen_count] = next_token;
+            gen_count += 1;
+        }
+
+        // Decode token to bytes
+        let mut tok_buf = [0u8; 64];
+        let tok_len = tokenizer.decode_token(next_token, &mut tok_buf);
+
+        if tok_len > 0 {
+            // ULTRA 48: Check ring buffer space before writing
+            if write_idx + tok_len >= RING_DATA_MAX {
+                println!("[INFERENCE] Ring buffer full at {} bytes", write_idx);
+                break;
+            }
+            // Write decoded bytes directly to ring
+            // Compositor uses from_utf8().unwrap_or("") for safe rendering (ULTRA 45)
+            unsafe {
+                let dst = (RING_SHMEM_VADDR as *mut u8)
+                    .add(16) // skip header (write_idx + status + _pad)
+                    .add(write_idx);
+                core::ptr::copy_nonoverlapping(
+                    tok_buf.as_ptr(), dst, tok_len
+                );
+            }
+            write_idx += tok_len;
+            // ULTRA 37: Release ordering so compositor sees data before updated index
+            ring.write_idx.store(write_idx as u32, Ordering::Release);
+
+            // Track last 9 bytes for <|/tool|> detection
+            for &b in &tok_buf[..tok_len] {
+                if tail_pos < 9 {
+                    tail_buf[tail_pos] = b;
+                    tail_pos += 1;
+                } else {
+                    tail_buf.copy_within(1..9, 0);
+                    tail_buf[8] = b;
+                }
+            }
+
+            // Check if we just completed a tool close tag
+            if tail_pos >= 9 && tail_buf == TOOL_CLOSE_TAG {
+                println!("[INFERENCE] Tool call detected at pos={}, pausing...", pos);
+                ring.tool_state.store(1, Ordering::Release); // 1 = paused
+
+                // Wait for compositor to execute tool and provide result
+                let mut wait = 0u32;
+                loop {
+                    if ring.tool_state.load(Ordering::Acquire) == 2 { break; }
+                    yield_cpu();
+                    wait += 1;
+                    if wait > 500_000 {
+                        println!("[INFERENCE] Tool result timeout after ~10s");
+                        ring.tool_state.store(0, Ordering::Release);
+                        break;
+                    }
+                }
+
+                if ring.tool_state.load(Ordering::Acquire) == 2 {
+                    // Read tool result from ring
+                    let result_len = ring.tool_result_len.load(Ordering::Acquire) as usize;
+                    let available = RING_DATA_MAX.saturating_sub(write_idx);
+                    let safe_len = result_len.min(available);
+
+                    if safe_len > 0 {
+                        let result_bytes = unsafe {
+                            core::slice::from_raw_parts(
+                                (RING_SHMEM_VADDR as *const u8).add(16).add(write_idx),
+                                safe_len,
+                            )
+                        };
+
+                        // Tokenize result for KV-cache injection
+                        let mut result_tokens = [0u32; 256];
+                        let n_result = tokenizer.encode(result_bytes, &mut result_tokens);
+
+                        if n_result > 0 {
+                            // Prefill all but last token
+                            if n_result > 1 {
+                                arena.reset_to(arena_mark_gen);
+                                if let Some((weights, _)) = build_weights_for_forward(eng, arena) {
+                                    use libtensor::transformer::forward_prefill_batch;
+                                    let _ = forward_prefill_batch(
+                                        &result_tokens[..n_result - 1], pos, config, &weights,
+                                        &mut eng.kv_cache, arena, &yield_cfg,
+                                    );
+                                    pos += n_result - 1;
+                                }
+                            }
+
+                            // Forward last token for fresh logits
+                            arena.reset_to(arena_mark_gen);
+                            if let Some((weights, _)) = build_weights_for_forward(eng, arena) {
+                                if let Some(logits) = forward(
+                                    result_tokens[n_result - 1], pos, config, &weights,
+                                    &mut eng.kv_cache, arena, &yield_cfg, None,
+                                ) {
+                                    pos += 1;
+                                    last_logits_token = sample_with_penalties(
+                                        logits, &gen_tokens[..gen_count], arena, &cfg,
+                                    );
+                                    println!("[INFERENCE] Tool result injected: {} tokens, pos={}", n_result, pos);
+                                }
+                            }
+                        }
+
+                        // Advance write_idx past the result so compositor sees it
+                        write_idx += safe_len;
+                        ring.write_idx.store(write_idx as u32, Ordering::Release);
+                    }
+
+                    ring.tool_state.store(0, Ordering::Release);
+                }
+                tail_pos = 0;
+                // Skip normal forward — we already have fresh logits from tool injection
+                // The `continue` jumps to next gen_idx where last_logits_token is used
+                continue;
+            }
+        }
+
+        pos += 1;
+        yield_cpu();
+        tcg_breathe();
+
+        if gen_idx % 8 == 0 {
+            println!("[INFERENCE] Async gen {} tokens, {} bytes streamed", gen_idx + 1, write_idx);
+        }
+        // Debug: log first 16 tokens as token_id + decoded text
+        if gen_idx < 16 {
+            let preview = core::str::from_utf8(&tok_buf[..tok_len]).unwrap_or("?");
+            println!("[TOKEN] #{} id={} len={} {:?}", gen_idx, next_token, tok_len, preview);
+        }
+    }
+
+    // Final health snapshot: write min_mse summary so Python reads the worst point
+    if cfg.telemetry_mode > 0 && health_gen_count > 0 {
+        write_health_sector(health_gen_count, 0, min_mse, cfg.drift_threshold,
+            min_mse, min_mse_step, health_gen_count);
+    }
+
+    // Mark done
+    ring.status.store(1, Ordering::Release);
+    let _ = shmem_unmap(ring_shmem, RING_SHMEM_VADDR);
+    eng.is_generating = false;
+
+    println!("[INFERENCE] Async generation complete: {} tokens, {} bytes", gen_count, write_idx);
+}
+
+/// Return the length of the longest valid UTF-8 prefix (ULTRA 47).
+fn valid_utf8_prefix_len(data: &[u8]) -> usize {
+    // Try from the full slice, shrinking by 1 byte at a time
+    let mut len = data.len();
+    while len > 0 {
+        if core::str::from_utf8(&data[..len]).is_ok() {
+            return len;
+        }
+        len -= 1;
+    }
+    0
 }
 
 /// Send a text response via shmem IPC
@@ -942,29 +1824,33 @@ fn load_model_from_disk() -> Result<(*const u8, usize), &'static str> {
     // Determine mmap size
     // ULTRA 35: Round up to 4KB boundary
     let mmap_size = if model_size > 0 {
-        (model_size + 4095) & !4095
+        (model_size + 4095) & !4095 // page-align
     } else {
-        MAX_MODEL_SIZE // unknown size, allocate max
+        MAX_MODEL_SIZE // unknown size, allocate max as fallback
     };
 
-    if mmap_size > MAX_MODEL_SIZE {
-        return Err("model too large");
-    }
+    // No hard limit — trust FOLKDISK header. QEMU RAM is sized dynamically.
 
     // Allocate mmap region in chunks (kernel limits mmap to 16MB per call)
     const MMAP_CHUNK: usize = 16 * 1024 * 1024; // 16MB per mmap call
+    let n_chunks = (mmap_size + MMAP_CHUNK - 1) / MMAP_CHUNK;
+    println!("[INFERENCE] Allocating {}MB in {} chunks of 16MB...", mmap_size / (1024 * 1024), n_chunks);
     let mut mapped = 0usize;
+    let mut chunk_idx = 0usize;
     while mapped < mmap_size {
         let chunk = (mmap_size - mapped).min(MMAP_CHUNK);
         let addr = MODEL_MMAP_BASE + mapped;
+        println!("[INFERENCE]   mmap chunk {}/{}: addr=0x{:X} size={}MB",
+            chunk_idx + 1, n_chunks, addr, chunk / (1024 * 1024));
         if mmap_at(addr, chunk, PROT_READ | PROT_WRITE).is_err() {
-            println!("[INFERENCE] mmap failed at offset {}MB", mapped / (1024 * 1024));
+            println!("[INFERENCE] *** mmap FAILED at chunk {} (offset {}MB) ***", chunk_idx, mapped / (1024 * 1024));
             return Err("mmap failed");
         }
         mapped += chunk;
+        chunk_idx += 1;
     }
     let model_ptr = MODEL_MMAP_BASE as *mut u8;
-    println!("[INFERENCE] Mapped {}MB in {} chunks", mmap_size / (1024 * 1024), (mmap_size + MMAP_CHUNK - 1) / MMAP_CHUNK);
+    println!("[INFERENCE] All {} mmap chunks allocated OK", chunk_idx);
 
     // Read model data from disk
     let sectors_to_read = if model_size > 0 {
@@ -976,14 +1862,13 @@ fn load_model_from_disk() -> Result<(*const u8, usize), &'static str> {
     let mut total_read = 0usize;
     let mut sector = model_start_sector;
 
-    // ULTRA 36: Read in 64-sector DMA bursts (32KB per VirtIO request)
-    let burst_sectors = 64usize;
-    let burst_bytes = burst_sectors * SECTOR_SIZE;
+    // DMA: 128-sector bursts (64KB per VirtIO request), no yielding
+    let burst_sectors = 128usize;
     let total_sectors = sectors_to_read;
     let mut last_progress_mb = 0usize;
     let mut remaining = total_sectors;
-    println!("[INFERENCE] Reading {} sectors ({} MB) via DMA bursts...",
-        total_sectors, model_size / (1024 * 1024));
+    println!("[INFERENCE] Reading {} sectors ({} MB) via {} DMA bursts (256KB each)...",
+        total_sectors, model_size / (1024 * 1024), (total_sectors + burst_sectors - 1) / burst_sectors);
 
     while remaining > 0 {
         let n = remaining.min(burst_sectors);
@@ -997,12 +1882,12 @@ fn load_model_from_disk() -> Result<(*const u8, usize), &'static str> {
                 sector += n as u64;
                 remaining -= n;
 
-                // Progress logging every 4MB
+                // Progress logging every 32MB
                 let current_mb = total_read / (1024 * 1024);
-                if current_mb >= last_progress_mb + 4 {
-                    println!("[INFERENCE] Loaded {}MB / {}MB", current_mb, model_size / (1024 * 1024));
+                if current_mb >= last_progress_mb + 32 {
+                    println!("[INFERENCE] Loaded {}MB / {}MB",
+                        current_mb, model_size / (1024 * 1024));
                     last_progress_mb = current_mb;
-                    yield_cpu();
                 }
 
                 // If we don't know model_size, check for zero sectors
@@ -1014,7 +1899,10 @@ fn load_model_from_disk() -> Result<(*const u8, usize), &'static str> {
                     }
                 }
             }
-            Err(_) => break,
+            Err(_) => {
+                println!("[INFERENCE] *** DMA read FAILED at sector {}, {}MB read so far ***", sector, total_read / (1024*1024));
+                break;
+            }
         }
     }
 

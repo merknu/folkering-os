@@ -964,6 +964,13 @@ extern "C" fn syscall_handler(
         0x54 => syscall_https_test(),
         0x55 => syscall_github_fetch(arg1, arg2, arg3, arg4),
         0x56 => syscall_github_clone(arg1, arg2, arg3, arg4),
+        // SMP: Parallel GEMM
+        0x60 => syscall_parallel_gemm(arg1, arg2, arg3, arg4, arg5, arg6),
+        // Hybrid AI: Ask Gemini cloud API
+        0x70 => syscall_ask_gemini(arg1, arg2, arg3),
+        // VirtIO GPU
+        0x80 => syscall_gpu_flush(arg1, arg2, arg3, arg4),
+        0x81 => syscall_gpu_info(arg1),
         _ => {
             crate::drivers::serial::write_str("[HANDLER] Invalid syscall!\n");
             u64::MAX // Return error
@@ -2101,6 +2108,150 @@ fn syscall_fs_read_file(name_ptr: u64, buf_ptr: u64, buf_size: u64) -> u64 {
 
 /// Power off the system (exits QEMU)
 /// Uses QEMU's debug exit port to terminate the emulator.
+/// Parallel GEMM: distribute output projection across AP compute workers
+/// Args: input_ptr, weight_ptr, output_ptr, k, n, quant_type
+fn syscall_parallel_gemm(
+    input_ptr: u64,
+    weight_ptr: u64,
+    output_ptr: u64,
+    k: u64,
+    n: u64,
+    quant_type: u64,
+) -> u64 {
+    crate::serial_str!("[PGEMM] syscall entry k=");
+    crate::drivers::serial::write_dec(k as u32);
+    crate::serial_str!(" n=");
+    crate::drivers::serial::write_dec(n as u32);
+    crate::drivers::serial::write_newline();
+
+    // Get current task's page table for AP workers
+    let task_id = crate::task::task::get_current_task();
+    let cr3 = match crate::task::task::get_task(task_id) {
+        Some(t) => t.lock().page_table_phys,
+        None => return u64::MAX,
+    };
+
+    crate::serial_str!("[PGEMM] task CR3=");
+    crate::drivers::serial::write_hex(cr3);
+    crate::serial_str!(" APs=");
+    crate::drivers::serial::write_dec(super::smp::ap_count() as u32);
+    crate::drivers::serial::write_newline();
+
+    let result = super::smp::dispatch_parallel_gemm(
+        input_ptr,
+        weight_ptr,
+        output_ptr,
+        k as u32,
+        n as u32,
+        quant_type as u8,
+        cr3,
+    );
+
+    if result == 0 { 0 } else { u64::MAX }
+}
+
+/// Ask Gemini cloud API via HTTPS POST.
+/// Args: prompt_ptr (userspace), prompt_len, response_buf_ptr (userspace buffer)
+/// Returns: response_len on success (bytes written to buf), u64::MAX on error
+///
+/// The response buffer must be pre-allocated by userspace (recommended 128KB).
+/// Gracefully handles DNS/TLS/HTTP failures — writes error message to buffer.
+fn syscall_ask_gemini(prompt_ptr: u64, prompt_len: u64, response_buf_ptr: u64) -> u64 {
+    let prompt_len = prompt_len as usize;
+
+    if prompt_len == 0 || prompt_len > 8192 {
+        return u64::MAX;
+    }
+
+    // Read prompt from userspace memory
+    let prompt_bytes = unsafe {
+        core::slice::from_raw_parts(prompt_ptr as *const u8, prompt_len)
+    };
+    let prompt = match core::str::from_utf8(prompt_bytes) {
+        Ok(s) => s,
+        Err(_) => return u64::MAX,
+    };
+
+    crate::serial_str!("[SYS_GEMINI] Prompt: ");
+    let preview = &prompt[..prompt.len().min(80)];
+    crate::drivers::serial::write_str(preview);
+    crate::drivers::serial::write_newline();
+
+    // Call Gemini API (DNS + TLS + POST — may take 5-10 seconds)
+    let result = crate::net::gemini::ask_gemini(prompt);
+
+    let response_bytes = match result {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            crate::serial_str!("[SYS_GEMINI] Error: ");
+            crate::drivers::serial::write_str(e);
+            crate::drivers::serial::write_newline();
+            let msg = alloc::format!("Error: {}", e);
+            msg.into_bytes()
+        }
+    };
+
+    // Write response to userspace buffer (max 128KB)
+    let max_write = response_bytes.len().min(131072);
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            response_bytes.as_ptr(),
+            response_buf_ptr as *mut u8,
+            max_write,
+        );
+    }
+
+    max_write as u64
+}
+
+/// Flush GPU framebuffer region to display.
+/// Args: x, y, width, height (dirty rectangle)
+fn syscall_gpu_flush(x: u64, y: u64, w: u64, h: u64) -> u64 {
+    crate::drivers::virtio_gpu::flush_rect(x as u32, y as u32, w as u32, h as u32);
+    0
+}
+
+/// Get GPU info and map framebuffer pages into task address space.
+/// arg1 = userspace virtual address to map framebuffer at.
+/// Returns: packed (width << 32 | height) on success, u64::MAX on error.
+fn syscall_gpu_info(virt_addr: u64) -> u64 {
+    use crate::drivers::virtio_gpu;
+
+    if !virtio_gpu::GPU_ACTIVE.load(core::sync::atomic::Ordering::Relaxed) {
+        return u64::MAX;
+    }
+
+    let (width, height) = match virtio_gpu::display_size() {
+        Some(wh) => wh,
+        None => return u64::MAX,
+    };
+
+    let pages = match virtio_gpu::framebuffer_pages() {
+        Some(p) => p,
+        None => return u64::MAX,
+    };
+
+    // Map each physical page into the calling task's address space
+    let task_id = crate::task::task::get_current_task();
+    if let Some(task_arc) = crate::task::task::get_task(task_id) {
+        let pml4_phys = task_arc.lock().page_table_phys;
+        let flags = x86_64::structures::paging::PageTableFlags::PRESENT
+            | x86_64::structures::paging::PageTableFlags::WRITABLE
+            | x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE
+            | x86_64::structures::paging::PageTableFlags::NO_EXECUTE
+            | x86_64::structures::paging::PageTableFlags::WRITE_THROUGH;
+
+        for (i, &phys_page) in pages.iter().enumerate() {
+            let virt = virt_addr as usize + i * 4096;
+            let _ = crate::memory::paging::map_page_in_table(
+                pml4_phys, virt, phys_page, flags
+            );
+        }
+    }
+
+    ((width as u64) << 32) | (height as u64)
+}
+
 fn syscall_poweroff() -> u64 {
     crate::serial_println!("\n[KERNEL] System poweroff requested");
     crate::serial_println!("[KERNEL] Goodbye!");

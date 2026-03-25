@@ -39,6 +39,18 @@ use libfolk::{entry, println};
 /// Virtual address for mapping shared memory received from shell
 const COMPOSITOR_SHMEM_VADDR: usize = 0x30000000;
 
+/// Virtual address for mapping TokenRing shmem (ULTRA 43: isolated from ask shmem)
+const RING_VADDR: usize = 0x32000000;
+
+/// Virtual address for query shmem to inference (ULTRA 43)
+const ASK_QUERY_VADDR: usize = 0x30000000;
+
+/// TokenRing header — must match inference-server's TokenRing layout (ULTRA 37, 40)
+/// [write_idx: AtomicU32, status: AtomicU32, _pad: [u32;2], data: [u8; 16368]]
+/// Total: 16384 bytes = 4 pages
+const RING_HEADER_SIZE: usize = 16;
+const RING_DATA_MAX: usize = 16368;
+
 /// Format a usize as a decimal string into buffer, return slice
 fn format_usize(n: usize, buf: &mut [u8; 16]) -> &str {
     if n == 0 {
@@ -552,7 +564,26 @@ fn main() -> ! {
         }
     }
 
-    // Step 5: Create FramebufferView
+    // Step 5: Try VirtIO-GPU first, fall back to Limine framebuffer
+    const GPU_FB_VADDR: usize = 0x0000_0002_0000_0000; // 8GB mark for GPU FB
+    let mut use_gpu = false;
+
+    if let Some((gpu_w, gpu_h)) = libfolk::sys::gpu_info(GPU_FB_VADDR) {
+        write_str("[COMPOSITOR] VirtIO-GPU: ");
+        if gpu_w >= 1000 { write_char(b'0' + ((gpu_w / 1000) % 10) as u8); }
+        if gpu_w >= 100 { write_char(b'0' + ((gpu_w / 100) % 10) as u8); }
+        write_char(b'0' + ((gpu_w / 10) % 10) as u8);
+        write_char(b'0' + (gpu_w % 10) as u8);
+        write_str("x");
+        if gpu_h >= 100 { write_char(b'0' + ((gpu_h / 100) % 10) as u8); }
+        write_char(b'0' + ((gpu_h / 10) % 10) as u8);
+        write_char(b'0' + (gpu_h % 10) as u8);
+        write_str(" mapped at GPU_FB_VADDR\n");
+        use_gpu = true;
+    }
+
+    // Use Limine framebuffer for rendering (always visible via VNC).
+    // GPU backing buffer is used for VirtIO-GPU scanout when available.
     let mut fb = unsafe {
         FramebufferView::new(FRAMEBUFFER_VADDR as *mut u8, fb_config)
     };
@@ -668,6 +699,44 @@ fn main() -> ! {
     // ===== Clipboard buffer (Milestone 20) =====
     let mut clipboard_buf: [u8; 256] = [0; 256];
     let mut clipboard_len: usize = 0;
+
+    // ===== Async Inference / Token Streaming State =====
+    let mut inference_ring_handle: u32 = 0;     // shmem handle for TokenRing (0 = no active stream)
+    let mut inference_ring_read_idx: usize = 0;  // bytes already read from ring
+    let mut inference_win_id: u32 = 0;           // window receiving streamed tokens
+    let mut inference_query_handle: u32 = 0;     // query shmem handle (for cleanup)
+
+    // ===== Tool Calling State Machine =====
+    // Detects <|tool|>...<|/tool|> in AI stream, hides from display, executes via IPC
+    let mut tool_state: u8 = 0;      // 0=scanning open, 1=buffering body, 3=completed
+    let mut tool_open_match: usize = 0;
+    let mut tool_close_match: usize = 0;
+    let mut tool_buf: [u8; 512] = [0; 512];
+    let mut tool_buf_len: usize = 0;
+    let mut tool_pending: [u8; 9] = [0; 9]; // max tag length for flush on partial match fail
+    let mut tool_pending_len: usize = 0;
+
+    const TOOL_OPEN: &[u8] = b"<|tool|>";    // 8 bytes
+    const TOOL_CLOSE: &[u8] = b"<|/tool|>";  // 9 bytes
+
+    // ===== Think Tag Filter =====
+    // Hides <think>...</think> reasoning from display (Qwen3 thinking mode)
+    let mut think_state: u8 = 0;     // 0=scanning open, 1=inside think block (hidden)
+    let mut think_open_match: usize = 0;
+    let mut think_close_match: usize = 0;
+    let mut think_pending: [u8; 8] = [0; 8]; // max tag length for flush
+    let mut think_pending_len: usize = 0;
+
+    const THINK_OPEN: &[u8] = b"<think>";    // 7 bytes
+    const THINK_CLOSE: &[u8] = b"</think>";  // 8 bytes
+
+    // ===== Tool Result Filter =====
+    // Hides <|tool_result|>...<|/tool_result|> from display (injected by compositor for AI context)
+    let mut result_state: u8 = 0;
+    let mut result_open_match: usize = 0;
+    let mut result_close_match: usize = 0;
+    const RESULT_OPEN: &[u8] = b"<|tool_result|>";   // 15 bytes
+    const RESULT_CLOSE: &[u8] = b"<|/tool_result|>"; // 16 bytes
 
     // Blinking caret state (toggles every ~500ms using uptime syscall)
     let mut caret_visible: bool = true;
@@ -943,6 +1012,10 @@ fn main() -> ! {
                     match zone {
                         HitZone::CloseButton => {
                             wm.close_window(win_id);
+                            // Prevent token stream from hijacking a recycled window ID
+                            if win_id == inference_win_id {
+                                inference_win_id = 0;
+                            }
                             need_redraw = true;
                             cursor_bg_dirty = true;
                             handled = true;
@@ -2176,9 +2249,8 @@ fn main() -> ! {
                             }
                         }
                     } else if cmd_str.starts_with("ask ") || cmd_str.starts_with("infer ") {
-                        // AI inference command — full shmem-based inference request
+                        // AI inference command — async streaming via TokenRing
                         use libfolk::sys::inference;
-                        use libfolk::sys::{shmem_create, shmem_map, shmem_grant, shmem_unmap, shmem_destroy};
                         let query = if cmd_str.starts_with("ask ") {
                             &cmd_str[4..]
                         } else {
@@ -2187,70 +2259,111 @@ fn main() -> ! {
                         let query = query.trim();
                         if query.is_empty() {
                             win.push_line("Usage: ask <question>");
+                        } else if inference_ring_handle != 0 {
+                            // ULTRA 42: Already generating
+                            win.push_line("[AI is busy]");
                         } else {
                             match inference::ping() {
                                 Ok(has_model) => {
                                     if !has_model {
                                         win.push_line("[AI] No model loaded (stub mode)");
-                                        win.push_line("[AI] Pack a GGUF into virtio-data.img");
                                     } else {
-                                        win.push_line("[AI] Thinking...");
+                                        // Create TokenRing shmem (4 pages = 16KB)
+                                        let ring_ok = if let Ok(rh) = shmem_create(16384) {
+                                            let _ = shmem_grant(rh, inference::inference_task_id());
+                                            // Create query shmem
+                                            let query_bytes = query.as_bytes();
+                                            if let Ok(qh) = shmem_create(4096) {
+                                                let _ = shmem_grant(qh, inference::inference_task_id());
+                                                if shmem_map(qh, ASK_QUERY_VADDR).is_ok() {
+                                                    unsafe {
+                                                        let ptr = ASK_QUERY_VADDR as *mut u8;
+                                                        core::ptr::copy_nonoverlapping(
+                                                            query_bytes.as_ptr(), ptr, query_bytes.len()
+                                                        );
+                                                    }
+                                                    let _ = shmem_unmap(qh, ASK_QUERY_VADDR);
 
-                                        // Create shmem with query text
-                                        let query_bytes = query.as_bytes();
-                                        if let Ok(handle) = shmem_create(4096) {
-                                            let _ = shmem_grant(handle, inference::INFERENCE_TASK_ID);
-                                            const ASK_SHMEM: usize = 0x30000000;
-                                            if shmem_map(handle, ASK_SHMEM).is_ok() {
-                                                unsafe {
-                                                    let ptr = ASK_SHMEM as *mut u8;
-                                                    core::ptr::copy_nonoverlapping(
-                                                        query_bytes.as_ptr(), ptr, query_bytes.len()
-                                                    );
-                                                }
-                                                let _ = shmem_unmap(handle, ASK_SHMEM);
-
-                                                // Send ask request
-                                                match inference::ask(handle, query_bytes.len()) {
-                                                    Ok((out_shmem, out_len)) => {
-                                                        if out_len > 0 && out_shmem > 0 {
-                                                            if shmem_map(out_shmem, ASK_SHMEM).is_ok() {
-                                                                let resp = unsafe {
-                                                                    core::slice::from_raw_parts(
-                                                                        ASK_SHMEM as *const u8, out_len.min(4000)
-                                                                    )
-                                                                };
-                                                                if let Ok(text) = core::str::from_utf8(resp) {
-                                                                    // Split response into lines for terminal
-                                                                    for line in text.split('\n') {
-                                                                        if !line.is_empty() {
-                                                                            win.push_line(line);
-                                                                        }
-                                                                    }
-                                                                } else {
-                                                                    win.push_line("[AI] (non-UTF8 response)");
-                                                                }
-                                                                let _ = shmem_unmap(out_shmem, ASK_SHMEM);
+                                                    // Send async request
+                                                    match inference::ask_async(qh, query_bytes.len(), rh) {
+                                                        Ok(()) => {
+                                                            // Map ring for polling
+                                                            if shmem_map(rh, RING_VADDR).is_ok() {
+                                                                inference_ring_handle = rh;
+                                                                inference_ring_read_idx = 0;
+                                                                inference_win_id = win_id;
+                                                                inference_query_handle = qh;
+                                                                win.push_line("[AI] Thinking...");
+                                                                win.typing = true;
+                                                                true
+                                                            } else {
+                                                                let _ = shmem_destroy(rh);
+                                                                let _ = shmem_destroy(qh);
+                                                                win.push_line("[AI] Ring map failed");
+                                                                false
                                                             }
-                                                            let _ = shmem_destroy(out_shmem);
-                                                        } else {
-                                                            win.push_line("[AI] (empty response)");
+                                                        }
+                                                        Err(_) => {
+                                                            let _ = shmem_destroy(rh);
+                                                            let _ = shmem_destroy(qh);
+                                                            win.push_line("[AI] Server offline — AI Core may need restart");
+                                                            false
                                                         }
                                                     }
-                                                    Err(_) => {
-                                                        win.push_line("[AI] Inference request failed");
-                                                    }
+                                                } else {
+                                                    let _ = shmem_destroy(rh);
+                                                    let _ = shmem_destroy(qh);
+                                                    win.push_line("[AI] Query map failed");
+                                                    false
                                                 }
+                                            } else {
+                                                let _ = shmem_destroy(rh);
+                                                win.push_line("[AI] Query alloc failed");
+                                                false
                                             }
-                                            let _ = shmem_destroy(handle);
                                         } else {
-                                            win.push_line("[AI] Failed to allocate shmem");
-                                        }
+                                            win.push_line("[AI] Ring alloc failed");
+                                            false
+                                        };
+                                        let _ = ring_ok; // suppress unused warning
                                     }
                                 }
                                 Err(_) => {
-                                    win.push_line("[AI] Inference server unavailable");
+                                    win.push_line("[AI] Inference server unavailable (may have crashed)");
+                                    win.push_line("[AI] Try again — server may auto-recover on next request");
                                 }
+                            }
+                        }
+                    } else if cmd_str.starts_with("gemini ") {
+                        // Direct Gemini cloud API query — bypasses local AI
+                        let prompt = cmd_str[7..].trim();
+                        write_str("[COMPOSITOR] gemini command: ");
+                        write_str(prompt);
+                        write_str("\n");
+                        if prompt.is_empty() {
+                            win.push_line("Usage: gemini <prompt>");
+                        } else {
+                            win.push_line(&alloc::format!("> gemini {}", &prompt[..prompt.len().min(60)]));
+                            win.push_line("[cloud] Contacting Gemini...");
+
+                            // Use heap-allocated Vec instead of mmap (simpler, no syscall needed)
+                            let mut gemini_buf = alloc::vec![0u8; 16384]; // 16KB buffer
+
+                            let response_len = libfolk::sys::ask_gemini(prompt, &mut gemini_buf);
+
+                            if response_len > 0 {
+                                if let Ok(text) = core::str::from_utf8(&gemini_buf[..response_len]) {
+                                    win.push_line("[Gemini]:");
+                                    for line in text.split('\n') {
+                                        if !line.is_empty() {
+                                            win.push_line(line);
+                                        }
+                                    }
+                                } else {
+                                    win.push_line("[cloud] Response not valid UTF-8");
+                                }
+                            } else {
+                                win.push_line("[cloud] Error: no response from Gemini API");
                             }
                         }
                     } else {
@@ -2744,7 +2857,7 @@ fn main() -> ! {
                 fb.draw_string_alpha(text_box_x + text_box_w - 24, text_box_y + 12, ">", folk_accent, 0x1a1a2e, omnibar_alpha);
 
                 // Context hints below omnibar
-                let hint = "find <query> | open calc | help";
+                let hint = "Type <query> | open calc | gemini <prompt> | help";
                 let hint_x = (fb.width.saturating_sub(hint.len() * 8)) / 2;
                 fb.draw_string(hint_x, text_box_y + text_box_h + 16, hint, dark_gray, folk_dark);
 
@@ -2912,7 +3025,261 @@ fn main() -> ! {
             Err(_) => {}
         }
 
-        // Only yield CPU if we did no work this iteration
+        // ===== Token Streaming: Poll TokenRing (ULTRA 37, 38, 46, 47) =====
+        if inference_ring_handle != 0 {
+            use core::sync::atomic::Ordering;
+            // Read ring header atomically
+            let ring_ptr = RING_VADDR as *const u32;
+            let write_idx_atomic = unsafe { &*(ring_ptr as *const core::sync::atomic::AtomicU32) };
+            let status_atomic = unsafe { &*((ring_ptr as *const core::sync::atomic::AtomicU32).add(1)) };
+
+            let new_write = write_idx_atomic.load(Ordering::Acquire) as usize;
+            if new_write > inference_ring_read_idx {
+                did_work = true;
+                // ULTRA 38: Batch-read ALL new bytes at once
+                let data_ptr = unsafe { (RING_VADDR as *const u8).add(RING_HEADER_SIZE) };
+                let new_data = unsafe {
+                    core::slice::from_raw_parts(
+                        data_ptr.add(inference_ring_read_idx),
+                        new_write - inference_ring_read_idx,
+                    )
+                };
+                // ULTRA 47: Data guaranteed valid UTF-8 by inference server
+                // Tool call interception: scan for <|tool|>...<|/tool|> tags
+                let mut visible_buf: [u8; 512] = [0; 512];
+                let mut vis_len: usize = 0;
+
+                for &byte in new_data.iter() {
+                    // ── Layer 1: Think tag filter ──
+                    // Intercepts <think>...</think> blocks and drops them entirely.
+                    // Bytes inside a think block never reach the tool/visible layer.
+                    if think_state == 0 {
+                        // Scanning for THINK_OPEN
+                        if byte == THINK_OPEN[think_open_match] {
+                            think_pending[think_pending_len] = byte;
+                            think_pending_len += 1;
+                            think_open_match += 1;
+                            if think_open_match == THINK_OPEN.len() {
+                                // Entered think block — drop all content
+                                think_state = 1;
+                                think_open_match = 0;
+                                think_pending_len = 0;
+                            }
+                            continue; // Don't pass to tool/visible layer yet
+                        } else if think_open_match > 0 {
+                            // Partial match failed — flush pending to tool/visible layer below
+                            // (fall through with pending bytes + current byte)
+                            // We need to process each pending byte through tool layer
+                            let pending_count = think_pending_len;
+                            think_open_match = 0;
+                            think_pending_len = 0;
+                            // Process each pending byte through tool/visible layer
+                            for j in 0..pending_count {
+                                let pb = think_pending[j];
+                                // (inline the tool/visible logic for flushed bytes)
+                                match tool_state {
+                                    0 => {
+                                        if pb == TOOL_OPEN[tool_open_match] {
+                                            tool_pending[tool_pending_len] = pb;
+                                            tool_pending_len += 1;
+                                            tool_open_match += 1;
+                                            if tool_open_match == TOOL_OPEN.len() {
+                                                tool_state = 1; tool_open_match = 0;
+                                                tool_pending_len = 0; tool_buf_len = 0;
+                                            }
+                                        } else if tool_open_match > 0 {
+                                            for k in 0..tool_pending_len {
+                                                if vis_len < visible_buf.len() { visible_buf[vis_len] = tool_pending[k]; vis_len += 1; }
+                                            }
+                                            tool_open_match = 0; tool_pending_len = 0;
+                                            if vis_len < visible_buf.len() { visible_buf[vis_len] = pb; vis_len += 1; }
+                                        } else if vis_len < visible_buf.len() { visible_buf[vis_len] = pb; vis_len += 1; }
+                                    }
+                                    1 => {
+                                        if pb == TOOL_CLOSE[tool_close_match] {
+                                            tool_close_match += 1;
+                                            if tool_close_match == TOOL_CLOSE.len() { tool_state = 3; tool_close_match = 0; }
+                                        } else {
+                                            for k in 0..tool_close_match { if tool_buf_len < tool_buf.len() { tool_buf[tool_buf_len] = TOOL_CLOSE[k]; tool_buf_len += 1; } }
+                                            tool_close_match = 0;
+                                            if tool_buf_len < tool_buf.len() { tool_buf[tool_buf_len] = pb; tool_buf_len += 1; }
+                                        }
+                                    }
+                                    _ => { if vis_len < visible_buf.len() { visible_buf[vis_len] = pb; vis_len += 1; } }
+                                }
+                            }
+                            // Now fall through to process current byte normally
+                        }
+                        // else: no partial match, byte falls through to tool/visible
+                    } else {
+                        // think_state == 1: Inside <think> block — scan for </think>
+                        if byte == THINK_CLOSE[think_close_match] {
+                            think_close_match += 1;
+                            if think_close_match == THINK_CLOSE.len() {
+                                // Exited think block — resume normal display
+                                think_state = 0;
+                                think_close_match = 0;
+                            }
+                        } else {
+                            think_close_match = 0;
+                        }
+                        continue; // Drop ALL bytes inside think block
+                    }
+
+                    // ── Layer 1.5: Tool result filter ──
+                    // Hides <|tool_result|>...<|/tool_result|> from display
+                    if result_state == 0 {
+                        if byte == RESULT_OPEN[result_open_match] {
+                            result_open_match += 1;
+                            if result_open_match == RESULT_OPEN.len() {
+                                result_state = 1;
+                                result_open_match = 0;
+                            }
+                            continue;
+                        } else if result_open_match > 0 {
+                            // Partial match failed — these bytes were '<|tool_r...' which
+                            // isn't a real result tag. They fall through to tool/visible.
+                            // For simplicity, just reset and let the current byte through.
+                            result_open_match = 0;
+                            // Fall through to process current byte
+                        }
+                    } else {
+                        // result_state == 1: Inside result block — scan for close tag
+                        if byte == RESULT_CLOSE[result_close_match] {
+                            result_close_match += 1;
+                            if result_close_match == RESULT_CLOSE.len() {
+                                result_state = 0;
+                                result_close_match = 0;
+                            }
+                        } else {
+                            result_close_match = 0;
+                        }
+                        continue; // Drop bytes inside result block
+                    }
+
+                    // ── Layer 2: Tool tag filter + visible output ──
+                    match tool_state {
+                        0 => {
+                            // Scanning for TOOL_OPEN tag
+                            if byte == TOOL_OPEN[tool_open_match] {
+                                tool_pending[tool_pending_len] = byte;
+                                tool_pending_len += 1;
+                                tool_open_match += 1;
+                                if tool_open_match == TOOL_OPEN.len() {
+                                    tool_state = 1;
+                                    tool_open_match = 0;
+                                    tool_pending_len = 0;
+                                    tool_buf_len = 0;
+                                }
+                            } else if tool_open_match > 0 {
+                                for j in 0..tool_pending_len {
+                                    if vis_len < visible_buf.len() {
+                                        visible_buf[vis_len] = tool_pending[j];
+                                        vis_len += 1;
+                                    }
+                                }
+                                tool_open_match = 0;
+                                tool_pending_len = 0;
+                                if vis_len < visible_buf.len() {
+                                    visible_buf[vis_len] = byte;
+                                    vis_len += 1;
+                                }
+                            } else {
+                                if vis_len < visible_buf.len() {
+                                    visible_buf[vis_len] = byte;
+                                    vis_len += 1;
+                                }
+                            }
+                        }
+                        1 => {
+                            // Buffering tool body, scanning for TOOL_CLOSE
+                            if byte == TOOL_CLOSE[tool_close_match] {
+                                tool_close_match += 1;
+                                if tool_close_match == TOOL_CLOSE.len() {
+                                    tool_state = 3;
+                                    tool_close_match = 0;
+                                }
+                            } else {
+                                for j in 0..tool_close_match {
+                                    if tool_buf_len < tool_buf.len() {
+                                        tool_buf[tool_buf_len] = TOOL_CLOSE[j];
+                                        tool_buf_len += 1;
+                                    }
+                                }
+                                tool_close_match = 0;
+                                if tool_buf_len < tool_buf.len() {
+                                    tool_buf[tool_buf_len] = byte;
+                                    tool_buf_len += 1;
+                                }
+                            }
+                        }
+                        _ => {
+                            if vis_len < visible_buf.len() {
+                                visible_buf[vis_len] = byte;
+                                vis_len += 1;
+                            }
+                        }
+                    }
+                }
+
+                // Append visible (non-tool) text to window
+                if vis_len > 0 {
+                    if let Some(win) = wm.get_window_mut(inference_win_id) {
+                        win.append_text(&visible_buf[..vis_len]);
+                    }
+                }
+
+                // Execute completed tool call + write result back to ring
+                if tool_state == 3 {
+                    let tool_content = core::str::from_utf8(&tool_buf[..tool_buf_len]).unwrap_or("");
+                    // Pass ring info so result can be written back for AI feedback
+                    let ring_va = if inference_ring_handle != 0 { RING_VADDR } else { 0 };
+                    let ring_write = new_write; // current write position in ring
+                    if let Some(win) = wm.get_window_mut(inference_win_id) {
+                        execute_tool_call(tool_content, win, ring_va, ring_write);
+                    }
+                    tool_state = 0;
+                    tool_buf_len = 0;
+                    need_redraw = true;
+                }
+                inference_ring_read_idx = new_write;
+                need_redraw = true;
+            }
+
+            let status = status_atomic.load(Ordering::Acquire);
+            if status != 0 {
+                // DONE (1) or ERROR (2) — cleanup
+                did_work = true;
+                let _ = shmem_unmap(inference_ring_handle, RING_VADDR);
+                let _ = shmem_destroy(inference_ring_handle);
+                let _ = shmem_destroy(inference_query_handle);
+                inference_ring_handle = 0;
+                inference_query_handle = 0;
+                // Flush incomplete tool tag if generation ended mid-tag
+                if tool_state != 0 {
+                    tool_state = 0;
+                    tool_open_match = 0;
+                    tool_close_match = 0;
+                    tool_buf_len = 0;
+                    tool_pending_len = 0;
+                }
+                if let Some(win) = wm.get_window_mut(inference_win_id) {
+                    win.typing = false;
+                    win.push_line(""); // new line after AI response
+                    if status == 2 {
+                        win.push_line("[AI] Error during generation");
+                    }
+                }
+                need_redraw = true;
+            }
+        }
+
+        // Flush GPU framebuffer if using VirtIO-GPU
+        if use_gpu {
+            libfolk::sys::gpu_flush(0, 0, fb.width as u32, fb.height as u32);
+        }
+
+        // Only yield CPU if we did no work this iteration (ULTRA 46)
         if !did_work {
             yield_cpu();
         }
@@ -2920,6 +3287,176 @@ fn main() -> ! {
 }
 
 /// Clamp focused_widget index after widget tree update
+
+/// Execute a tool call and write result back to TokenRing for AI feedback.
+/// Shows brief status in window; full result goes to ring for KV-cache injection.
+fn execute_tool_call(
+    tool_content: &str,
+    win: &mut compositor::window_manager::Window,
+    ring_vaddr: usize,
+    write_idx: usize,
+) {
+    use libfolk::sys::{shmem_map, shmem_unmap, shmem_destroy};
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    let trimmed = tool_content.trim();
+    let (cmd, args) = if let Some(pos) = trimmed.find(' ') {
+        (&trimmed[..pos], trimmed[pos + 1..].trim())
+    } else {
+        (trimmed, "")
+    };
+
+    const TOOL_SHMEM_VADDR: usize = 0x30000000;
+    const PREFIX: &[u8] = b"\n<|tool_result|>";
+    const SUFFIX: &[u8] = b"<|/tool_result|>\n";
+
+    // Stack buffer for tool result content (8KB — large enough for Gemini responses)
+    let mut result_buf = [0u8; 8192];
+    let mut result_len: usize = 0;
+
+    match cmd {
+        "write" => {
+            if let Some(pos) = args.find(' ') {
+                let filename = args[..pos].trim();
+                let content = args[pos + 1..].trim();
+                if filename.is_empty() || content.is_empty() {
+                    result_len = copy_str(b"Error: write requires FILENAME CONTENT", &mut result_buf);
+                } else if filename.contains("..") || content.len() > 4096 {
+                    result_len = copy_str(b"Error: write denied (security)", &mut result_buf);
+                } else {
+                    match libfolk::sys::synapse::write_file(filename, content.as_bytes()) {
+                        Ok(()) => {
+                            result_len = copy_str(b"OK: File written: ", &mut result_buf);
+                            let fname_bytes = filename.as_bytes();
+                            let add = fname_bytes.len().min(result_buf.len() - result_len);
+                            result_buf[result_len..result_len + add].copy_from_slice(&fname_bytes[..add]);
+                            result_len += add;
+                        }
+                        Err(_) => result_len = copy_str(b"Error: Write failed", &mut result_buf),
+                    }
+                }
+            } else {
+                result_len = copy_str(b"Error: write requires FILENAME CONTENT", &mut result_buf);
+            }
+        }
+        "read" => {
+            if args.is_empty() {
+                result_len = copy_str(b"Error: read requires FILENAME", &mut result_buf);
+            } else {
+                match libfolk::sys::synapse::read_file_shmem(args) {
+                    Ok(resp) => {
+                        if shmem_map(resp.shmem_handle, TOOL_SHMEM_VADDR).is_ok() {
+                            let data = unsafe {
+                                core::slice::from_raw_parts(
+                                    TOOL_SHMEM_VADDR as *const u8,
+                                    (resp.size as usize).min(4096),
+                                )
+                            };
+                            // Copy file content (safe UTF-8 truncation by lines)
+                            if let Ok(text) = core::str::from_utf8(data) {
+                                for line in text.lines().take(8) {
+                                    let lb = line.as_bytes();
+                                    let add = lb.len().min(result_buf.len() - result_len);
+                                    if add == 0 { break; }
+                                    result_buf[result_len..result_len + add].copy_from_slice(&lb[..add]);
+                                    result_len += add;
+                                    if result_len < result_buf.len() {
+                                        result_buf[result_len] = b'\n';
+                                        result_len += 1;
+                                    }
+                                }
+                            } else {
+                                result_len = copy_str(b"(binary data)", &mut result_buf);
+                            }
+                            let _ = shmem_unmap(resp.shmem_handle, TOOL_SHMEM_VADDR);
+                        }
+                        let _ = shmem_destroy(resp.shmem_handle);
+                    }
+                    Err(_) => result_len = copy_str(b"Error: File not found", &mut result_buf),
+                }
+            }
+        }
+        "ls" => {
+            result_len = copy_str(b"Files: (listing not yet implemented)", &mut result_buf);
+        }
+        "ask_gemini" => {
+            if args.is_empty() {
+                result_len = copy_str(b"Error: ask_gemini requires a prompt", &mut result_buf);
+            } else {
+                // Large response buffer for cloud AI responses (128KB via mmap)
+                const GEMINI_BUF_SIZE: usize = 131072;
+                const GEMINI_BUF_VADDR: usize = 0x32000000;
+
+                // Allocate anonymous memory for response
+                if libfolk::sys::mmap_at(GEMINI_BUF_VADDR, GEMINI_BUF_SIZE, 3).is_ok() {
+                    let gemini_buf = unsafe {
+                        core::slice::from_raw_parts_mut(GEMINI_BUF_VADDR as *mut u8, GEMINI_BUF_SIZE)
+                    };
+
+                    win.push_line("[tool] Asking Gemini...");
+
+                    let response_len = libfolk::sys::ask_gemini(args, gemini_buf);
+
+                    if response_len > 0 {
+                        // Truncate to fit in ring buffer (max 8KB for tool result)
+                        let usable = response_len.min(8000);
+                        result_len = usable.min(result_buf.len());
+                        result_buf[..result_len].copy_from_slice(&gemini_buf[..result_len]);
+                    } else {
+                        result_len = copy_str(b"Error: Cloud API unreachable", &mut result_buf);
+                    }
+
+                    // Free the buffer
+                    let _ = libfolk::sys::munmap(GEMINI_BUF_VADDR as *mut u8, GEMINI_BUF_SIZE);
+                } else {
+                    result_len = copy_str(b"Error: memory allocation failed", &mut result_buf);
+                }
+            }
+        }
+        _ => {
+            result_len = copy_str(b"Error: Unknown tool command", &mut result_buf);
+        }
+    }
+
+    // Show brief status in window
+    win.push_line("[tool] Executed: ");
+    win.append_text(cmd.as_bytes());
+
+    // Write result back to ring for inference-server to consume
+    let total_len = PREFIX.len() + result_len + SUFFIX.len();
+    let available = RING_DATA_MAX.saturating_sub(write_idx);
+
+    if total_len <= available && ring_vaddr != 0 {
+        unsafe {
+            let base = (ring_vaddr as *mut u8).add(RING_HEADER_SIZE).add(write_idx);
+            core::ptr::copy_nonoverlapping(PREFIX.as_ptr(), base, PREFIX.len());
+            core::ptr::copy_nonoverlapping(
+                result_buf.as_ptr(),
+                base.add(PREFIX.len()),
+                result_len,
+            );
+            core::ptr::copy_nonoverlapping(
+                SUFFIX.as_ptr(),
+                base.add(PREFIX.len() + result_len),
+                SUFFIX.len(),
+            );
+        }
+
+        // Signal inference-server: result ready
+        let tool_result_len = unsafe { &*((ring_vaddr + 12) as *const AtomicU32) };
+        let tool_state = unsafe { &*((ring_vaddr + 8) as *const AtomicU32) };
+        tool_result_len.store(total_len as u32, Ordering::Release);
+        tool_state.store(2, Ordering::Release); // 2 = result_ready
+    }
+}
+
+/// Helper: copy bytes into buffer, return length copied
+fn copy_str(src: &[u8], dst: &mut [u8]) -> usize {
+    let n = src.len().min(dst.len());
+    dst[..n].copy_from_slice(&src[..n]);
+    n
+}
+
 fn clamp_focus(wm: &mut WindowManager, win_id: u32) {
     if let Some(win) = wm.get_window_mut(win_id) {
         if let Some(idx) = win.focused_widget {
