@@ -8,10 +8,102 @@ use spin::Mutex;
 use uart_16550::SerialPort;
 
 static SERIAL1: Mutex<SerialPort> = Mutex::new(unsafe { SerialPort::new(0x3F8) });
+static SERIAL2: Mutex<SerialPort> = Mutex::new(unsafe { SerialPort::new(0x2F8) });
+static SERIAL3: Mutex<SerialPort> = Mutex::new(unsafe { SerialPort::new(0x3E8) });
 
-/// Initialize serial console
+/// Initialize serial consoles (COM1=log, COM2=Gemini proxy, COM3=God Mode Pipe)
 pub fn init() {
     SERIAL1.lock().init();
+    SERIAL2.lock().init();
+    SERIAL3.lock().init();
+}
+
+// ── COM3 (God Mode Pipe — direct command injection) ─────────────────────
+
+/// Read a byte from COM3 (non-blocking). Returns None if no data.
+pub fn com3_read_byte() -> Option<u8> {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let _serial = SERIAL3.lock();
+        let lsr: u8 = unsafe {
+            x86_64::instructions::port::Port::<u8>::new(0x3E8 + 5).read()
+        };
+        if (lsr & 0x01) != 0 {
+            Some(unsafe { x86_64::instructions::port::Port::<u8>::new(0x3E8).read() })
+        } else {
+            None
+        }
+    })
+}
+
+// ── COM2 (Gemini Proxy Channel) ─────────────────────────────────────────
+
+/// Write bytes to COM2 (Gemini proxy channel)
+pub fn com2_write(data: &[u8]) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut serial = SERIAL2.lock();
+        for &byte in data {
+            serial.send(byte);
+        }
+    });
+}
+
+/// Read a byte from COM2 (non-blocking). Returns None if no data.
+pub fn com2_read_byte() -> Option<u8> {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let _serial = SERIAL2.lock();
+        let lsr: u8 = unsafe {
+            x86_64::instructions::port::Port::<u8>::new(0x2F8 + 5).read()
+        };
+        if (lsr & 0x01) != 0 {
+            Some(unsafe { x86_64::instructions::port::Port::<u8>::new(0x2F8).read() })
+        } else {
+            None
+        }
+    })
+}
+
+/// Read until delimiter or timeout (blocking with yield).
+/// Returns bytes read (excluding delimiter).
+pub fn com2_read_until(delimiter: &[u8], buf: &mut [u8], timeout_ms: u64) -> usize {
+    // Use TSC for all timing (uptime_ms doesn't advance in syscall context)
+    fn tsc_ms() -> u64 {
+        let tsc: u64;
+        unsafe { core::arch::asm!("rdtsc", "shl rdx, 32", "or rax, rdx", out("rax") tsc, out("rdx") _); }
+        tsc / 2_000_000
+    }
+
+    let start = tsc_ms();
+    let mut pos = 0;
+    let mut delim_match = 0;
+
+    loop {
+        if let Some(byte) = com2_read_byte() {
+            if pos < buf.len() {
+                buf[pos] = byte;
+                pos += 1;
+            }
+            // Check for delimiter match
+            if byte == delimiter[delim_match] {
+                delim_match += 1;
+                if delim_match == delimiter.len() {
+                    return pos - delimiter.len();
+                }
+            } else {
+                delim_match = if byte == delimiter[0] { 1 } else { 0 };
+            }
+        }
+
+        let now = tsc_ms();
+        if pos == 0 && now - start > timeout_ms {
+            break; // No data at all within timeout
+        }
+        if pos > 0 && now - start > timeout_ms + 30_000 {
+            break; // Data started but incomplete after extended timeout
+        }
+
+        for _ in 0..100 { core::hint::spin_loop(); }
+    }
+    pos
 }
 
 /// Print formatted arguments to serial console

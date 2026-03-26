@@ -971,6 +971,13 @@ extern "C" fn syscall_handler(
         // VirtIO GPU
         0x80 => syscall_gpu_flush(arg1, arg2, arg3, arg4),
         0x81 => syscall_gpu_info(arg1),
+        // God Mode Pipe: read byte from COM3
+        0x90 => {
+            match crate::drivers::serial::com3_read_byte() {
+                Some(b) => b as u64,
+                None => u64::MAX,
+            }
+        },
         _ => {
             crate::drivers::serial::write_str("[HANDLER] Invalid syscall!\n");
             u64::MAX // Return error

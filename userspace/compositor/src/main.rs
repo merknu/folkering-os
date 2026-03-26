@@ -583,10 +583,19 @@ fn main() -> ! {
     }
 
     // Use Limine framebuffer for rendering (always visible via VNC).
-    // GPU backing buffer is used for VirtIO-GPU scanout when available.
     let mut fb = unsafe {
         FramebufferView::new(FRAMEBUFFER_VADDR as *mut u8, fb_config)
     };
+
+    // Initialize damage tracker for dirty rectangle optimization
+    let mut damage = compositor::damage::DamageTracker::new(fb.width as u32, fb.height as u32);
+    // First frame: mark everything dirty
+    damage.damage_full();
+
+    // God Mode Pipe (COM3) — direct command injection buffer
+    let mut com3_buf = [0u8; 512];
+    let mut com3_len = 0usize;
+    let mut com3_inject: Option<alloc::string::String> = None;
 
     // ===== NEURAL DESKTOP =====
     // AI-native interface with Omnibar at center
@@ -909,6 +918,25 @@ fn main() -> ! {
         let mut did_work = false;
         // Consolidated redraw flag — any subsystem can set this
         let mut need_redraw = false;
+
+        // ===== GOD MODE PIPE (COM3) — Poll for injected commands =====
+        while let Some(byte) = libfolk::sys::com3_read() {
+            if byte == b'\n' && com3_len > 0 {
+                // Complete command received — inject into omnibar dispatcher
+                if let Ok(cmd) = alloc::str::from_utf8(&com3_buf[..com3_len]) {
+                    write_str("[COM3] Inject: ");
+                    write_str(cmd);
+                    write_str("\n");
+                    com3_inject = Some(alloc::string::String::from(cmd));
+                }
+                com3_len = 0;
+                did_work = true;
+                break;
+            } else if byte != b'\n' && byte != b'\r' && com3_len < com3_buf.len() {
+                com3_buf[com3_len] = byte;
+                com3_len += 1;
+            }
+        }
 
         // Check if Alt+Tab HUD has expired — clear HUD area and trigger redraw
         if hud_show_until > 0 && uptime() >= hud_show_until {
@@ -1734,6 +1762,16 @@ fn main() -> ! {
         // Track deferred app creation from omnibar (no terminal window needed)
         let mut deferred_app_handle: u32 = 0;
 
+        // COM3 God Mode: inject command directly (bypasses keyboard)
+        if let Some(injected) = com3_inject.take() {
+            let bytes = injected.as_bytes();
+            let copy_len = bytes.len().min(text_buffer.len());
+            text_buffer[..copy_len].copy_from_slice(&bytes[..copy_len]);
+            text_len = copy_len;
+            execute_command = true;
+            need_redraw = true;
+        }
+
         if execute_command && text_len > 0 {
             if let Ok(cmd_str) = core::str::from_utf8(&text_buffer[..text_len]) {
 
@@ -1820,6 +1858,28 @@ fn main() -> ! {
                 let wy = 60 + win_count * 24;
                 let win_id = wm.create_terminal(cmd_str, wx, wy, 480, 200);
 
+                // Pre-compute UI state for gemini command (before win borrow)
+                let ui_state_snapshot = {
+                    let ui_wins: alloc::vec::Vec<compositor::ui_serialize::WindowInfo> =
+                        wm.windows.iter().map(|w| {
+                            let t = alloc::str::from_utf8(&w.title[..w.title_len]).unwrap_or("?");
+                            let ll = w.lines.last().map(|l|
+                                alloc::str::from_utf8(&l.buf[..l.len]).unwrap_or("")
+                            ).unwrap_or("");
+                            compositor::ui_serialize::WindowInfo {
+                                id: w.id, z_index: 0,
+                                title: alloc::string::String::from(t),
+                                x: w.x as u32, y: w.y as u32,
+                                w: w.width, h: w.height,
+                                visible_text: alloc::string::String::from(ll),
+                            }
+                        }).collect();
+                    compositor::ui_serialize::serialize_ui_state(
+                        fb.width as u32, fb.height as u32, &ui_wins, "",
+                    )
+                };
+
+                let mut deferred_intent_action: Option<(u32, u32, u32, u32)> = None;
                 if let Some(win) = wm.get_window_mut(win_id) {
                     // Execute the command and populate the window
                     win.push_line("> ");  // we'll append cmd below
@@ -2335,7 +2395,7 @@ fn main() -> ! {
                             }
                         }
                     } else if cmd_str.starts_with("gemini ") {
-                        // Direct Gemini cloud API query — bypasses local AI
+                        // Agentic AI: serialize UI state → send to proxy → parse intent → execute
                         let prompt = cmd_str[7..].trim();
                         write_str("[COMPOSITOR] gemini command: ");
                         write_str(prompt);
@@ -2344,19 +2404,62 @@ fn main() -> ! {
                             win.push_line("Usage: gemini <prompt>");
                         } else {
                             win.push_line(&alloc::format!("> gemini {}", &prompt[..prompt.len().min(60)]));
-                            win.push_line("[cloud] Contacting Gemini...");
 
-                            // Use heap-allocated Vec instead of mmap (simpler, no syscall needed)
-                            let mut gemini_buf = alloc::vec![0u8; 16384]; // 16KB buffer
+                            // Step 1+2: Build augmented prompt with pre-computed UI state
+                            let full_prompt = alloc::format!(
+                                "You are Folkering OS AI assistant. Current screen state:\n{}\nUser command: {}\n\nRespond with either plain text OR a JSON action:\n{{\"action\": \"move_window\", \"window_id\": N, \"x\": N, \"y\": N}}\n{{\"action\": \"close_window\", \"window_id\": N}}\n{{\"action\": \"generate_tool\", \"prompt\": \"...\"}}\nIf no action needed, respond with plain helpful text.",
+                                ui_state_snapshot, prompt
+                            );
 
-                            let response_len = libfolk::sys::ask_gemini(prompt, &mut gemini_buf);
+                            win.push_line("[cloud] Sending with UI context...");
+
+                            // Step 3: Call Gemini proxy
+                            let mut gemini_buf = alloc::vec![0u8; 16384];
+                            let response_len = libfolk::sys::ask_gemini(&full_prompt, &mut gemini_buf);
 
                             if response_len > 0 {
-                                if let Ok(text) = core::str::from_utf8(&gemini_buf[..response_len]) {
-                                    win.push_line("[Gemini]:");
-                                    for line in text.split('\n') {
-                                        if !line.is_empty() {
-                                            win.push_line(line);
+                                if let Ok(text) = alloc::str::from_utf8(&gemini_buf[..response_len]) {
+                                    // Step 4: Parse intent and display result
+                                    use compositor::intent::AgentIntent;
+                                    let intent = compositor::intent::parse_intent(text);
+                                    write_str("[COMPOSITOR] Intent parsed\n");
+
+                                    match intent {
+                                        AgentIntent::MoveWindow { window_id, x, y } => {
+                                            win.push_line(&alloc::format!(
+                                                "[AI] Moving window {} to ({},{})", window_id, x, y
+                                            ));
+                                            // Deferred: execute after dropping win
+                                            deferred_intent_action = Some((1, window_id, x, y));
+                                        }
+                                        AgentIntent::CloseWindow { window_id } => {
+                                            win.push_line(&alloc::format!("[AI] Closing window {}", window_id));
+                                            deferred_intent_action = Some((2, window_id, 0, 0));
+                                        }
+                                        AgentIntent::ResizeWindow { window_id, w, h } => {
+                                            win.push_line(&alloc::format!(
+                                                "[AI] Resizing window {} to {}x{}", window_id, w, h
+                                            ));
+                                            deferred_intent_action = Some((3, window_id, w, h));
+                                        }
+                                        AgentIntent::GenerateTool { prompt: tp } => {
+                                            win.push_line(&alloc::format!(
+                                                "[AI] Tool: {}", &tp[..tp.len().min(60)]
+                                            ));
+                                        }
+                                        AgentIntent::TextResponse { text: resp } => {
+                                            win.push_line("[Gemini]:");
+                                            for line in resp.split('\n') {
+                                                if !line.is_empty() {
+                                                    win.push_line(line);
+                                                }
+                                            }
+                                        }
+                                        AgentIntent::Error { message } => {
+                                            win.push_line(&alloc::format!("[AI Error] {}", message));
+                                        }
+                                        _ => {
+                                            win.push_line("[AI] Unhandled intent");
                                         }
                                     }
                                 } else {
@@ -2371,6 +2474,30 @@ fn main() -> ! {
                     }
                     if !win.interactive {
                         win.push_line("---");
+                    }
+                }
+                // Execute deferred AI intent actions (after win borrow is dropped)
+                if let Some((action, wid, a1, a2)) = deferred_intent_action {
+                    match action {
+                        1 => { // MoveWindow
+                            if let Some(w) = wm.get_window_mut(wid) {
+                                w.x = a1 as i32;
+                                w.y = a2 as i32;
+                            }
+                            damage.damage_full();
+                        }
+                        2 => { // CloseWindow
+                            wm.close_window(wid);
+                            damage.damage_full();
+                        }
+                        3 => { // ResizeWindow
+                            if let Some(w) = wm.get_window_mut(wid) {
+                                w.width = a1;
+                                w.height = a2;
+                            }
+                            damage.damage_full();
+                        }
+                        _ => {}
                     }
                 }
                 } // end if deferred_app_handle == 0
@@ -3274,9 +3401,14 @@ fn main() -> ! {
             }
         }
 
-        // Flush GPU framebuffer if using VirtIO-GPU
-        if use_gpu {
-            libfolk::sys::gpu_flush(0, 0, fb.width as u32, fb.height as u32);
+        // Flush only dirty regions to VirtIO-GPU (or mark frame complete)
+        if use_gpu && damage.has_damage() {
+            for rect in damage.regions() {
+                libfolk::sys::gpu_flush(rect.x, rect.y, rect.w, rect.h);
+            }
+            damage.clear();
+        } else {
+            damage.clear();
         }
 
         // Only yield CPU if we did no work this iteration (ULTRA 46)
