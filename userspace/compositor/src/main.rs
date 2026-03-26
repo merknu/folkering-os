@@ -743,6 +743,10 @@ fn main() -> ! {
     // Phase 2: Persistent interactive WASM app (game loop)
     let mut active_wasm_app: Option<compositor::wasm_runtime::PersistentWasmApp> = None;
 
+    // App Persistence: cache last compiled WASM for save/run
+    let mut last_wasm_bytes: Option<alloc::vec::Vec<u8>> = None;
+    let mut last_wasm_interactive: bool = false;
+
     // ===== NEURAL DESKTOP =====
     // AI-native interface with Omnibar at center
     let folk_blue = fb.color_from_rgb24(colors::FOLK_BLUE);
@@ -1101,6 +1105,9 @@ fn main() -> ! {
                                 write_str(nstr);
                                 write_str(" bytes, executing...\n");
 
+                                // Cache WASM bytes for "save app" command
+                                last_wasm_bytes = Some(wasm_bytes.clone());
+
                                 let config = compositor::wasm_runtime::WasmConfig {
                                     screen_width: fb.width as u32,
                                     screen_height: fb.height as u32,
@@ -1115,6 +1122,8 @@ fn main() -> ! {
                                         || find_ci(p, b"mouse") || find_ci(p, b"tetris")
                                         || find_ci(p, b"follow") || find_ci(p, b"cursor")
                                 };
+
+                                last_wasm_interactive = interactive;
 
                                 if interactive {
                                     // Launch as persistent app (game loop)
@@ -2722,6 +2731,85 @@ fn main() -> ! {
                                 }
                             }
                         }
+                    } else if starts_with_ci(cmd_str, "save app ") {
+                        // App Persistence: save last compiled WASM to VFS
+                        let app_name = cmd_str[9..].trim();
+                        if app_name.is_empty() {
+                            win.push_line("Usage: save app <name>");
+                        } else if let Some(ref wasm) = last_wasm_bytes {
+                            let filename = alloc::format!("{}.wasm", app_name);
+                            match libfolk::sys::synapse::write_file(&filename, wasm) {
+                                Ok(()) => {
+                                    win.push_line(&alloc::format!(
+                                        "[OS] Saved '{}' ({} bytes, {})",
+                                        app_name, wasm.len(),
+                                        if last_wasm_interactive { "interactive" } else { "one-shot" }
+                                    ));
+                                    write_str("[COMPOSITOR] App saved to VFS: ");
+                                    write_str(&filename);
+                                    write_str("\n");
+                                }
+                                Err(_) => {
+                                    win.push_line("[OS] Save failed — VFS write error");
+                                }
+                            }
+                        } else {
+                            win.push_line("[OS] No app to save. Run 'gemini ...' first.");
+                        }
+                    } else if starts_with_ci(cmd_str, "run ") {
+                        // App Persistence: load and execute saved WASM from VFS
+                        let app_name = cmd_str[4..].trim();
+                        if app_name.is_empty() {
+                            win.push_line("Usage: run <name>");
+                        } else {
+                            let filename = if app_name.ends_with(".wasm") {
+                                alloc::string::String::from(app_name)
+                            } else {
+                                alloc::format!("{}.wasm", app_name)
+                            };
+                            win.push_line(&alloc::format!("[OS] Loading {}...", filename));
+
+                            // Read WASM from Synapse VFS via shmem
+                            const VFS_READ_VADDR: usize = 0x50040000;
+                            match libfolk::sys::synapse::read_file_shmem(&filename) {
+                                Ok(resp) => {
+                                    if shmem_map(resp.shmem_handle, VFS_READ_VADDR).is_ok() {
+                                        let data = unsafe {
+                                            core::slice::from_raw_parts(VFS_READ_VADDR as *const u8, resp.size as usize)
+                                        };
+                                        let wasm_bytes = alloc::vec::Vec::from(data);
+                                        let _ = shmem_unmap(resp.shmem_handle, VFS_READ_VADDR);
+                                        let _ = shmem_destroy(resp.shmem_handle);
+
+                                        win.push_line(&alloc::format!("[OS] Loaded {} bytes", wasm_bytes.len()));
+
+                                        let config = compositor::wasm_runtime::WasmConfig {
+                                            screen_width: fb.width as u32,
+                                            screen_height: fb.height as u32,
+                                            uptime_ms: libfolk::sys::uptime() as u32,
+                                        };
+
+                                        match compositor::wasm_runtime::PersistentWasmApp::new(&wasm_bytes, config) {
+                                            Ok(app) => {
+                                                win.push_line("[OS] App launched! Press ESC to exit.");
+                                                active_wasm_app = Some(app);
+                                                last_wasm_bytes = Some(wasm_bytes);
+                                                last_wasm_interactive = true;
+                                            }
+                                            Err(e) => {
+                                                win.push_line(&alloc::format!("[OS] Load error: {}", &e[..e.len().min(60)]));
+                                            }
+                                        }
+                                    } else {
+                                        let _ = shmem_destroy(resp.shmem_handle);
+                                        win.push_line("[OS] Failed to map file data");
+                                    }
+                                }
+                                Err(_) => {
+                                    win.push_line(&alloc::format!("[OS] App '{}' not found", app_name));
+                                }
+                            }
+                        }
                     } else if cmd_str.starts_with("gemini ") {
                         // Agentic AI: serialize UI state → send to proxy → parse intent → execute
                         let prompt = cmd_str[7..].trim();
@@ -3408,6 +3496,51 @@ fn main() -> ! {
                 wm.composite(&mut fb);
             }
 
+            // ===== WASM App Rendering (ON TOP of windows, below cursor) =====
+            if let Some(app) = &mut active_wasm_app {
+                if app.active {
+                    let config = compositor::wasm_runtime::WasmConfig {
+                        screen_width: fb.width as u32,
+                        screen_height: fb.height as u32,
+                        uptime_ms: libfolk::sys::uptime() as u32,
+                    };
+                    let (result, output) = app.run_frame(config);
+
+                    match &result {
+                        compositor::wasm_runtime::WasmResult::OutOfFuel => {
+                            app.active = false;
+                            write_str("[WASM APP] Halted: fuel exhausted\n");
+                        }
+                        compositor::wasm_runtime::WasmResult::Trap(msg) => {
+                            app.active = false;
+                            write_str("[WASM APP] Trap: ");
+                            write_str(&msg[..msg.len().min(80)]);
+                            write_str("\n");
+                        }
+                        _ => {}
+                    }
+
+                    if let Some(color) = output.fill_screen {
+                        fb.clear(fb.color_from_rgb24(color));
+                    }
+                    for cmd in &output.draw_commands {
+                        fb.fill_rect(cmd.x as usize, cmd.y as usize, cmd.w as usize, cmd.h as usize, fb.color_from_rgb24(cmd.color));
+                    }
+                    for cmd in &output.line_commands {
+                        let c = fb.color_from_rgb24(cmd.color);
+                        compositor::graphics::draw_line(&mut fb, cmd.x1, cmd.y1, cmd.x2, cmd.y2, c);
+                    }
+                    for cmd in &output.circle_commands {
+                        let c = fb.color_from_rgb24(cmd.color);
+                        compositor::graphics::draw_circle(&mut fb, cmd.cx, cmd.cy, cmd.r, c);
+                    }
+                    for cmd in &output.text_commands {
+                        fb.draw_string(cmd.x as usize, cmd.y as usize, &cmd.text, fb.color_from_rgb24(cmd.color), fb.color_from_rgb24(0));
+                    }
+                    did_work = true;
+                }
+            }
+
             // ===== Alt+Tab HUD overlay =====
             if hud_show_until > 0 && hud_title_len > 0 {
                 let hud_text = unsafe { core::str::from_utf8_unchecked(&hud_title[..hud_title_len]) };
@@ -3742,60 +3875,6 @@ fn main() -> ! {
                     }
                 }
                 need_redraw = true;
-            }
-        }
-
-        // ===== WASM App Game Loop (Phase 2) — execute every frame =====
-        if let Some(app) = &mut active_wasm_app {
-            if app.active {
-                let config = compositor::wasm_runtime::WasmConfig {
-                    screen_width: fb.width as u32,
-                    screen_height: fb.height as u32,
-                    uptime_ms: libfolk::sys::uptime() as u32,
-                };
-                let (result, output) = app.run_frame(config);
-
-                // Check for errors
-                match &result {
-                    compositor::wasm_runtime::WasmResult::OutOfFuel => {
-                        app.active = false;
-                        write_str("[WASM APP] Halted: fuel exhausted\n");
-                    }
-                    compositor::wasm_runtime::WasmResult::Trap(msg) => {
-                        app.active = false;
-                        write_str("[WASM APP] Trap: ");
-                        write_str(&msg[..msg.len().min(80)]);
-                        write_str("\n");
-                    }
-                    _ => {}
-                }
-
-                // Render WASM output (fill → rects → lines → circles → text)
-                if let Some(color) = output.fill_screen {
-                    let c = fb.color_from_rgb24(color);
-                    fb.clear(c);
-                }
-                for cmd in &output.draw_commands {
-                    let color = fb.color_from_rgb24(cmd.color);
-                    fb.fill_rect(cmd.x as usize, cmd.y as usize, cmd.w as usize, cmd.h as usize, color);
-                }
-                for cmd in &output.line_commands {
-                    let color = fb.color_from_rgb24(cmd.color);
-                    compositor::graphics::draw_line(&mut fb, cmd.x1, cmd.y1, cmd.x2, cmd.y2, color);
-                }
-                for cmd in &output.circle_commands {
-                    let color = fb.color_from_rgb24(cmd.color);
-                    compositor::graphics::draw_circle(&mut fb, cmd.cx, cmd.cy, cmd.r, color);
-                }
-                for cmd in &output.text_commands {
-                    let color = fb.color_from_rgb24(cmd.color);
-                    let bg = fb.color_from_rgb24(0x000000);
-                    fb.draw_string(cmd.x as usize, cmd.y as usize, &cmd.text, color, bg);
-                }
-
-                need_redraw = true;
-                did_work = true;
-                damage.damage_full();
             }
         }
 
