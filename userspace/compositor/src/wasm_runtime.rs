@@ -10,7 +10,7 @@
 //! - `folk_draw_line(x1, y1, x2, y2, color)` — Bresenham line
 //! - `folk_draw_circle(cx, cy, r, color)` — midpoint circle
 //! - `folk_fill_screen(color)` — fill entire framebuffer
-//! - `folk_get_time() -> i64` — uptime in milliseconds
+//! - `folk_get_time() -> i32` — uptime in milliseconds
 //! - `folk_screen_width() -> i32` — framebuffer width
 //! - `folk_screen_height() -> i32` — framebuffer height
 //! - `folk_random() -> i32` — hardware random (RDRAND)
@@ -201,10 +201,12 @@ pub fn execute_wasm(
         },
     );
 
-    // FIXED: return actual uptime (was dummy 0). i64 for large uptimes.
+    // FIXED: return actual uptime (was dummy 0).
+    // Use i32 for maximum compatibility — LLMs often generate i32 extern declarations.
+    // Uptime wraps at ~24 days which is acceptable for WASM tool execution.
     let _ = linker.func_wrap("env", "folk_get_time",
-        |caller: Caller<HostState>| -> i64 {
-            caller.data().config.uptime_ms as i64
+        |caller: Caller<HostState>| -> i32 {
+            caller.data().config.uptime_ms as i32
         },
     );
 

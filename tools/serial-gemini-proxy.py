@@ -25,7 +25,7 @@ API_KEY = "***REDACTED***"
 # Model selection: lite for simple/fast queries, flash for complex tasks
 GEMINI_LITE = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite-preview:generateContent?key={API_KEY}"
 GEMINI_FLASH = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key={API_KEY}"
-GEMINI_URL = GEMINI_FLASH  # Default to Gemini 3 Flash
+GEMINI_URL = GEMINI_LITE  # Use Lite to avoid 429 rate limits on Flash
 COM2_HOST = "127.0.0.1"
 COM2_PORT = 4567
 
@@ -63,7 +63,7 @@ fn folk_draw_text(x: i32, y: i32, ptr: i32, len: i32, color: i32);  // text (ptr
 fn folk_fill_screen(color: i32);  // fill entire framebuffer with solid color
 
 === System Metrics ===
-fn folk_get_time() -> i64;       // uptime in milliseconds (i64!)
+fn folk_get_time() -> i32;       // uptime in milliseconds
 fn folk_screen_width() -> i32;   // screen width in pixels (use for self-scaling UI!)
 fn folk_screen_height() -> i32;  // screen height in pixels
 fn folk_random() -> i32;         // hardware random number (RDRAND)
