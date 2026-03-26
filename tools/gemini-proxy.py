@@ -173,9 +173,28 @@ Output ONLY the Rust code, no explanation."""
         pass  # Suppress default logging
 
 
+import threading
+
+class ThreadedHTTPServer(http.server.HTTPServer):
+    """Handle each request in a new thread to prevent guestfwd blocking."""
+    def process_request(self, request, client_address):
+        thread = threading.Thread(target=self.process_request_thread,
+                                  args=(request, client_address))
+        thread.daemon = True
+        thread.start()
+
+    def process_request_thread(self, request, client_address):
+        try:
+            self.finish_request(request, client_address)
+        except Exception:
+            self.handle_error(request, client_address)
+        finally:
+            self.shutdown_request(request)
+
+
 if __name__ == "__main__":
-    server = http.server.HTTPServer(("0.0.0.0", PORT), GeminiHandler)
-    print(f"[PROXY] Gemini proxy listening on 0.0.0.0:{PORT}")
+    server = ThreadedHTTPServer(("0.0.0.0", PORT), GeminiHandler)
+    print(f"[PROXY] Gemini proxy listening on 0.0.0.0:{PORT} (threaded)")
     print(f"[PROXY] From QEMU guest: http://10.0.2.2:{PORT}/generate")
     try:
         server.serve_forever()

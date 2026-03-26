@@ -28,8 +28,14 @@ const MAX_RESPONSE: usize = 131072;
 /// 3. Makes an HTTPS POST with TLS 1.3
 /// 4. Parses the response JSON to extract the generated text
 /// 5. Returns unescaped text ready for display
-/// Host proxy IP: 10.0.2.100 via QEMU guestfwd → host localhost:8080
-const PROXY_IP: [u8; 4] = [10, 0, 2, 100];
+/// Brief yield — let scheduler run other tasks + let VirtIO-net process DMA
+fn libfolk_yield() {
+    // Small spin to give VirtIO-net time to process TX/RX DMA descriptors
+    for _ in 0..5000 { core::hint::spin_loop(); }
+}
+
+/// Host proxy IP: 10.0.2.2 = QEMU SLIRP host gateway (direct, no guestfwd)
+const PROXY_IP: [u8; 4] = [10, 0, 2, 2];
 const PROXY_PORT: u16 = 8080;
 
 pub fn ask_gemini(prompt: &str) -> Result<Vec<u8>, &'static str> {
@@ -138,86 +144,97 @@ fn http_post_raw(ip: [u8; 4], port: u16, request: &[u8]) -> Result<Vec<u8>, &'st
 
     crate::serial_str!("[GEMINI] Proxy TCP connected\n");
 
-    // Send request with interleaved polling (smoltcp needs poll to actually TX)
-    let mut sent = 0;
-    while sent < request.len() {
-        {
-            let socket = state.sockets.get_mut::<tcp::Socket>(tcp_handle);
-            if socket.can_send() {
-                match socket.send_slice(&request[sent..]) {
-                    Ok(n) => sent += n,
-                    Err(_) => break,
-                }
-            }
-        }
-        // Poll to push TX data to wire
-        let now = Instant::from_millis(tls::tsc_ms());
-        let mut device = FolkeringDevice;
-        state.iface.poll(now, &mut device, &mut state.sockets);
-        for _ in 0..500 { core::hint::spin_loop(); }
-    }
+    // === UNIFIED SEND + FLUSH + READ STATE MACHINE ===
+    // smoltcp is async: send_slice() buffers data, poll() pushes it to VirtIO-net.
+    // We MUST poll repeatedly until the TX buffer is drained AND ACKed,
+    // then continue polling to receive the response.
 
-    crate::serial_str!("[GEMINI] TCP sent ");
-    crate::drivers::serial::write_dec(sent as u32);
-    crate::serial_str!(" bytes\n");
-
-    // Extra polls to ensure all segments are transmitted
-    for _ in 0..200 {
-        let now = Instant::from_millis(tls::tsc_ms());
-        let mut device = FolkeringDevice;
-        state.iface.poll(now, &mut device, &mut state.sockets);
-        for _ in 0..1000 { core::hint::spin_loop(); }
-    }
-
-    crate::serial_str!("[GEMINI] TX flushed, reading response...\n");
-
-    // Read response with aggressive polling
+    let mut sent = 0usize;
     let mut response = Vec::new();
-    let read_start = tls::tsc_ms();
-    let mut poll_count = 0u32;
+    let start = tls::tsc_ms();
+    let mut phase = 0u8; // 0=sending, 1=flushing, 2=receiving
+
     loop {
+        // === POLL THE NETWORK STACK ===
+        // This is the critical call that drives VirtIO-net TX/RX
         let now = Instant::from_millis(tls::tsc_ms());
         let mut device = FolkeringDevice;
         state.iface.poll(now, &mut device, &mut state.sockets);
-        poll_count += 1;
 
-        // Log progress every 1000 polls
-        if poll_count % 5000 == 0 {
-            let socket = state.sockets.get_mut::<tcp::Socket>(tcp_handle);
-            crate::serial_str!("[GEMINI] Poll ");
-            crate::drivers::serial::write_dec(poll_count);
-            crate::serial_str!(" active=");
-            crate::drivers::serial::write_dec(if socket.is_active() { 1 } else { 0 });
-            crate::serial_str!(" can_recv=");
-            crate::drivers::serial::write_dec(if socket.can_recv() { 1 } else { 0 });
-            crate::serial_str!(" recv_q=");
-            crate::drivers::serial::write_dec(socket.recv_queue() as u32);
-            crate::drivers::serial::write_newline();
-        }
+        // Brief yield to let VirtIO-net process DMA + let other tasks run
+        libfolk_yield();
+
+        // Poll again immediately to process any response to our TX
+        let now2 = Instant::from_millis(tls::tsc_ms());
+        state.iface.poll(now2, &mut device, &mut state.sockets);
 
         let socket = state.sockets.get_mut::<tcp::Socket>(tcp_handle);
-        if socket.can_recv() {
-            let mut buf = [0u8; 4096];
-            match socket.recv_slice(&mut buf) {
-                Ok(n) if n > 0 => {
-                    response.extend_from_slice(&buf[..n]);
-                    if response.len() > 65536 { break; }
+
+        match phase {
+            0 => {
+                // PHASE 0: SENDING — enqueue request bytes into smoltcp TX buffer
+                if sent < request.len() && socket.can_send() {
+                    match socket.send_slice(&request[sent..]) {
+                        Ok(n) => sent += n,
+                        Err(_) => {
+                            state.sockets.remove(tcp_handle);
+                            return Err("TCP send error");
+                        }
+                    }
                 }
-                _ => {}
+                if sent >= request.len() {
+                    crate::serial_str!("[GEMINI] Enqueued ");
+                    crate::drivers::serial::write_dec(sent as u32);
+                    crate::serial_str!(" bytes, flushing TX...\n");
+                    phase = 1;
+                }
             }
+            1 => {
+                // PHASE 1: FLUSHING — poll until TX buffer is drained to wire
+                let send_q = socket.send_queue();
+                if send_q == 0 {
+                    crate::serial_str!("[GEMINI] TX buffer drained! Waiting for response...\n");
+                    phase = 2;
+                }
+            }
+            2 => {
+                // PHASE 2: RECEIVING — read response bytes as they arrive
+                if socket.can_recv() {
+                    let mut buf = [0u8; 4096];
+                    match socket.recv_slice(&mut buf) {
+                        Ok(n) if n > 0 => {
+                            crate::serial_str!("[GEMINI] RX ");
+                            crate::drivers::serial::write_dec(n as u32);
+                            crate::serial_str!(" bytes (total ");
+                            crate::drivers::serial::write_dec((response.len() + n) as u32);
+                            crate::serial_str!(")\n");
+                            response.extend_from_slice(&buf[..n]);
+                            if response.len() > 65536 { break; }
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Server closed connection → we have the full response
+                if !socket.is_active() && !response.is_empty() {
+                    crate::serial_str!("[GEMINI] Connection closed, got ");
+                    crate::drivers::serial::write_dec(response.len() as u32);
+                    crate::serial_str!(" bytes total\n");
+                    break;
+                }
+            }
+            _ => break,
         }
 
-        // Check for connection close (server sent all data)
-        if !socket.is_active() && response.len() > 0 { break; }
-
-        // Timeout
-        if tls::tsc_ms() - read_start > 30_000 {
-            if response.len() > 0 { break; } // Got some data, use it
+        // Timeout: 60s total (Gemini can take 5-10s to respond)
+        if tls::tsc_ms() - start > 60_000 {
+            if !response.is_empty() { break; }
+            crate::serial_str!("[GEMINI] TIMEOUT after 60s, phase=");
+            crate::drivers::serial::write_dec(phase as u32);
+            crate::drivers::serial::write_newline();
             state.sockets.remove(tcp_handle);
-            return Err("read timeout");
+            return Err("proxy timeout");
         }
-
-        for _ in 0..500 { core::hint::spin_loop(); }
     }
 
     state.sockets.remove(tcp_handle);
