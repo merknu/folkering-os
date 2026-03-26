@@ -40,6 +40,11 @@ boot/*-test.txt
 boot/working-*.txt
 boot/phase*.txt
 
+# Secrets — NEVER commit API keys
+.env
+*.env
+api_keys.txt
+
 # Python
 __pycache__/
 *.pyc
@@ -50,3 +55,15 @@ __pycache__/
 
 # Windows reserved names
 nul
+
+# Claude Code context (local only)
+_claude_context.md
+active_debug_log.md
+
+# Test databases
+*.db
+!boot/files.db
+
+# Model files (download on demand, too large for git)
+boot/models/
+*.gguf

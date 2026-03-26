@@ -11,8 +11,9 @@ use alloc::vec::Vec;
 use super::json;
 use super::tls;
 
-/// Gemini API key — replace with your actual key
-const API_KEY: &str = "AIzaSyBTJNGrHPMvPn31zLsOOhXUhi35AH5OdTA";
+/// Gemini API key — UNUSED in COM2 serial mode (proxy handles auth).
+/// Only needed if using direct HTTPS (legacy path). Set via .env file in tools/.
+const API_KEY: &str = "";
 
 /// Gemini API host
 const GEMINI_HOST: &str = "generativelanguage.googleapis.com";
