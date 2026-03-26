@@ -23,7 +23,17 @@ PORT = 8080  # Default; override with command line arg
 class GeminiHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         content_length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(content_length)
+        print(f"[PROXY] Receiving {content_length} bytes from {self.client_address}...")
+        self.connection.settimeout(30)  # 30s timeout on read
+        try:
+            body = self.rfile.read(content_length)
+        except Exception as e:
+            print(f"[PROXY] Read error: {e}")
+            self.send_response(500)
+            self.end_headers()
+            self.wfile.write(b"Read timeout")
+            return
+        print(f"[PROXY] Received {len(body)} bytes")
 
         try:
             data = json.loads(body)
