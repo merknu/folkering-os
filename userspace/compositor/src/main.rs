@@ -86,6 +86,21 @@ fn format_arena_line<'a>(buf: &'a mut [u8; 32], kb: usize) -> &'a str {
     unsafe { core::str::from_utf8_unchecked(&buf[..end + 2]) }
 }
 
+/// Case-insensitive substring search in byte slices
+fn find_ci(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.len() > haystack.len() { return false; }
+    for i in 0..=(haystack.len() - needle.len()) {
+        let mut ok = true;
+        for j in 0..needle.len() {
+            let a = if haystack[i + j] >= b'A' && haystack[i + j] <= b'Z' { haystack[i + j] + 32 } else { haystack[i + j] };
+            let b = if needle[j] >= b'A' && needle[j] <= b'Z' { needle[j] + 32 } else { needle[j] };
+            if a != b { ok = false; break; }
+        }
+        if ok { return true; }
+    }
+    false
+}
+
 fn starts_with_ci(haystack: &str, needle: &str) -> bool {
     if haystack.len() < needle.len() { return false; }
     for (a, b) in haystack.bytes().zip(needle.bytes()) {
@@ -405,50 +420,173 @@ fn format_uptime(ms: u64, buf: &mut [u8; 32]) -> &str {
 }
 
 // ============================================================================
-// Simple Bump Allocator for userspace
+// Free-List Allocator for userspace (supports dealloc!)
 // ============================================================================
+//
+// Replaces the bump allocator that never freed memory. wasmi allocates ~500KB
+// per WASM execution and frees it after — without dealloc the heap exhausts
+// after 2-3 runs. This linked-list allocator recycles freed blocks.
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 
-/// Simple bump allocator for userspace tasks.
-/// Allocates from a fixed-size heap, never deallocates (sufficient for Phase 6).
-struct BumpAllocator {
-    heap: UnsafeCell<[u8; HEAP_SIZE]>,
-    next: UnsafeCell<usize>,
+const HEAP_SIZE: usize = 4 * 1024 * 1024; // 4MB heap (wasmi + persistent apps need room for fragmentation)
+
+/// Minimum block size (header + usable). Must fit a FreeNode.
+const MIN_BLOCK: usize = 32;
+
+/// Header stored before every allocated block
+#[repr(C)]
+struct BlockHeader {
+    size: usize,  // Total size including header, aligned
+    _pad: usize,  // Alignment padding to 16 bytes
 }
 
-const HEAP_SIZE: usize = 64 * 1024; // 64KB heap
+const HEADER_SIZE: usize = core::mem::size_of::<BlockHeader>();
 
-unsafe impl Sync for BumpAllocator {}
+/// Node in the free list (stored inside free blocks)
+#[repr(C)]
+struct FreeNode {
+    size: usize,
+    next: *mut FreeNode,
+}
 
-unsafe impl GlobalAlloc for BumpAllocator {
+struct FreeListAllocator {
+    heap: UnsafeCell<[u8; HEAP_SIZE]>,
+    free_head: UnsafeCell<*mut FreeNode>,
+    initialized: UnsafeCell<bool>,
+}
+
+unsafe impl Sync for FreeListAllocator {}
+
+impl FreeListAllocator {
+    /// Initialize the free list with the entire heap as one free block
+    unsafe fn init(&self) {
+        let heap_ptr = (*self.heap.get()).as_mut_ptr();
+        let node = heap_ptr as *mut FreeNode;
+        (*node).size = HEAP_SIZE;
+        (*node).next = core::ptr::null_mut();
+        *self.free_head.get() = node;
+        *self.initialized.get() = true;
+    }
+}
+
+unsafe impl GlobalAlloc for FreeListAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let next = &mut *self.next.get();
-        let heap = &mut *self.heap.get();
-
-        // Align up
-        let align = layout.align();
-        let aligned_next = (*next + align - 1) & !(align - 1);
-
-        let new_next = aligned_next + layout.size();
-        if new_next > HEAP_SIZE {
-            core::ptr::null_mut() // Out of memory
-        } else {
-            *next = new_next;
-            heap.as_mut_ptr().add(aligned_next)
+        if !*self.initialized.get() {
+            self.init();
         }
+
+        // Required size: header + payload, aligned up
+        let align = layout.align().max(16); // Minimum 16-byte alignment
+        let payload_size = layout.size();
+        let total_size = ((HEADER_SIZE + payload_size + align - 1) & !(align - 1)).max(MIN_BLOCK);
+
+        // First-fit search through free list
+        let mut prev: *mut FreeNode = core::ptr::null_mut();
+        let mut current = *self.free_head.get();
+
+        while !current.is_null() {
+            let block_size = (*current).size;
+
+            if block_size >= total_size {
+                // Found a suitable block
+                let remaining = block_size - total_size;
+
+                if remaining >= MIN_BLOCK {
+                    // Split: create new free node after our allocation
+                    let new_free = (current as *mut u8).add(total_size) as *mut FreeNode;
+                    (*new_free).size = remaining;
+                    (*new_free).next = (*current).next;
+
+                    // Update links
+                    if prev.is_null() {
+                        *self.free_head.get() = new_free;
+                    } else {
+                        (*prev).next = new_free;
+                    }
+                } else {
+                    // Use entire block (no split, avoid tiny fragments)
+                    let actual_size = block_size; // Use full block
+                    if prev.is_null() {
+                        *self.free_head.get() = (*current).next;
+                    } else {
+                        (*prev).next = (*current).next;
+                    }
+                    // Store actual block size in header
+                    let header = current as *mut BlockHeader;
+                    (*header).size = actual_size;
+                    return (header as *mut u8).add(HEADER_SIZE);
+                }
+
+                // Store header
+                let header = current as *mut BlockHeader;
+                (*header).size = total_size;
+                return (header as *mut u8).add(HEADER_SIZE);
+            }
+
+            prev = current;
+            current = (*current).next;
+        }
+
+        // Out of memory
+        core::ptr::null_mut()
     }
 
-    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
-        // Bump allocator doesn't deallocate
+    unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
+        if ptr.is_null() { return; }
+
+        // Recover header
+        let header = ptr.sub(HEADER_SIZE) as *mut BlockHeader;
+        let block_start = header as *mut u8;
+        let block_size = (*header).size;
+
+        // Insert into free list (sorted by address for coalescing)
+        let new_node = block_start as *mut FreeNode;
+        (*new_node).size = block_size;
+
+        let mut prev: *mut FreeNode = core::ptr::null_mut();
+        let mut current = *self.free_head.get();
+
+        // Find insertion point (sorted by address)
+        while !current.is_null() && (current as *mut u8) < block_start {
+            prev = current;
+            current = (*current).next;
+        }
+
+        (*new_node).next = current;
+
+        if prev.is_null() {
+            *self.free_head.get() = new_node;
+        } else {
+            (*prev).next = new_node;
+        }
+
+        // Coalesce with next block if adjacent
+        if !current.is_null() {
+            let new_end = (new_node as *mut u8).add((*new_node).size);
+            if new_end == current as *mut u8 {
+                (*new_node).size += (*current).size;
+                (*new_node).next = (*current).next;
+            }
+        }
+
+        // Coalesce with previous block if adjacent
+        if !prev.is_null() {
+            let prev_end = (prev as *mut u8).add((*prev).size);
+            if prev_end == new_node as *mut u8 {
+                (*prev).size += (*new_node).size;
+                (*prev).next = (*new_node).next;
+            }
+        }
     }
 }
 
 #[global_allocator]
-static ALLOCATOR: BumpAllocator = BumpAllocator {
+static ALLOCATOR: FreeListAllocator = FreeListAllocator {
     heap: UnsafeCell::new([0; HEAP_SIZE]),
-    next: UnsafeCell::new(0),
+    free_head: UnsafeCell::new(core::ptr::null_mut()),
+    initialized: UnsafeCell::new(false),
 };
 
 // IPC message types
@@ -596,6 +734,14 @@ fn main() -> ! {
     let mut com3_buf = [0u8; 512];
     let mut com3_len = 0usize;
     let mut com3_inject: Option<alloc::string::String> = None;
+
+    // WASM JIT Toolsmithing — deferred tool generation (2-frame pattern)
+    // Frame 1: show "[AI] Generating tool...", mark damage_full → renders + flushes
+    // Frame 2: make second ask_gemini call, decode WASM, execute, render results
+    let mut deferred_tool_gen: Option<(u32, alloc::string::String)> = None; // (win_id, prompt)
+
+    // Phase 2: Persistent interactive WASM app (game loop)
+    let mut active_wasm_app: Option<compositor::wasm_runtime::PersistentWasmApp> = None;
 
     // ===== NEURAL DESKTOP =====
     // AI-native interface with Omnibar at center
@@ -919,6 +1065,160 @@ fn main() -> ! {
         // Consolidated redraw flag — any subsystem can set this
         let mut need_redraw = false;
 
+        // ===== WASM JIT TOOLSMITHING — Deferred tool generation (Frame 2) =====
+        // Previous frame rendered "[AI] Generating tool..." and flushed to GPU.
+        // Now make the second ask_gemini call with [GENERATE_TOOL] prefix.
+        if let Some((tool_win_id, tool_prompt)) = deferred_tool_gen.take() {
+            did_work = true;
+            write_str("[COMPOSITOR] WASM tool generation starting...\n");
+
+            let tool_request = alloc::format!("[GENERATE_TOOL] {}", tool_prompt);
+            // 128KB via mmap (bump allocator is only 64KB, never frees)
+            const WASM_BUF_VADDR: usize = 0x50020000; // Must be >= 0x40000000 (MMAP_BASE)
+            const WASM_BUF_SIZE: usize = 131072;
+            let wasm_resp_len = if libfolk::sys::mmap_at(WASM_BUF_VADDR, WASM_BUF_SIZE, 3).is_ok() {
+                let wasm_buf = unsafe {
+                    core::slice::from_raw_parts_mut(WASM_BUF_VADDR as *mut u8, WASM_BUF_SIZE)
+                };
+                libfolk::sys::ask_gemini(&tool_request, wasm_buf)
+            } else { 0 };
+            let wasm_buf = unsafe {
+                core::slice::from_raw_parts(WASM_BUF_VADDR as *const u8, WASM_BUF_SIZE)
+            };
+
+            if wasm_resp_len > 0 {
+                if let Ok(text) = core::str::from_utf8(&wasm_buf[..wasm_resp_len]) {
+                    use compositor::intent::AgentIntent;
+                    let wasm_intent = compositor::intent::parse_intent(text);
+
+                    match wasm_intent {
+                        AgentIntent::ToolReady { binary_base64 } => {
+                            write_str("[COMPOSITOR] ToolReady received, decoding base64...\n");
+                            if let Some(wasm_bytes) = compositor::intent::base64_decode(&binary_base64) {
+                                let mut nbuf = [0u8; 16];
+                                let nstr = format_usize(wasm_bytes.len(), &mut nbuf);
+                                write_str("[COMPOSITOR] WASM decoded: ");
+                                write_str(nstr);
+                                write_str(" bytes, executing...\n");
+
+                                let config = compositor::wasm_runtime::WasmConfig {
+                                    screen_width: fb.width as u32,
+                                    screen_height: fb.height as u32,
+                                    uptime_ms: libfolk::sys::uptime() as u32,
+                                };
+
+                                // Detect interactive app (game/app/mouse keywords)
+                                let interactive = {
+                                    let p = tool_prompt.as_bytes();
+                                    find_ci(p, b"interactive") || find_ci(p, b"game")
+                                        || find_ci(p, b"app") || find_ci(p, b"click")
+                                        || find_ci(p, b"mouse") || find_ci(p, b"tetris")
+                                        || find_ci(p, b"follow") || find_ci(p, b"cursor")
+                                };
+
+                                if interactive {
+                                    // Launch as persistent app (game loop)
+                                    match compositor::wasm_runtime::PersistentWasmApp::new(&wasm_bytes, config) {
+                                        Ok(app) => {
+                                            write_str("[COMPOSITOR] Launched interactive WASM app!\n");
+                                            if let Some(win) = wm.get_window_mut(tool_win_id) {
+                                                win.push_line("[AI] Interactive app launched! Press ESC to exit.");
+                                            }
+                                            active_wasm_app = Some(app);
+                                        }
+                                        Err(e) => {
+                                            if let Some(win) = wm.get_window_mut(tool_win_id) {
+                                                win.push_line(&alloc::format!("[AI] App load error: {}", &e[..e.len().min(80)]));
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    // One-shot tool execution
+                                    let (result, output) =
+                                        compositor::wasm_runtime::execute_wasm(&wasm_bytes, config);
+
+                                    let total_cmds = output.draw_commands.len()
+                                        + output.line_commands.len()
+                                        + output.circle_commands.len()
+                                        + output.text_commands.len()
+                                        + if output.fill_screen.is_some() { 1 } else { 0 };
+                                    if let Some(win) = wm.get_window_mut(tool_win_id) {
+                                        match &result {
+                                            compositor::wasm_runtime::WasmResult::Ok => {
+                                                win.push_line(&alloc::format!("[AI] Tool executed: {} commands", total_cmds));
+                                            }
+                                            compositor::wasm_runtime::WasmResult::OutOfFuel => {
+                                                win.push_line("[AI] Tool halted: fuel exhausted");
+                                            }
+                                            compositor::wasm_runtime::WasmResult::Trap(msg) => {
+                                                win.push_line(&alloc::format!("[AI] Trap: {}", &msg[..msg.len().min(80)]));
+                                            }
+                                            compositor::wasm_runtime::WasmResult::LoadError(msg) => {
+                                                win.push_line(&alloc::format!("[AI] Load: {}", &msg[..msg.len().min(80)]));
+                                            }
+                                        }
+                                    }
+
+                                    // Render one-shot output
+                                    if let Some(color) = output.fill_screen {
+                                        fb.clear(fb.color_from_rgb24(color));
+                                    }
+                                    for cmd in &output.draw_commands {
+                                        fb.fill_rect(cmd.x as usize, cmd.y as usize, cmd.w as usize, cmd.h as usize, fb.color_from_rgb24(cmd.color));
+                                    }
+                                    for cmd in &output.line_commands {
+                                        let c = fb.color_from_rgb24(cmd.color);
+                                        compositor::graphics::draw_line(&mut fb, cmd.x1, cmd.y1, cmd.x2, cmd.y2, c);
+                                    }
+                                    for cmd in &output.circle_commands {
+                                        let c = fb.color_from_rgb24(cmd.color);
+                                        compositor::graphics::draw_circle(&mut fb, cmd.cx, cmd.cy, cmd.r, c);
+                                    }
+                                    for cmd in &output.text_commands {
+                                        fb.draw_string(cmd.x as usize, cmd.y as usize, &cmd.text, fb.color_from_rgb24(cmd.color), fb.color_from_rgb24(0));
+                                    }
+
+                                    if total_cmds > 0 { damage.damage_full(); }
+                                }
+                            } else {
+                                if let Some(win) = wm.get_window_mut(tool_win_id) {
+                                    win.push_line("[AI] Error: invalid base64 in WASM response");
+                                }
+                            }
+                        }
+                        AgentIntent::TextResponse { text: resp } => {
+                            // Proxy sent error as plain text (compile failure etc.)
+                            if let Some(win) = wm.get_window_mut(tool_win_id) {
+                                win.push_line("[AI Tool Error]:");
+                                for line in resp.split('\n') {
+                                    if !line.is_empty() {
+                                        win.push_line(&line[..line.len().min(100)]);
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            if let Some(win) = wm.get_window_mut(tool_win_id) {
+                                win.push_line("[AI] Unexpected response from tool pipeline");
+                            }
+                        }
+                    }
+                } else {
+                    if let Some(win) = wm.get_window_mut(tool_win_id) {
+                        win.push_line("[AI] Tool response not valid UTF-8");
+                    }
+                }
+            } else {
+                if let Some(win) = wm.get_window_mut(tool_win_id) {
+                    win.push_line("[AI] Error: no response from tool pipeline (timeout?)");
+                }
+            }
+            // Free mmap'd buffer
+            let _ = libfolk::sys::munmap(WASM_BUF_VADDR as *mut u8, WASM_BUF_SIZE);
+            need_redraw = true;
+            damage.damage_full();
+        }
+
         // ===== GOD MODE PIPE (COM3) — Poll for injected commands =====
         while let Some(byte) = libfolk::sys::com3_read() {
             if byte == b'\n' && com3_len > 0 {
@@ -966,6 +1266,21 @@ fn main() -> ! {
         }
 
         if had_mouse_events {
+            // Route mouse events to active WASM app (Phase 2)
+            if let Some(app) = &mut active_wasm_app {
+                let new_click = (latest_buttons & 1 != 0) && (last_buttons & 1 == 0);
+                // Always send mouse position
+                app.push_event(compositor::wasm_runtime::FolkEvent {
+                    event_type: 1, x: cursor_x, y: cursor_y, data: latest_buttons as i32,
+                });
+                // Send click event on button press edge
+                if new_click {
+                    app.push_event(compositor::wasm_runtime::FolkEvent {
+                        event_type: 2, x: cursor_x, y: cursor_y, data: 1,
+                    });
+                }
+            }
+
             // Sanity check cursor position
             if cursor_x < 0 || cursor_x >= fb.width as i32 || cursor_y < 0 || cursor_y >= fb.height as i32 {
                 cursor_x = (fb.width / 2) as i32;
@@ -1195,6 +1510,19 @@ fn main() -> ! {
         let mut win_execute_command: Option<u32> = None; // window id to execute from
         while let Some(key) = read_key() {
             did_work = true;
+
+            // Route to active WASM app (Phase 2) — ESC kills the app
+            if let Some(app) = &mut active_wasm_app {
+                if key == 0x1B { // ESC
+                    active_wasm_app = None;
+                    need_redraw = true;
+                    damage.damage_full();
+                    continue;
+                }
+                app.push_event(compositor::wasm_runtime::FolkEvent {
+                    event_type: 3, x: key as i32, y: 0, data: key as i32,
+                });
+            }
 
             // Arrow key codes from kernel keyboard driver
             const KEY_ARROW_LEFT: u8 = 0x82;
@@ -2413,9 +2741,19 @@ fn main() -> ! {
 
                             win.push_line("[cloud] Sending with UI context...");
 
-                            // Step 3: Call Gemini proxy
-                            let mut gemini_buf = alloc::vec![0u8; 16384];
-                            let response_len = libfolk::sys::ask_gemini(&full_prompt, &mut gemini_buf);
+                            // Step 3: Call Gemini proxy (128KB via mmap — bump allocator is only 64KB)
+                            const GEMINI_CMD_VADDR: usize = 0x50000000; // Must be >= 0x40000000 (MMAP_BASE)
+                            const GEMINI_CMD_SIZE: usize = 131072;
+                            let response_len = if libfolk::sys::mmap_at(GEMINI_CMD_VADDR, GEMINI_CMD_SIZE, 3).is_ok() {
+                                let gemini_buf = unsafe {
+                                    core::slice::from_raw_parts_mut(GEMINI_CMD_VADDR as *mut u8, GEMINI_CMD_SIZE)
+                                };
+                                let rlen = libfolk::sys::ask_gemini(&full_prompt, gemini_buf);
+                                rlen
+                            } else { 0 };
+                            let gemini_buf = unsafe {
+                                core::slice::from_raw_parts(GEMINI_CMD_VADDR as *const u8, GEMINI_CMD_SIZE)
+                            };
 
                             if response_len > 0 {
                                 if let Ok(text) = alloc::str::from_utf8(&gemini_buf[..response_len]) {
@@ -2444,8 +2782,12 @@ fn main() -> ! {
                                         }
                                         AgentIntent::GenerateTool { prompt: tp } => {
                                             win.push_line(&alloc::format!(
-                                                "[AI] Tool: {}", &tp[..tp.len().min(60)]
+                                                "[AI] Generating tool: {}...", &tp[..tp.len().min(50)]
                                             ));
+                                            // Deferred 2-frame: this frame renders the message,
+                                            // next frame executes the WASM pipeline
+                                            deferred_tool_gen = Some((win_id, tp));
+                                            damage.damage_full();
                                         }
                                         AgentIntent::TextResponse { text: resp } => {
                                             win.push_line("[Gemini]:");
@@ -2468,6 +2810,8 @@ fn main() -> ! {
                             } else {
                                 win.push_line("[cloud] Error: no response from Gemini API");
                             }
+                            // Free mmap'd buffer
+                            let _ = libfolk::sys::munmap(GEMINI_CMD_VADDR as *mut u8, GEMINI_CMD_SIZE);
                         }
                     } else {
                         win.push_line("Sent to shell...");
@@ -3398,6 +3742,60 @@ fn main() -> ! {
                     }
                 }
                 need_redraw = true;
+            }
+        }
+
+        // ===== WASM App Game Loop (Phase 2) — execute every frame =====
+        if let Some(app) = &mut active_wasm_app {
+            if app.active {
+                let config = compositor::wasm_runtime::WasmConfig {
+                    screen_width: fb.width as u32,
+                    screen_height: fb.height as u32,
+                    uptime_ms: libfolk::sys::uptime() as u32,
+                };
+                let (result, output) = app.run_frame(config);
+
+                // Check for errors
+                match &result {
+                    compositor::wasm_runtime::WasmResult::OutOfFuel => {
+                        app.active = false;
+                        write_str("[WASM APP] Halted: fuel exhausted\n");
+                    }
+                    compositor::wasm_runtime::WasmResult::Trap(msg) => {
+                        app.active = false;
+                        write_str("[WASM APP] Trap: ");
+                        write_str(&msg[..msg.len().min(80)]);
+                        write_str("\n");
+                    }
+                    _ => {}
+                }
+
+                // Render WASM output (fill → rects → lines → circles → text)
+                if let Some(color) = output.fill_screen {
+                    let c = fb.color_from_rgb24(color);
+                    fb.clear(c);
+                }
+                for cmd in &output.draw_commands {
+                    let color = fb.color_from_rgb24(cmd.color);
+                    fb.fill_rect(cmd.x as usize, cmd.y as usize, cmd.w as usize, cmd.h as usize, color);
+                }
+                for cmd in &output.line_commands {
+                    let color = fb.color_from_rgb24(cmd.color);
+                    compositor::graphics::draw_line(&mut fb, cmd.x1, cmd.y1, cmd.x2, cmd.y2, color);
+                }
+                for cmd in &output.circle_commands {
+                    let color = fb.color_from_rgb24(cmd.color);
+                    compositor::graphics::draw_circle(&mut fb, cmd.cx, cmd.cy, cmd.r, color);
+                }
+                for cmd in &output.text_commands {
+                    let color = fb.color_from_rgb24(cmd.color);
+                    let bg = fb.color_from_rgb24(0x000000);
+                    fb.draw_string(cmd.x as usize, cmd.y as usize, &cmd.text, color, bg);
+                }
+
+                need_redraw = true;
+                did_work = true;
+                damage.damage_full();
             }
         }
 

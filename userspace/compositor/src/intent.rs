@@ -25,8 +25,10 @@ pub enum AgentIntent {
     ReadFile { path: String },
     /// Write content to a file
     WriteFile { path: String, content: String },
-    /// Generate a WASM tool (future Sprint 6)
+    /// Generate a WASM tool — triggers second call to proxy
     GenerateTool { prompt: String },
+    /// WASM tool compiled and ready — binary is base64-encoded
+    ToolReady { binary_base64: String },
     /// Plain text response (no structured action)
     TextResponse { text: String },
     /// Error from the AI
@@ -86,6 +88,10 @@ pub fn parse_intent(response: &str) -> AgentIntent {
             let prompt = extract_str(trimmed, "prompt").unwrap_or_default();
             AgentIntent::GenerateTool { prompt }
         }
+        "tool_ready" => {
+            let binary = extract_str(trimmed, "binary").unwrap_or_default();
+            AgentIntent::ToolReady { binary_base64: binary }
+        }
         "error" => {
             let msg = extract_str(trimmed, "message").unwrap_or_default();
             AgentIntent::Error { message: msg }
@@ -135,4 +141,53 @@ fn extract_num(json: &str, key: &str) -> Option<u32> {
 
     if end == 0 { return None; }
     rest[..end].parse().ok()
+}
+
+// ── Base64 Decoder ──────────────────────────────────────────────────────
+
+use alloc::vec::Vec;
+
+/// Decode base64 string to bytes. Standard alphabet (A-Z, a-z, 0-9, +, /).
+/// Handles = and == padding. Returns None on invalid input.
+pub fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    #[inline]
+    fn decode_char(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+
+    let bytes = input.as_bytes();
+    // Filter out whitespace/newlines
+    let clean: Vec<u8> = bytes.iter().copied().filter(|&b| b != b'\n' && b != b'\r' && b != b' ').collect();
+    let len = clean.len();
+    if len == 0 { return Some(Vec::new()); }
+    if len % 4 != 0 { return None; }
+
+    let mut out = Vec::with_capacity(len / 4 * 3);
+
+    for chunk in clean.chunks_exact(4) {
+        let a = decode_char(chunk[0])?;
+        let b = decode_char(chunk[1])?;
+
+        // Third and fourth may be padding
+        let c_pad = chunk[2] == b'=';
+        let d_pad = chunk[3] == b'=';
+
+        let c = if c_pad { 0 } else { decode_char(chunk[2])? };
+        let d = if d_pad { 0 } else { decode_char(chunk[3])? };
+
+        let triple = ((a as u32) << 18) | ((b as u32) << 12) | ((c as u32) << 6) | (d as u32);
+
+        out.push((triple >> 16) as u8);
+        if !c_pad { out.push((triple >> 8) as u8); }
+        if !d_pad { out.push(triple as u8); }
+    }
+
+    Some(out)
 }

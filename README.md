@@ -8,23 +8,26 @@ Folkering OS runs on bare-metal x86-64 hardware (via QEMU) with its own kernel, 
 
 ```
 > ask hi
-[AI] Thinking...
-  <SmolLM2-135M generates 64 tokens in real-time>
+[AI] <think>Okay, the user said "hi". I need to respond</think>
+  Hello! How can I help you today?
+  <Qwen3-0.6B generates coherent text with reasoning>
 
-> ai-status
-AI: model loaded
-Arena: 8MB
-
-> ls
-  synapse      51672
-  shell        48824
-  compositor  109944
-  inference    64944
-  files.db    253952
-  hello.txt       25
+> gemini draw a green rectangle on the screen
+[cloud] Sending with UI context...
+[AI] Generating tool: draw a green rectangle...
+[AI] Tool executed: 1 draw + 0 text commands
+  → Green rectangle appears on framebuffer!
+  (Gemini 3 Flash → Rust code → WASM compile → wasmi execute → render)
 
 > open calc
   → [Calculator] WASM-powered app with button grid
+
+> gemini make an interactive app where a circle follows the mouse
+[cloud] Sending with UI context...
+[AI] Generating tool: interactive app...
+[AI] Tool executed: persistent WASM app activated
+  → Circle tracks mouse in real-time! (folk_poll_event → per-frame loop)
+  → ESC to exit, fuel resets each frame (1M instructions)
 ```
 
 ## Architecture
@@ -104,7 +107,34 @@ Inference Server (Task 6):
 Compositor displays generated text in terminal window
 ```
 
-Model: SmolLM2-135M-Instruct (Q4_0, 87MB) loaded from VirtIO disk via DMA bursting.
+Model: Qwen3-0.6B (Q4_0, 364MB) loaded from VirtIO disk via DMA bursting. Produces coherent reasoning with `<think>` tags.
+
+### Hybrid AI: Cloud + On-Device
+
+Folkering OS combines local SLM inference with Gemini 3 Flash cloud API:
+
+- **On-device**: Qwen3-0.6B for private reasoning and text generation
+- **Cloud**: Gemini 3 Flash via COM2 serial proxy for complex tasks (intent parsing, code generation)
+- **WASM JIT Toolsmithing**: Ask Gemini to generate a tool → Rust code → compile to WASM → execute on bare metal
+- **Interactive WASM Apps**: Keywords like "game/app/click/mouse/tetris" trigger persistent mode — `PersistentWasmApp` keeps Store/Instance/Linear Memory alive between frames, `folk_poll_event` routes real-time mouse + keyboard input, `run()` is called every frame with fuel reset (1M instructions)
+
+```
+User: "gemini draw a green rectangle"
+  → Gemini 3 Flash: {"action": "generate_tool", "prompt": "draw a green rectangle"}
+  → Proxy: Gemini code-gen → Cargo compile → 153 byte WASM → base64
+  → OS: base64_decode → wasmi execute → folk_draw_rect() → framebuffer
+  → Green rectangle on screen!
+
+User: "gemini make a game where a ball bounces around"
+  → Persistent WASM app: static mut variables survive between frames
+  → folk_poll_event() returns FolkEvent (16-byte struct) for mouse/keyboard
+  → Per-frame execution loop, ESC kills app, trap/out-of-fuel auto-deactivates
+```
+
+The serial proxy (`serial-gemini-proxy.py`) handles the full toolchain autonomously:
+temp Cargo workspace with `opt-level="z"`, `lto=true`, `strip=true` → minimal WASM binary.
+
+Folk API: 12 host functions including `folk_draw_rect`, `folk_draw_line`, `folk_draw_circle`, `folk_fill_screen`, `folk_draw_text`, `folk_screen_width/height`, `folk_random`, `folk_get_time`, `folk_poll_event`.
 
 ### Semantic VFS
 
@@ -142,6 +172,10 @@ shmem_unmap(handle, 0x30000000)?;      // unmap
 | **IPC** | Done | Synchronous send/reply, async recv, CallerToken |
 | **VirtIO block** | Done | DMA burst reads (64 sectors/request), FOLKDISK header |
 | **VirtIO network** | Done | DHCP, ICMP ping, DNS resolution |
+| **VirtIO GPU** | Done | Modern PCI transport, 2D scanout, 1280x800 |
+| **SMP (4-core)** | Done | Limine SMP, parallel GEMM, HHDM zero-copy |
+| **Free-list allocator** | Done | Replaces bump allocator, supports dealloc, survives infinite WASM runs |
+| **Serial I/O** | Done | COM1 log, COM2 Gemini proxy, COM3 God Mode Pipe |
 | **I/O APIC** | Done | Keyboard + mouse + VirtIO interrupt routing |
 | **Panic screen** | Done | Graphical panic with register dump, recursion guard |
 
@@ -149,7 +183,7 @@ shmem_unmap(handle, 0x30000000)?;      // unmap
 
 | Component | Purpose | Lines |
 |-----------|---------|-------|
-| **Compositor** | Window manager, terminal, omnibar, mouse/keyboard | ~3000 |
+| **Compositor** | Window manager, terminal, omnibar, AI intents, WASM execution | ~3500 |
 | **Inference Server** | GGUF model loading, tokenizer, transformer, sampling | ~1000 |
 | **Shell** | Command execution, WASM apps, IPC handlers | ~2400 |
 | **Synapse** | SQLite parser, file cache, VirtIO persistence | ~1100 |
@@ -197,15 +231,25 @@ qemu-system-x86_64 -drive file=boot/current.img -serial file:serial.log -m 512M
 ### AI Model Setup
 
 ```bash
-# Download SmolLM2-135M-Instruct Q4_0 (~87MB)
-curl -L -o boot/model.gguf \
-  "https://huggingface.co/amai-gsu/SmolLM2-135M-Instruct-Q4_0-GGUF/resolve/main/smollm2-135m-instruct-q4_0.gguf"
+# Download Qwen3-0.6B Q4_0 (~364MB) — recommended
+# Or SmolLM2-135M-Instruct Q4_0 (~87MB) for faster iteration
 
-# Pack model into VirtIO disk (ULTRA 26: 4KB-aligned)
+# Pack model into VirtIO disk (4KB-aligned)
 cd tools/folk-pack && cargo run --release -- pack-model boot/virtio-data.img boot/model.gguf
 ```
 
-Model loads in ~45 seconds via multi-sector DMA bursting (ULTRA 36).
+Model loads via multi-sector DMA bursting (~60s for Qwen3-0.6B, ~15s for SmolLM2-135M).
+
+### Serial Proxy Setup (for Gemini cloud AI)
+
+```bash
+# Start the serial-gemini proxy (connects to QEMU COM2 on port 4567)
+python tools/serial-gemini-proxy.py
+
+# Requires: Google Gemini API key in the script
+# QEMU flags: -serial tcp:127.0.0.1:4567,server,nowait (COM2)
+#             -serial tcp:127.0.0.1:4568,server,nowait (COM3)
+```
 
 ### MCP Servers
 
@@ -215,9 +259,13 @@ Model loads in ~45 seconds via multi-sector DMA bursting (ULTRA 36).
 - `folkering_interact` — scripted keyboard/mouse sequences
 
 **folkering-debug** (live debugging):
-- `kernel_symbol_lookup` — resolve hex addresses to function names
-- `serial_throttle_analyzer` — collapse loop patterns in serial logs
-- `qemu_inspect_registers` — live CPU state via QMP
+- `tensor_dump` — read tensor data from inference engine
+- `python_ref_runner` — PyTorch ground-truth oracle for comparison
+- `attention_heatmap` — visual attention pattern analysis
+- `topo_parity_map` — MSE/cosine drift analysis per layer
+- `await_serial_log` — wait for regex pattern (eliminates blind sleep)
+- `run_host_tensor_test` — test math on host (~1s vs 15min QEMU boot)
+- `qmp_memory_dump` — read QEMU memory via QMP
 
 ## Roadmap
 
@@ -233,13 +281,19 @@ Model loads in ~45 seconds via multi-sector DMA bursting (ULTRA 36).
 - [x] M31-M32: GitHub API, JSON parser, clone-to-VFS
 - [x] **M33-M41: libtensor** — Q4_0/Q8_0 GEMM, RMSNorm, RoPE, SiLU, KV-cache, GGUF parser, BPE tokenizer, transformer forward pass
 - [x] **M42: First Words** — SmolLM2-135M generates tokens on bare metal
+- [x] **M43: Qwen3-0.6B** — Coherent reasoning with `<think>` tags, proper BPE tokenizer
+- [x] **SMP GEMM** — 4-core parallel output projection (0.57s/tok)
+- [x] **VirtIO-GPU 2D** — Modern PCI Capabilities, 1280x800 scanout
+- [x] **Neural Desktop** — Dirty rects, alpha blending, scaled fonts, intent engine, UI serialization
+- [x] **Hybrid AI** — Gemini 3 Flash via COM2 serial proxy, intent parsing, autonomous actions
+- [x] **WASM JIT Toolsmithing** — AI generates Rust → compiles to WASM → executes on bare metal
+- [x] **Phase 2: Interactive WASM** — PersistentWasmApp with per-frame execution, folk_poll_event real-time input, free-list allocator, Bresenham line + midpoint circle algorithms, 12 Folk API host functions
 
-### Next: Epoch 1 Completion
+### Next
 
-- [ ] Token streaming (IPC per token for typewriter effect)
-- [ ] AVX2 GEMM acceleration (requires kernel XSAVE support)
-- [ ] Conversation context / multi-turn chat
-- [ ] Smaller model support (TinyStories-33M for faster iteration)
+- [ ] WASM tool persistence (save generated tools to Synapse VFS)
+- [ ] Multi-turn conversation with Gemini (context window management)
+- [ ] AVX2 GEMM acceleration for faster on-device inference
 
 ### Epoch 2-3: Agent-Native Paradigm (Vision)
 
@@ -249,10 +303,23 @@ Model loads in ~45 seconds via multi-sector DMA bursting (ULTRA 36).
 4. **Active Inference Immunity** — Security via free energy minimization, not signatures
 5. **Declarative Intent Syscalls** — `SYS_DO_INTENT("summarize this")` — apps describe intent, OS implements
 
+## Documentation
+
+- **[ARCHITECTURE.md](ARCHITECTURE.md)** — Complete technical overview for developers
+- **[CONTRIBUTING.md](CONTRIBUTING.md)** — How to contribute + CLA requirement
+
 ## Author
 
-Knut Ingmar Merødningen
+Knut Ingmar Merødningen — [ikkjekvifull@gmail.com](mailto:ikkjekvifull@gmail.com)
 
 ## License
 
-To be determined.
+Folkering OS is **dual-licensed**:
+
+- **AGPL-3.0** ([LICENSE](LICENSE)) — Free for open-source use. If you modify Folkering OS and distribute it (including as a network service), you must release your source code under the same license.
+
+- **Commercial License** — For proprietary, closed-source, or embedded use without AGPL obligations. Contact **ikkjekvifull@gmail.com** for enterprise licensing.
+
+All contributors must sign a [Contributor License Agreement](CONTRIBUTING.md) (CLA) before pull requests are merged. This enables dual licensing while contributors retain their copyright.
+
+**"Folkering OS"** is a trademark of Knut Ingmar Merødningen. Forks may not use the Folkering OS name or branding without permission.
