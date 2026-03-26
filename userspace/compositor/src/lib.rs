@@ -58,6 +58,7 @@ pub mod font;
 pub mod intent;
 pub mod ui_serialize;
 pub mod vector_font;
+pub mod wasm_runtime;
 pub mod window_manager;
 
 extern crate alloc;
