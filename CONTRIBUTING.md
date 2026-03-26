@@ -63,4 +63,4 @@ Use [GitHub Issues](https://github.com/merknu/folkering-os/issues). Include:
 
 Folkering OS is dual-licensed:
 - **Open source**: [AGPL-3.0](LICENSE) — free for open-source use
-- **Commercial**: Contact knut@meray.no for proprietary/closed-source licensing
+- **Commercial**: Contact ikkjekvifull@gmail.com for proprietary/closed-source licensing
