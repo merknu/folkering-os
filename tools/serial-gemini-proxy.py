@@ -56,7 +56,7 @@ if not LLM_API_KEY:
 
 # Default models per provider
 DEFAULT_MODELS = {
-    "gemini": "gemini-2.5-flash",
+    "gemini": "gemini-3.1-flash-lite-preview",
     "openai": "gpt-4o-mini",
     "claude": "claude-sonnet-4-20250514",
 }
