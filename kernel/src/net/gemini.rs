@@ -57,9 +57,10 @@ pub fn ask_gemini(prompt: &str) -> Result<Vec<u8>, &'static str> {
     crate::serial_str!(" bytes, waiting for response...\n");
 
     // Read response from COM2: @@GEMINI_RESP@@{text}@@END@@
-    let mut resp_buf = vec![0u8; 16384];
+    // 128KB heap-allocated buffer for WASM base64 payloads (NEVER stack-allocate)
+    let mut resp_buf = vec![0u8; 131072];
     let resp_len = crate::drivers::serial::com2_read_until(
-        b"@@END@@", &mut resp_buf, 15_000
+        b"@@END@@", &mut resp_buf, 45_000
     );
 
     if resp_len == 0 {

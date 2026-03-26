@@ -88,14 +88,7 @@ pub fn execute_wasm(
     // Create linker with host functions
     let mut linker = Linker::<HostState>::new(&engine);
 
-    // Register host functions
-    let _ = linker.func_wrap("env", "draw_rect",
-        |_caller: Caller<HostState>, x: i32, y: i32, w: i32, h: i32, color: i32| {
-            // Will be collected after execution
-        },
-    );
-
-    // Use a simpler approach: define host functions that store commands
+    // Register host functions — only safe draw functions, NO yield
     let _ = linker.func_wrap("env", "folk_draw_rect",
         |mut caller: Caller<HostState>, x: i32, y: i32, w: i32, h: i32, color: i32| {
             caller.data_mut().draw_commands.push(DrawCmd {
@@ -131,11 +124,9 @@ pub fn execute_wasm(
         },
     );
 
-    let _ = linker.func_wrap("env", "folk_yield",
-        |_caller: Caller<HostState>| {
-            libfolk::sys::yield_cpu();
-        },
-    );
+    // NOTE: folk_yield intentionally REMOVED — sys_yield() inside wasmi's
+    // synchronous interpreter loop corrupts interpreter state. WASM scripts
+    // are strictly run-to-completion. Fuel metering prevents infinite loops.
 
     // Instantiate module
     let instance = match linker.instantiate(&mut store, &module) {

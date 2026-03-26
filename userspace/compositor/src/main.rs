@@ -418,7 +418,7 @@ struct BumpAllocator {
     next: UnsafeCell<usize>,
 }
 
-const HEAP_SIZE: usize = 64 * 1024; // 64KB heap
+const HEAP_SIZE: usize = 2 * 1024 * 1024; // 2MB heap (wasmi + all format!/String allocs are permanent in bump allocator)
 
 unsafe impl Sync for BumpAllocator {}
 
@@ -596,6 +596,11 @@ fn main() -> ! {
     let mut com3_buf = [0u8; 512];
     let mut com3_len = 0usize;
     let mut com3_inject: Option<alloc::string::String> = None;
+
+    // WASM JIT Toolsmithing — deferred tool generation (2-frame pattern)
+    // Frame 1: show "[AI] Generating tool...", mark damage_full → renders + flushes
+    // Frame 2: make second ask_gemini call, decode WASM, execute, render results
+    let mut deferred_tool_gen: Option<(u32, alloc::string::String)> = None; // (win_id, prompt)
 
     // ===== NEURAL DESKTOP =====
     // AI-native interface with Omnibar at center
@@ -918,6 +923,120 @@ fn main() -> ! {
         let mut did_work = false;
         // Consolidated redraw flag — any subsystem can set this
         let mut need_redraw = false;
+
+        // ===== WASM JIT TOOLSMITHING — Deferred tool generation (Frame 2) =====
+        // Previous frame rendered "[AI] Generating tool..." and flushed to GPU.
+        // Now make the second ask_gemini call with [GENERATE_TOOL] prefix.
+        if let Some((tool_win_id, tool_prompt)) = deferred_tool_gen.take() {
+            did_work = true;
+            write_str("[COMPOSITOR] WASM tool generation starting...\n");
+
+            let tool_request = alloc::format!("[GENERATE_TOOL] {}", tool_prompt);
+            // 128KB via mmap (bump allocator is only 64KB, never frees)
+            const WASM_BUF_VADDR: usize = 0x50020000; // Must be >= 0x40000000 (MMAP_BASE)
+            const WASM_BUF_SIZE: usize = 131072;
+            let wasm_resp_len = if libfolk::sys::mmap_at(WASM_BUF_VADDR, WASM_BUF_SIZE, 3).is_ok() {
+                let wasm_buf = unsafe {
+                    core::slice::from_raw_parts_mut(WASM_BUF_VADDR as *mut u8, WASM_BUF_SIZE)
+                };
+                libfolk::sys::ask_gemini(&tool_request, wasm_buf)
+            } else { 0 };
+            let wasm_buf = unsafe {
+                core::slice::from_raw_parts(WASM_BUF_VADDR as *const u8, WASM_BUF_SIZE)
+            };
+
+            if wasm_resp_len > 0 {
+                if let Ok(text) = core::str::from_utf8(&wasm_buf[..wasm_resp_len]) {
+                    use compositor::intent::AgentIntent;
+                    let wasm_intent = compositor::intent::parse_intent(text);
+
+                    match wasm_intent {
+                        AgentIntent::ToolReady { binary_base64 } => {
+                            write_str("[COMPOSITOR] ToolReady received, decoding base64...\n");
+                            if let Some(wasm_bytes) = compositor::intent::base64_decode(&binary_base64) {
+                                let mut nbuf = [0u8; 16];
+                                let nstr = format_usize(wasm_bytes.len(), &mut nbuf);
+                                write_str("[COMPOSITOR] WASM decoded: ");
+                                write_str(nstr);
+                                write_str(" bytes, executing...\n");
+
+                                // Execute WASM in sandboxed wasmi runtime
+                                let (result, draw_cmds, text_cmds) =
+                                    compositor::wasm_runtime::execute_wasm(&wasm_bytes);
+
+                                // Report result
+                                if let Some(win) = wm.get_window_mut(tool_win_id) {
+                                    match &result {
+                                        compositor::wasm_runtime::WasmResult::Ok => {
+                                            win.push_line(&alloc::format!(
+                                                "[AI] Tool executed: {} draw + {} text commands",
+                                                draw_cmds.len(), text_cmds.len()
+                                            ));
+                                        }
+                                        compositor::wasm_runtime::WasmResult::OutOfFuel => {
+                                            win.push_line("[AI] Tool halted: fuel exhausted (infinite loop?)");
+                                        }
+                                        compositor::wasm_runtime::WasmResult::Trap(msg) => {
+                                            win.push_line(&alloc::format!("[AI] Tool trap: {}", &msg[..msg.len().min(80)]));
+                                        }
+                                        compositor::wasm_runtime::WasmResult::LoadError(msg) => {
+                                            win.push_line(&alloc::format!("[AI] Load error: {}", &msg[..msg.len().min(80)]));
+                                        }
+                                    }
+                                }
+
+                                // Render WASM draw commands to framebuffer
+                                for cmd in &draw_cmds {
+                                    let color = fb.color_from_rgb24(cmd.color);
+                                    fb.fill_rect(cmd.x as usize, cmd.y as usize, cmd.w as usize, cmd.h as usize, color);
+                                }
+                                for cmd in &text_cmds {
+                                    let color = fb.color_from_rgb24(cmd.color);
+                                    let bg = fb.color_from_rgb24(0x000000);
+                                    fb.draw_string(cmd.x as usize, cmd.y as usize, &cmd.text, color, bg);
+                                }
+
+                                if !draw_cmds.is_empty() || !text_cmds.is_empty() {
+                                    damage.damage_full();
+                                }
+                            } else {
+                                if let Some(win) = wm.get_window_mut(tool_win_id) {
+                                    win.push_line("[AI] Error: invalid base64 in WASM response");
+                                }
+                            }
+                        }
+                        AgentIntent::TextResponse { text: resp } => {
+                            // Proxy sent error as plain text (compile failure etc.)
+                            if let Some(win) = wm.get_window_mut(tool_win_id) {
+                                win.push_line("[AI Tool Error]:");
+                                for line in resp.split('\n') {
+                                    if !line.is_empty() {
+                                        win.push_line(&line[..line.len().min(100)]);
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            if let Some(win) = wm.get_window_mut(tool_win_id) {
+                                win.push_line("[AI] Unexpected response from tool pipeline");
+                            }
+                        }
+                    }
+                } else {
+                    if let Some(win) = wm.get_window_mut(tool_win_id) {
+                        win.push_line("[AI] Tool response not valid UTF-8");
+                    }
+                }
+            } else {
+                if let Some(win) = wm.get_window_mut(tool_win_id) {
+                    win.push_line("[AI] Error: no response from tool pipeline (timeout?)");
+                }
+            }
+            // Free mmap'd buffer
+            let _ = libfolk::sys::munmap(WASM_BUF_VADDR as *mut u8, WASM_BUF_SIZE);
+            need_redraw = true;
+            damage.damage_full();
+        }
 
         // ===== GOD MODE PIPE (COM3) — Poll for injected commands =====
         while let Some(byte) = libfolk::sys::com3_read() {
@@ -2413,9 +2532,26 @@ fn main() -> ! {
 
                             win.push_line("[cloud] Sending with UI context...");
 
-                            // Step 3: Call Gemini proxy
-                            let mut gemini_buf = alloc::vec![0u8; 16384];
-                            let response_len = libfolk::sys::ask_gemini(&full_prompt, &mut gemini_buf);
+                            // Step 3: Call Gemini proxy (128KB via mmap — bump allocator is only 64KB)
+                            const GEMINI_CMD_VADDR: usize = 0x50000000; // Must be >= 0x40000000 (MMAP_BASE)
+                            const GEMINI_CMD_SIZE: usize = 131072;
+                            let mmap_ok = libfolk::sys::mmap_at(GEMINI_CMD_VADDR, GEMINI_CMD_SIZE, 3).is_ok();
+                            write_str("[COMPOSITOR] mmap_at(0x34000000)=");
+                            write_str(if mmap_ok { "OK" } else { "FAIL" });
+                            write_str(" prompt_len=");
+                            let mut plbuf = [0u8; 16];
+                            write_str(format_usize(full_prompt.len(), &mut plbuf));
+                            write_str("\n");
+                            let response_len = if mmap_ok {
+                                let gemini_buf = unsafe {
+                                    core::slice::from_raw_parts_mut(GEMINI_CMD_VADDR as *mut u8, GEMINI_CMD_SIZE)
+                                };
+                                let rlen = libfolk::sys::ask_gemini(&full_prompt, gemini_buf);
+                                rlen
+                            } else { 0 };
+                            let gemini_buf = unsafe {
+                                core::slice::from_raw_parts(GEMINI_CMD_VADDR as *const u8, GEMINI_CMD_SIZE)
+                            };
 
                             if response_len > 0 {
                                 if let Ok(text) = alloc::str::from_utf8(&gemini_buf[..response_len]) {
@@ -2444,8 +2580,12 @@ fn main() -> ! {
                                         }
                                         AgentIntent::GenerateTool { prompt: tp } => {
                                             win.push_line(&alloc::format!(
-                                                "[AI] Tool: {}", &tp[..tp.len().min(60)]
+                                                "[AI] Generating tool: {}...", &tp[..tp.len().min(50)]
                                             ));
+                                            // Deferred 2-frame: this frame renders the message,
+                                            // next frame executes the WASM pipeline
+                                            deferred_tool_gen = Some((win_id, tp));
+                                            damage.damage_full();
                                         }
                                         AgentIntent::TextResponse { text: resp } => {
                                             win.push_line("[Gemini]:");
@@ -2468,6 +2608,8 @@ fn main() -> ! {
                             } else {
                                 win.push_line("[cloud] Error: no response from Gemini API");
                             }
+                            // Free mmap'd buffer
+                            let _ = libfolk::sys::munmap(GEMINI_CMD_VADDR as *mut u8, GEMINI_CMD_SIZE);
                         }
                     } else {
                         win.push_line("Sent to shell...");
