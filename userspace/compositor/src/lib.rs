@@ -54,6 +54,7 @@
 pub mod damage;
 pub mod framebuffer;
 pub mod font;
+pub mod vector_font;
 pub mod window_manager;
 
 extern crate alloc;
