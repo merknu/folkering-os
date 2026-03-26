@@ -56,6 +56,14 @@ __pycache__/
 # Windows reserved names
 nul
 
+# Claude Code context (local only)
+_claude_context.md
+active_debug_log.md
+
+# Test databases
+*.db
+!boot/files.db
+
 # Model files (download on demand, too large for git)
 boot/models/
 *.gguf
