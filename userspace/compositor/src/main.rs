@@ -86,6 +86,21 @@ fn format_arena_line<'a>(buf: &'a mut [u8; 32], kb: usize) -> &'a str {
     unsafe { core::str::from_utf8_unchecked(&buf[..end + 2]) }
 }
 
+/// Case-insensitive substring search in byte slices
+fn find_ci(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.len() > haystack.len() { return false; }
+    for i in 0..=(haystack.len() - needle.len()) {
+        let mut ok = true;
+        for j in 0..needle.len() {
+            let a = if haystack[i + j] >= b'A' && haystack[i + j] <= b'Z' { haystack[i + j] + 32 } else { haystack[i + j] };
+            let b = if needle[j] >= b'A' && needle[j] <= b'Z' { needle[j] + 32 } else { needle[j] };
+            if a != b { ok = false; break; }
+        }
+        if ok { return true; }
+    }
+    false
+}
+
 fn starts_with_ci(haystack: &str, needle: &str) -> bool {
     if haystack.len() < needle.len() { return false; }
     for (a, b) in haystack.bytes().zip(needle.bytes()) {
@@ -725,6 +740,9 @@ fn main() -> ! {
     // Frame 2: make second ask_gemini call, decode WASM, execute, render results
     let mut deferred_tool_gen: Option<(u32, alloc::string::String)> = None; // (win_id, prompt)
 
+    // Phase 2: Persistent interactive WASM app (game loop)
+    let mut active_wasm_app: Option<compositor::wasm_runtime::PersistentWasmApp> = None;
+
     // ===== NEURAL DESKTOP =====
     // AI-native interface with Omnibar at center
     let folk_blue = fb.color_from_rgb24(colors::FOLK_BLUE);
@@ -1083,66 +1101,84 @@ fn main() -> ! {
                                 write_str(nstr);
                                 write_str(" bytes, executing...\n");
 
-                                // Execute WASM in sandboxed wasmi runtime with config
                                 let config = compositor::wasm_runtime::WasmConfig {
                                     screen_width: fb.width as u32,
                                     screen_height: fb.height as u32,
                                     uptime_ms: libfolk::sys::uptime() as u32,
                                 };
-                                let (result, output) =
-                                    compositor::wasm_runtime::execute_wasm(&wasm_bytes, config);
 
-                                // Report result
-                                let total_cmds = output.draw_commands.len()
-                                    + output.line_commands.len()
-                                    + output.circle_commands.len()
-                                    + output.text_commands.len()
-                                    + if output.fill_screen.is_some() { 1 } else { 0 };
-                                if let Some(win) = wm.get_window_mut(tool_win_id) {
-                                    match &result {
-                                        compositor::wasm_runtime::WasmResult::Ok => {
-                                            win.push_line(&alloc::format!(
-                                                "[AI] Tool executed: {} commands", total_cmds
-                                            ));
+                                // Detect interactive app (game/app/mouse keywords)
+                                let interactive = {
+                                    let p = tool_prompt.as_bytes();
+                                    find_ci(p, b"interactive") || find_ci(p, b"game")
+                                        || find_ci(p, b"app") || find_ci(p, b"click")
+                                        || find_ci(p, b"mouse") || find_ci(p, b"tetris")
+                                        || find_ci(p, b"follow") || find_ci(p, b"cursor")
+                                };
+
+                                if interactive {
+                                    // Launch as persistent app (game loop)
+                                    match compositor::wasm_runtime::PersistentWasmApp::new(&wasm_bytes, config) {
+                                        Ok(app) => {
+                                            write_str("[COMPOSITOR] Launched interactive WASM app!\n");
+                                            if let Some(win) = wm.get_window_mut(tool_win_id) {
+                                                win.push_line("[AI] Interactive app launched! Press ESC to exit.");
+                                            }
+                                            active_wasm_app = Some(app);
                                         }
-                                        compositor::wasm_runtime::WasmResult::OutOfFuel => {
-                                            win.push_line("[AI] Tool halted: fuel exhausted (infinite loop?)");
-                                        }
-                                        compositor::wasm_runtime::WasmResult::Trap(msg) => {
-                                            win.push_line(&alloc::format!("[AI] Tool trap: {}", &msg[..msg.len().min(80)]));
-                                        }
-                                        compositor::wasm_runtime::WasmResult::LoadError(msg) => {
-                                            win.push_line(&alloc::format!("[AI] Load error: {}", &msg[..msg.len().min(80)]));
+                                        Err(e) => {
+                                            if let Some(win) = wm.get_window_mut(tool_win_id) {
+                                                win.push_line(&alloc::format!("[AI] App load error: {}", &e[..e.len().min(80)]));
+                                            }
                                         }
                                     }
-                                }
+                                } else {
+                                    // One-shot tool execution
+                                    let (result, output) =
+                                        compositor::wasm_runtime::execute_wasm(&wasm_bytes, config);
 
-                                // Render WASM output to framebuffer
-                                // Order: fill → rects → lines → circles → text
-                                if let Some(color) = output.fill_screen {
-                                    let c = fb.color_from_rgb24(color);
-                                    fb.clear(c);
-                                }
-                                for cmd in &output.draw_commands {
-                                    let color = fb.color_from_rgb24(cmd.color);
-                                    fb.fill_rect(cmd.x as usize, cmd.y as usize, cmd.w as usize, cmd.h as usize, color);
-                                }
-                                for cmd in &output.line_commands {
-                                    let color = fb.color_from_rgb24(cmd.color);
-                                    compositor::graphics::draw_line(&mut fb, cmd.x1, cmd.y1, cmd.x2, cmd.y2, color);
-                                }
-                                for cmd in &output.circle_commands {
-                                    let color = fb.color_from_rgb24(cmd.color);
-                                    compositor::graphics::draw_circle(&mut fb, cmd.cx, cmd.cy, cmd.r, color);
-                                }
-                                for cmd in &output.text_commands {
-                                    let color = fb.color_from_rgb24(cmd.color);
-                                    let bg = fb.color_from_rgb24(0x000000);
-                                    fb.draw_string(cmd.x as usize, cmd.y as usize, &cmd.text, color, bg);
-                                }
+                                    let total_cmds = output.draw_commands.len()
+                                        + output.line_commands.len()
+                                        + output.circle_commands.len()
+                                        + output.text_commands.len()
+                                        + if output.fill_screen.is_some() { 1 } else { 0 };
+                                    if let Some(win) = wm.get_window_mut(tool_win_id) {
+                                        match &result {
+                                            compositor::wasm_runtime::WasmResult::Ok => {
+                                                win.push_line(&alloc::format!("[AI] Tool executed: {} commands", total_cmds));
+                                            }
+                                            compositor::wasm_runtime::WasmResult::OutOfFuel => {
+                                                win.push_line("[AI] Tool halted: fuel exhausted");
+                                            }
+                                            compositor::wasm_runtime::WasmResult::Trap(msg) => {
+                                                win.push_line(&alloc::format!("[AI] Trap: {}", &msg[..msg.len().min(80)]));
+                                            }
+                                            compositor::wasm_runtime::WasmResult::LoadError(msg) => {
+                                                win.push_line(&alloc::format!("[AI] Load: {}", &msg[..msg.len().min(80)]));
+                                            }
+                                        }
+                                    }
 
-                                if total_cmds > 0 {
-                                    damage.damage_full();
+                                    // Render one-shot output
+                                    if let Some(color) = output.fill_screen {
+                                        fb.clear(fb.color_from_rgb24(color));
+                                    }
+                                    for cmd in &output.draw_commands {
+                                        fb.fill_rect(cmd.x as usize, cmd.y as usize, cmd.w as usize, cmd.h as usize, fb.color_from_rgb24(cmd.color));
+                                    }
+                                    for cmd in &output.line_commands {
+                                        let c = fb.color_from_rgb24(cmd.color);
+                                        compositor::graphics::draw_line(&mut fb, cmd.x1, cmd.y1, cmd.x2, cmd.y2, c);
+                                    }
+                                    for cmd in &output.circle_commands {
+                                        let c = fb.color_from_rgb24(cmd.color);
+                                        compositor::graphics::draw_circle(&mut fb, cmd.cx, cmd.cy, cmd.r, c);
+                                    }
+                                    for cmd in &output.text_commands {
+                                        fb.draw_string(cmd.x as usize, cmd.y as usize, &cmd.text, fb.color_from_rgb24(cmd.color), fb.color_from_rgb24(0));
+                                    }
+
+                                    if total_cmds > 0 { damage.damage_full(); }
                                 }
                             } else {
                                 if let Some(win) = wm.get_window_mut(tool_win_id) {
@@ -1230,6 +1266,21 @@ fn main() -> ! {
         }
 
         if had_mouse_events {
+            // Route mouse events to active WASM app (Phase 2)
+            if let Some(app) = &mut active_wasm_app {
+                let new_click = (latest_buttons & 1 != 0) && (last_buttons & 1 == 0);
+                // Always send mouse position
+                app.push_event(compositor::wasm_runtime::FolkEvent {
+                    event_type: 1, x: cursor_x, y: cursor_y, data: latest_buttons as i32,
+                });
+                // Send click event on button press edge
+                if new_click {
+                    app.push_event(compositor::wasm_runtime::FolkEvent {
+                        event_type: 2, x: cursor_x, y: cursor_y, data: 1,
+                    });
+                }
+            }
+
             // Sanity check cursor position
             if cursor_x < 0 || cursor_x >= fb.width as i32 || cursor_y < 0 || cursor_y >= fb.height as i32 {
                 cursor_x = (fb.width / 2) as i32;
@@ -1459,6 +1510,19 @@ fn main() -> ! {
         let mut win_execute_command: Option<u32> = None; // window id to execute from
         while let Some(key) = read_key() {
             did_work = true;
+
+            // Route to active WASM app (Phase 2) — ESC kills the app
+            if let Some(app) = &mut active_wasm_app {
+                if key == 0x1B { // ESC
+                    active_wasm_app = None;
+                    need_redraw = true;
+                    damage.damage_full();
+                    continue;
+                }
+                app.push_event(compositor::wasm_runtime::FolkEvent {
+                    event_type: 3, x: key as i32, y: 0, data: key as i32,
+                });
+            }
 
             // Arrow key codes from kernel keyboard driver
             const KEY_ARROW_LEFT: u8 = 0x82;
@@ -3678,6 +3742,60 @@ fn main() -> ! {
                     }
                 }
                 need_redraw = true;
+            }
+        }
+
+        // ===== WASM App Game Loop (Phase 2) — execute every frame =====
+        if let Some(app) = &mut active_wasm_app {
+            if app.active {
+                let config = compositor::wasm_runtime::WasmConfig {
+                    screen_width: fb.width as u32,
+                    screen_height: fb.height as u32,
+                    uptime_ms: libfolk::sys::uptime() as u32,
+                };
+                let (result, output) = app.run_frame(config);
+
+                // Check for errors
+                match &result {
+                    compositor::wasm_runtime::WasmResult::OutOfFuel => {
+                        app.active = false;
+                        write_str("[WASM APP] Halted: fuel exhausted\n");
+                    }
+                    compositor::wasm_runtime::WasmResult::Trap(msg) => {
+                        app.active = false;
+                        write_str("[WASM APP] Trap: ");
+                        write_str(&msg[..msg.len().min(80)]);
+                        write_str("\n");
+                    }
+                    _ => {}
+                }
+
+                // Render WASM output (fill → rects → lines → circles → text)
+                if let Some(color) = output.fill_screen {
+                    let c = fb.color_from_rgb24(color);
+                    fb.clear(c);
+                }
+                for cmd in &output.draw_commands {
+                    let color = fb.color_from_rgb24(cmd.color);
+                    fb.fill_rect(cmd.x as usize, cmd.y as usize, cmd.w as usize, cmd.h as usize, color);
+                }
+                for cmd in &output.line_commands {
+                    let color = fb.color_from_rgb24(cmd.color);
+                    compositor::graphics::draw_line(&mut fb, cmd.x1, cmd.y1, cmd.x2, cmd.y2, color);
+                }
+                for cmd in &output.circle_commands {
+                    let color = fb.color_from_rgb24(cmd.color);
+                    compositor::graphics::draw_circle(&mut fb, cmd.cx, cmd.cy, cmd.r, color);
+                }
+                for cmd in &output.text_commands {
+                    let color = fb.color_from_rgb24(cmd.color);
+                    let bg = fb.color_from_rgb24(0x000000);
+                    fb.draw_string(cmd.x as usize, cmd.y as usize, &cmd.text, color, bg);
+                }
+
+                need_redraw = true;
+                did_work = true;
+                damage.damage_full();
             }
         }
 
