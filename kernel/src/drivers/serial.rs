@@ -46,7 +46,14 @@ pub fn com2_read_byte() -> Option<u8> {
 /// Read until delimiter or timeout (blocking with yield).
 /// Returns bytes read (excluding delimiter).
 pub fn com2_read_until(delimiter: &[u8], buf: &mut [u8], timeout_ms: u64) -> usize {
-    let start = crate::timer::uptime_ms();
+    // Use TSC for all timing (uptime_ms doesn't advance in syscall context)
+    fn tsc_ms() -> u64 {
+        let tsc: u64;
+        unsafe { core::arch::asm!("rdtsc", "shl rdx, 32", "or rax, rdx", out("rax") tsc, out("rdx") _); }
+        tsc / 2_000_000
+    }
+
+    let start = tsc_ms();
     let mut pos = 0;
     let mut delim_match = 0;
 
@@ -60,25 +67,19 @@ pub fn com2_read_until(delimiter: &[u8], buf: &mut [u8], timeout_ms: u64) -> usi
             if byte == delimiter[delim_match] {
                 delim_match += 1;
                 if delim_match == delimiter.len() {
-                    return pos - delimiter.len(); // Exclude delimiter
+                    return pos - delimiter.len();
                 }
             } else {
-                delim_match = 0;
+                delim_match = if byte == delimiter[0] { 1 } else { 0 };
             }
         }
 
-        // Use TSC for timeout (uptime_ms may not advance in syscall context)
-        let elapsed = {
-            let tsc: u64;
-            unsafe { core::arch::asm!("rdtsc", "shl rdx, 32", "or rax, rdx", out("rax") tsc, out("rdx") _); }
-            tsc / 2_000_000 // ~ms
-        };
-        // Simple timeout: if we've been reading for too long, stop
-        if pos == 0 && elapsed > start + timeout_ms {
-            break;
+        let now = tsc_ms();
+        if pos == 0 && now - start > timeout_ms {
+            break; // No data at all within timeout
         }
-        if pos > 0 && elapsed > start + timeout_ms + 30_000 {
-            break; // Extra 30s grace for ongoing data
+        if pos > 0 && now - start > timeout_ms + 30_000 {
+            break; // Data started but incomplete after extended timeout
         }
 
         for _ in 0..100 { core::hint::spin_loop(); }
