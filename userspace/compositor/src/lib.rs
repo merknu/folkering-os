@@ -51,6 +51,7 @@
 #![no_std]
 
 // Graphics modules (Phase 6.2)
+pub mod blend;
 pub mod damage;
 pub mod framebuffer;
 pub mod font;
