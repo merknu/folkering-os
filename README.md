@@ -303,10 +303,23 @@ python tools/serial-gemini-proxy.py
 4. **Active Inference Immunity** — Security via free energy minimization, not signatures
 5. **Declarative Intent Syscalls** — `SYS_DO_INTENT("summarize this")` — apps describe intent, OS implements
 
+## Documentation
+
+- **[ARCHITECTURE.md](ARCHITECTURE.md)** — Complete technical overview for developers
+- **[CONTRIBUTING.md](CONTRIBUTING.md)** — How to contribute + CLA requirement
+
 ## Author
 
-Knut Ingmar Merødningen
+Knut Ingmar Merødningen — [knut@meray.no](mailto:knut@meray.no)
 
 ## License
 
-To be determined.
+Folkering OS is **dual-licensed**:
+
+- **AGPL-3.0** ([LICENSE](LICENSE)) — Free for open-source use. If you modify Folkering OS and distribute it (including as a network service), you must release your source code under the same license.
+
+- **Commercial License** — For proprietary, closed-source, or embedded use without AGPL obligations. Contact **knut@meray.no** for enterprise licensing.
+
+All contributors must sign a [Contributor License Agreement](CONTRIBUTING.md) (CLA) before pull requests are merged. This enables dual licensing while contributors retain their copyright.
+
+**"Folkering OS"** is a trademark of Knut Ingmar Merødningen. Forks may not use the Folkering OS name or branding without permission.
