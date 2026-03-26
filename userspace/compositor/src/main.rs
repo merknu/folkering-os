@@ -743,6 +743,10 @@ fn main() -> ! {
     // Phase 2: Persistent interactive WASM app (game loop)
     let mut active_wasm_app: Option<compositor::wasm_runtime::PersistentWasmApp> = None;
 
+    // App Persistence: cache last compiled WASM for save/run
+    let mut last_wasm_bytes: Option<alloc::vec::Vec<u8>> = None;
+    let mut last_wasm_interactive: bool = false;
+
     // ===== NEURAL DESKTOP =====
     // AI-native interface with Omnibar at center
     let folk_blue = fb.color_from_rgb24(colors::FOLK_BLUE);
@@ -1101,6 +1105,9 @@ fn main() -> ! {
                                 write_str(nstr);
                                 write_str(" bytes, executing...\n");
 
+                                // Cache WASM bytes for "save app" command
+                                last_wasm_bytes = Some(wasm_bytes.clone());
+
                                 let config = compositor::wasm_runtime::WasmConfig {
                                     screen_width: fb.width as u32,
                                     screen_height: fb.height as u32,
@@ -1115,6 +1122,8 @@ fn main() -> ! {
                                         || find_ci(p, b"mouse") || find_ci(p, b"tetris")
                                         || find_ci(p, b"follow") || find_ci(p, b"cursor")
                                 };
+
+                                last_wasm_interactive = interactive;
 
                                 if interactive {
                                     // Launch as persistent app (game loop)
@@ -2719,6 +2728,85 @@ fn main() -> ! {
                                 Err(_) => {
                                     win.push_line("[AI] Inference server unavailable (may have crashed)");
                                     win.push_line("[AI] Try again — server may auto-recover on next request");
+                                }
+                            }
+                        }
+                    } else if starts_with_ci(cmd_str, "save app ") {
+                        // App Persistence: save last compiled WASM to VFS
+                        let app_name = cmd_str[9..].trim();
+                        if app_name.is_empty() {
+                            win.push_line("Usage: save app <name>");
+                        } else if let Some(ref wasm) = last_wasm_bytes {
+                            let filename = alloc::format!("{}.wasm", app_name);
+                            match libfolk::sys::synapse::write_file(&filename, wasm) {
+                                Ok(()) => {
+                                    win.push_line(&alloc::format!(
+                                        "[OS] Saved '{}' ({} bytes, {})",
+                                        app_name, wasm.len(),
+                                        if last_wasm_interactive { "interactive" } else { "one-shot" }
+                                    ));
+                                    write_str("[COMPOSITOR] App saved to VFS: ");
+                                    write_str(&filename);
+                                    write_str("\n");
+                                }
+                                Err(_) => {
+                                    win.push_line("[OS] Save failed — VFS write error");
+                                }
+                            }
+                        } else {
+                            win.push_line("[OS] No app to save. Run 'gemini ...' first.");
+                        }
+                    } else if starts_with_ci(cmd_str, "run ") {
+                        // App Persistence: load and execute saved WASM from VFS
+                        let app_name = cmd_str[4..].trim();
+                        if app_name.is_empty() {
+                            win.push_line("Usage: run <name>");
+                        } else {
+                            let filename = if app_name.ends_with(".wasm") {
+                                alloc::string::String::from(app_name)
+                            } else {
+                                alloc::format!("{}.wasm", app_name)
+                            };
+                            win.push_line(&alloc::format!("[OS] Loading {}...", filename));
+
+                            // Read WASM from Synapse VFS via shmem
+                            const VFS_READ_VADDR: usize = 0x50040000;
+                            match libfolk::sys::synapse::read_file_shmem(&filename) {
+                                Ok(resp) => {
+                                    if shmem_map(resp.shmem_handle, VFS_READ_VADDR).is_ok() {
+                                        let data = unsafe {
+                                            core::slice::from_raw_parts(VFS_READ_VADDR as *const u8, resp.size as usize)
+                                        };
+                                        let wasm_bytes = alloc::vec::Vec::from(data);
+                                        let _ = shmem_unmap(resp.shmem_handle, VFS_READ_VADDR);
+                                        let _ = shmem_destroy(resp.shmem_handle);
+
+                                        win.push_line(&alloc::format!("[OS] Loaded {} bytes", wasm_bytes.len()));
+
+                                        let config = compositor::wasm_runtime::WasmConfig {
+                                            screen_width: fb.width as u32,
+                                            screen_height: fb.height as u32,
+                                            uptime_ms: libfolk::sys::uptime() as u32,
+                                        };
+
+                                        match compositor::wasm_runtime::PersistentWasmApp::new(&wasm_bytes, config) {
+                                            Ok(app) => {
+                                                win.push_line("[OS] App launched! Press ESC to exit.");
+                                                active_wasm_app = Some(app);
+                                                last_wasm_bytes = Some(wasm_bytes);
+                                                last_wasm_interactive = true;
+                                            }
+                                            Err(e) => {
+                                                win.push_line(&alloc::format!("[OS] Load error: {}", &e[..e.len().min(60)]));
+                                            }
+                                        }
+                                    } else {
+                                        let _ = shmem_destroy(resp.shmem_handle);
+                                        win.push_line("[OS] Failed to map file data");
+                                    }
+                                }
+                                Err(_) => {
+                                    win.push_line(&alloc::format!("[OS] App '{}' not found", app_name));
                                 }
                             }
                         }
