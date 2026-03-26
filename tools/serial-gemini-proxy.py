@@ -48,7 +48,8 @@ STRICT RULES:
 - #![no_std] and #![no_main] are REQUIRED
 - Export: #[no_mangle] pub extern "C" fn run()
 - Include: #[panic_handler] fn panic(_: &core::panic::PanicInfo) -> ! { loop {} }
-- NO loops, NO yielding, NO sleeping — run-to-completion ONLY
+- NO infinite loops, NO yielding, NO sleeping — run-to-completion per frame
+- Event polling loops (while folk_poll_event() != 0) are OK
 - NO println!, NO std, NO allocation, NO extern crate
 - Color format: 0x00RRGGBB (alpha channel is IGNORED, use solid colors only)
   Examples: 0x00FF0000 = red, 0x0000FF00 = green, 0x000000FF = blue, 0x00FFFFFF = white
@@ -68,9 +69,12 @@ fn folk_screen_width() -> i32;   // screen width in pixels (use for self-scaling
 fn folk_screen_height() -> i32;  // screen height in pixels
 fn folk_random() -> i32;         // hardware random number (RDRAND)
 
-=== Future Stubs (available but return 0) ===
-fn folk_poll_event(event_ptr: i32) -> i32;  // interactive input (Phase 2, returns 0)
-  // FolkEvent layout: { event_type: i32, x: i32, y: i32, data: i32 } = 16 bytes
+=== Input (Interactive Apps) ===
+fn folk_poll_event(event_ptr: i32) -> i32;  // returns event_type (>0) or 0 if none
+  // Writes 16-byte FolkEvent at event_ptr: { event_type: i32, x: i32, y: i32, data: i32 }
+  // event_type: 1=mouse_move (x,y=absolute pos, data=buttons), 2=mouse_click (x,y=pos, data=button), 3=key_down (data=keycode)
+
+=== Future ===
 fn folk_get_surface() -> i32;  // zero-copy pixel buffer (Phase 3, returns 0)
 
 TIPS:
@@ -79,6 +83,26 @@ TIPS:
 - folk_random() returns random i32 — mask with & 0x7FFF for positive values, % N for range
 - Negative coordinates are safe (off-screen pixels are clipped automatically)
 - You may call the same function multiple times (e.g., draw 20 rectangles)
+
+INTERACTIVE APPS:
+- run() is called EVERY FRAME (not just once). Use static mut variables to keep state!
+- Call folk_poll_event in a loop at the start of run() to process all pending input
+- Use folk_fill_screen to clear before redrawing (prevents ghosting)
+- If the user mentions "interactive", "game", "app", "click", "mouse", use this pattern:
+
+```rust
+static mut STATE: i32 = 0;  // persists between frames!
+#[no_mangle] pub extern "C" fn run() {
+    unsafe {
+        let mut evt = [0i32; 4];  // [event_type, x, y, data]
+        while folk_poll_event(evt.as_mut_ptr() as i32) != 0 {
+            if evt[0] == 2 { STATE = evt[1]; }  // mouse click: save x
+        }
+        folk_fill_screen(0x001a1a2e);
+        folk_draw_circle(STATE, 200, 30, 0x00FF0000);
+    }
+}
+```
 
 EXAMPLE — centered circle with screen-adaptive sizing:
 ```rust
