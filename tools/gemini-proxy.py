@@ -16,8 +16,8 @@ import ssl
 import sys
 
 API_KEY = "AIzaSyBTJNGrHPMvPn31zLsOOhXUhi35AH5OdTA"
-GEMINI_LITE = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={API_KEY}"
-GEMINI_FLASH = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={API_KEY}"
+GEMINI_LITE = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite-preview:generateContent?key={API_KEY}"
+GEMINI_FLASH = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key={API_KEY}"
 GEMINI_URL = GEMINI_FLASH
 PORT = 8080  # Default; override with command line arg
 
