@@ -77,6 +77,9 @@ pub const SYS_ASK_GEMINI: u64 = 0x70; // 112 - HTTPS POST to Gemini API
 pub const SYS_GPU_FLUSH: u64 = 0x80; // 128 - Flush dirty rect to display
 pub const SYS_GPU_INFO: u64 = 0x81;  // 129 - Get GPU info + map framebuffer
 
+// God Mode Pipe (COM3)
+pub const SYS_COM3_READ: u64 = 0x90; // 144 - Read byte from COM3 (non-blocking)
+
 /// Execute a syscall with no arguments
 #[inline(always)]
 pub unsafe fn syscall0(nr: u64) -> u64 {

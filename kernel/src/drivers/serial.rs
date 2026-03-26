@@ -9,11 +9,30 @@ use uart_16550::SerialPort;
 
 static SERIAL1: Mutex<SerialPort> = Mutex::new(unsafe { SerialPort::new(0x3F8) });
 static SERIAL2: Mutex<SerialPort> = Mutex::new(unsafe { SerialPort::new(0x2F8) });
+static SERIAL3: Mutex<SerialPort> = Mutex::new(unsafe { SerialPort::new(0x3E8) });
 
-/// Initialize serial consoles (COM1 for logging, COM2 for Gemini proxy)
+/// Initialize serial consoles (COM1=log, COM2=Gemini proxy, COM3=God Mode Pipe)
 pub fn init() {
     SERIAL1.lock().init();
     SERIAL2.lock().init();
+    SERIAL3.lock().init();
+}
+
+// ── COM3 (God Mode Pipe — direct command injection) ─────────────────────
+
+/// Read a byte from COM3 (non-blocking). Returns None if no data.
+pub fn com3_read_byte() -> Option<u8> {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let _serial = SERIAL3.lock();
+        let lsr: u8 = unsafe {
+            x86_64::instructions::port::Port::<u8>::new(0x3E8 + 5).read()
+        };
+        if (lsr & 0x01) != 0 {
+            Some(unsafe { x86_64::instructions::port::Port::<u8>::new(0x3E8).read() })
+        } else {
+            None
+        }
+    })
 }
 
 // ── COM2 (Gemini Proxy Channel) ─────────────────────────────────────────

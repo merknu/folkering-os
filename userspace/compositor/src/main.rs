@@ -592,6 +592,11 @@ fn main() -> ! {
     // First frame: mark everything dirty
     damage.damage_full();
 
+    // God Mode Pipe (COM3) — direct command injection buffer
+    let mut com3_buf = [0u8; 512];
+    let mut com3_len = 0usize;
+    let mut com3_inject: Option<alloc::string::String> = None;
+
     // ===== NEURAL DESKTOP =====
     // AI-native interface with Omnibar at center
     let folk_blue = fb.color_from_rgb24(colors::FOLK_BLUE);
@@ -913,6 +918,25 @@ fn main() -> ! {
         let mut did_work = false;
         // Consolidated redraw flag — any subsystem can set this
         let mut need_redraw = false;
+
+        // ===== GOD MODE PIPE (COM3) — Poll for injected commands =====
+        while let Some(byte) = libfolk::sys::com3_read() {
+            if byte == b'\n' && com3_len > 0 {
+                // Complete command received — inject into omnibar dispatcher
+                if let Ok(cmd) = alloc::str::from_utf8(&com3_buf[..com3_len]) {
+                    write_str("[COM3] Inject: ");
+                    write_str(cmd);
+                    write_str("\n");
+                    com3_inject = Some(alloc::string::String::from(cmd));
+                }
+                com3_len = 0;
+                did_work = true;
+                break;
+            } else if byte != b'\n' && byte != b'\r' && com3_len < com3_buf.len() {
+                com3_buf[com3_len] = byte;
+                com3_len += 1;
+            }
+        }
 
         // Check if Alt+Tab HUD has expired — clear HUD area and trigger redraw
         if hud_show_until > 0 && uptime() >= hud_show_until {
@@ -1737,6 +1761,16 @@ fn main() -> ! {
         // ===== Milestone 2.3: Create terminal window on Enter =====
         // Track deferred app creation from omnibar (no terminal window needed)
         let mut deferred_app_handle: u32 = 0;
+
+        // COM3 God Mode: inject command directly (bypasses keyboard)
+        if let Some(injected) = com3_inject.take() {
+            let bytes = injected.as_bytes();
+            let copy_len = bytes.len().min(text_buffer.len());
+            text_buffer[..copy_len].copy_from_slice(&bytes[..copy_len]);
+            text_len = copy_len;
+            execute_command = true;
+            need_redraw = true;
+        }
 
         if execute_command && text_len > 0 {
             if let Ok(cmd_str) = core::str::from_utf8(&text_buffer[..text_len]) {
