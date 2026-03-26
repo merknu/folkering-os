@@ -252,13 +252,21 @@ cd tools/folk-pack && cargo run --release -- pack-model boot/virtio-data.img boo
 
 Model loads via multi-sector DMA bursting (~60s for Qwen3-0.6B via TCG).
 
-### Serial Proxy Setup (for Gemini cloud AI)
+### Cloud LLM Setup (Gemini, OpenAI, or Claude)
+
+The serial proxy supports multiple LLM providers. Copy `.env.example` and configure:
 
 ```bash
-# Create .env file with your Gemini API key
-echo "GEMINI_API_KEY=your_key_here" > .env
+cp .env.example .env
+# Edit .env — set LLM_PROVIDER, LLM_API_KEY, LLM_MODEL
 
-# Start the serial-gemini proxy (connects to QEMU COM2 on port 4567)
+# Supported providers:
+#   gemini  — Google Gemini (default, free tier available)
+#   openai  — OpenAI / ChatGPT (gpt-4o-mini, gpt-4o, etc.)
+#   claude  — Anthropic Claude (claude-sonnet-4-20250514, etc.)
+#   openai  — Local models via Ollama/LM Studio (set LLM_BASE_URL=http://localhost:11434/v1)
+
+# Start the proxy (connects to QEMU COM2 on port 4567)
 python tools/serial-gemini-proxy.py
 
 # QEMU flags: -serial tcp:127.0.0.1:4567,server,nowait (COM2)

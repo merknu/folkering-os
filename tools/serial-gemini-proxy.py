@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Serial Gemini Proxy — communicates with Folkering OS via COM2 (TCP socket).
+"""Serial LLM Proxy — communicates with Folkering OS via COM2 (TCP socket).
+
+Supports multiple LLM providers: Gemini, OpenAI/ChatGPT, and Claude.
+Configure via .env file or environment variables.
 
 QEMU exposes COM2 as TCP server on port 4567.
 This proxy connects, reads @@GEMINI_REQ@@{json}@@END@@ from COM2,
-calls Gemini API, and writes @@GEMINI_RESP@@{text}@@END@@ back.
+calls the configured LLM API, and writes @@GEMINI_RESP@@{text}@@END@@ back.
 
 Usage: python serial-gemini-proxy.py
 """
@@ -21,21 +24,56 @@ import os
 import base64
 import shutil
 
-API_KEY = os.environ.get("GEMINI_API_KEY", "")
-if not API_KEY:
-    # Try loading from .env file in project root
+# ── Configuration (from .env or environment variables) ────────────────────
+
+def load_env():
+    """Load .env file from project root into a dict."""
+    env = {}
     _env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
     if os.path.exists(_env_path):
-        for _line in open(_env_path):
-            if _line.startswith("GEMINI_API_KEY="):
-                API_KEY = _line.strip().split("=", 1)[1].strip('"').strip("'")
-    if not API_KEY:
-        print("[SERIAL-PROXY] ERROR: Set GEMINI_API_KEY env var or create .env file")
-        sys.exit(1)
-# Model selection: lite for simple/fast queries, flash for complex tasks
-GEMINI_LITE = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite-preview:generateContent?key={API_KEY}"
-GEMINI_FLASH = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key={API_KEY}"
-GEMINI_URL = GEMINI_LITE  # Use Lite to avoid 429 rate limits on Flash
+        for line in open(_env_path):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, val = line.split("=", 1)
+                env[key.strip()] = val.strip().strip('"').strip("'")
+    return env
+
+_env = load_env()
+
+def cfg(key, default=""):
+    """Get config from env var or .env file."""
+    return os.environ.get(key, _env.get(key, default))
+
+# Provider: "gemini", "openai", or "claude"
+LLM_PROVIDER = cfg("LLM_PROVIDER", "gemini")
+LLM_API_KEY = cfg("LLM_API_KEY", "") or cfg("GEMINI_API_KEY", "")
+LLM_MODEL = cfg("LLM_MODEL", "")
+LLM_BASE_URL = cfg("LLM_BASE_URL", "")
+
+if not LLM_API_KEY:
+    print("[PROXY] ERROR: Set LLM_API_KEY (or GEMINI_API_KEY) in .env or environment")
+    sys.exit(1)
+
+# Default models per provider
+DEFAULT_MODELS = {
+    "gemini": "gemini-2.5-flash",
+    "openai": "gpt-4o-mini",
+    "claude": "claude-sonnet-4-20250514",
+}
+if not LLM_MODEL:
+    LLM_MODEL = DEFAULT_MODELS.get(LLM_PROVIDER, "gemini-2.5-flash")
+
+# Default base URLs per provider
+DEFAULT_URLS = {
+    "gemini": "https://generativelanguage.googleapis.com/v1beta",
+    "openai": "https://api.openai.com/v1",
+    "claude": "https://api.anthropic.com/v1",
+}
+if not LLM_BASE_URL:
+    LLM_BASE_URL = DEFAULT_URLS.get(LLM_PROVIDER, DEFAULT_URLS["gemini"])
+
+print(f"[PROXY] Provider: {LLM_PROVIDER} | Model: {LLM_MODEL} | URL: {LLM_BASE_URL}")
+
 COM2_HOST = "127.0.0.1"
 COM2_PORT = 4567
 
@@ -147,8 +185,8 @@ def generate_and_compile_wasm(prompt: str, sock: socket.socket):
 
     # Step 1: Call Gemini with code-gen system prompt
     full_prompt = f"{WASM_SYSTEM_PROMPT}\n\nGenerate: {prompt}"
-    print("[SERIAL-PROXY] Calling Gemini for code generation...")
-    source = call_gemini(full_prompt)
+    print(f"[SERIAL-PROXY] Calling {LLM_PROVIDER} for code generation...")
+    source = call_llm(full_prompt)
 
     if source.startswith("Error:"):
         error_resp = RESP_START + source.encode() + RESP_END + b"\n"
@@ -258,25 +296,70 @@ panic = "abort"
             pass
 
 
-def call_gemini(prompt: str) -> str:
-    """Call Gemini API and return response text."""
+def call_llm(prompt: str) -> str:
+    """Call the configured LLM provider and return response text."""
+    try:
+        if LLM_PROVIDER == "gemini":
+            return _call_gemini(prompt)
+        elif LLM_PROVIDER == "openai":
+            return _call_openai(prompt)
+        elif LLM_PROVIDER == "claude":
+            return _call_claude(prompt)
+        else:
+            return f"Error: Unknown provider '{LLM_PROVIDER}'"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def _call_gemini(prompt: str) -> str:
+    """Google Gemini API."""
+    url = f"{LLM_BASE_URL}/models/{LLM_MODEL}:generateContent?key={LLM_API_KEY}"
     body = json.dumps({
         "contents": [{"parts": [{"text": prompt}]}]
     }).encode()
+    req = urllib.request.Request(url, data=body,
+        headers={"Content-Type": "application/json"}, method="POST")
+    ctx = ssl.create_default_context()
+    with urllib.request.urlopen(req, context=ctx, timeout=60) as resp:
+        result = json.loads(resp.read())
+        return result["candidates"][0]["content"]["parts"][0]["text"]
 
-    req = urllib.request.Request(
-        GEMINI_URL, data=body,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
 
-    try:
-        ctx = ssl.create_default_context()
-        with urllib.request.urlopen(req, context=ctx, timeout=30) as resp:
-            result = json.loads(resp.read())
-            return result["candidates"][0]["content"]["parts"][0]["text"]
-    except Exception as e:
-        return f"Error: {e}"
+def _call_openai(prompt: str) -> str:
+    """OpenAI / ChatGPT API (also works with compatible APIs like Ollama, LM Studio)."""
+    url = f"{LLM_BASE_URL}/chat/completions"
+    body = json.dumps({
+        "model": LLM_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 4096,
+    }).encode()
+    req = urllib.request.Request(url, data=body, headers={
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {LLM_API_KEY}",
+    }, method="POST")
+    ctx = ssl.create_default_context()
+    with urllib.request.urlopen(req, context=ctx, timeout=60) as resp:
+        result = json.loads(resp.read())
+        return result["choices"][0]["message"]["content"]
+
+
+def _call_claude(prompt: str) -> str:
+    """Anthropic Claude API."""
+    url = f"{LLM_BASE_URL}/messages"
+    body = json.dumps({
+        "model": LLM_MODEL,
+        "max_tokens": 4096,
+        "messages": [{"role": "user", "content": prompt}],
+    }).encode()
+    req = urllib.request.Request(url, data=body, headers={
+        "Content-Type": "application/json",
+        "x-api-key": LLM_API_KEY,
+        "anthropic-version": "2023-06-01",
+    }, method="POST")
+    ctx = ssl.create_default_context()
+    with urllib.request.urlopen(req, context=ctx, timeout=60) as resp:
+        result = json.loads(resp.read())
+        return result["content"][0]["text"]
 
 
 def handle_serial(sock: socket.socket):
@@ -322,8 +405,8 @@ def handle_serial(sock: socket.socket):
                     continue
 
                 # Regular Gemini query
-                print(f"[SERIAL-PROXY] Calling Gemini...")
-                response_text = call_gemini(prompt)
+                print(f"[SERIAL-PROXY] Calling {LLM_PROVIDER}...")
+                response_text = call_llm(prompt)
                 print(f"[SERIAL-PROXY] Response: {len(response_text)} chars")
 
                 # Send response back via COM2
