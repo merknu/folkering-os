@@ -161,10 +161,10 @@ folkering_rebuild_run()
 
 ## Author
 
-Knut Ingmar Merødningen — knut@meray.no
+Knut Ingmar Merødningen — ikkjekvifull@gmail.com
 
 ## License
 
 Folkering OS is dual-licensed:
 - **AGPL-3.0**: Free for open-source use. See [LICENSE](LICENSE).
-- **Commercial**: For proprietary/closed-source use. Contact knut@meray.no.
+- **Commercial**: For proprietary/closed-source use. Contact ikkjekvifull@gmail.com.

@@ -310,7 +310,7 @@ python tools/serial-gemini-proxy.py
 
 ## Author
 
-Knut Ingmar Merødningen — [knut@meray.no](mailto:knut@meray.no)
+Knut Ingmar Merødningen — [ikkjekvifull@gmail.com](mailto:ikkjekvifull@gmail.com)
 
 ## License
 
@@ -318,7 +318,7 @@ Folkering OS is **dual-licensed**:
 
 - **AGPL-3.0** ([LICENSE](LICENSE)) — Free for open-source use. If you modify Folkering OS and distribute it (including as a network service), you must release your source code under the same license.
 
-- **Commercial License** — For proprietary, closed-source, or embedded use without AGPL obligations. Contact **knut@meray.no** for enterprise licensing.
+- **Commercial License** — For proprietary, closed-source, or embedded use without AGPL obligations. Contact **ikkjekvifull@gmail.com** for enterprise licensing.
 
 All contributors must sign a [Contributor License Agreement](CONTRIBUTING.md) (CLA) before pull requests are merged. This enables dual licensing while contributors retain their copyright.
 
