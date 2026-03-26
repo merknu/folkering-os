@@ -4,6 +4,14 @@
 
 Folkering OS runs on bare-metal x86-64 hardware (via QEMU) with its own kernel, compositor, shell, filesystem, IPC system, and a complete on-device SLM inference engine. No libc, no POSIX, no Linux — pure `no_std` Rust from bootloader to token generation.
 
+## Screenshots
+
+| Neural Desktop | System Monitor (WASM App) |
+|:-:|:-:|
+| ![Neural Desktop](screenshots/neural-desktop.png) | ![System Monitor](screenshots/system-monitor-clean.png) |
+
+*Left: Neural Desktop with cascading WASM app windows and omnibar. Right: Interactive System Monitor — a WASM app running at 60fps with live uptime, frame counter, and activity bars. All rendered on bare metal via wasmi interpreter.*
+
 ## What It Can Do Today
 
 ```
