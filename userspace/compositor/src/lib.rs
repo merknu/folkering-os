@@ -55,6 +55,8 @@ pub mod blend;
 pub mod damage;
 pub mod framebuffer;
 pub mod font;
+pub mod intent;
+pub mod ui_serialize;
 pub mod vector_font;
 pub mod window_manager;
 
