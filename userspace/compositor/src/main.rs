@@ -960,17 +960,26 @@ fn main() -> ! {
                                 write_str(nstr);
                                 write_str(" bytes, executing...\n");
 
-                                // Execute WASM in sandboxed wasmi runtime
-                                let (result, draw_cmds, text_cmds) =
-                                    compositor::wasm_runtime::execute_wasm(&wasm_bytes);
+                                // Execute WASM in sandboxed wasmi runtime with config
+                                let config = compositor::wasm_runtime::WasmConfig {
+                                    screen_width: fb.width as u32,
+                                    screen_height: fb.height as u32,
+                                    uptime_ms: libfolk::sys::uptime() as u32,
+                                };
+                                let (result, output) =
+                                    compositor::wasm_runtime::execute_wasm(&wasm_bytes, config);
 
                                 // Report result
+                                let total_cmds = output.draw_commands.len()
+                                    + output.line_commands.len()
+                                    + output.circle_commands.len()
+                                    + output.text_commands.len()
+                                    + if output.fill_screen.is_some() { 1 } else { 0 };
                                 if let Some(win) = wm.get_window_mut(tool_win_id) {
                                     match &result {
                                         compositor::wasm_runtime::WasmResult::Ok => {
                                             win.push_line(&alloc::format!(
-                                                "[AI] Tool executed: {} draw + {} text commands",
-                                                draw_cmds.len(), text_cmds.len()
+                                                "[AI] Tool executed: {} commands", total_cmds
                                             ));
                                         }
                                         compositor::wasm_runtime::WasmResult::OutOfFuel => {
@@ -985,18 +994,31 @@ fn main() -> ! {
                                     }
                                 }
 
-                                // Render WASM draw commands to framebuffer
-                                for cmd in &draw_cmds {
+                                // Render WASM output to framebuffer
+                                // Order: fill → rects → lines → circles → text
+                                if let Some(color) = output.fill_screen {
+                                    let c = fb.color_from_rgb24(color);
+                                    fb.clear(c);
+                                }
+                                for cmd in &output.draw_commands {
                                     let color = fb.color_from_rgb24(cmd.color);
                                     fb.fill_rect(cmd.x as usize, cmd.y as usize, cmd.w as usize, cmd.h as usize, color);
                                 }
-                                for cmd in &text_cmds {
+                                for cmd in &output.line_commands {
+                                    let color = fb.color_from_rgb24(cmd.color);
+                                    compositor::graphics::draw_line(&mut fb, cmd.x1, cmd.y1, cmd.x2, cmd.y2, color);
+                                }
+                                for cmd in &output.circle_commands {
+                                    let color = fb.color_from_rgb24(cmd.color);
+                                    compositor::graphics::draw_circle(&mut fb, cmd.cx, cmd.cy, cmd.r, color);
+                                }
+                                for cmd in &output.text_commands {
                                     let color = fb.color_from_rgb24(cmd.color);
                                     let bg = fb.color_from_rgb24(0x000000);
                                     fb.draw_string(cmd.x as usize, cmd.y as usize, &cmd.text, color, bg);
                                 }
 
-                                if !draw_cmds.is_empty() || !text_cmds.is_empty() {
+                                if total_cmds > 0 {
                                     damage.damage_full();
                                 }
                             } else {
