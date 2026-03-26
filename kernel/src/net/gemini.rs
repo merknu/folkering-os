@@ -39,56 +39,49 @@ const PROXY_IP: [u8; 4] = [10, 0, 2, 2];
 const PROXY_PORT: u16 = 8080;
 
 pub fn ask_gemini(prompt: &str) -> Result<Vec<u8>, &'static str> {
-    crate::serial_str!("[GEMINI] Sending via host proxy (");
+    crate::serial_str!("[GEMINI] Sending via COM2 serial (");
     crate::drivers::serial::write_dec(prompt.len() as u32);
     crate::serial_str!(" bytes)...\n");
 
-    // Build JSON body: {"prompt":"..."}
-    let mut body = Vec::with_capacity(prompt.len() + 32);
-    body.extend_from_slice(b"{\"prompt\":\"");
+    // Build JSON request: {"prompt":"..."}
+    let mut body = Vec::with_capacity(prompt.len() + 64);
+    body.extend_from_slice(b"@@GEMINI_REQ@@{\"prompt\":\"");
     json_escape_into(prompt, &mut body);
-    body.extend_from_slice(b"\"}");
+    body.extend_from_slice(b"\"}@@END@@\n");
 
-    // Build HTTP POST to local proxy (plain HTTP, no TLS needed!)
-    let mut request = Vec::with_capacity(256 + body.len());
-    request.extend_from_slice(b"POST /generate HTTP/1.1\r\n");
-    request.extend_from_slice(b"Host: 10.0.2.2:8080\r\n");
-    request.extend_from_slice(b"Content-Type: application/json\r\n");
-    request.extend_from_slice(b"Content-Length: ");
-    let mut len_buf = [0u8; 10];
-    let len_str = format_decimal(body.len(), &mut len_buf);
-    request.extend_from_slice(len_str);
-    request.extend_from_slice(b"\r\nConnection: close\r\n\r\n");
-    request.extend_from_slice(&body);
+    // Send via COM2 serial port (bypasses TCP/SLIRP entirely)
+    crate::drivers::serial::com2_write(&body);
 
-    crate::serial_str!("[GEMINI] HTTP POST to proxy: ");
-    crate::drivers::serial::write_dec(request.len() as u32);
-    crate::serial_str!(" bytes\n");
+    crate::serial_str!("[GEMINI] COM2 sent ");
+    crate::drivers::serial::write_dec(body.len() as u32);
+    crate::serial_str!(" bytes, waiting for response...\n");
 
-    // Send via plain TCP (no TLS — proxy handles HTTPS to Google)
-    let response = http_post_raw(PROXY_IP, PROXY_PORT, &request)?;
+    // Read response from COM2: @@GEMINI_RESP@@{text}@@END@@
+    let mut resp_buf = vec![0u8; 16384];
+    let resp_len = crate::drivers::serial::com2_read_until(
+        b"@@END@@", &mut resp_buf, 60_000
+    );
 
-    crate::serial_str!("[GEMINI] Proxy response: ");
-    crate::drivers::serial::write_dec(response.len() as u32);
-    crate::serial_str!(" bytes\n");
-
-    // Parse HTTP status
-    let status = parse_http_status(&response);
-    if status != 200 {
-        crate::serial_str!("[GEMINI] Proxy HTTP ");
-        crate::drivers::serial::write_dec(status as u32);
-        crate::drivers::serial::write_newline();
-        return Err("Gemini proxy error");
+    if resp_len == 0 {
+        return Err("COM2 response timeout");
     }
 
-    // Extract body (after \r\n\r\n) — proxy returns plain text directly
-    let body_start = find_body_start(&response).ok_or("no HTTP body")?;
-    let text = response[body_start..].to_vec();
+    // Strip @@GEMINI_RESP@@ prefix if present
+    let response = &resp_buf[..resp_len];
+    let text_start = if let Some(pos) = find_pattern(response, b"@@GEMINI_RESP@@") {
+        pos + b"@@GEMINI_RESP@@".len()
+    } else {
+        0
+    };
 
-    crate::serial_str!("[GEMINI] Got ");
+    let text = response[text_start..].to_vec();
+
+    crate::serial_str!("[GEMINI] COM2 got ");
     crate::drivers::serial::write_dec(text.len() as u32);
-    crate::serial_str!(" bytes of text\n");
+    crate::serial_str!(" bytes\n");
 
+    // Parse HTTP status (not needed for serial — response is raw text)
+    // Return directly
     Ok(text)
 }
 
