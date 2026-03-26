@@ -430,7 +430,7 @@ fn format_uptime(ms: u64, buf: &mut [u8; 32]) -> &str {
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 
-const HEAP_SIZE: usize = 2 * 1024 * 1024; // 2MB heap
+const HEAP_SIZE: usize = 4 * 1024 * 1024; // 4MB heap (wasmi + persistent apps need room for fragmentation)
 
 /// Minimum block size (header + usable). Must fit a FreeNode.
 const MIN_BLOCK: usize = 32;
