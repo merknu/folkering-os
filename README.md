@@ -230,23 +230,29 @@ qemu-system-x86_64 -drive file=boot/current.img -serial file:serial.log -m 512M
 
 ### AI Model Setup
 
+Folkering OS has been tested with [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) (Apache 2.0 license by Alibaba/Qwen team). Model files are **not included** in this repository — download separately:
+
 ```bash
 # Download Qwen3-0.6B Q4_0 (~364MB) — recommended
-# Or SmolLM2-135M-Instruct Q4_0 (~87MB) for faster iteration
+# Model is licensed under Apache 2.0 by the Qwen team (Alibaba)
+pip install huggingface-hub
+huggingface-cli download Qwen/Qwen3-0.6B-GGUF --include "qwen3-0.6b-q4_0.gguf" --local-dir boot/
 
 # Pack model into VirtIO disk (4KB-aligned)
 cd tools/folk-pack && cargo run --release -- pack-model boot/virtio-data.img boot/model.gguf
 ```
 
-Model loads via multi-sector DMA bursting (~60s for Qwen3-0.6B, ~15s for SmolLM2-135M).
+Model loads via multi-sector DMA bursting (~60s for Qwen3-0.6B via TCG).
 
 ### Serial Proxy Setup (for Gemini cloud AI)
 
 ```bash
+# Create .env file with your Gemini API key
+echo "GEMINI_API_KEY=your_key_here" > .env
+
 # Start the serial-gemini proxy (connects to QEMU COM2 on port 4567)
 python tools/serial-gemini-proxy.py
 
-# Requires: Google Gemini API key in the script
 # QEMU flags: -serial tcp:127.0.0.1:4567,server,nowait (COM2)
 #             -serial tcp:127.0.0.1:4568,server,nowait (COM3)
 ```
