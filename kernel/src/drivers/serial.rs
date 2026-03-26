@@ -8,10 +8,82 @@ use spin::Mutex;
 use uart_16550::SerialPort;
 
 static SERIAL1: Mutex<SerialPort> = Mutex::new(unsafe { SerialPort::new(0x3F8) });
+static SERIAL2: Mutex<SerialPort> = Mutex::new(unsafe { SerialPort::new(0x2F8) });
 
-/// Initialize serial console
+/// Initialize serial consoles (COM1 for logging, COM2 for Gemini proxy)
 pub fn init() {
     SERIAL1.lock().init();
+    SERIAL2.lock().init();
+}
+
+// ── COM2 (Gemini Proxy Channel) ─────────────────────────────────────────
+
+/// Write bytes to COM2 (Gemini proxy channel)
+pub fn com2_write(data: &[u8]) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut serial = SERIAL2.lock();
+        for &byte in data {
+            serial.send(byte);
+        }
+    });
+}
+
+/// Read a byte from COM2 (non-blocking). Returns None if no data.
+pub fn com2_read_byte() -> Option<u8> {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let _serial = SERIAL2.lock();
+        let lsr: u8 = unsafe {
+            x86_64::instructions::port::Port::<u8>::new(0x2F8 + 5).read()
+        };
+        if (lsr & 0x01) != 0 {
+            Some(unsafe { x86_64::instructions::port::Port::<u8>::new(0x2F8).read() })
+        } else {
+            None
+        }
+    })
+}
+
+/// Read until delimiter or timeout (blocking with yield).
+/// Returns bytes read (excluding delimiter).
+pub fn com2_read_until(delimiter: &[u8], buf: &mut [u8], timeout_ms: u64) -> usize {
+    let start = crate::timer::uptime_ms();
+    let mut pos = 0;
+    let mut delim_match = 0;
+
+    loop {
+        if let Some(byte) = com2_read_byte() {
+            if pos < buf.len() {
+                buf[pos] = byte;
+                pos += 1;
+            }
+            // Check for delimiter match
+            if byte == delimiter[delim_match] {
+                delim_match += 1;
+                if delim_match == delimiter.len() {
+                    return pos - delimiter.len(); // Exclude delimiter
+                }
+            } else {
+                delim_match = 0;
+            }
+        }
+
+        // Use TSC for timeout (uptime_ms may not advance in syscall context)
+        let elapsed = {
+            let tsc: u64;
+            unsafe { core::arch::asm!("rdtsc", "shl rdx, 32", "or rax, rdx", out("rax") tsc, out("rdx") _); }
+            tsc / 2_000_000 // ~ms
+        };
+        // Simple timeout: if we've been reading for too long, stop
+        if pos == 0 && elapsed > start + timeout_ms {
+            break;
+        }
+        if pos > 0 && elapsed > start + timeout_ms + 30_000 {
+            break; // Extra 30s grace for ongoing data
+        }
+
+        for _ in 0..100 { core::hint::spin_loop(); }
+    }
+    pos
 }
 
 /// Print formatted arguments to serial console
