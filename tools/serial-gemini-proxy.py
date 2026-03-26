@@ -21,17 +21,7 @@ import os
 import base64
 import shutil
 
-API_KEY = os.environ.get("GEMINI_API_KEY", "")
-if not API_KEY:
-    # Try loading from .env file in project root
-    _env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
-    if os.path.exists(_env_path):
-        for _line in open(_env_path):
-            if _line.startswith("GEMINI_API_KEY="):
-                API_KEY = _line.strip().split("=", 1)[1].strip('"').strip("'")
-    if not API_KEY:
-        print("[SERIAL-PROXY] ERROR: Set GEMINI_API_KEY env var or create .env file")
-        sys.exit(1)
+API_KEY = "AIzaSyBTJNGrHPMvPn31zLsOOhXUhi35AH5OdTA"
 # Model selection: lite for simple/fast queries, flash for complex tasks
 GEMINI_LITE = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite-preview:generateContent?key={API_KEY}"
 GEMINI_FLASH = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key={API_KEY}"
