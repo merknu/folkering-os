@@ -21,6 +21,13 @@ Folkering OS runs on bare-metal x86-64 hardware (via QEMU) with its own kernel, 
 
 > open calc
   → [Calculator] WASM-powered app with button grid
+
+> gemini make an interactive app where a circle follows the mouse
+[cloud] Sending with UI context...
+[AI] Generating tool: interactive app...
+[AI] Tool executed: persistent WASM app activated
+  → Circle tracks mouse in real-time! (folk_poll_event → per-frame loop)
+  → ESC to exit, fuel resets each frame (1M instructions)
 ```
 
 ## Architecture
@@ -109,6 +116,7 @@ Folkering OS combines local SLM inference with Gemini 3 Flash cloud API:
 - **On-device**: Qwen3-0.6B for private reasoning and text generation
 - **Cloud**: Gemini 3 Flash via COM2 serial proxy for complex tasks (intent parsing, code generation)
 - **WASM JIT Toolsmithing**: Ask Gemini to generate a tool → Rust code → compile to WASM → execute on bare metal
+- **Interactive WASM Apps**: Keywords like "game/app/click/mouse/tetris" trigger persistent mode — `PersistentWasmApp` keeps Store/Instance/Linear Memory alive between frames, `folk_poll_event` routes real-time mouse + keyboard input, `run()` is called every frame with fuel reset (1M instructions)
 
 ```
 User: "gemini draw a green rectangle"
@@ -116,10 +124,17 @@ User: "gemini draw a green rectangle"
   → Proxy: Gemini code-gen → Cargo compile → 153 byte WASM → base64
   → OS: base64_decode → wasmi execute → folk_draw_rect() → framebuffer
   → Green rectangle on screen!
+
+User: "gemini make a game where a ball bounces around"
+  → Persistent WASM app: static mut variables survive between frames
+  → folk_poll_event() returns FolkEvent (16-byte struct) for mouse/keyboard
+  → Per-frame execution loop, ESC kills app, trap/out-of-fuel auto-deactivates
 ```
 
 The serial proxy (`serial-gemini-proxy.py`) handles the full toolchain autonomously:
 temp Cargo workspace with `opt-level="z"`, `lto=true`, `strip=true` → minimal WASM binary.
+
+Folk API: 12 host functions including `folk_draw_rect`, `folk_draw_line`, `folk_draw_circle`, `folk_fill_screen`, `folk_draw_text`, `folk_screen_width/height`, `folk_random`, `folk_get_time`, `folk_poll_event`.
 
 ### Semantic VFS
 
@@ -159,6 +174,7 @@ shmem_unmap(handle, 0x30000000)?;      // unmap
 | **VirtIO network** | Done | DHCP, ICMP ping, DNS resolution |
 | **VirtIO GPU** | Done | Modern PCI transport, 2D scanout, 1280x800 |
 | **SMP (4-core)** | Done | Limine SMP, parallel GEMM, HHDM zero-copy |
+| **Free-list allocator** | Done | Replaces bump allocator, supports dealloc, survives infinite WASM runs |
 | **Serial I/O** | Done | COM1 log, COM2 Gemini proxy, COM3 God Mode Pipe |
 | **I/O APIC** | Done | Keyboard + mouse + VirtIO interrupt routing |
 | **Panic screen** | Done | Graphical panic with register dump, recursion guard |
@@ -271,10 +287,10 @@ python tools/serial-gemini-proxy.py
 - [x] **Neural Desktop** — Dirty rects, alpha blending, scaled fonts, intent engine, UI serialization
 - [x] **Hybrid AI** — Gemini 3 Flash via COM2 serial proxy, intent parsing, autonomous actions
 - [x] **WASM JIT Toolsmithing** — AI generates Rust → compiles to WASM → executes on bare metal
+- [x] **Phase 2: Interactive WASM** — PersistentWasmApp with per-frame execution, folk_poll_event real-time input, free-list allocator, Bresenham line + midpoint circle algorithms, 12 Folk API host functions
 
 ### Next
 
-- [ ] Proper freeing allocator for compositor (linked_list_allocator)
 - [ ] WASM tool persistence (save generated tools to Synapse VFS)
 - [ ] Multi-turn conversation with Gemini (context window management)
 - [ ] AVX2 GEMM acceleration for faster on-device inference
