@@ -2,7 +2,7 @@
 //!
 //! Functions for controlling the current task's execution.
 
-use crate::syscall::{syscall0, syscall1, syscall2, syscall3, syscall4, syscall6, SYS_EXIT, SYS_YIELD, SYS_GET_PID, SYS_SPAWN, SYS_PARALLEL_GEMM, SYS_ASK_GEMINI, SYS_GPU_FLUSH, SYS_GPU_INFO};
+use crate::syscall::{syscall0, syscall1, syscall2, syscall3, syscall4, syscall6, SYS_EXIT, SYS_YIELD, SYS_GET_PID, SYS_SPAWN, SYS_PARALLEL_GEMM, SYS_ASK_GEMINI, SYS_GPU_FLUSH, SYS_GPU_INFO, SYS_COM3_READ};
 
 /// Exit the current task with the given exit code
 ///
@@ -101,4 +101,10 @@ pub fn gpu_info(virt_addr: usize) -> Option<(u32, u32)> {
         let h = (ret & 0xFFFFFFFF) as u32;
         Some((w, h))
     }
+}
+
+/// Read a byte from COM3 God Mode Pipe (non-blocking).
+pub fn com3_read() -> Option<u8> {
+    let ret = unsafe { syscall0(SYS_COM3_READ) };
+    if ret == u64::MAX { None } else { Some(ret as u8) }
 }
