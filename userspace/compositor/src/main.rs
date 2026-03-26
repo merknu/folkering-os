@@ -2535,14 +2535,7 @@ fn main() -> ! {
                             // Step 3: Call Gemini proxy (128KB via mmap — bump allocator is only 64KB)
                             const GEMINI_CMD_VADDR: usize = 0x50000000; // Must be >= 0x40000000 (MMAP_BASE)
                             const GEMINI_CMD_SIZE: usize = 131072;
-                            let mmap_ok = libfolk::sys::mmap_at(GEMINI_CMD_VADDR, GEMINI_CMD_SIZE, 3).is_ok();
-                            write_str("[COMPOSITOR] mmap_at(0x34000000)=");
-                            write_str(if mmap_ok { "OK" } else { "FAIL" });
-                            write_str(" prompt_len=");
-                            let mut plbuf = [0u8; 16];
-                            write_str(format_usize(full_prompt.len(), &mut plbuf));
-                            write_str("\n");
-                            let response_len = if mmap_ok {
+                            let response_len = if libfolk::sys::mmap_at(GEMINI_CMD_VADDR, GEMINI_CMD_SIZE, 3).is_ok() {
                                 let gemini_buf = unsafe {
                                     core::slice::from_raw_parts_mut(GEMINI_CMD_VADDR as *mut u8, GEMINI_CMD_SIZE)
                                 };

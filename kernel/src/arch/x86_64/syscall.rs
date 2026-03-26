@@ -2164,18 +2164,9 @@ fn syscall_parallel_gemm(
 /// The response buffer must be pre-allocated by userspace (recommended 128KB).
 /// Gracefully handles DNS/TLS/HTTP failures — writes error message to buffer.
 fn syscall_ask_gemini(prompt_ptr: u64, prompt_len: u64, response_buf_ptr: u64) -> u64 {
-    crate::serial_str!("[SYS_GEMINI] ptr=");
-    crate::drivers::serial::write_hex(prompt_ptr);
-    crate::serial_str!(" len=");
-    crate::drivers::serial::write_dec(prompt_len as u32);
-    crate::serial_str!(" buf=");
-    crate::drivers::serial::write_hex(response_buf_ptr);
-    crate::drivers::serial::write_newline();
-
     let prompt_len = prompt_len as usize;
 
     if prompt_len == 0 || prompt_len > 8192 {
-        crate::serial_str!("[SYS_GEMINI] REJECTED: prompt_len out of range\n");
         return u64::MAX;
     }
 
