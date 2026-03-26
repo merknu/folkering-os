@@ -20,3 +20,6 @@ libfolk = { path = "../libfolk" }
 # AccessKit schema for UI tree
 libaccesskit-folk = { path = "../libaccesskit-folk" }
 
+# WebAssembly interpreter for JIT tool execution (no_std, fuel metering)
+wasmi = { version = "0.38", default-features = false }
+
