@@ -17,10 +17,10 @@ import sys
 import threading
 
 API_KEY = "***REDACTED***"
-# Model selection: lite for simple queries, flash for complex tasks
-GEMINI_LITE = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={API_KEY}"
-GEMINI_FLASH = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={API_KEY}"
-GEMINI_URL = GEMINI_FLASH  # Default to flash
+# Model selection: lite for simple/fast queries, flash for complex tasks
+GEMINI_LITE = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite-preview:generateContent?key={API_KEY}"
+GEMINI_FLASH = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key={API_KEY}"
+GEMINI_URL = GEMINI_FLASH  # Default to Gemini 3 Flash
 COM2_HOST = "127.0.0.1"
 COM2_PORT = 4567
 
