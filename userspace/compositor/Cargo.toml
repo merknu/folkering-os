@@ -19,3 +19,4 @@ libfolk = { path = "../libfolk" }
 
 # AccessKit schema for UI tree
 libaccesskit-folk = { path = "../libaccesskit-folk" }
+
