@@ -1779,6 +1779,14 @@ fn main() -> ! {
         while let Some(key) = read_key() {
             did_work = true;
 
+            // Ctrl+G (0x07) or 'G'/'g': toggle RAM graph
+            if key == 0x07 || (active_wasm_app.is_none() && (key == b'G' || key == b'g') && !omnibar_visible) {
+                show_ram_graph = !show_ram_graph;
+                need_redraw = true;
+                damage.damage_full();
+                continue;
+            }
+
             // Route to active WASM app (Phase 2) — ESC kills the app
             // ESC: close folder view first, then WASM app
             if key == 0x1B && open_folder >= 0 && active_wasm_app.is_none() {
