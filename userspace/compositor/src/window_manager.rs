@@ -11,7 +11,7 @@ use super::font::FONT_8X16;
 
 // ===== Constants =====
 
-pub const TITLE_BAR_H: usize = 24;
+pub const TITLE_BAR_H: usize = 26;
 pub const BORDER_W: usize = 2;
 const CLOSE_BTN_W: usize = 16;
 const CLOSE_BTN_MARGIN: usize = 4;
@@ -462,7 +462,7 @@ fn draw_window(fb: &mut FramebufferView, win: &Window, focused: bool) {
     let title_str = unsafe {
         core::str::from_utf8_unchecked(&win.title[..win.title_len])
     };
-    let ty = wy + BORDER_W + (TITLE_BAR_H.saturating_sub(8)) / 2 + 1; // +1 for visual centering
+    let ty = wy + BORDER_W + (TITLE_BAR_H.saturating_sub(16)) / 2; // Center 16px font in title bar
     draw_str_small(fb, wx + BORDER_W + 8, ty, title_str, title_fg, title_bg);
 
     // Close button
@@ -474,7 +474,7 @@ fn draw_window(fb: &mut FramebufferView, win: &Window, focused: bool) {
     // Draw X in close button using small font
     let x_char_x = close_x + (CLOSE_BTN_W - 8) / 2;
     let x_char_y = close_y + (CLOSE_BTN_W - 8) / 2;
-    draw_char_small(fb, x_char_x, x_char_y, 'x', close_fg, close_bg);
+    draw_char_full(fb, x_char_x, x_char_y, 'x', close_fg, close_bg);
 
     // Content area background
     let content_x = wx + BORDER_W;
@@ -483,7 +483,7 @@ fn draw_window(fb: &mut FramebufferView, win: &Window, focused: bool) {
 
     // Draw text lines
     let text_fg = rgb(fb, WIN_TEXT_FG);
-    let line_h = 14usize;  // 8px char + 6px gap (breathable spacing)
+    let line_h = 20usize;  // 16px char + 4px gap (full 8x16 font with spacing)
     let text_x = content_x + 8;
     let mut text_y = content_y + 8;
     let max_lines = (content_h as usize).saturating_sub(16) / line_h;
@@ -901,20 +901,21 @@ pub fn hit_test_widgets(widgets: &[UiWidget], x: usize, mut y: usize, click_x: u
     None
 }
 
-/// Draw a string using the 8×8 upper half of the 8×16 font (compact for window text).
+/// Draw a string using the full 8×16 VGA font for window text.
 fn draw_str_small(fb: &mut FramebufferView, mut x: usize, y: usize, s: &str, fg: u32, bg: u32) {
     for ch in s.chars() {
         if x + 8 > fb.width { break; }
-        draw_char_small(fb, x, y, ch, fg, bg);
+        draw_char_full(fb, x, y, ch, fg, bg);
         x += 8;
     }
 }
 
-/// Draw a single character using the top 8 rows of the 8×16 font glyph.
-fn draw_char_small(fb: &mut FramebufferView, x: usize, y: usize, ch: char, fg: u32, bg: u32) {
+/// Draw a single character using all 16 rows of the 8×16 font glyph.
+/// Previously only drew top 8 rows, cutting off descenders (g, y, p, q).
+fn draw_char_full(fb: &mut FramebufferView, x: usize, y: usize, ch: char, fg: u32, bg: u32) {
     let idx = ch as usize;
     let glyph = if idx < 256 { &FONT_8X16[idx] } else { &FONT_8X16[0] };
-    for row in 0..8usize {
+    for row in 0..16usize {
         let bits = glyph[row];
         for col in 0..8usize {
             if x + col >= fb.width || y + row >= fb.height { continue; }
