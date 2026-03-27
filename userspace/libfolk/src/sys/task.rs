@@ -97,6 +97,36 @@ pub fn gpu_vsync(x: u32, y: u32, w: u32, h: u32) {
     unsafe { syscall4(0x82, x as u64, y as u64, w as u64, h as u64); }
 }
 
+/// Read Real-Time Clock (CMOS RTC). Returns packed DateTime.
+/// Unpack: year=2000+(v>>26)&0x3F, month=(v>>22)&0xF, day=(v>>17)&0x1F,
+///         hour=(v>>12)&0x1F, minute=(v>>6)&0x3F, second=v&0x3F
+pub fn get_rtc_packed() -> u64 {
+    unsafe { syscall0(0x83) }
+}
+
+/// Parsed date/time from RTC
+pub struct DateTime {
+    pub year: u16,
+    pub month: u8,
+    pub day: u8,
+    pub hour: u8,
+    pub minute: u8,
+    pub second: u8,
+}
+
+/// Read Real-Time Clock and return parsed DateTime
+pub fn get_rtc() -> DateTime {
+    let v = get_rtc_packed();
+    DateTime {
+        year: 2000 + ((v >> 26) & 0x3F) as u16,
+        month: ((v >> 22) & 0x0F) as u8,
+        day: ((v >> 17) & 0x1F) as u8,
+        hour: ((v >> 12) & 0x1F) as u8,
+        minute: ((v >> 6) & 0x3F) as u8,
+        second: (v & 0x3F) as u8,
+    }
+}
+
 /// Get GPU info and map framebuffer at given virtual address.
 /// Returns (width, height) on success, None if no GPU.
 pub fn gpu_info(virt_addr: usize) -> Option<(u32, u32)> {

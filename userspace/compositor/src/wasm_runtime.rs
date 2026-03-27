@@ -204,6 +204,28 @@ fn register_host_functions(linker: &mut Linker<HostState>) {
         },
     );
 
+    // Real-Time Clock: write 6 × i32 (year, month, day, hour, minute, second) to WASM memory
+    let _ = linker.func_wrap("env", "folk_get_datetime",
+        |mut caller: Caller<HostState>, ptr: i32| -> i32 {
+            let p = ptr as u32;
+            let end = match p.checked_add(24) { Some(e) => e, None => return 0 };
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return 0,
+            };
+            if end as usize > mem.data_size(&caller) { return 0; }
+            let dt = libfolk::sys::get_rtc();
+            let mut buf = [0u8; 24];
+            buf[0..4].copy_from_slice(&(dt.year as i32).to_le_bytes());
+            buf[4..8].copy_from_slice(&(dt.month as i32).to_le_bytes());
+            buf[8..12].copy_from_slice(&(dt.day as i32).to_le_bytes());
+            buf[12..16].copy_from_slice(&(dt.hour as i32).to_le_bytes());
+            buf[16..20].copy_from_slice(&(dt.minute as i32).to_le_bytes());
+            buf[20..24].copy_from_slice(&(dt.second as i32).to_le_bytes());
+            if mem.write(&mut caller, ptr as usize, &buf).is_ok() { 1 } else { 0 }
+        },
+    );
+
     // Phase 2: Input polling — dequeue from pending_events
     let _ = linker.func_wrap("env", "folk_poll_event",
         |mut caller: Caller<HostState>, event_ptr: i32| -> i32 {
