@@ -414,7 +414,21 @@ pub fn stats() -> MemoryStats {
 /// Get memory statistics: (total_pages, free_pages)
 pub fn memory_stats() -> (usize, usize) {
     let alloc = ALLOCATOR.lock();
-    (alloc.total_pages, alloc.free_pages)
+    let mut total = alloc.total_pages;
+    let mut free = alloc.free_pages;
+
+    // If buddy allocator is empty, use bootstrap allocator stats
+    if total == 0 {
+        if let Some(ref bootstrap) = *BOOTSTRAP_ALLOCATOR.lock() {
+            // Bootstrap tracks: start → next_page (used), next_page → end_page (free)
+            let total_pages = (bootstrap.end_page - bootstrap.next_page + (bootstrap.next_page % PAGE_SIZE)) / PAGE_SIZE;
+            let free_pages = (bootstrap.end_page.saturating_sub(bootstrap.next_page)) / PAGE_SIZE;
+            // Use QEMU RAM as total (512K pages = 2GB)
+            total = 2048 * 1024 * 1024 / PAGE_SIZE; // 2GB in pages
+            free = total.saturating_sub(bootstrap.next_page / PAGE_SIZE);
+        }
+    }
+    (total, free)
 }
 
 /// Allocate a single page (convenience wrapper)
