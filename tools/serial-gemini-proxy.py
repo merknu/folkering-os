@@ -122,8 +122,10 @@ fn folk_poll_event(event_ptr: i32) -> i32;  // returns event_type (>0) or 0 if n
   // Writes 16-byte FolkEvent at event_ptr: { event_type: i32, x: i32, y: i32, data: i32 }
   // event_type: 1=mouse_move (x,y=absolute pos, data=buttons), 2=mouse_click (x,y=pos, data=button), 3=key_down (data=keycode)
 
-=== Future ===
-fn folk_get_surface() -> i32;  // zero-copy pixel buffer (Phase 3, returns 0)
+=== Direct Pixel Access (Advanced) ===
+fn folk_get_surface() -> i32;       // Returns pixel buffer offset in WASM memory (0 if unavailable)
+fn folk_surface_pitch() -> i32;     // Bytes per row (screen_width * 4)
+fn folk_surface_present();          // Call AFTER writing all pixels to trigger display
 
 TIPS:
 - Use folk_screen_width()/folk_screen_height() to make UIs that adapt to any resolution
@@ -172,6 +174,37 @@ static LABEL: &[u8] = b"Folkering OS";
         folk_fill_screen(0x001a1a2e);
         folk_draw_circle(w / 2, h / 2, h / 4, 0x0000FF00);
         folk_draw_text(w / 2 - 48, h / 2 + h / 4 + 20, LABEL.as_ptr() as i32, LABEL.len() as i32, 0x00FFFFFF);
+    }
+}
+```
+
+DIRECT PIXEL EXAMPLE — gradient fill using folk_get_surface:
+```rust
+#![no_std]
+#![no_main]
+extern "C" {
+    fn folk_get_surface() -> i32;
+    fn folk_surface_pitch() -> i32;
+    fn folk_surface_present();
+    fn folk_screen_width() -> i32;
+    fn folk_screen_height() -> i32;
+}
+#[panic_handler] fn panic(_: &core::panic::PanicInfo) -> ! { loop {} }
+#[no_mangle] pub extern "C" fn run() {
+    unsafe {
+        let surface = folk_get_surface();
+        if surface == 0 { return; }
+        let w = folk_screen_width();
+        let h = folk_screen_height();
+        let pitch = folk_surface_pitch() / 4;
+        let pixels = surface as *mut u32;
+        let mut y = 0;
+        while y < h { let mut x = 0; while x < w {
+            let r = (x * 255 / w) as u32;
+            let b = (y * 255 / h) as u32;
+            *pixels.add(y as usize * pitch as usize + x as usize) = (r << 16) | b;
+            x += 1; } y += 1; }
+        folk_surface_present();
     }
 }
 ```

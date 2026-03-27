@@ -19,8 +19,10 @@
 //! - `folk_random() -> i32` — hardware random (RDRAND)
 //! ## Input (Phase 2)
 //! - `folk_poll_event(event_ptr) -> i32` — dequeue input event (16 bytes)
-//! ## Future
-//! - `folk_get_surface() -> i32` — zero-copy pixel buffer (stub, returns 0)
+//! ## Direct Pixel Access (Phase 3)
+//! - `folk_get_surface() -> i32` — returns offset in WASM memory for pixel buffer
+//! - `folk_surface_pitch() -> i32` — bytes per row (width * 4)
+//! - `folk_surface_present()` — marks surface dirty for blit to framebuffer
 
 extern crate alloc;
 
@@ -33,6 +35,12 @@ const FUEL_LIMIT: u64 = 1_000_000;
 
 /// Maximum pending events per frame (prevent unbounded growth)
 const MAX_EVENTS: usize = 64;
+
+/// Offset in WASM linear memory where the surface pixel buffer starts (1MB)
+const SURFACE_OFFSET: usize = 0x100000;
+
+/// Minimum WASM memory pages for surface support (64 pages = 4MB)
+const MIN_SURFACE_PAGES: u32 = 64;
 
 // ── Public Types ─────────────────────────────────────────────────────────
 
@@ -77,6 +85,7 @@ pub struct WasmOutput {
     pub line_commands: Vec<LineCmd>,
     pub circle_commands: Vec<CircleCmd>,
     pub fill_screen: Option<u32>,
+    pub surface_dirty: bool,
 }
 
 // ── Internal State ───────────────────────────────────────────────────────
@@ -88,6 +97,7 @@ struct HostState {
     line_commands: Vec<LineCmd>,
     circle_commands: Vec<CircleCmd>,
     fill_screen: Option<u32>,
+    surface_dirty: bool,
     pending_events: Vec<FolkEvent>,
     config: WasmConfig,
 }
@@ -196,9 +206,35 @@ fn register_host_functions(linker: &mut Linker<HostState>) {
         },
     );
 
-    // Phase 3 stub: Zero-copy surface (returns 0 / null)
+    // Phase 3: Direct pixel access — returns offset in WASM linear memory
     let _ = linker.func_wrap("env", "folk_get_surface",
-        |_caller: Caller<HostState>| -> i32 { 0 },
+        |caller: Caller<HostState>| -> i32 {
+            // Return surface offset (only if memory is large enough)
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return 0,
+            };
+            let mem_size = mem.data_size(&caller);
+            let fb_size = (caller.data().config.screen_width as usize)
+                * (caller.data().config.screen_height as usize) * 4;
+            if SURFACE_OFFSET + fb_size <= mem_size {
+                SURFACE_OFFSET as i32
+            } else {
+                0 // Memory too small
+            }
+        },
+    );
+
+    let _ = linker.func_wrap("env", "folk_surface_pitch",
+        |caller: Caller<HostState>| -> i32 {
+            (caller.data().config.screen_width * 4) as i32
+        },
+    );
+
+    let _ = linker.func_wrap("env", "folk_surface_present",
+        |mut caller: Caller<HostState>| {
+            caller.data_mut().surface_dirty = true;
+        },
     );
 }
 
@@ -262,6 +298,7 @@ pub fn execute_wasm(
 /// WASM `static mut` variables persist. Called every frame with fresh events.
 pub struct PersistentWasmApp {
     store: Store<HostState>,
+    instance: Instance,
     run_fn: TypedFunc<(), ()>,
     pub active: bool,
 }
@@ -285,10 +322,18 @@ impl PersistentWasmApp {
             .ensure_no_start(&mut store)
             .map_err(|e| alloc::format!("Start trap: {:?}", e))?;
 
+        // Grow WASM memory to 4MB for surface buffer support
+        if let Some(Extern::Memory(mem)) = instance.get_export(&store, "memory") {
+            let current_pages = mem.size(&store);
+            if current_pages < MIN_SURFACE_PAGES {
+                let _ = mem.grow(&mut store, MIN_SURFACE_PAGES - current_pages);
+            }
+        }
+
         let run_fn = instance.get_typed_func::<(), ()>(&store, "run")
             .map_err(|_| String::from("No 'run' exported"))?;
 
-        Ok(Self { store, run_fn, active: true })
+        Ok(Self { store, instance, run_fn, active: true })
     }
 
     /// Push an input event into the app's queue (max 64 per frame).
@@ -310,6 +355,7 @@ impl PersistentWasmApp {
             state.line_commands.clear();
             state.circle_commands.clear();
             state.fill_screen = None;
+            state.surface_dirty = false;
             state.config = config;
         }
 
@@ -334,6 +380,18 @@ impl PersistentWasmApp {
             }
         }
     }
+
+    /// Access WASM linear memory as a byte slice (for surface blit).
+    /// Returns the full WASM linear memory including the surface buffer at SURFACE_OFFSET.
+    pub fn get_memory_slice(&self) -> Option<&[u8]> {
+        match self.instance.get_export(&self.store, "memory") {
+            Some(Extern::Memory(mem)) => Some(mem.data(&self.store)),
+            _ => None,
+        }
+    }
+
+    /// Surface buffer offset constant (for bounds checking in compositor).
+    pub fn surface_offset(&self) -> usize { SURFACE_OFFSET }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────
@@ -345,6 +403,7 @@ fn new_host_state(config: WasmConfig) -> HostState {
         line_commands: Vec::new(),
         circle_commands: Vec::new(),
         fill_screen: None,
+        surface_dirty: false,
         pending_events: Vec::new(),
         config,
     }
@@ -357,6 +416,7 @@ fn empty_output() -> WasmOutput {
         line_commands: Vec::new(),
         circle_commands: Vec::new(),
         fill_screen: None,
+        surface_dirty: false,
     }
 }
 
@@ -367,6 +427,7 @@ fn state_to_output(state: HostState) -> WasmOutput {
         line_commands: state.line_commands,
         circle_commands: state.circle_commands,
         fill_screen: state.fill_screen,
+        surface_dirty: state.surface_dirty,
     }
 }
 
@@ -376,11 +437,14 @@ fn take_output(state: &mut HostState) -> WasmOutput {
     let texts = ::core::mem::replace(&mut state.text_commands, Vec::new());
     let lines = ::core::mem::replace(&mut state.line_commands, Vec::new());
     let circles = ::core::mem::replace(&mut state.circle_commands, Vec::new());
+    let dirty = state.surface_dirty;
+    state.surface_dirty = false;
     WasmOutput {
         draw_commands: draws,
         text_commands: texts,
         line_commands: lines,
         circle_commands: circles,
         fill_screen: state.fill_screen.take(),
+        surface_dirty: dirty,
     }
 }
