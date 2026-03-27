@@ -3490,6 +3490,37 @@ fn main() -> ! {
                 fb.draw_string(hint_x, fb.height - 50, hint, dark_gray, folk_dark);
             }
 
+            // ===== System Tray Clock (top-right corner) =====
+            {
+                let dt = libfolk::sys::get_rtc();
+                // Format: "2026-03-27 14:30:05"
+                let mut clock_buf = [0u8; 19];
+                // Year
+                let y = dt.year;
+                clock_buf[0] = b'0' + ((y / 1000) % 10) as u8;
+                clock_buf[1] = b'0' + ((y / 100) % 10) as u8;
+                clock_buf[2] = b'0' + ((y / 10) % 10) as u8;
+                clock_buf[3] = b'0' + (y % 10) as u8;
+                clock_buf[4] = b'-';
+                clock_buf[5] = b'0' + (dt.month / 10);
+                clock_buf[6] = b'0' + (dt.month % 10);
+                clock_buf[7] = b'-';
+                clock_buf[8] = b'0' + (dt.day / 10);
+                clock_buf[9] = b'0' + (dt.day % 10);
+                clock_buf[10] = b' ';
+                clock_buf[11] = b'0' + (dt.hour / 10);
+                clock_buf[12] = b'0' + (dt.hour % 10);
+                clock_buf[13] = b':';
+                clock_buf[14] = b'0' + (dt.minute / 10);
+                clock_buf[15] = b'0' + (dt.minute % 10);
+                clock_buf[16] = b':';
+                clock_buf[17] = b'0' + (dt.second / 10);
+                clock_buf[18] = b'0' + (dt.second % 10);
+                let clock_str = unsafe { core::str::from_utf8_unchecked(&clock_buf) };
+                let clock_x = fb.width.saturating_sub(19 * 8 + 12);
+                fb.draw_string(clock_x, 8, clock_str, folk_accent, folk_dark);
+            }
+
             // ===== Composite Windows (Milestone 2.1) =====
             // Draw all managed windows on top of the desktop/omnibar
             if wm.has_visible() {

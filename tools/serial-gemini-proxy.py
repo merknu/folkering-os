@@ -116,6 +116,7 @@ fn folk_get_time() -> i32;       // uptime in milliseconds
 fn folk_screen_width() -> i32;   // screen width in pixels (use for self-scaling UI!)
 fn folk_screen_height() -> i32;  // screen height in pixels
 fn folk_random() -> i32;         // hardware random number (RDRAND)
+fn folk_get_datetime(ptr: i32) -> i32;  // writes 6 x i32 (year,month,day,hour,minute,second) at ptr, returns 1 on success
 
 === Input (Interactive Apps) ===
 fn folk_poll_event(event_ptr: i32) -> i32;  // returns event_type (>0) or 0 if none

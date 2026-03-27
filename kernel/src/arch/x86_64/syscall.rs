@@ -978,6 +978,8 @@ extern "C" fn syscall_handler(
             );
             0
         },
+        // Real-Time Clock (CMOS RTC)
+        0x83 => super::rtc::read_rtc_packed(),
         // God Mode Pipe: read byte from COM3
         0x90 => {
             match crate::drivers::serial::com3_read_byte() {
