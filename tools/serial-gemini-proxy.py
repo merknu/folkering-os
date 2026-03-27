@@ -85,6 +85,7 @@ RESP_END = b"@@END@@"
 
 TOOL_GENERATE_PREFIX = "[GENERATE_TOOL]"
 TIME_SYNC_PREFIX = "[TIME_SYNC]"
+LOAD_WASM_PREFIX = "[LOAD_WASM:"  # [LOAD_WASM:/path/to/file.wasm]
 
 # Maximum compiled WASM size (64KB) — prevents COM2 buffer overflow
 MAX_WASM_SIZE = 64 * 1024
@@ -461,6 +462,27 @@ def handle_serial(sock: socket.socket):
                     response = RESP_START + time_data.encode() + RESP_END + b"\n"
                     sock.sendall(response)
                     print(f"[SERIAL-PROXY] Time sync: {time_data}")
+                    continue
+
+                # Check for [LOAD_WASM:path] → load precompiled WASM from host disk
+                if prompt.startswith(LOAD_WASM_PREFIX):
+                    wasm_path = prompt[len(LOAD_WASM_PREFIX):].rstrip("]").strip()
+                    print(f"[SERIAL-PROXY] Loading WASM from: {wasm_path}")
+                    try:
+                        with open(wasm_path, "rb") as wf:
+                            wasm_binary = wf.read()
+                        if len(wasm_binary) > MAX_WASM_SIZE:
+                            error = f"WASM too large: {len(wasm_binary)} bytes"
+                            sock.sendall(RESP_START + error.encode() + RESP_END + b"\n")
+                        else:
+                            b64_data = base64.b64encode(wasm_binary).decode("ascii")
+                            resp_json = json.dumps({"action": "tool_ready", "binary": b64_data})
+                            sock.sendall(RESP_START + resp_json.encode() + RESP_END + b"\n")
+                            print(f"[SERIAL-PROXY] Loaded {len(wasm_binary)} bytes WASM")
+                    except FileNotFoundError:
+                        sock.sendall(RESP_START + f"File not found: {wasm_path}".encode() + RESP_END + b"\n")
+                    except Exception as e:
+                        sock.sendall(RESP_START + f"Load error: {e}".encode() + RESP_END + b"\n")
                     continue
 
                 # Check for [GENERATE_TOOL] prefix → WASM pipeline
