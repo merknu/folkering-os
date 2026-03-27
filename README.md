@@ -6,13 +6,13 @@ Folkering OS runs on bare-metal x86-64 hardware (via QEMU) with its own kernel, 
 
 ## Screenshots
 
-| Neural Desktop | RAM History Graph |
-|:-:|:-:|
-| ![Neural Desktop](screenshots/neural-desktop.png) | ![RAM Graph](screenshots/ram-graph.png) |
-| Zero-Copy Gradient | System Monitor |
-| ![Gradient](screenshots/gradient-surface.png) | ![System Monitor](screenshots/system-monitor-clean.png) |
+| Neural Desktop | Calculator | Paint |
+|:-:|:-:|:-:|
+| ![Desktop](screenshots/neural-desktop.png) | ![Calculator](screenshots/calculator.png) | ![Paint](screenshots/paint.png) |
+| About Dialog | Zero-Copy Gradient | RAM Graph |
+| ![About](screenshots/about-dialog.png) | ![Gradient](screenshots/gradient-surface.png) | ![RAM](screenshots/ram-graph.png) |
 
-*Top left: Neural Desktop with status bar (date, clock, RAM%). Top right: Live RAM usage graph (2-minute history, click to toggle). Bottom left: Zero-copy gradient — 786K pixels direct from WASM. Bottom right: Interactive System Monitor at 60fps.*
+*Row 1: Neural Desktop with status bar (date + clock + RAM%), interactive Calculator with click-to-compute, Mini Paint with 8-color palette. Row 2: Win3.1 About Dialog with animated starfield, Zero-copy gradient (786K pixels direct from WASM), live RAM usage history graph.*
 
 ## What It Can Do Today
 
