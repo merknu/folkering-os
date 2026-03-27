@@ -127,6 +127,13 @@ fn folk_get_surface() -> i32;       // Returns pixel buffer offset in WASM memor
 fn folk_surface_pitch() -> i32;     // Bytes per row (screen_width * 4)
 fn folk_surface_present();          // Call AFTER writing all pixels to trigger display
 
+=== Async File Loading ===
+fn folk_request_file(path_ptr: i32, path_len: i32, dest_ptr: i32, dest_len: i32) -> i32;
+  // Request async file load from VFS. Returns handle (>0) or 0 on error.
+  // File data is written to dest_ptr in WASM memory when ready.
+  // Check folk_poll_event for event_type=4 (AssetLoaded):
+  //   x=handle, y=status (0=ok, 1=not_found), data=bytes_loaded
+
 TIPS:
 - Use folk_screen_width()/folk_screen_height() to make UIs that adapt to any resolution
 - folk_draw_text ptr must point to static bytes: static TEXT: &[u8] = b"Hello"; then pass TEXT.as_ptr() as i32
