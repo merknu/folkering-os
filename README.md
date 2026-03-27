@@ -6,11 +6,13 @@ Folkering OS runs on bare-metal x86-64 hardware (via QEMU) with its own kernel, 
 
 ## Screenshots
 
-| Neural Desktop | System Monitor (WASM App) |
+| Neural Desktop | Zero-Copy Gradient (786K pixels direct from WASM) |
 |:-:|:-:|
-| ![Neural Desktop](screenshots/neural-desktop.png) | ![System Monitor](screenshots/system-monitor-clean.png) |
+| ![Neural Desktop](screenshots/neural-desktop.png) | ![Gradient](screenshots/gradient-surface.png) |
+| System Monitor (60fps WASM App) | |
+| ![System Monitor](screenshots/system-monitor-clean.png) | |
 
-*Left: Neural Desktop with cascading WASM app windows and omnibar. Right: Interactive System Monitor — a WASM app running at 60fps with live uptime, frame counter, and activity bars. All rendered on bare metal via wasmi interpreter.*
+*Top left: Neural Desktop with cascading WASM app windows and omnibar. Top right: Full-screen rainbow gradient — every pixel written directly from WASM linear memory to framebuffer via `folk_get_surface()`. Bottom: Interactive System Monitor running at 60fps.*
 
 ## What It Can Do Today
 
