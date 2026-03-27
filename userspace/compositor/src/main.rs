@@ -1067,51 +1067,6 @@ fn main() -> ! {
     let mut tz_offset_minutes: i32 = 0; // UTC offset from host time sync
     let mut tz_synced = false;
 
-    // Boot-time sync: request local time from host via COM2
-    {
-        write_str("[COMPOSITOR] Requesting time sync from host...\n");
-        const TIME_BUF_VADDR: usize = 0x50080000;
-        const TIME_BUF_SIZE: usize = 4096;
-        if libfolk::sys::mmap_at(TIME_BUF_VADDR, TIME_BUF_SIZE, 3).is_ok() {
-            let time_buf = unsafe {
-                core::slice::from_raw_parts_mut(TIME_BUF_VADDR as *mut u8, TIME_BUF_SIZE)
-            };
-            let resp_len = libfolk::sys::ask_gemini("[TIME_SYNC]", time_buf);
-            if resp_len > 0 {
-                if let Ok(text) = core::str::from_utf8(&time_buf[..resp_len]) {
-                    // Parse JSON: find "utc_offset_minutes": N
-                    if let Some(pos) = text.find("utc_offset_minutes") {
-                        let rest = &text[pos..];
-                        if let Some(colon) = rest.find(':') {
-                            let num_start = &rest[colon + 1..].trim_start();
-                            let mut val: i32 = 0;
-                            let mut neg = false;
-                            let mut started = false;
-                            for c in num_start.chars() {
-                                if c == '-' && !started { neg = true; continue; }
-                                if c.is_ascii_digit() { val = val * 10 + (c as i32 - '0' as i32); started = true; }
-                                else if started { break; }
-                            }
-                            if neg { val = -val; }
-                            tz_offset_minutes = val;
-                            tz_synced = true;
-                            write_str("[COMPOSITOR] Time sync: UTC offset = ");
-                            if val >= 0 { write_str("+"); }
-                            // Simple decimal print
-                            let abs_val = if val < 0 { -val } else { val } as u32;
-                            let mut nbuf = [0u8; 16];
-                            let nstr = format_usize(abs_val as usize, &mut nbuf);
-                            if val < 0 { write_str("-"); }
-                            write_str(nstr);
-                            write_str(" minutes\n");
-                        }
-                    }
-                }
-            }
-            let _ = libfolk::sys::munmap(TIME_BUF_VADDR as *mut u8, TIME_BUF_SIZE);
-        }
-    }
-
     loop {
         // Track if we did any work this iteration
         let mut did_work = false;
@@ -1123,6 +1078,46 @@ fn main() -> ! {
         if current_second != last_clock_second {
             last_clock_second = current_second;
             need_redraw = true;
+
+            // Lazy timezone sync: try once when clock first ticks (proxy should be ready)
+            if !tz_synced {
+                const TIME_BUF_VADDR: usize = 0x50080000;
+                const TIME_BUF_SIZE: usize = 4096;
+                if libfolk::sys::mmap_at(TIME_BUF_VADDR, TIME_BUF_SIZE, 3).is_ok() {
+                    let time_buf = unsafe {
+                        core::slice::from_raw_parts_mut(TIME_BUF_VADDR as *mut u8, TIME_BUF_SIZE)
+                    };
+                    let resp_len = libfolk::sys::ask_gemini("[TIME_SYNC]", time_buf);
+                    if resp_len > 0 {
+                        if let Ok(text) = core::str::from_utf8(&time_buf[..resp_len]) {
+                            if let Some(pos) = text.find("utc_offset_minutes") {
+                                let rest = &text[pos..];
+                                if let Some(colon) = rest.find(':') {
+                                    let num_start = &rest[colon + 1..].trim_start();
+                                    let mut val: i32 = 0;
+                                    let mut neg = false;
+                                    let mut started = false;
+                                    for c in num_start.chars() {
+                                        if c == '-' && !started { neg = true; continue; }
+                                        if c.is_ascii_digit() {
+                                            val = val * 10 + (c as i32 - '0' as i32);
+                                            started = true;
+                                        } else if started { break; }
+                                    }
+                                    if neg { val = -val; }
+                                    tz_offset_minutes = val;
+                                    tz_synced = true;
+                                    write_str("[COMPOSITOR] Time sync: UTC+");
+                                    let mut nbuf = [0u8; 16];
+                                    write_str(format_usize((val / 60) as usize, &mut nbuf));
+                                    write_str("\n");
+                                }
+                            }
+                        }
+                    }
+                    let _ = libfolk::sys::munmap(TIME_BUF_VADDR as *mut u8, TIME_BUF_SIZE);
+                }
+            }
         }
 
         // ===== WASM JIT TOOLSMITHING — Deferred tool generation (Frame 2) =====
