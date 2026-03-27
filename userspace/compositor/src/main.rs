@@ -3753,57 +3753,7 @@ fn main() -> ! {
                 fb.draw_string(hint_x, fb.height - 50, hint, dark_gray, folk_dark);
             }
 
-            // ===== System Tray Clock (top-right corner) =====
-            // Applies timezone offset from host time sync
-            {
-                let dt = libfolk::sys::get_rtc();
-                // Apply timezone offset (RTC is UTC, offset is in minutes)
-                let mut total_minutes = dt.hour as i32 * 60 + dt.minute as i32 + tz_offset_minutes;
-                let mut day = dt.day as i32;
-                let mut month = dt.month;
-                let mut year = dt.year;
-                // Handle day rollover
-                if total_minutes >= 24 * 60 {
-                    total_minutes -= 24 * 60;
-                    day += 1;
-                    // Simple month-end check (approximate, good enough for display)
-                    let days_in_month = match month {
-                        2 => 28, 4 | 6 | 9 | 11 => 30, _ => 31,
-                    };
-                    if day > days_in_month { day = 1; month += 1; if month > 12 { month = 1; year += 1; } }
-                } else if total_minutes < 0 {
-                    total_minutes += 24 * 60;
-                    day -= 1;
-                    if day < 1 { month -= 1; if month < 1 { month = 12; year -= 1; } day = 28; }
-                }
-                let local_hour = (total_minutes / 60) as u8;
-                let local_minute = (total_minutes % 60) as u8;
-                let local_second = dt.second;
-                // Format: "2026-03-27 14:30:05"
-                let mut clock_buf = [0u8; 19];
-                clock_buf[0] = b'0' + ((year / 1000) % 10) as u8;
-                clock_buf[1] = b'0' + ((year / 100) % 10) as u8;
-                clock_buf[2] = b'0' + ((year / 10) % 10) as u8;
-                clock_buf[3] = b'0' + (year % 10) as u8;
-                clock_buf[4] = b'-';
-                clock_buf[5] = b'0' + (month / 10);
-                clock_buf[6] = b'0' + (month % 10);
-                clock_buf[7] = b'-';
-                clock_buf[8] = b'0' + (day as u8 / 10);
-                clock_buf[9] = b'0' + (day as u8 % 10);
-                clock_buf[10] = b' ';
-                clock_buf[11] = b'0' + (local_hour / 10);
-                clock_buf[12] = b'0' + (local_hour % 10);
-                clock_buf[13] = b':';
-                clock_buf[14] = b'0' + (local_minute / 10);
-                clock_buf[15] = b'0' + (local_minute % 10);
-                clock_buf[16] = b':';
-                clock_buf[17] = b'0' + (local_second / 10);
-                clock_buf[18] = b'0' + (local_second % 10);
-                let clock_str = unsafe { core::str::from_utf8_unchecked(&clock_buf) };
-                let clock_x = fb.width.saturating_sub(19 * 8 + 12);
-                fb.draw_string(clock_x, 8, clock_str, folk_accent, folk_dark);
-            }
+            // (System Tray Clock moved to always-on-top section below)
 
             // ===== App Launcher: Folder grid or app grid =====
             {
@@ -4081,6 +4031,52 @@ fn main() -> ! {
                 fb.fill_rect_alpha(hud_x, hud_y, hud_w, 24, 0x1a1a2e, 200);
                 fb.draw_rect(hud_x, hud_y, hud_w, 24, folk_accent);
                 fb.draw_string(hud_x + 12, hud_y + 8, hud_text, white, folk_dark);
+            }
+
+            // ===== System Tray Clock — ALWAYS ON TOP =====
+            // Rendered after windows, WASM apps, HUD — only cursor is above
+            {
+                let dt = libfolk::sys::get_rtc();
+                let mut total_minutes = dt.hour as i32 * 60 + dt.minute as i32 + tz_offset_minutes;
+                let mut day = dt.day as i32;
+                let mut month = dt.month;
+                let mut year = dt.year;
+                if total_minutes >= 24 * 60 {
+                    total_minutes -= 24 * 60; day += 1;
+                    let dim = match month { 2 => 28, 4|6|9|11 => 30, _ => 31 };
+                    if day > dim { day = 1; month += 1; if month > 12 { month = 1; year += 1; } }
+                } else if total_minutes < 0 {
+                    total_minutes += 24 * 60; day -= 1;
+                    if day < 1 { month -= 1; if month < 1 { month = 12; year -= 1; } day = 28; }
+                }
+                let lh = (total_minutes / 60) as u8;
+                let lm = (total_minutes % 60) as u8;
+                let ls = dt.second;
+                // Format: "14:30:05"  (compact, like a phone status bar)
+                let mut t = [0u8; 8];
+                t[0] = b'0' + lh / 10; t[1] = b'0' + lh % 10;
+                t[2] = b':';
+                t[3] = b'0' + lm / 10; t[4] = b'0' + lm % 10;
+                t[5] = b':';
+                t[6] = b'0' + ls / 10; t[7] = b'0' + ls % 10;
+                let time_str = unsafe { core::str::from_utf8_unchecked(&t) };
+
+                // Status bar background (semi-transparent strip at top)
+                let bar_h = 20usize;
+                fb.fill_rect_alpha(0, 0, fb.width, bar_h, 0x000000, 140);
+
+                // Clock centered at top
+                let time_x = (fb.width.saturating_sub(8 * 8)) / 2;
+                fb.draw_string(time_x, 2, time_str, white, fb.color_from_rgb24(0x0a0a0a));
+
+                // Date on the left
+                let mut d = [0u8; 10];
+                d[0] = b'0' + ((year/1000)%10) as u8; d[1] = b'0' + ((year/100)%10) as u8;
+                d[2] = b'0' + ((year/10)%10) as u8; d[3] = b'0' + (year%10) as u8;
+                d[4] = b'-'; d[5] = b'0' + month/10; d[6] = b'0' + month%10;
+                d[7] = b'-'; d[8] = b'0' + day as u8/10; d[9] = b'0' + day as u8%10;
+                let date_str = unsafe { core::str::from_utf8_unchecked(&d) };
+                fb.draw_string(8, 2, date_str, gray, fb.color_from_rgb24(0x0a0a0a));
             }
 
             // After full redraw: re-save cursor background and redraw cursor on top
