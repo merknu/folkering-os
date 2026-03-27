@@ -1063,11 +1063,20 @@ fn main() -> ! {
         // No saved state or empty — normal boot, no error
     }
 
+    let mut last_clock_second: u8 = 255; // Force first draw
+
     loop {
         // Track if we did any work this iteration
         let mut did_work = false;
         // Consolidated redraw flag — any subsystem can set this
         let mut need_redraw = false;
+
+        // Clock tick: redraw once per second for system tray
+        let current_second = (libfolk::sys::get_rtc_packed() & 0x3F) as u8;
+        if current_second != last_clock_second {
+            last_clock_second = current_second;
+            need_redraw = true;
+        }
 
         // ===== WASM JIT TOOLSMITHING — Deferred tool generation (Frame 2) =====
         // Previous frame rendered "[AI] Generating tool..." and flushed to GPU.
@@ -1524,6 +1533,13 @@ fn main() -> ! {
             if let Some(app) = &mut active_wasm_app {
                 if key == 0x1B { // ESC
                     active_wasm_app = None;
+                    // Clear WASM residue from framebuffer
+                    fb.clear(folk_dark);
+                    // Re-draw desktop title
+                    let title_x2 = (fb.width.saturating_sub(12 * 8)) / 2;
+                    fb.draw_string(title_x2, 40, "FOLKERING OS", folk_accent, folk_dark);
+                    let sub_x2 = (fb.width.saturating_sub(14 * 8)) / 2;
+                    fb.draw_string(sub_x2, 60, "Neural Desktop", gray, folk_dark);
                     need_redraw = true;
                     damage.damage_full();
                     continue;
