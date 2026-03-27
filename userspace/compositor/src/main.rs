@@ -3038,12 +3038,9 @@ fn main() -> ! {
                                                     win.push_line(&alloc::format!("[OS] Loaded {} bytes", wasm_bytes.len()));
                                                     last_wasm_bytes = Some(wasm_bytes.clone());
 
-                                                    let interactive = find_ci(path.as_bytes(), b"app")
-                                                        || find_ci(path.as_bytes(), b"game")
-                                                        || find_ci(path.as_bytes(), b"interactive")
-                                                        || find_ci(path.as_bytes(), b"click")
-                                                        || find_ci(path.as_bytes(), b"mouse");
-                                                    last_wasm_interactive = interactive;
+                                                    // load command ALWAYS launches as interactive app
+                                                    let interactive = true;
+                                                    last_wasm_interactive = true;
 
                                                     let config = compositor::wasm_runtime::WasmConfig {
                                                         screen_width: fb.width as u32,
@@ -3054,7 +3051,8 @@ fn main() -> ! {
                                                     if interactive {
                                                         match compositor::wasm_runtime::PersistentWasmApp::new(&wasm_bytes, config) {
                                                             Ok(app) => {
-                                                                win.push_line("[OS] Interactive app launched! ESC to exit.");
+                                                                // Hide the load window — WASM app takes over screen
+                                                                win.visible = false;
                                                                 active_wasm_app = Some(app);
                                                             }
                                                             Err(e) => { win.push_line(&alloc::format!("[OS] Error: {}", &e[..e.len().min(60)])); }
