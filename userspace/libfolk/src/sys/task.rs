@@ -127,6 +127,18 @@ pub fn get_rtc() -> DateTime {
     }
 }
 
+/// Get system memory statistics: (total_mb, used_mb, usage_percent)
+pub fn memory_stats() -> (u32, u32, u32) {
+    let raw = unsafe { syscall0(0x84) };
+    let total_pages = (raw >> 32) as u32;
+    let free_pages = (raw & 0xFFFFFFFF) as u32;
+    let total_mb = total_pages * 4 / 1024; // 4KB pages → MB
+    let used_pages = total_pages.saturating_sub(free_pages);
+    let used_mb = used_pages * 4 / 1024;
+    let pct = if total_pages > 0 { (used_pages * 100 / total_pages) as u32 } else { 0 };
+    (total_mb, used_mb, pct)
+}
+
 /// Get GPU info and map framebuffer at given virtual address.
 /// Returns (width, height) on success, None if no GPU.
 pub fn gpu_info(virt_addr: usize) -> Option<(u32, u32)> {
