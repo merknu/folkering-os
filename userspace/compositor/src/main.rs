@@ -1064,6 +1064,53 @@ fn main() -> ! {
     }
 
     let mut last_clock_second: u8 = 255; // Force first draw
+    let mut tz_offset_minutes: i32 = 0; // UTC offset from host time sync
+    let mut tz_synced = false;
+
+    // Boot-time sync: request local time from host via COM2
+    {
+        write_str("[COMPOSITOR] Requesting time sync from host...\n");
+        const TIME_BUF_VADDR: usize = 0x50080000;
+        const TIME_BUF_SIZE: usize = 4096;
+        if libfolk::sys::mmap_at(TIME_BUF_VADDR, TIME_BUF_SIZE, 3).is_ok() {
+            let time_buf = unsafe {
+                core::slice::from_raw_parts_mut(TIME_BUF_VADDR as *mut u8, TIME_BUF_SIZE)
+            };
+            let resp_len = libfolk::sys::ask_gemini("[TIME_SYNC]", time_buf);
+            if resp_len > 0 {
+                if let Ok(text) = core::str::from_utf8(&time_buf[..resp_len]) {
+                    // Parse JSON: find "utc_offset_minutes": N
+                    if let Some(pos) = text.find("utc_offset_minutes") {
+                        let rest = &text[pos..];
+                        if let Some(colon) = rest.find(':') {
+                            let num_start = &rest[colon + 1..].trim_start();
+                            let mut val: i32 = 0;
+                            let mut neg = false;
+                            let mut started = false;
+                            for c in num_start.chars() {
+                                if c == '-' && !started { neg = true; continue; }
+                                if c.is_ascii_digit() { val = val * 10 + (c as i32 - '0' as i32); started = true; }
+                                else if started { break; }
+                            }
+                            if neg { val = -val; }
+                            tz_offset_minutes = val;
+                            tz_synced = true;
+                            write_str("[COMPOSITOR] Time sync: UTC offset = ");
+                            if val >= 0 { write_str("+"); }
+                            // Simple decimal print
+                            let abs_val = if val < 0 { -val } else { val } as u32;
+                            let mut nbuf = [0u8; 16];
+                            let nstr = format_usize(abs_val as usize, &mut nbuf);
+                            if val < 0 { write_str("-"); }
+                            write_str(nstr);
+                            write_str(" minutes\n");
+                        }
+                    }
+                }
+            }
+            let _ = libfolk::sys::munmap(TIME_BUF_VADDR as *mut u8, TIME_BUF_SIZE);
+        }
+    }
 
     loop {
         // Track if we did any work this iteration
@@ -3507,31 +3554,52 @@ fn main() -> ! {
             }
 
             // ===== System Tray Clock (top-right corner) =====
+            // Applies timezone offset from host time sync
             {
                 let dt = libfolk::sys::get_rtc();
+                // Apply timezone offset (RTC is UTC, offset is in minutes)
+                let mut total_minutes = dt.hour as i32 * 60 + dt.minute as i32 + tz_offset_minutes;
+                let mut day = dt.day as i32;
+                let mut month = dt.month;
+                let mut year = dt.year;
+                // Handle day rollover
+                if total_minutes >= 24 * 60 {
+                    total_minutes -= 24 * 60;
+                    day += 1;
+                    // Simple month-end check (approximate, good enough for display)
+                    let days_in_month = match month {
+                        2 => 28, 4 | 6 | 9 | 11 => 30, _ => 31,
+                    };
+                    if day > days_in_month { day = 1; month += 1; if month > 12 { month = 1; year += 1; } }
+                } else if total_minutes < 0 {
+                    total_minutes += 24 * 60;
+                    day -= 1;
+                    if day < 1 { month -= 1; if month < 1 { month = 12; year -= 1; } day = 28; }
+                }
+                let local_hour = (total_minutes / 60) as u8;
+                let local_minute = (total_minutes % 60) as u8;
+                let local_second = dt.second;
                 // Format: "2026-03-27 14:30:05"
                 let mut clock_buf = [0u8; 19];
-                // Year
-                let y = dt.year;
-                clock_buf[0] = b'0' + ((y / 1000) % 10) as u8;
-                clock_buf[1] = b'0' + ((y / 100) % 10) as u8;
-                clock_buf[2] = b'0' + ((y / 10) % 10) as u8;
-                clock_buf[3] = b'0' + (y % 10) as u8;
+                clock_buf[0] = b'0' + ((year / 1000) % 10) as u8;
+                clock_buf[1] = b'0' + ((year / 100) % 10) as u8;
+                clock_buf[2] = b'0' + ((year / 10) % 10) as u8;
+                clock_buf[3] = b'0' + (year % 10) as u8;
                 clock_buf[4] = b'-';
-                clock_buf[5] = b'0' + (dt.month / 10);
-                clock_buf[6] = b'0' + (dt.month % 10);
+                clock_buf[5] = b'0' + (month / 10);
+                clock_buf[6] = b'0' + (month % 10);
                 clock_buf[7] = b'-';
-                clock_buf[8] = b'0' + (dt.day / 10);
-                clock_buf[9] = b'0' + (dt.day % 10);
+                clock_buf[8] = b'0' + (day as u8 / 10);
+                clock_buf[9] = b'0' + (day as u8 % 10);
                 clock_buf[10] = b' ';
-                clock_buf[11] = b'0' + (dt.hour / 10);
-                clock_buf[12] = b'0' + (dt.hour % 10);
+                clock_buf[11] = b'0' + (local_hour / 10);
+                clock_buf[12] = b'0' + (local_hour % 10);
                 clock_buf[13] = b':';
-                clock_buf[14] = b'0' + (dt.minute / 10);
-                clock_buf[15] = b'0' + (dt.minute % 10);
+                clock_buf[14] = b'0' + (local_minute / 10);
+                clock_buf[15] = b'0' + (local_minute % 10);
                 clock_buf[16] = b':';
-                clock_buf[17] = b'0' + (dt.second / 10);
-                clock_buf[18] = b'0' + (dt.second % 10);
+                clock_buf[17] = b'0' + (local_second / 10);
+                clock_buf[18] = b'0' + (local_second % 10);
                 let clock_str = unsafe { core::str::from_utf8_unchecked(&clock_buf) };
                 let clock_x = fb.width.saturating_sub(19 * 8 + 12);
                 fb.draw_string(clock_x, 8, clock_str, folk_accent, folk_dark);
