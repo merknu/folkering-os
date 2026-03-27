@@ -39,7 +39,9 @@ const MAX_EVENTS: usize = 64;
 /// Offset in WASM linear memory where the surface pixel buffer starts (1MB)
 const SURFACE_OFFSET: usize = 0x100000;
 
-/// Minimum WASM memory pages for surface support (64 pages = 4MB)
+/// Minimum WASM memory pages for surface support
+/// 1024*768*4 = 3MB at offset 1MB = need 4MB = 64 pages
+/// But only grow if heap can afford it (check before growing)
 const MIN_SURFACE_PAGES: u32 = 64;
 
 // ── Public Types ─────────────────────────────────────────────────────────
@@ -338,11 +340,16 @@ impl PersistentWasmApp {
             .ensure_no_start(&mut store)
             .map_err(|e| alloc::format!("Start trap: {:?}", e))?;
 
-        // Grow WASM memory to 4MB for surface buffer support
+        // Try to grow WASM memory for surface buffer support.
+        // If allocation fails (heap too small), surface just won't be available
+        // and folk_get_surface() will return 0 (apps use DrawCmd fallback).
         if let Some(Extern::Memory(mem)) = instance.get_export(&store, "memory") {
             let current_pages = mem.size(&store);
             if current_pages < MIN_SURFACE_PAGES {
-                let _ = mem.grow(&mut store, MIN_SURFACE_PAGES - current_pages);
+                match mem.grow(&mut store, MIN_SURFACE_PAGES - current_pages) {
+                    Ok(_) => {} // Surface buffer available
+                    Err(_) => {} // Growth failed — surface won't work, but app runs fine with DrawCmd
+                }
             }
         }
 

@@ -430,7 +430,7 @@ fn format_uptime(ms: u64, buf: &mut [u8; 32]) -> &str {
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 
-const HEAP_SIZE: usize = 4 * 1024 * 1024; // 4MB heap (wasmi + persistent apps need room for fragmentation)
+const HEAP_SIZE: usize = 16 * 1024 * 1024; // 16MB heap (wasmi engine ~1MB + WASM 4MB surface + DrawCmd + previous app remnants)
 
 /// Minimum block size (header + usable). Must fit a FreeNode.
 const MIN_BLOCK: usize = 32;
@@ -3915,20 +3915,12 @@ fn main() -> ! {
         }
 
         // Flush dirty regions to VirtIO-GPU
+        // NOTE: gpu_vsync() is available (syscall 0x82) but requires proper
+        // VirtIO-GPU interrupt routing which isn't set up yet. Using fire-and-forget
+        // flush for now. VSync will be enabled when ISR handling is implemented.
         if use_gpu && damage.has_damage() {
-            let has_wasm_app = active_wasm_app.as_ref().map_or(false, |a| a.active);
-            let regions: alloc::vec::Vec<_> = damage.regions().iter().cloned().collect();
-
-            if has_wasm_app && regions.len() == 1 {
-                // WASM app active: use VSync (fence + HLT sleep)
-                // CPU sleeps until GPU finishes presenting → ~5% CPU, no tearing
-                let r = &regions[0];
-                libfolk::sys::gpu_vsync(r.x, r.y, r.w, r.h);
-            } else {
-                // Normal desktop: fire-and-forget flush (existing behavior)
-                for rect in &regions {
-                    libfolk::sys::gpu_flush(rect.x, rect.y, rect.w, rect.h);
-                }
+            for rect in damage.regions() {
+                libfolk::sys::gpu_flush(rect.x, rect.y, rect.w, rect.h);
             }
             damage.clear();
         } else {
