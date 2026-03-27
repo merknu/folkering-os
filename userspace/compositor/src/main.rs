@@ -86,6 +86,31 @@ fn format_arena_line<'a>(buf: &'a mut [u8; 32], kb: usize) -> &'a str {
     unsafe { core::str::from_utf8_unchecked(&buf[..end + 2]) }
 }
 
+/// Auto-categorize an app name into a folder index (0-5)
+fn categorize_app(name: &str) -> usize {
+    let n = name.as_bytes();
+    // System: monitor, clock, system, about, info, settings, status
+    if find_ci(n, b"monitor") || find_ci(n, b"clock") || find_ci(n, b"system")
+        || find_ci(n, b"about") || find_ci(n, b"info") || find_ci(n, b"setting")
+        || find_ci(n, b"status") { return 0; }
+    // Games: game, tetris, snake, pong, ball, bounce, breakout, chess, maze
+    if find_ci(n, b"game") || find_ci(n, b"tetris") || find_ci(n, b"snake")
+        || find_ci(n, b"pong") || find_ci(n, b"ball") || find_ci(n, b"bounce")
+        || find_ci(n, b"breakout") || find_ci(n, b"chess") || find_ci(n, b"maze") { return 1; }
+    // Creative: paint, draw, art, sketch, pixel, color, canvas, music
+    if find_ci(n, b"paint") || find_ci(n, b"draw") || find_ci(n, b"art")
+        || find_ci(n, b"sketch") || find_ci(n, b"pixel") || find_ci(n, b"color")
+        || find_ci(n, b"canvas") || find_ci(n, b"music") { return 2; }
+    // Tools: calc, timer, note, tool, convert, edit, text, writer
+    if find_ci(n, b"calc") || find_ci(n, b"timer") || find_ci(n, b"note")
+        || find_ci(n, b"tool") || find_ci(n, b"convert") || find_ci(n, b"edit")
+        || find_ci(n, b"text") || find_ci(n, b"writer") { return 3; }
+    // Demos: demo, gradient, test, screen, star, hello
+    if find_ci(n, b"demo") || find_ci(n, b"gradient") || find_ci(n, b"test")
+        || find_ci(n, b"screen") || find_ci(n, b"star") || find_ci(n, b"hello") { return 4; }
+    5 // Other
+}
+
 /// Case-insensitive substring search in byte slices
 fn find_ci(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.len() > haystack.len() { return false; }
@@ -747,6 +772,41 @@ fn main() -> ! {
     let mut last_wasm_bytes: Option<alloc::vec::Vec<u8>> = None;
     let mut last_wasm_interactive: bool = false;
 
+    // ===== App Launcher: Android-style folders + app grid =====
+    const MAX_CATEGORIES: usize = 6;
+    const MAX_APPS_PER_CAT: usize = 20;
+    const FOLDER_W: usize = 100;
+    const FOLDER_H: usize = 100;
+    const FOLDER_GAP: usize = 20;
+    const APP_TILE_W: usize = 72;
+    const APP_TILE_H: usize = 72;
+    const APP_TILE_GAP: usize = 12;
+    const APP_TILE_COLS: usize = 5;
+
+    // Category definitions: (name, icon_color, keywords for auto-sort)
+    struct AppEntry { name: [u8; 24], name_len: usize }
+    struct Category {
+        label: &'static [u8],
+        color: u32,
+        apps: [AppEntry; MAX_APPS_PER_CAT],
+        count: usize,
+    }
+
+    // Initialize categories
+    let mut categories: [Category; MAX_CATEGORIES] = [
+        Category { label: b"System",   color: 0x003388FF, apps: core::array::from_fn(|_| AppEntry { name: [0; 24], name_len: 0 }), count: 0 },
+        Category { label: b"Games",    color: 0x00FF4466, apps: core::array::from_fn(|_| AppEntry { name: [0; 24], name_len: 0 }), count: 0 },
+        Category { label: b"Creative", color: 0x00FF8800, apps: core::array::from_fn(|_| AppEntry { name: [0; 24], name_len: 0 }), count: 0 },
+        Category { label: b"Tools",    color: 0x0044CC44, apps: core::array::from_fn(|_| AppEntry { name: [0; 24], name_len: 0 }), count: 0 },
+        Category { label: b"Demos",    color: 0x00AA44FF, apps: core::array::from_fn(|_| AppEntry { name: [0; 24], name_len: 0 }), count: 0 },
+        Category { label: b"Other",    color: 0x00888888, apps: core::array::from_fn(|_| AppEntry { name: [0; 24], name_len: 0 }), count: 0 },
+    ];
+
+    // -1 = home (show folders), 0-5 = inside a specific folder
+    let mut open_folder: i32 = -1;
+    let mut hover_folder: i32 = -1; // Folder mouse is hovering over (-1 = none)
+    let mut tile_clicked: i32 = -1;
+
     // ===== NEURAL DESKTOP =====
     // AI-native interface with Omnibar at center
     let folk_blue = fb.color_from_rgb24(colors::FOLK_BLUE);
@@ -1326,6 +1386,30 @@ fn main() -> ! {
         }
 
         if had_mouse_events {
+            // Hover detection for folder preview (home view)
+            if open_folder < 0 && active_wasm_app.is_none() {
+                let old_hover = hover_folder;
+                hover_folder = -1;
+                let mut vi = 0usize;
+                for ci in 0..MAX_CATEGORIES {
+                    if categories[ci].count == 0 { continue; }
+                    let cols = { let mut c = 0; for j in 0..MAX_CATEGORIES { if categories[j].count > 0 { c += 1; } } c.min(3) };
+                    let gw = cols * (FOLDER_W + FOLDER_GAP) - FOLDER_GAP;
+                    let gx = (fb.width.saturating_sub(gw)) / 2;
+                    let gy: usize = 120;
+                    let col = vi % 3;
+                    let row = vi / 3;
+                    let fx = gx + col * (FOLDER_W + FOLDER_GAP);
+                    let fy = gy + row * (FOLDER_H + FOLDER_GAP);
+                    if cursor_x as usize >= fx && (cursor_x as usize) < fx + FOLDER_W
+                        && cursor_y as usize >= fy && (cursor_y as usize) < fy + FOLDER_H {
+                        hover_folder = ci as i32;
+                    }
+                    vi += 1;
+                }
+                if hover_folder != old_hover { need_redraw = true; }
+            }
+
             // Route mouse events to active WASM app (Phase 2)
             if let Some(app) = &mut active_wasm_app {
                 let new_click = (latest_buttons & 1 != 0) && (last_buttons & 1 == 0);
@@ -1511,6 +1595,64 @@ fn main() -> ! {
                     let cx = cx as usize;
                     let cy = cy as usize;
 
+                    // Hit-test: app launcher (folders or app tiles)
+                    if open_folder < 0 {
+                        // HOME: check folder clicks
+                        let mut vis_count = 0usize;
+                        for ci in 0..MAX_CATEGORIES { if categories[ci].count > 0 { vis_count += 1; } }
+                        if vis_count > 0 {
+                            let cols = vis_count.min(3);
+                            let gw = cols * (FOLDER_W + FOLDER_GAP) - FOLDER_GAP;
+                            let gx = (fb.width.saturating_sub(gw)) / 2;
+                            let gy: usize = 120;
+                            let mut vi = 0usize;
+                            for ci in 0..MAX_CATEGORIES {
+                                if categories[ci].count == 0 { continue; }
+                                let col = vi % 3;
+                                let row = vi / 3;
+                                let fx = gx + col * (FOLDER_W + FOLDER_GAP);
+                                let fy = gy + row * (FOLDER_H + FOLDER_GAP);
+                                if cx >= fx && cx < fx + FOLDER_W && cy >= fy && cy < fy + FOLDER_H {
+                                    open_folder = ci as i32;
+                                    handled = true;
+                                    need_redraw = true;
+                                    damage.damage_full();
+                                    break;
+                                }
+                                vi += 1;
+                            }
+                        }
+                    } else {
+                        // FOLDER VIEW: check "< Back" button or app tile clicks
+                        let header_y: usize = 90;
+                        if cy >= header_y && cy < header_y + 30 && cx < 100 {
+                            // Back button
+                            open_folder = -1;
+                            handled = true;
+                            need_redraw = true;
+                            damage.damage_full();
+                        } else {
+                            // App tile click
+                            let cat_idx = open_folder as usize;
+                            if cat_idx < MAX_CATEGORIES {
+                                let gw = APP_TILE_COLS * (APP_TILE_W + APP_TILE_GAP) - APP_TILE_GAP;
+                                let gx = (fb.width.saturating_sub(gw)) / 2;
+                                let gy: usize = 130;
+                                for i in 0..categories[cat_idx].count {
+                                    let col = i % APP_TILE_COLS;
+                                    let row = i / APP_TILE_COLS;
+                                    let ax = gx + col * (APP_TILE_W + APP_TILE_GAP);
+                                    let ay = gy + row * (APP_TILE_H + APP_TILE_GAP);
+                                    if cx >= ax && cx < ax + APP_TILE_W && cy >= ay && cy < ay + APP_TILE_H {
+                                        tile_clicked = i as i32;
+                                        handled = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // Hit-test: click inside the omnibar
                     if cx >= text_box_x && cx < text_box_x + text_box_w
                         && cy >= text_box_y && cy < text_box_y + text_box_h
@@ -1564,6 +1706,51 @@ fn main() -> ! {
         }
 
 
+        // ===== Handle app tile click → launch saved app =====
+        if tile_clicked >= 0 && open_folder >= 0 {
+            let cat_idx = open_folder as usize;
+            let app_idx = tile_clicked as usize;
+            if cat_idx < MAX_CATEGORIES && app_idx < categories[cat_idx].count {
+                let entry = &categories[cat_idx].apps[app_idx];
+                let name_len = entry.name_len;
+                let name_buf = entry.name;
+                let app_name = unsafe { core::str::from_utf8_unchecked(&name_buf[..name_len]) };
+                let filename = alloc::format!("{}.wasm", app_name);
+                write_str("[DESKTOP] Launching: ");
+                write_str(app_name);
+                write_str("\n");
+
+                // Load from VFS
+                const VFS_TILE_VADDR: usize = 0x50040000;
+                if let Ok(resp) = libfolk::sys::synapse::read_file_shmem(&filename) {
+                    if shmem_map(resp.shmem_handle, VFS_TILE_VADDR).is_ok() {
+                        let data = unsafe {
+                            core::slice::from_raw_parts(VFS_TILE_VADDR as *const u8, resp.size as usize)
+                        };
+                        let wasm_bytes = alloc::vec::Vec::from(data);
+                        let _ = shmem_unmap(resp.shmem_handle, VFS_TILE_VADDR);
+                        let _ = shmem_destroy(resp.shmem_handle);
+
+                        let config = compositor::wasm_runtime::WasmConfig {
+                            screen_width: fb.width as u32,
+                            screen_height: fb.height as u32,
+                            uptime_ms: libfolk::sys::uptime() as u32,
+                        };
+                        match compositor::wasm_runtime::PersistentWasmApp::new(&wasm_bytes, config) {
+                            Ok(app) => {
+                                active_wasm_app = Some(app);
+                                last_wasm_bytes = Some(wasm_bytes);
+                            }
+                            Err(_) => {}
+                        }
+                    } else {
+                        let _ = shmem_destroy(resp.shmem_handle);
+                    }
+                }
+            }
+            tile_clicked = -1;
+        }
+
         // ===== Process keyboard input =====
         // First, collect all pending keys without redrawing
         let mut execute_command = false;
@@ -1572,6 +1759,13 @@ fn main() -> ! {
             did_work = true;
 
             // Route to active WASM app (Phase 2) — ESC kills the app
+            // ESC: close folder view first, then WASM app
+            if key == 0x1B && open_folder >= 0 && active_wasm_app.is_none() {
+                open_folder = -1;
+                need_redraw = true;
+                damage.damage_full();
+                continue;
+            }
             if let Some(app) = &mut active_wasm_app {
                 if key == 0x1B { // ESC
                     active_wasm_app = None;
@@ -2806,6 +3000,17 @@ fn main() -> ! {
                                     write_str("[COMPOSITOR] App saved to VFS: ");
                                     write_str(&filename);
                                     write_str("\n");
+                                    // Add to categorized desktop folder
+                                    let cat = categorize_app(app_name);
+                                    if categories[cat].count < MAX_APPS_PER_CAT {
+                                        let name_bytes = app_name.as_bytes();
+                                        let copy_len = name_bytes.len().min(24);
+                                        let idx = categories[cat].count;
+                                        categories[cat].apps[idx].name[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
+                                        categories[cat].apps[idx].name_len = copy_len;
+                                        categories[cat].count += 1;
+                                        damage.damage_full();
+                                    }
                                 }
                                 Err(_) => {
                                     win.push_line("[OS] Save failed — VFS write error");
@@ -3598,6 +3803,132 @@ fn main() -> ! {
                 let clock_str = unsafe { core::str::from_utf8_unchecked(&clock_buf) };
                 let clock_x = fb.width.saturating_sub(19 * 8 + 12);
                 fb.draw_string(clock_x, 8, clock_str, folk_accent, folk_dark);
+            }
+
+            // ===== App Launcher: Folder grid or app grid =====
+            {
+                let tile_text = fb.color_from_rgb24(0xDDDDDD);
+                let tile_bg = fb.color_from_rgb24(0x222244);
+                let tile_border = fb.color_from_rgb24(0x444477);
+
+                if open_folder < 0 {
+                    // HOME VIEW: show category folders
+                    // Only show folders that have apps
+                    let mut visible: [(usize, usize); MAX_CATEGORIES] = [(0, 0); MAX_CATEGORIES];
+                    let mut vis_count = 0;
+                    for i in 0..MAX_CATEGORIES {
+                        if categories[i].count > 0 {
+                            visible[vis_count] = (i, vis_count);
+                            vis_count += 1;
+                        }
+                    }
+
+                    if vis_count > 0 {
+                        let cols = vis_count.min(3);
+                        let grid_w = cols * (FOLDER_W + FOLDER_GAP) - FOLDER_GAP;
+                        let grid_x = (fb.width.saturating_sub(grid_w)) / 2;
+                        let grid_y = 120;
+
+                        for v in 0..vis_count {
+                            let (cat_idx, _) = visible[v];
+                            let col = v % 3;
+                            let row = v / 3;
+                            let fx = grid_x + col * (FOLDER_W + FOLDER_GAP);
+                            let fy = grid_y + row * (FOLDER_H + FOLDER_GAP);
+
+                            let cat = &categories[cat_idx];
+                            let c = fb.color_from_rgb24(cat.color);
+
+                            // Folder tile
+                            fb.fill_rect(fx, fy, FOLDER_W, FOLDER_H, tile_bg);
+                            fb.draw_rect(fx, fy, FOLDER_W, FOLDER_H, c);
+                            fb.draw_rect(fx + 1, fy + 1, FOLDER_W - 2, FOLDER_H - 2, tile_border);
+
+                            // Mini app preview squares (2×2 grid inside folder)
+                            let preview_count = cat.count.min(4);
+                            for p in 0..preview_count {
+                                let px = fx + 15 + (p % 2) * 35;
+                                let py = fy + 10 + (p / 2) * 25;
+                                fb.fill_rect(px, py, 28, 20, c);
+                            }
+
+                            // Folder label
+                            let label = unsafe { core::str::from_utf8_unchecked(cat.label) };
+                            let lbl_len = label.trim_end_matches('\0').len();
+                            let lbl_trimmed = &label[..lbl_len];
+                            let lx = fx + (FOLDER_W.saturating_sub(lbl_len * 8)) / 2;
+                            fb.draw_string(lx, fy + FOLDER_H - 20, lbl_trimmed, tile_text, tile_bg);
+
+                            // App count badge
+                            let mut nbuf = [0u8; 16];
+                            let ns = format_usize(cat.count, &mut nbuf);
+                            fb.draw_string(fx + FOLDER_W - 16, fy + 4, ns, c, tile_bg);
+
+                            // Hover preview: show app list below the folder
+                            if hover_folder == cat_idx as i32 {
+                                let hover_bg = fb.color_from_rgb24(0x2a2a5a);
+                                let prev_x = fx;
+                                let prev_y = fy + FOLDER_H + 4;
+                                let prev_w = FOLDER_W + 60;
+                                let prev_h = 20 + cat.count.min(5) * 18;
+                                fb.fill_rect(prev_x, prev_y, prev_w, prev_h, hover_bg);
+                                fb.draw_rect(prev_x, prev_y, prev_w, prev_h, c);
+                                for ai in 0..cat.count.min(5) {
+                                    let entry = &cat.apps[ai];
+                                    if entry.name_len > 0 {
+                                        let name = unsafe { core::str::from_utf8_unchecked(&entry.name[..entry.name_len]) };
+                                        fb.draw_string(prev_x + 8, prev_y + 4 + ai * 18, &name[..name.len().min(16)], tile_text, hover_bg);
+                                    }
+                                }
+                                if cat.count > 5 {
+                                    fb.draw_string(prev_x + 8, prev_y + 4 + 5 * 18, "...", tile_text, hover_bg);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // FOLDER VIEW: show apps inside the selected category
+                    let cat_idx = open_folder as usize;
+                    if cat_idx < MAX_CATEGORIES {
+                        let cat = &categories[cat_idx];
+                        let label = unsafe { core::str::from_utf8_unchecked(cat.label) };
+                        let c = fb.color_from_rgb24(cat.color);
+
+                        // Folder header
+                        let header_y = 90;
+                        fb.fill_rect(0, header_y, fb.width, 30, fb.color_from_rgb24(0x1a1a3a));
+                        let back_str = "< Back";
+                        fb.draw_string(16, header_y + 7, back_str, tile_text, fb.color_from_rgb24(0x1a1a3a));
+                        let title_x = (fb.width.saturating_sub(label.trim_end_matches('\0').len() * 8)) / 2;
+                        fb.draw_string(title_x, header_y + 7, label.trim_end_matches('\0'), c, fb.color_from_rgb24(0x1a1a3a));
+
+                        // App grid
+                        let grid_w = APP_TILE_COLS * (APP_TILE_W + APP_TILE_GAP) - APP_TILE_GAP;
+                        let grid_x = (fb.width.saturating_sub(grid_w)) / 2;
+                        let grid_y = 130;
+
+                        for i in 0..cat.count {
+                            let col = i % APP_TILE_COLS;
+                            let row = i / APP_TILE_COLS;
+                            let ax = grid_x + col * (APP_TILE_W + APP_TILE_GAP);
+                            let ay = grid_y + row * (APP_TILE_H + APP_TILE_GAP);
+
+                            fb.fill_rect(ax, ay, APP_TILE_W, APP_TILE_H, tile_bg);
+                            fb.draw_rect(ax, ay, APP_TILE_W, APP_TILE_H, tile_border);
+
+                            // Icon (colored square)
+                            fb.fill_rect(ax + 16, ay + 8, 40, 36, c);
+
+                            // App name
+                            let entry = &cat.apps[i];
+                            if entry.name_len > 0 {
+                                let name = unsafe { core::str::from_utf8_unchecked(&entry.name[..entry.name_len]) };
+                                let nx = ax + (APP_TILE_W.saturating_sub(entry.name_len.min(9) * 8)) / 2;
+                                fb.draw_string(nx, ay + APP_TILE_H - 20, &name[..name.len().min(9)], tile_text, tile_bg);
+                            }
+                        }
+                    }
+                }
             }
 
             // ===== Composite Windows (Milestone 2.1) =====
