@@ -35,7 +35,7 @@ pub struct FramebufferView {
     /// Height in pixels
     pub height: usize,
     /// Bytes per scanline (pitch)
-    pitch: usize,
+    pub pitch: usize,
     /// Bytes per pixel
     bpp: usize,
     /// Red shift (bit position)
@@ -111,7 +111,7 @@ impl FramebufferView {
 
     /// Get pointer to a pixel at (x, y).
     #[inline]
-    fn pixel_ptr(&self, x: usize, y: usize) -> *mut u32 {
+    pub fn pixel_ptr(&self, x: usize, y: usize) -> *mut u32 {
         debug_assert!(x < self.width && y < self.height);
         unsafe {
             self.buffer.add(y * self.pitch + x * self.bpp) as *mut u32

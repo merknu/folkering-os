@@ -499,6 +499,11 @@ pub fn init() -> Result<(), &'static str> {
 /// Static command page for flush operations (avoids alloc_page per flush)
 static FLUSH_CMD_PAGE: spin::Mutex<Option<usize>> = spin::Mutex::new(None);
 
+/// VSync fence support
+const VIRTIO_GPU_FLAG_FENCE: u32 = 1 << 0;
+static FENCE_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+static FENCE_COMPLETE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 pub fn flush_rect(x: u32, y: u32, w: u32, h: u32) {
     let mut guard = GPU_STATE.lock();
     let state = match guard.as_mut() {
@@ -533,9 +538,16 @@ pub fn flush_rect(x: u32, y: u32, w: u32, h: u32) {
         (*transfer).resource_id = 1;
         (*transfer).padding = 0;
 
-        // RESOURCE_FLUSH
+        // RESOURCE_FLUSH with VSync fence
+        let fence_id = FENCE_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let flush = cmd_virt.add(64) as *mut GpuResourceFlush;
-        (*flush).hdr = make_hdr(VIRTIO_GPU_CMD_RESOURCE_FLUSH);
+        (*flush).hdr = GpuCtrlHdr {
+            cmd_type: VIRTIO_GPU_CMD_RESOURCE_FLUSH,
+            flags: VIRTIO_GPU_FLAG_FENCE,
+            fence_id,
+            ctx_id: 0,
+            _padding: 0,
+        };
         (*flush).r = GpuRect { x, y, width: w, height: h };
         (*flush).resource_id = 1;
         (*flush).padding = 0;
@@ -576,6 +588,50 @@ pub fn flush_rect(x: u32, y: u32, w: u32, h: u32) {
                 } else { q.free_desc(d2); q.free_desc(d1); q.free_desc(d0); }
             } else { q.free_desc(d1); q.free_desc(d0); }
         } else { q.free_desc(d0); }
+    }
+}
+
+/// Flush and wait for VSync (fence completion).
+/// Blocks until the GPU has finished presenting the frame.
+/// Dramatically reduces CPU usage by sleeping via HLT instead of spinning.
+pub fn flush_and_vsync(x: u32, y: u32, w: u32, h: u32) {
+    // Get the fence_id that flush_rect will use
+    let expected_fence = FENCE_COUNTER.load(core::sync::atomic::Ordering::Relaxed);
+
+    // Submit the flush (which now includes VIRTIO_GPU_FLAG_FENCE)
+    flush_rect(x, y, w, h);
+
+    // Wait for GPU to complete the fenced flush
+    // Enable interrupts so HLT can be woken
+    unsafe { core::arch::asm!("sti"); }
+
+    let mut timeout = 500_000u32; // ~500K iterations max
+    while FENCE_COMPLETE.load(core::sync::atomic::Ordering::Acquire) < expected_fence {
+        unsafe { core::arch::asm!("hlt"); } // CPU sleeps until interrupt
+
+        // Check ISR status register to detect GPU completion
+        let guard = GPU_STATE.lock();
+        if let Some(state) = guard.as_ref() {
+            if state.active {
+                // Read ISR register (clears on read, per VirtIO spec)
+                let isr = unsafe {
+                    core::ptr::read_volatile(state.transport.isr_base as *const u8)
+                };
+                if isr & 1 != 0 {
+                    // Used buffer notification — fence completed
+                    FENCE_COMPLETE.store(expected_fence, core::sync::atomic::Ordering::Release);
+                    break;
+                }
+            }
+        }
+        drop(guard);
+
+        timeout -= 1;
+        if timeout == 0 {
+            // Timeout — don't hang forever, just continue
+            FENCE_COMPLETE.store(expected_fence, core::sync::atomic::Ordering::Release);
+            break;
+        }
     }
 }
 

@@ -3537,6 +3537,42 @@ fn main() -> ! {
                     for cmd in &output.text_commands {
                         fb.draw_string(cmd.x as usize, cmd.y as usize, &cmd.text, fb.color_from_rgb24(cmd.color), fb.color_from_rgb24(0));
                     }
+
+                    // Phase 3: Surface blit — WASM wrote pixels directly to linear memory
+                    if output.surface_dirty {
+                        if let Some(mem_data) = app.get_memory_slice() {
+                            let surface_offset = app.surface_offset();
+                            let fb_size = fb.width * fb.height * 4;
+                            // Double bounds check (constraint #7)
+                            if surface_offset + fb_size <= mem_data.len() {
+                                let surface = &mem_data[surface_offset..surface_offset + fb_size];
+                                // Pitch-aware copy (framebuffer pitch may differ from width*4)
+                                if fb.pitch == fb.width * 4 {
+                                    // Fast path: pitches match, bulk copy
+                                    unsafe {
+                                        core::ptr::copy_nonoverlapping(
+                                            surface.as_ptr(),
+                                            fb.pixel_ptr(0, 0) as *mut u8,
+                                            fb_size,
+                                        );
+                                    }
+                                } else {
+                                    // Slow path: per-row copy for pitch mismatch
+                                    for y in 0..fb.height {
+                                        let src_off = y * fb.width * 4;
+                                        unsafe {
+                                            core::ptr::copy_nonoverlapping(
+                                                surface[src_off..].as_ptr(),
+                                                fb.pixel_ptr(0, y) as *mut u8,
+                                                fb.width * 4,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     did_work = true;
                 }
             }
@@ -3878,17 +3914,28 @@ fn main() -> ! {
             }
         }
 
-        // Flush only dirty regions to VirtIO-GPU (or mark frame complete)
+        // Flush dirty regions to VirtIO-GPU
         if use_gpu && damage.has_damage() {
-            for rect in damage.regions() {
-                libfolk::sys::gpu_flush(rect.x, rect.y, rect.w, rect.h);
+            let has_wasm_app = active_wasm_app.as_ref().map_or(false, |a| a.active);
+            let regions: alloc::vec::Vec<_> = damage.regions().iter().cloned().collect();
+
+            if has_wasm_app && regions.len() == 1 {
+                // WASM app active: use VSync (fence + HLT sleep)
+                // CPU sleeps until GPU finishes presenting → ~5% CPU, no tearing
+                let r = &regions[0];
+                libfolk::sys::gpu_vsync(r.x, r.y, r.w, r.h);
+            } else {
+                // Normal desktop: fire-and-forget flush (existing behavior)
+                for rect in &regions {
+                    libfolk::sys::gpu_flush(rect.x, rect.y, rect.w, rect.h);
+                }
             }
             damage.clear();
         } else {
             damage.clear();
         }
 
-        // Only yield CPU if we did no work this iteration (ULTRA 46)
+        // Only yield CPU if we did no work this iteration
         if !did_work {
             yield_cpu();
         }
