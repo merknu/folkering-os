@@ -57,10 +57,19 @@ pub struct WasmConfig {
 /// Input event passed to WASM apps (16 bytes, 4 × i32)
 #[derive(Clone)]
 pub struct FolkEvent {
-    pub event_type: i32,  // 1=mouse_move, 2=mouse_click, 3=key_down
-    pub x: i32,
-    pub y: i32,
-    pub data: i32,
+    pub event_type: i32,  // 1=mouse_move, 2=mouse_click, 3=key_down, 4=asset_loaded
+    pub x: i32,           // mouse x / asset handle
+    pub y: i32,           // mouse y / asset status (0=ok, 1=not_found)
+    pub data: i32,        // buttons / keycode / bytes_loaded
+}
+
+/// Pending async file request (submitted by WASM, resolved by compositor)
+#[derive(Clone)]
+pub struct PendingAssetRequest {
+    pub handle: u32,
+    pub filename: String,
+    pub dest_ptr: u32,   // Offset in WASM linear memory
+    pub dest_len: u32,   // Max bytes to write
 }
 
 /// Result of a WASM app execution
@@ -88,6 +97,7 @@ pub struct WasmOutput {
     pub circle_commands: Vec<CircleCmd>,
     pub fill_screen: Option<u32>,
     pub surface_dirty: bool,
+    pub asset_requests: Vec<PendingAssetRequest>,
 }
 
 // ── Internal State ───────────────────────────────────────────────────────
@@ -101,6 +111,8 @@ struct HostState {
     fill_screen: Option<u32>,
     surface_dirty: bool,
     pending_events: Vec<FolkEvent>,
+    pending_asset_requests: Vec<PendingAssetRequest>,
+    next_asset_handle: u32,
     config: WasmConfig,
 }
 
@@ -252,6 +264,53 @@ fn register_host_functions(linker: &mut Linker<HostState>) {
     let _ = linker.func_wrap("env", "folk_surface_present",
         |mut caller: Caller<HostState>| {
             caller.data_mut().surface_dirty = true;
+        },
+    );
+
+    // Phase 4: Async file loading — request file, get handle, poll for completion
+    let _ = linker.func_wrap("env", "folk_request_file",
+        |mut caller: Caller<HostState>, path_ptr: i32, path_len: i32, dest_ptr: i32, dest_len: i32| -> i32 {
+            // Bounds check path pointer
+            if path_len <= 0 || path_len > 256 { return 0; }
+            let p = path_ptr as u32;
+            let end = match p.checked_add(path_len as u32) {
+                Some(e) => e,
+                None => return 0,
+            };
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return 0,
+            };
+            if end as usize > mem.data_size(&caller) { return 0; }
+
+            // Read filename from WASM memory
+            let mut name_buf = alloc::vec![0u8; path_len as usize];
+            if mem.read(&caller, path_ptr as usize, &mut name_buf).is_err() { return 0; }
+            let filename = match alloc::str::from_utf8(&name_buf) {
+                Ok(s) => String::from(s),
+                Err(_) => return 0,
+            };
+
+            // Bounds check dest pointer
+            if dest_len <= 0 { return 0; }
+            let d = dest_ptr as u32;
+            let dend = match d.checked_add(dest_len as u32) {
+                Some(e) => e,
+                None => return 0,
+            };
+            if dend as usize > mem.data_size(&caller) { return 0; }
+
+            // Assign handle and queue request
+            let handle = caller.data_mut().next_asset_handle;
+            caller.data_mut().next_asset_handle += 1;
+            caller.data_mut().pending_asset_requests.push(PendingAssetRequest {
+                handle,
+                filename,
+                dest_ptr: dest_ptr as u32,
+                dest_len: dest_len as u32,
+            });
+
+            handle as i32
         },
     );
 }
@@ -415,6 +474,16 @@ impl PersistentWasmApp {
 
     /// Surface buffer offset constant (for bounds checking in compositor).
     pub fn surface_offset(&self) -> usize { SURFACE_OFFSET }
+
+    /// Write data into WASM linear memory at given offset (for async asset loading).
+    pub fn write_memory(&mut self, offset: usize, data: &[u8]) -> bool {
+        if let Some(Extern::Memory(mem)) = self.instance.get_export(&self.store, "memory") {
+            if offset + data.len() <= mem.data_size(&self.store) {
+                return mem.write(&mut self.store, offset, data).is_ok();
+            }
+        }
+        false
+    }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────
@@ -428,6 +497,8 @@ fn new_host_state(config: WasmConfig) -> HostState {
         fill_screen: None,
         surface_dirty: false,
         pending_events: Vec::new(),
+        pending_asset_requests: Vec::new(),
+        next_asset_handle: 1,
         config,
     }
 }
@@ -440,6 +511,7 @@ fn empty_output() -> WasmOutput {
         circle_commands: Vec::new(),
         fill_screen: None,
         surface_dirty: false,
+        asset_requests: Vec::new(),
     }
 }
 
@@ -451,6 +523,7 @@ fn state_to_output(state: HostState) -> WasmOutput {
         circle_commands: state.circle_commands,
         fill_screen: state.fill_screen,
         surface_dirty: state.surface_dirty,
+        asset_requests: state.pending_asset_requests,
     }
 }
 
@@ -460,6 +533,7 @@ fn take_output(state: &mut HostState) -> WasmOutput {
     let texts = ::core::mem::replace(&mut state.text_commands, Vec::new());
     let lines = ::core::mem::replace(&mut state.line_commands, Vec::new());
     let circles = ::core::mem::replace(&mut state.circle_commands, Vec::new());
+    let assets = ::core::mem::replace(&mut state.pending_asset_requests, Vec::new());
     let dirty = state.surface_dirty;
     state.surface_dirty = false;
     WasmOutput {
@@ -469,5 +543,6 @@ fn take_output(state: &mut HostState) -> WasmOutput {
         circle_commands: circles,
         fill_screen: state.fill_screen.take(),
         surface_dirty: dirty,
+        asset_requests: assets,
     }
 }

@@ -3573,6 +3573,60 @@ fn main() -> ! {
                         }
                     }
 
+                    // Phase 4: Async asset loading — process file requests from WASM
+                    if !output.asset_requests.is_empty() {
+                        for req in &output.asset_requests {
+                            // Read file from VFS (non-blocking: happens between frames)
+                            const VFS_ASSET_VADDR: usize = 0x50060000;
+                            match libfolk::sys::synapse::read_file_shmem(&req.filename) {
+                                Ok(resp) => {
+                                    if shmem_map(resp.shmem_handle, VFS_ASSET_VADDR).is_ok() {
+                                        let file_data = unsafe {
+                                            core::slice::from_raw_parts(
+                                                VFS_ASSET_VADDR as *const u8,
+                                                resp.size as usize
+                                            )
+                                        };
+                                        let copy_len = (resp.size as u32).min(req.dest_len) as usize;
+
+                                        // Write file data into WASM linear memory
+                                        app.write_memory(
+                                            req.dest_ptr as usize,
+                                            &file_data[..copy_len]
+                                        );
+                                        let _ = shmem_unmap(resp.shmem_handle, VFS_ASSET_VADDR);
+                                        let _ = shmem_destroy(resp.shmem_handle);
+
+                                        // Push AssetLoaded event for next frame
+                                        app.push_event(compositor::wasm_runtime::FolkEvent {
+                                            event_type: 4, // AssetLoaded
+                                            x: req.handle as i32,
+                                            y: 0, // status: OK
+                                            data: copy_len as i32,
+                                        });
+                                    } else {
+                                        let _ = shmem_destroy(resp.shmem_handle);
+                                        app.push_event(compositor::wasm_runtime::FolkEvent {
+                                            event_type: 4,
+                                            x: req.handle as i32,
+                                            y: 2, // status: map failed
+                                            data: 0,
+                                        });
+                                    }
+                                }
+                                Err(_) => {
+                                    // File not found — push error event
+                                    app.push_event(compositor::wasm_runtime::FolkEvent {
+                                        event_type: 4, // AssetLoaded
+                                        x: req.handle as i32,
+                                        y: 1, // status: not found
+                                        data: 0,
+                                    });
+                                }
+                            }
+                        }
+                    }
+
                     did_work = true;
                 }
             }

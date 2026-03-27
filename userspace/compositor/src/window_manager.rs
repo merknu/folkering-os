@@ -11,7 +11,7 @@ use super::font::FONT_8X16;
 
 // ===== Constants =====
 
-pub const TITLE_BAR_H: usize = 22;
+pub const TITLE_BAR_H: usize = 24;
 pub const BORDER_W: usize = 2;
 const CLOSE_BTN_W: usize = 16;
 const CLOSE_BTN_MARGIN: usize = 4;
@@ -462,8 +462,8 @@ fn draw_window(fb: &mut FramebufferView, win: &Window, focused: bool) {
     let title_str = unsafe {
         core::str::from_utf8_unchecked(&win.title[..win.title_len])
     };
-    let ty = wy + BORDER_W + (TITLE_BAR_H - 8) / 2;  // 8px tall (small font), center
-    draw_str_small(fb, wx + BORDER_W + 6, ty, title_str, title_fg, title_bg);
+    let ty = wy + BORDER_W + (TITLE_BAR_H.saturating_sub(8)) / 2 + 1; // +1 for visual centering
+    draw_str_small(fb, wx + BORDER_W + 8, ty, title_str, title_fg, title_bg);
 
     // Close button
     let close_x = wx + total_w - CLOSE_BTN_W - CLOSE_BTN_MARGIN - BORDER_W;
@@ -483,10 +483,10 @@ fn draw_window(fb: &mut FramebufferView, win: &Window, focused: bool) {
 
     // Draw text lines
     let text_fg = rgb(fb, WIN_TEXT_FG);
-    let line_h = 10usize;  // 8px char + 2px gap
-    let text_x = content_x + 6;
-    let mut text_y = content_y + 6;
-    let max_lines = (content_h as usize).saturating_sub(12) / line_h;
+    let line_h = 14usize;  // 8px char + 6px gap (breathable spacing)
+    let text_x = content_x + 8;
+    let mut text_y = content_y + 8;
+    let max_lines = (content_h as usize).saturating_sub(16) / line_h;
 
     let skip = if win.lines.len() > max_lines {
         win.lines.len() - max_lines
