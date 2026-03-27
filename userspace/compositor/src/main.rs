@@ -772,6 +772,13 @@ fn main() -> ! {
     let mut last_wasm_bytes: Option<alloc::vec::Vec<u8>> = None;
     let mut last_wasm_interactive: bool = false;
 
+    // ===== RAM History Graph =====
+    const RAM_HISTORY_LEN: usize = 120; // 2 minutes at 1 sample/sec
+    let mut ram_history: [u8; RAM_HISTORY_LEN] = [0; RAM_HISTORY_LEN]; // % values
+    let mut ram_history_idx: usize = 0;
+    let mut ram_history_count: usize = 0;
+    let mut show_ram_graph: bool = false;
+
     // ===== App Launcher: Android-style folders + app grid =====
     const MAX_CATEGORIES: usize = 6;
     const MAX_APPS_PER_CAT: usize = 20;
@@ -1133,11 +1140,17 @@ fn main() -> ! {
         // Consolidated redraw flag — any subsystem can set this
         let mut need_redraw = false;
 
-        // Clock tick: redraw once per second for system tray
+        // Clock tick: redraw once per second for system tray + RAM sampling
         let current_second = (libfolk::sys::get_rtc_packed() & 0x3F) as u8;
         if current_second != last_clock_second {
             last_clock_second = current_second;
             need_redraw = true;
+
+            // Sample RAM usage for history graph
+            let (_, _, mem_pct) = libfolk::sys::memory_stats();
+            ram_history[ram_history_idx] = mem_pct.min(100) as u8;
+            ram_history_idx = (ram_history_idx + 1) % RAM_HISTORY_LEN;
+            if ram_history_count < RAM_HISTORY_LEN { ram_history_count += 1; }
 
             // Lazy timezone sync: try once when clock first ticks (proxy should be ready)
             if !tz_synced {
@@ -1594,6 +1607,14 @@ fn main() -> ! {
                 if !handled {
                     let cx = cx as usize;
                     let cy = cy as usize;
+
+                    // Hit-test: RAM% in status bar (toggle graph)
+                    if cy < 20 && cx > fb.width.saturating_sub(80) {
+                        show_ram_graph = !show_ram_graph;
+                        need_redraw = true;
+                        damage.damage_full();
+                        handled = true;
+                    }
 
                     // Hit-test: app launcher (folders or app tiles)
                     if open_folder < 0 {
@@ -4094,6 +4115,61 @@ fn main() -> ! {
                     else { fb.color_from_rgb24(0x44FF44) };
                 let ram_x = fb.width.saturating_sub(ri * 8 + 8);
                 fb.draw_string(ram_x, 2, ram_str, ram_col, fb.color_from_rgb24(0x0a0a0a));
+
+                // RAM history graph (popup when clicked)
+                if show_ram_graph && ram_history_count > 1 {
+                    let graph_w: usize = 240;
+                    let graph_h: usize = 100;
+                    let graph_x = fb.width.saturating_sub(graph_w + 8);
+                    let graph_y: usize = 24;
+                    let graph_bg = fb.color_from_rgb24(0x0a0a1e);
+                    let graph_border = fb.color_from_rgb24(0x334466);
+                    let graph_grid = fb.color_from_rgb24(0x1a1a3a);
+
+                    // Background
+                    fb.fill_rect(graph_x, graph_y, graph_w, graph_h, graph_bg);
+                    fb.draw_rect(graph_x, graph_y, graph_w, graph_h, graph_border);
+
+                    // Grid lines at 25%, 50%, 75%
+                    for pct in [25usize, 50, 75] {
+                        let gy = graph_y + graph_h - (pct * graph_h / 100);
+                        for gx in (graph_x + 1..graph_x + graph_w - 1).step_by(4) {
+                            fb.set_pixel(gx, gy, graph_grid);
+                        }
+                    }
+
+                    // Title
+                    fb.draw_string(graph_x + 4, graph_y + 2, "RAM % (2min)", fb.color_from_rgb24(0x6688AA), graph_bg);
+
+                    // Scale labels
+                    fb.draw_string(graph_x + graph_w - 28, graph_y + graph_h - 14, "0%", fb.color_from_rgb24(0x445566), graph_bg);
+                    fb.draw_string(graph_x + graph_w - 36, graph_y + 16, "100%", fb.color_from_rgb24(0x445566), graph_bg);
+
+                    // Plot data points as filled columns
+                    let samples = ram_history_count.min(graph_w - 4);
+                    let bar_w = 1usize.max((graph_w - 4) / samples.max(1));
+
+                    for i in 0..samples {
+                        // Read from oldest to newest
+                        let hist_idx = if ram_history_count >= RAM_HISTORY_LEN {
+                            (ram_history_idx + RAM_HISTORY_LEN - samples + i) % RAM_HISTORY_LEN
+                        } else {
+                            i
+                        };
+                        let pct_val = ram_history[hist_idx] as usize;
+                        let bar_height = pct_val * (graph_h - 20) / 100;
+                        let bx = graph_x + 2 + i * bar_w;
+                        let by = graph_y + graph_h - 2 - bar_height;
+
+                        let bar_color = if pct_val > 80 { fb.color_from_rgb24(0xFF4444) }
+                            else if pct_val > 50 { fb.color_from_rgb24(0xFFAA00) }
+                            else { fb.color_from_rgb24(0x44FF44) };
+
+                        if bx + bar_w < graph_x + graph_w - 1 {
+                            fb.fill_rect(bx, by, bar_w, bar_height, bar_color);
+                        }
+                    }
+                }
             }
 
             // After full redraw: re-save cursor background and redraw cursor on top
