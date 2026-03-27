@@ -680,7 +680,7 @@ pub mod net;
 pub mod panic;
 pub mod task;
 pub mod timer;
-pub mod userspace_test;
+// userspace_test removed (cleanup)
 
 // Boot information structure (moved from boot module)
 pub mod boot {

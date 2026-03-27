@@ -117,10 +117,19 @@ fn register_host_functions(linker: &mut Linker<HostState>) {
 
     let _ = linker.func_wrap("env", "folk_draw_text",
         |mut caller: Caller<HostState>, x: i32, y: i32, ptr: i32, len: i32, color: i32| {
+            // Bounds check: prevent integer overflow and out-of-bounds read
+            if len <= 0 || len > 4096 { return; }
+            let ptr_u = ptr as u32;
+            let len_u = len as u32;
+            let end = match ptr_u.checked_add(len_u) {
+                Some(e) => e,
+                None => return, // Integer overflow
+            };
             let mem = match caller.get_export("memory") {
                 Some(Extern::Memory(m)) => m,
                 _ => return,
             };
+            if end as usize > mem.data_size(&caller) { return; }
             let mut buf = alloc::vec![0u8; len as usize];
             if mem.read(&caller, ptr as usize, &mut buf).is_ok() {
                 if let Ok(text) = alloc::str::from_utf8(&buf) {
@@ -188,10 +197,17 @@ fn register_host_functions(linker: &mut Linker<HostState>) {
                 Some(e) => e,
                 None => return 0,
             };
+            // Bounds check: event_ptr + 16 must fit in WASM memory
+            let ptr_u = event_ptr as u32;
+            let end = match ptr_u.checked_add(16) {
+                Some(e) => e,
+                None => return 0,
+            };
             let mem = match caller.get_export("memory") {
                 Some(Extern::Memory(m)) => m,
                 _ => return 0,
             };
+            if end as usize > mem.data_size(&caller) { return 0; }
             // Serialize FolkEvent as 16 bytes (4 × i32 little-endian)
             let mut buf = [0u8; 16];
             buf[0..4].copy_from_slice(&event.event_type.to_le_bytes());

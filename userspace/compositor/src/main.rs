@@ -3914,17 +3914,28 @@ fn main() -> ! {
             }
         }
 
-        // Flush only dirty regions to VirtIO-GPU (or mark frame complete)
+        // Flush dirty regions to VirtIO-GPU
         if use_gpu && damage.has_damage() {
-            for rect in damage.regions() {
-                libfolk::sys::gpu_flush(rect.x, rect.y, rect.w, rect.h);
+            let has_wasm_app = active_wasm_app.as_ref().map_or(false, |a| a.active);
+            let regions: alloc::vec::Vec<_> = damage.regions().iter().cloned().collect();
+
+            if has_wasm_app && regions.len() == 1 {
+                // WASM app active: use VSync (fence + HLT sleep)
+                // CPU sleeps until GPU finishes presenting → ~5% CPU, no tearing
+                let r = &regions[0];
+                libfolk::sys::gpu_vsync(r.x, r.y, r.w, r.h);
+            } else {
+                // Normal desktop: fire-and-forget flush (existing behavior)
+                for rect in &regions {
+                    libfolk::sys::gpu_flush(rect.x, rect.y, rect.w, rect.h);
+                }
             }
             damage.clear();
         } else {
             damage.clear();
         }
 
-        // Only yield CPU if we did no work this iteration (ULTRA 46)
+        // Only yield CPU if we did no work this iteration
         if !did_work {
             yield_cpu();
         }

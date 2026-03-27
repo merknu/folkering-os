@@ -85,9 +85,16 @@ pub fn ask_gemini(prompt: &str, response_buf: &mut [u8]) -> usize {
     if ret == u64::MAX { 0 } else { ret as usize }
 }
 
-/// Flush GPU framebuffer dirty rectangle to display.
+/// Flush GPU framebuffer dirty rectangle to display (fire-and-forget).
 pub fn gpu_flush(x: u32, y: u32, w: u32, h: u32) {
     unsafe { syscall4(SYS_GPU_FLUSH, x as u64, y as u64, w as u64, h as u64); }
+}
+
+/// Flush GPU and wait for VSync (fence completion). CPU sleeps via HLT.
+/// Blocks until the GPU has finished presenting the frame.
+/// Use this instead of gpu_flush() for frame-paced rendering.
+pub fn gpu_vsync(x: u32, y: u32, w: u32, h: u32) {
+    unsafe { syscall4(0x82, x as u64, y as u64, w as u64, h as u64); }
 }
 
 /// Get GPU info and map framebuffer at given virtual address.

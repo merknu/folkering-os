@@ -971,6 +971,13 @@ extern "C" fn syscall_handler(
         // VirtIO GPU
         0x80 => syscall_gpu_flush(arg1, arg2, arg3, arg4),
         0x81 => syscall_gpu_info(arg1),
+        // VSync: flush + wait for GPU fence completion (CPU sleeps via HLT)
+        0x82 => {
+            crate::drivers::virtio_gpu::flush_and_vsync(
+                arg1 as u32, arg2 as u32, arg3 as u32, arg4 as u32
+            );
+            0
+        },
         // God Mode Pipe: read byte from COM3
         0x90 => {
             match crate::drivers::serial::com3_read_byte() {
