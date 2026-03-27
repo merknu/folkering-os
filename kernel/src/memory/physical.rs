@@ -411,6 +411,12 @@ pub fn stats() -> MemoryStats {
     ALLOCATOR.lock().stats()
 }
 
+/// Get memory statistics: (total_pages, free_pages)
+pub fn memory_stats() -> (usize, usize) {
+    let alloc = ALLOCATOR.lock();
+    (alloc.total_pages, alloc.free_pages)
+}
+
 /// Allocate a single page (convenience wrapper)
 #[inline]
 pub fn alloc_page() -> Option<usize> {

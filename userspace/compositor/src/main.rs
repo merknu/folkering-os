@@ -4077,6 +4077,23 @@ fn main() -> ! {
                 d[7] = b'-'; d[8] = b'0' + day as u8/10; d[9] = b'0' + day as u8%10;
                 let date_str = unsafe { core::str::from_utf8_unchecked(&d) };
                 fb.draw_string(8, 2, date_str, gray, fb.color_from_rgb24(0x0a0a0a));
+
+                // RAM usage on the right side of status bar
+                let (_total_mb, _used_mb, mem_pct) = libfolk::sys::memory_stats();
+                let mut rbuf = [0u8; 8];
+                let mut ri = 0usize;
+                // "RAM XX%"
+                rbuf[ri] = b'R'; ri += 1; rbuf[ri] = b'A'; ri += 1; rbuf[ri] = b'M'; ri += 1; rbuf[ri] = b' '; ri += 1;
+                if mem_pct >= 100 { rbuf[ri] = b'1'; ri += 1; rbuf[ri] = b'0'; ri += 1; rbuf[ri] = b'0'; ri += 1; }
+                else { if mem_pct >= 10 { rbuf[ri] = b'0' + (mem_pct / 10) as u8; ri += 1; }
+                    rbuf[ri] = b'0' + (mem_pct % 10) as u8; ri += 1; }
+                rbuf[ri] = b'%'; ri += 1;
+                let ram_str = unsafe { core::str::from_utf8_unchecked(&rbuf[..ri]) };
+                let ram_col = if mem_pct > 80 { fb.color_from_rgb24(0xFF4444) }
+                    else if mem_pct > 50 { fb.color_from_rgb24(0xFFAA00) }
+                    else { fb.color_from_rgb24(0x44FF44) };
+                let ram_x = fb.width.saturating_sub(ri * 8 + 8);
+                fb.draw_string(ram_x, 2, ram_str, ram_col, fb.color_from_rgb24(0x0a0a0a));
             }
 
             // After full redraw: re-save cursor background and redraw cursor on top
