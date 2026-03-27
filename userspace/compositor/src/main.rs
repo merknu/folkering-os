@@ -777,7 +777,7 @@ fn main() -> ! {
     let mut ram_history: [u8; RAM_HISTORY_LEN] = [0; RAM_HISTORY_LEN]; // % values
     let mut ram_history_idx: usize = 0;
     let mut ram_history_count: usize = 0;
-    let mut show_ram_graph: bool = false;
+    let mut show_ram_graph: bool = false; // Toggle with G key or click RAM%
 
     // ===== App Launcher: Android-style folders + app grid =====
     const MAX_CATEGORIES: usize = 6;
