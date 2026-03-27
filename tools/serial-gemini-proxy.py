@@ -84,6 +84,7 @@ RESP_END = b"@@END@@"
 
 
 TOOL_GENERATE_PREFIX = "[GENERATE_TOOL]"
+TIME_SYNC_PREFIX = "[TIME_SYNC]"
 
 # Maximum compiled WASM size (64KB) — prevents COM2 buffer overflow
 MAX_WASM_SIZE = 64 * 1024
@@ -438,6 +439,29 @@ def handle_serial(sock: socket.socket):
                     prompt = data.get("prompt", payload.decode("utf-8", errors="replace"))
                 except json.JSONDecodeError:
                     prompt = payload.decode("utf-8", errors="replace")
+
+                # Check for [TIME_SYNC] prefix → return host local time
+                if prompt.startswith(TIME_SYNC_PREFIX):
+                    import datetime
+                    now = datetime.datetime.now(datetime.timezone.utc).astimezone()
+                    utc_offset = now.utcoffset()
+                    offset_minutes = int(utc_offset.total_seconds() / 60) if utc_offset else 0
+                    # Round to nearest 15 min (all real timezones are multiples of 15/30/45/60)
+                    offset_minutes = round(offset_minutes / 15) * 15
+                    is_dst = bool(time.daylight and time.localtime().tm_isdst)
+                    tz_name = time.tzname[1] if is_dst else time.tzname[0]
+                    # Use timezone-aware local time
+                    now_local = datetime.datetime.now()
+                    time_data = json.dumps({
+                        "year": now_local.year, "month": now_local.month, "day": now_local.day,
+                        "hour": now_local.hour, "minute": now_local.minute, "second": now_local.second,
+                        "utc_offset_minutes": offset_minutes,
+                        "tz": tz_name, "dst": is_dst,
+                    })
+                    response = RESP_START + time_data.encode() + RESP_END + b"\n"
+                    sock.sendall(response)
+                    print(f"[SERIAL-PROXY] Time sync: {time_data}")
+                    continue
 
                 # Check for [GENERATE_TOOL] prefix → WASM pipeline
                 if prompt.startswith(TOOL_GENERATE_PREFIX):
