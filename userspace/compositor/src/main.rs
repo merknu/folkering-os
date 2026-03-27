@@ -747,6 +747,19 @@ fn main() -> ! {
     let mut last_wasm_bytes: Option<alloc::vec::Vec<u8>> = None;
     let mut last_wasm_interactive: bool = false;
 
+    // Desktop App Tiles (mobile-style grid)
+    const MAX_DESKTOP_APPS: usize = 12;
+    const TILE_W: usize = 80;
+    const TILE_H: usize = 80;
+    const TILE_GAP: usize = 16;
+    const TILE_COLS: usize = 4;
+    let mut desktop_apps: [(bool, [u8; 24], usize); MAX_DESKTOP_APPS] =
+        [(false, [0u8; 24], 0); MAX_DESKTOP_APPS];
+    let mut desktop_app_count: usize = 0;
+    let mut desktop_apps_loaded = false;
+    // Tile click detection: which tile was clicked (-1 = none)
+    let mut tile_clicked: i32 = -1;
+
     // ===== NEURAL DESKTOP =====
     // AI-native interface with Omnibar at center
     let folk_blue = fb.color_from_rgb24(colors::FOLK_BLUE);
@@ -1511,6 +1524,24 @@ fn main() -> ! {
                     let cx = cx as usize;
                     let cy = cy as usize;
 
+                    // Hit-test: desktop app tiles
+                    if desktop_app_count > 0 {
+                        let grid_w = TILE_COLS * (TILE_W + TILE_GAP) - TILE_GAP;
+                        let grid_x = (fb.width.saturating_sub(grid_w)) / 2;
+                        let grid_y: usize = 100;
+                        for i in 0..desktop_app_count {
+                            let col = i % TILE_COLS;
+                            let row = i / TILE_COLS;
+                            let tx = grid_x + col * (TILE_W + TILE_GAP);
+                            let ty = grid_y + row * (TILE_H + TILE_GAP);
+                            if cx >= tx && cx < tx + TILE_W && cy >= ty && cy < ty + TILE_H {
+                                tile_clicked = i as i32;
+                                handled = true;
+                                break;
+                            }
+                        }
+                    }
+
                     // Hit-test: click inside the omnibar
                     if cx >= text_box_x && cx < text_box_x + text_box_w
                         && cy >= text_box_y && cy < text_box_y + text_box_h
@@ -1563,6 +1594,48 @@ fn main() -> ! {
             }
         }
 
+
+        // ===== Handle desktop tile click → launch saved app =====
+        if tile_clicked >= 0 && (tile_clicked as usize) < desktop_app_count {
+            let idx = tile_clicked as usize;
+            let (_, name_buf, name_len) = desktop_apps[idx];
+            if name_len > 0 {
+                let app_name = unsafe { core::str::from_utf8_unchecked(&name_buf[..name_len]) };
+                let filename = alloc::format!("{}.wasm", app_name);
+                write_str("[DESKTOP] Launching: ");
+                write_str(app_name);
+                write_str("\n");
+
+                // Load from VFS
+                const VFS_TILE_VADDR: usize = 0x50040000;
+                if let Ok(resp) = libfolk::sys::synapse::read_file_shmem(&filename) {
+                    if shmem_map(resp.shmem_handle, VFS_TILE_VADDR).is_ok() {
+                        let data = unsafe {
+                            core::slice::from_raw_parts(VFS_TILE_VADDR as *const u8, resp.size as usize)
+                        };
+                        let wasm_bytes = alloc::vec::Vec::from(data);
+                        let _ = shmem_unmap(resp.shmem_handle, VFS_TILE_VADDR);
+                        let _ = shmem_destroy(resp.shmem_handle);
+
+                        let config = compositor::wasm_runtime::WasmConfig {
+                            screen_width: fb.width as u32,
+                            screen_height: fb.height as u32,
+                            uptime_ms: libfolk::sys::uptime() as u32,
+                        };
+                        match compositor::wasm_runtime::PersistentWasmApp::new(&wasm_bytes, config) {
+                            Ok(app) => {
+                                active_wasm_app = Some(app);
+                                last_wasm_bytes = Some(wasm_bytes);
+                            }
+                            Err(_) => {}
+                        }
+                    } else {
+                        let _ = shmem_destroy(resp.shmem_handle);
+                    }
+                }
+            }
+            tile_clicked = -1;
+        }
 
         // ===== Process keyboard input =====
         // First, collect all pending keys without redrawing
@@ -2806,6 +2879,16 @@ fn main() -> ! {
                                     write_str("[COMPOSITOR] App saved to VFS: ");
                                     write_str(&filename);
                                     write_str("\n");
+                                    // Add to desktop tiles
+                                    if desktop_app_count < MAX_DESKTOP_APPS {
+                                        let name_bytes = app_name.as_bytes();
+                                        let copy_len = name_bytes.len().min(24);
+                                        let mut nb = [0u8; 24];
+                                        nb[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
+                                        desktop_apps[desktop_app_count] = (true, nb, copy_len);
+                                        desktop_app_count += 1;
+                                        damage.damage_full();
+                                    }
                                 }
                                 Err(_) => {
                                     win.push_line("[OS] Save failed — VFS write error");
@@ -3598,6 +3681,44 @@ fn main() -> ! {
                 let clock_str = unsafe { core::str::from_utf8_unchecked(&clock_buf) };
                 let clock_x = fb.width.saturating_sub(19 * 8 + 12);
                 fb.draw_string(clock_x, 8, clock_str, folk_accent, folk_dark);
+            }
+
+            // ===== Desktop App Tiles (mobile-style grid) =====
+            if desktop_app_count > 0 {
+                let grid_w = TILE_COLS * (TILE_W + TILE_GAP) - TILE_GAP;
+                let grid_x = (fb.width.saturating_sub(grid_w)) / 2;
+                let grid_y = 100; // Below title
+
+                let tile_bg = fb.color_from_rgb24(0x2a2a4e);
+                let tile_border = fb.color_from_rgb24(0x4a4a7e);
+                let tile_text = fb.color_from_rgb24(0xCCCCCC);
+                let tile_icon = fb.color_from_rgb24(0x00BBFF);
+
+                for i in 0..desktop_app_count {
+                    let col = i % TILE_COLS;
+                    let row = i / TILE_COLS;
+                    let tx = grid_x + col * (TILE_W + TILE_GAP);
+                    let ty = grid_y + row * (TILE_H + TILE_GAP);
+
+                    // Tile background (rounded look via nested rects)
+                    fb.fill_rect(tx, ty, TILE_W, TILE_H, tile_bg);
+                    fb.draw_rect(tx, ty, TILE_W, TILE_H, tile_border);
+
+                    // App icon: simple colored square
+                    let icon_colors = [0x00FF6644, 0x0044FF66, 0x006644FF, 0x00FFFF44,
+                                       0x00FF44FF, 0x0044FFFF, 0x00FF8800, 0x008800FF,
+                                       0x0088FF00, 0x00FF0088, 0x000088FF, 0x00884400];
+                    let icon_col = fb.color_from_rgb24(icon_colors[i % 12] as u32);
+                    fb.fill_rect(tx + 20, ty + 10, 40, 40, icon_col);
+
+                    // App name (below icon, centered)
+                    let (_, name_buf, name_len) = desktop_apps[i];
+                    if name_len > 0 {
+                        let name = unsafe { core::str::from_utf8_unchecked(&name_buf[..name_len]) };
+                        let name_x = tx + (TILE_W.saturating_sub(name_len * 8)) / 2;
+                        fb.draw_string(name_x, ty + 56, name, tile_text, tile_bg);
+                    }
+                }
             }
 
             // ===== Composite Windows (Milestone 2.1) =====
