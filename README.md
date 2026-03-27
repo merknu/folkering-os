@@ -144,7 +144,7 @@ User: "gemini make a game where a ball bounces around"
 The serial proxy (`serial-gemini-proxy.py`) handles the full toolchain autonomously:
 temp Cargo workspace with `opt-level="z"`, `lto=true`, `strip=true` → minimal WASM binary.
 
-Folk API: 12 host functions including `folk_draw_rect`, `folk_draw_line`, `folk_draw_circle`, `folk_fill_screen`, `folk_draw_text`, `folk_screen_width/height`, `folk_random`, `folk_get_time`, `folk_poll_event`.
+Folk API: 17 host functions including `folk_draw_rect`, `folk_draw_line`, `folk_draw_circle`, `folk_fill_screen`, `folk_draw_text`, `folk_screen_width/height`, `folk_random`, `folk_get_time`, `folk_poll_event`.
 
 ### Semantic VFS
 
@@ -311,11 +311,17 @@ python tools/serial-gemini-proxy.py
 - [x] **Neural Desktop** — Dirty rects, alpha blending, scaled fonts, intent engine, UI serialization
 - [x] **Hybrid AI** — Gemini 3 Flash via COM2 serial proxy, intent parsing, autonomous actions
 - [x] **WASM JIT Toolsmithing** — AI generates Rust → compiles to WASM → executes on bare metal
-- [x] **Phase 2: Interactive WASM** — PersistentWasmApp with per-frame execution, folk_poll_event real-time input, free-list allocator, Bresenham line + midpoint circle algorithms, 12 Folk API host functions
+- [x] **Phase 2: Interactive WASM** — PersistentWasmApp with per-frame execution, folk_poll_event real-time input, free-list allocator, Bresenham line + midpoint circle algorithms
+- [x] **Phase 3: Zero-Copy Surface** — folk_get_surface() direct pixel access, 786K pixels per frame via bulk memcpy
+- [x] **App Persistence** — save/run commands store WASM binaries to VFS (SQLite → VirtIO disk)
+- [x] **Async Asset Loading** — folk_request_file() with AssetLoaded events via folk_poll_event
+- [x] **RTC + System Tray** — CMOS RTC driver, folk_get_datetime(), live clock in top-right corner
+- [x] **17 Folk API host functions** — drawing, input, surface, files, datetime
 
 ### Next
 
-- [ ] WASM tool persistence (save generated tools to Synapse VFS)
+- [ ] VSync via VirtIO-GPU fence (kernel code ready, needs ISR routing)
+- [ ] VirtIO-Sound audio subsystem (SPSC lock-free ring buffer)
 - [ ] Multi-turn conversation with Gemini (context window management)
 - [ ] AVX2 GEMM acceleration for faster on-device inference
 
