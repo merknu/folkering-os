@@ -99,6 +99,9 @@ impl BuddyAllocator {
         self.total_pages = total_mem;
         self.free_pages = usable_mem;
 
+        // Set global RAM counters for status bar
+        TOTAL_RAM_PAGES.store(total_mem, core::sync::atomic::Ordering::Relaxed);
+
         crate::serial_str!("[PMM] Total: ");
         crate::drivers::serial::write_dec((total_mem * PAGE_SIZE / (1024 * 1024)) as u32);
         crate::serial_str!(" MB, Usable: ");
@@ -361,6 +364,7 @@ impl BootstrapAllocator {
         if self.next_page < self.end_page {
             let page = self.next_page;
             self.next_page += PAGE_SIZE;
+            ALLOCATED_PAGES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             Some(page)
         } else {
             None
@@ -411,23 +415,15 @@ pub fn stats() -> MemoryStats {
     ALLOCATOR.lock().stats()
 }
 
+/// Total physical RAM detected at boot (set during PMM init)
+static TOTAL_RAM_PAGES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static ALLOCATED_PAGES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
 /// Get memory statistics: (total_pages, free_pages)
 pub fn memory_stats() -> (usize, usize) {
-    let alloc = ALLOCATOR.lock();
-    let mut total = alloc.total_pages;
-    let mut free = alloc.free_pages;
-
-    // If buddy allocator is empty, use bootstrap allocator stats
-    if total == 0 {
-        if let Some(ref bootstrap) = *BOOTSTRAP_ALLOCATOR.lock() {
-            // Bootstrap tracks: start → next_page (used), next_page → end_page (free)
-            let total_pages = (bootstrap.end_page - bootstrap.next_page + (bootstrap.next_page % PAGE_SIZE)) / PAGE_SIZE;
-            let free_pages = (bootstrap.end_page.saturating_sub(bootstrap.next_page)) / PAGE_SIZE;
-            // Use QEMU RAM as total (512K pages = 2GB)
-            total = 2048 * 1024 * 1024 / PAGE_SIZE; // 2GB in pages
-            free = total.saturating_sub(bootstrap.next_page / PAGE_SIZE);
-        }
-    }
+    let total = TOTAL_RAM_PAGES.load(core::sync::atomic::Ordering::Relaxed);
+    let allocated = ALLOCATED_PAGES.load(core::sync::atomic::Ordering::Relaxed);
+    let free = total.saturating_sub(allocated);
     (total, free)
 }
 
