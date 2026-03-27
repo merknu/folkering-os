@@ -3012,6 +3012,76 @@ fn main() -> ! {
                                 }
                             }
                         }
+                    } else if starts_with_ci(cmd_str, "load ") {
+                        // Load precompiled WASM from host filesystem via proxy
+                        let path = cmd_str[5..].trim();
+                        if path.is_empty() {
+                            win.push_line("Usage: load <path.wasm>");
+                        } else {
+                            win.push_line(&alloc::format!("[OS] Loading {}...", path));
+                            // Send [LOAD_WASM:path] to proxy via COM2
+                            let load_cmd = alloc::format!("[LOAD_WASM:{}]", path);
+                            const LOAD_BUF_VADDR: usize = 0x50080000;
+                            const LOAD_BUF_SIZE: usize = 131072;
+                            if libfolk::sys::mmap_at(LOAD_BUF_VADDR, LOAD_BUF_SIZE, 3).is_ok() {
+                                let load_buf = unsafe {
+                                    core::slice::from_raw_parts_mut(LOAD_BUF_VADDR as *mut u8, LOAD_BUF_SIZE)
+                                };
+                                let resp_len = libfolk::sys::ask_gemini(&load_cmd, load_buf);
+                                if resp_len > 0 {
+                                    if let Ok(text) = core::str::from_utf8(&load_buf[..resp_len]) {
+                                        use compositor::intent::AgentIntent;
+                                        let intent = compositor::intent::parse_intent(text);
+                                        match intent {
+                                            AgentIntent::ToolReady { binary_base64 } => {
+                                                if let Some(wasm_bytes) = compositor::intent::base64_decode(&binary_base64) {
+                                                    win.push_line(&alloc::format!("[OS] Loaded {} bytes", wasm_bytes.len()));
+                                                    last_wasm_bytes = Some(wasm_bytes.clone());
+
+                                                    let interactive = find_ci(path.as_bytes(), b"app")
+                                                        || find_ci(path.as_bytes(), b"game")
+                                                        || find_ci(path.as_bytes(), b"interactive")
+                                                        || find_ci(path.as_bytes(), b"click")
+                                                        || find_ci(path.as_bytes(), b"mouse");
+                                                    last_wasm_interactive = interactive;
+
+                                                    let config = compositor::wasm_runtime::WasmConfig {
+                                                        screen_width: fb.width as u32,
+                                                        screen_height: fb.height as u32,
+                                                        uptime_ms: libfolk::sys::uptime() as u32,
+                                                    };
+
+                                                    if interactive {
+                                                        match compositor::wasm_runtime::PersistentWasmApp::new(&wasm_bytes, config) {
+                                                            Ok(app) => {
+                                                                win.push_line("[OS] Interactive app launched! ESC to exit.");
+                                                                active_wasm_app = Some(app);
+                                                            }
+                                                            Err(e) => { win.push_line(&alloc::format!("[OS] Error: {}", &e[..e.len().min(60)])); }
+                                                        }
+                                                    } else {
+                                                        let (result, output) = compositor::wasm_runtime::execute_wasm(&wasm_bytes, config);
+                                                        win.push_line(&alloc::format!("[OS] One-shot: {} commands", output.draw_commands.len()));
+                                                        if let Some(color) = output.fill_screen { fb.clear(fb.color_from_rgb24(color)); }
+                                                        for cmd in &output.draw_commands { fb.fill_rect(cmd.x as usize, cmd.y as usize, cmd.w as usize, cmd.h as usize, fb.color_from_rgb24(cmd.color)); }
+                                                        for cmd in &output.line_commands { let c = fb.color_from_rgb24(cmd.color); compositor::graphics::draw_line(&mut fb, cmd.x1, cmd.y1, cmd.x2, cmd.y2, c); }
+                                                        for cmd in &output.circle_commands { let c = fb.color_from_rgb24(cmd.color); compositor::graphics::draw_circle(&mut fb, cmd.cx, cmd.cy, cmd.r, c); }
+                                                        for cmd in &output.text_commands { fb.draw_string(cmd.x as usize, cmd.y as usize, &cmd.text, fb.color_from_rgb24(cmd.color), fb.color_from_rgb24(0)); }
+                                                        damage.damage_full();
+                                                    }
+                                                }
+                                            }
+                                            _ => {
+                                                win.push_line(&alloc::format!("[OS] Error: {}", &text[..text.len().min(80)]));
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    win.push_line("[OS] No response from proxy");
+                                }
+                                let _ = libfolk::sys::munmap(LOAD_BUF_VADDR as *mut u8, LOAD_BUF_SIZE);
+                            }
+                        }
                     } else if starts_with_ci(cmd_str, "save app ") {
                         // App Persistence: save last compiled WASM to VFS
                         let app_name = cmd_str[9..].trim();
