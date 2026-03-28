@@ -2445,7 +2445,73 @@ fn main() -> ! {
                     }
                 }
 
-                if !is_open_cmd {
+                // Omnibar `run <app>` — load WASM app in fullscreen
+                let is_run_cmd = cmd_str.starts_with("run ");
+                if is_run_cmd {
+                    let app_name = cmd_str[4..].trim();
+                    if !app_name.is_empty() {
+                        let filename = if app_name.as_bytes().windows(5).any(|w| w == b".wasm") {
+                            let mut f = [0u8; 64];
+                            let n = app_name.len().min(63);
+                            f[..n].copy_from_slice(&app_name.as_bytes()[..n]);
+                            (f, n)
+                        } else {
+                            let mut f = [0u8; 64];
+                            let nb = app_name.as_bytes();
+                            let ext = b".wasm";
+                            if nb.len() + ext.len() < 64 {
+                                f[..nb.len()].copy_from_slice(nb);
+                                f[nb.len()..nb.len()+ext.len()].copy_from_slice(ext);
+                                (f, nb.len() + ext.len())
+                            } else {
+                                (f, 0)
+                            }
+                        };
+                        if filename.1 > 0 {
+                            let fname_str = unsafe { core::str::from_utf8_unchecked(&filename.0[..filename.1]) };
+                            const VFS_RUN_VADDR: usize = 0x50040000;
+                            if let Ok(resp) = libfolk::sys::synapse::read_file_shmem(fname_str) {
+                                if shmem_map(resp.shmem_handle, VFS_RUN_VADDR).is_ok() {
+                                    let data = unsafe {
+                                        core::slice::from_raw_parts(VFS_RUN_VADDR as *const u8, resp.size as usize)
+                                    };
+                                    let wasm_bytes = alloc::vec::Vec::from(data);
+                                    let _ = shmem_unmap(resp.shmem_handle, VFS_RUN_VADDR);
+                                    let _ = shmem_destroy(resp.shmem_handle);
+
+                                    let config = compositor::wasm_runtime::WasmConfig {
+                                        screen_width: fb.width as u32,
+                                        screen_height: fb.height as u32,
+                                        uptime_ms: libfolk::sys::uptime() as u32,
+                                    };
+                                    match compositor::wasm_runtime::PersistentWasmApp::new(&wasm_bytes, config) {
+                                        Ok(app) => {
+                                            active_wasm_app = Some(app);
+                                            last_wasm_bytes = Some(wasm_bytes);
+                                            last_wasm_interactive = true;
+                                            write_str("[WASM] Launched fullscreen: ");
+                                            write_str(fname_str);
+                                            write_str("\n");
+                                        }
+                                        Err(_) => {
+                                            write_str("[WASM] Failed to instantiate: ");
+                                            write_str(fname_str);
+                                            write_str("\n");
+                                        }
+                                    }
+                                } else {
+                                    let _ = shmem_destroy(resp.shmem_handle);
+                                }
+                            } else {
+                                write_str("[WASM] App not found: ");
+                                write_str(fname_str);
+                                write_str("\n");
+                            }
+                        }
+                    }
+                }
+
+                if !is_open_cmd && !is_run_cmd {
                 // M13: Try semantic intent match BEFORE creating terminal window
                 if let Some(app_name) = try_intent_match(cmd_str) {
                     let mut fname = [0u8; 64];
@@ -3870,6 +3936,7 @@ fn main() -> ! {
                         }
 
                         did_work = true;
+                        damage.damage_full(); // WASM wrote to fb — flush to VirtIO-GPU
                     }
                 }
             }
