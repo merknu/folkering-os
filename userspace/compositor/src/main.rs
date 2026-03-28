@@ -3740,7 +3740,10 @@ fn main() -> ! {
 
         // Only redraw once after processing all keys
         if need_redraw {
-            if omnibar_visible {
+            // Skip desktop UI when WASM app owns the screen
+            let wasm_fullscreen = active_wasm_app.as_ref().map_or(false, |a| a.active);
+
+            if omnibar_visible && !wasm_fullscreen {
                 // ===== Draw Glass Omnibar (alpha-blended) =====
                 let omnibar_alpha: u8 = 180; // 70% opaque — scene bleeds through
 
@@ -3979,8 +3982,8 @@ fn main() -> ! {
             }
 
             // ===== Composite Windows (Milestone 2.1) =====
-            // Draw all managed windows on top of the desktop/omnibar
-            if wm.has_visible() {
+            // Skip window compositing when WASM app is fullscreen (it owns the screen)
+            if wm.has_visible() && active_wasm_app.as_ref().map_or(true, |a| !a.active) {
                 wm.composite(&mut fb);
             }
 
