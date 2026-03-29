@@ -3351,10 +3351,50 @@ fn main() -> ! {
                                             damage.damage_full();
                                         }
                                         AgentIntent::TextResponse { text: resp } => {
+                                            // Filter <think>...</think> from response → overlay
+                                            let mut visible = alloc::string::String::new();
+                                            let mut in_think = false;
+                                            let mut rest = resp.as_str();
+                                            while !rest.is_empty() {
+                                                if !in_think {
+                                                    if let Some(pos) = rest.find("<think>") {
+                                                        visible.push_str(&rest[..pos]);
+                                                        rest = &rest[pos + 7..];
+                                                        in_think = true;
+                                                        think_active = true;
+                                                        think_display_len = 0;
+                                                    } else {
+                                                        visible.push_str(rest);
+                                                        break;
+                                                    }
+                                                } else {
+                                                    if let Some(pos) = rest.find("</think>") {
+                                                        // Store think content in overlay buffer
+                                                        let think_text = &rest[..pos];
+                                                        let copy_len = think_text.len().min(THINK_BUF_SIZE - think_display_len);
+                                                        think_display[think_display_len..think_display_len + copy_len]
+                                                            .copy_from_slice(&think_text.as_bytes()[..copy_len]);
+                                                        think_display_len += copy_len;
+                                                        think_active = false;
+                                                        think_fade_timer = 180; // 3 seconds visible
+                                                        need_redraw = true;
+                                                        rest = &rest[pos + 8..];
+                                                        in_think = false;
+                                                    } else {
+                                                        // Unclosed think — store all, show nothing
+                                                        let copy_len = rest.len().min(THINK_BUF_SIZE - think_display_len);
+                                                        think_display[think_display_len..think_display_len + copy_len]
+                                                            .copy_from_slice(&rest.as_bytes()[..copy_len]);
+                                                        think_display_len += copy_len;
+                                                        break;
+                                                    }
+                                                }
+                                            }
                                             win.push_line("[Gemini]:");
-                                            for line in resp.split('\n') {
-                                                if !line.is_empty() {
-                                                    win.push_line(line);
+                                            for line in visible.split('\n') {
+                                                let trimmed = line.trim();
+                                                if !trimmed.is_empty() {
+                                                    win.push_line(trimmed);
                                                 }
                                             }
                                         }

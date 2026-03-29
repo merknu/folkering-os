@@ -348,7 +348,9 @@ def call_llm(prompt: str) -> str:
     try:
         if LLM_PROVIDER == "gemini":
             return _call_gemini(prompt)
-        elif LLM_PROVIDER in ("openai", "local"):
+        elif LLM_PROVIDER == "local":
+            return _call_local(prompt)
+        elif LLM_PROVIDER == "openai":
             return _call_openai(prompt)
         elif LLM_PROVIDER == "claude":
             return _call_claude(prompt)
@@ -392,6 +394,29 @@ def _call_openai(prompt: str) -> str:
     with urllib.request.urlopen(req, **kwargs) as resp:
         result = json.loads(resp.read())
         return result["choices"][0]["message"]["content"]
+
+
+def _call_local(prompt: str) -> str:
+    """Local Ollama API — uses native /api/chat to capture <think> reasoning."""
+    # Use Ollama native API (not OpenAI compat) to get 'thinking' field
+    base = LLM_BASE_URL.rstrip("/v1").rstrip("/")  # http://localhost:11434
+    url = f"{base}/api/chat"
+    body = json.dumps({
+        "model": LLM_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+    }).encode()
+    req = urllib.request.Request(url, data=body,
+        headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        result = json.loads(resp.read())
+        msg = result.get("message", {})
+        content = msg.get("content", "")
+        thinking = msg.get("thinking", "")
+        # Wrap thinking in <think> tags for Folkering OS FSA parser
+        if thinking:
+            return f"<think>\n{thinking}\n</think>\n{content}"
+        return content
 
 
 def _call_claude(prompt: str) -> str:
