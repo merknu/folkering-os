@@ -1153,6 +1153,8 @@ fn main() -> ! {
         if current_second != last_clock_second {
             last_clock_second = current_second;
             need_redraw = true;
+            // Only damage system tray area (top bar, ~30px high)
+            damage.add_damage(compositor::damage::Rect::new(0, 0, fb.width as u32, 30));
 
             // Sample RAM usage for history graph
             let (_, _, mem_pct) = libfolk::sys::memory_stats();
@@ -1791,7 +1793,7 @@ fn main() -> ! {
             if key == 0x07 || (active_wasm_app.is_none() && (key == b'G' || key == b'g') && !omnibar_visible) {
                 show_ram_graph = !show_ram_graph;
                 need_redraw = true;
-                damage.damage_full();
+                damage.damage_full(); // RAM graph covers large area
                 continue;
             }
 
@@ -1800,7 +1802,7 @@ fn main() -> ! {
             if key == 0x1B && open_folder >= 0 && active_wasm_app.is_none() {
                 open_folder = -1;
                 need_redraw = true;
-                damage.damage_full();
+                damage.damage_full(); // folder covers large area, full redraw needed
                 continue;
             }
             if let Some(app) = &mut active_wasm_app {
@@ -4022,7 +4024,8 @@ fn main() -> ! {
                         }
 
                         did_work = true;
-                        damage.damage_full(); // WASM wrote to fb — flush to VirtIO-GPU
+                        // WASM owns fullscreen — damage entire screen
+                        damage.damage_full();
                     }
                 }
             }
@@ -4401,6 +4404,28 @@ fn main() -> ! {
                             fb.fill_rect(bx, by, bar_w, bar_height, bar_color);
                         }
                     }
+                }
+            }
+
+            // Add targeted damage for rendered areas (instead of damage_full)
+            if !wasm_fullscreen {
+                // Omnibar area
+                if omnibar_visible {
+                    damage.add_damage(compositor::damage::Rect::new(
+                        text_box_x.saturating_sub(4) as u32,
+                        text_box_y.saturating_sub(4) as u32,
+                        (text_box_w + 8) as u32,
+                        (text_box_h + 40) as u32, // include hint text below
+                    ));
+                }
+                // System tray (top bar)
+                damage.add_damage(compositor::damage::Rect::new(0, 0, fb.width as u32, 22));
+                // Windows area (approximate)
+                for w in wm.windows.iter() {
+                    damage.add_damage(compositor::damage::Rect::new(
+                        w.x.max(0) as u32, w.y.max(0) as u32,
+                        (w.width + 20) as u32, (w.height + 40) as u32,
+                    ));
                 }
             }
 
@@ -4821,7 +4846,9 @@ fn main() -> ! {
                 }
             }
 
-            damage.damage_full();
+            let overlay_w_u32 = 400;
+            damage.add_damage(compositor::damage::Rect::new(
+                overlay_x as u32, overlay_y as u32, overlay_w_u32, overlay_h as u32));
             need_redraw = true;
         }
 
