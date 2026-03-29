@@ -461,7 +461,14 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
                 let is_shell = name.as_bytes() == b"shell";
                 let is_synapse = name.as_bytes() == b"synapse";
                 let is_compositor = name.as_bytes() == b"compositor";
+                let is_inference = name.as_bytes() == b"inference";
                 if is_shell || is_synapse {
+                    continue;
+                }
+                // Phase 5 Hybrid AI: skip built-in inference server to save ~400MB RAM.
+                // AI runs on host via LM Studio/llama.cpp, proxied through COM2.
+                if is_inference {
+                    serial_strln!("[BOOT] Skipping inference server (Phase 5 Hybrid AI mode)");
                     continue;
                 }
                 if entry.is_elf() {

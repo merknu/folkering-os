@@ -44,14 +44,16 @@ def cfg(key, default=""):
     """Get config from env var or .env file."""
     return os.environ.get(key, _env.get(key, default))
 
-# Provider: "gemini", "openai", or "claude"
+# Provider: "gemini", "openai", "claude", or "local" (LM Studio / llama.cpp / Ollama)
 LLM_PROVIDER = cfg("LLM_PROVIDER", "gemini")
 LLM_API_KEY = cfg("LLM_API_KEY", "") or cfg("GEMINI_API_KEY", "")
 LLM_MODEL = cfg("LLM_MODEL", "")
 LLM_BASE_URL = cfg("LLM_BASE_URL", "")
 
-if not LLM_API_KEY:
+# "local" provider needs no API key (LM Studio, Ollama, llama.cpp --server)
+if not LLM_API_KEY and LLM_PROVIDER not in ("local",):
     print("[PROXY] ERROR: Set LLM_API_KEY (or GEMINI_API_KEY) in .env or environment")
+    print("[PROXY] TIP: Use LLM_PROVIDER=local for LM Studio (no key needed)")
     sys.exit(1)
 
 # Default models per provider
@@ -59,6 +61,7 @@ DEFAULT_MODELS = {
     "gemini": "gemini-3.1-flash-lite-preview",
     "openai": "gpt-4o-mini",
     "claude": "claude-sonnet-4-20250514",
+    "local": "default",  # LM Studio uses whichever model is loaded
 }
 if not LLM_MODEL:
     LLM_MODEL = DEFAULT_MODELS.get(LLM_PROVIDER, "gemini-2.5-flash")
@@ -68,6 +71,7 @@ DEFAULT_URLS = {
     "gemini": "https://generativelanguage.googleapis.com/v1beta",
     "openai": "https://api.openai.com/v1",
     "claude": "https://api.anthropic.com/v1",
+    "local": "http://localhost:1234/v1",  # LM Studio default port
 }
 if not LLM_BASE_URL:
     LLM_BASE_URL = DEFAULT_URLS.get(LLM_PROVIDER, DEFAULT_URLS["gemini"])
@@ -344,7 +348,7 @@ def call_llm(prompt: str) -> str:
     try:
         if LLM_PROVIDER == "gemini":
             return _call_gemini(prompt)
-        elif LLM_PROVIDER == "openai":
+        elif LLM_PROVIDER in ("openai", "local"):
             return _call_openai(prompt)
         elif LLM_PROVIDER == "claude":
             return _call_claude(prompt)
@@ -369,19 +373,23 @@ def _call_gemini(prompt: str) -> str:
 
 
 def _call_openai(prompt: str) -> str:
-    """OpenAI / ChatGPT API (also works with compatible APIs like Ollama, LM Studio)."""
+    """OpenAI-compatible API (OpenAI, LM Studio, Ollama, llama.cpp server)."""
     url = f"{LLM_BASE_URL}/chat/completions"
     body = json.dumps({
         "model": LLM_MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": 4096,
+        "temperature": 0.7,
     }).encode()
-    req = urllib.request.Request(url, data=body, headers={
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {LLM_API_KEY}",
-    }, method="POST")
-    ctx = ssl.create_default_context()
-    with urllib.request.urlopen(req, context=ctx, timeout=60) as resp:
+    headers = {"Content-Type": "application/json"}
+    if LLM_API_KEY:
+        headers["Authorization"] = f"Bearer {LLM_API_KEY}"
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    # Use SSL only for HTTPS URLs
+    kwargs = {"timeout": 120}
+    if url.startswith("https"):
+        kwargs["context"] = ssl.create_default_context()
+    with urllib.request.urlopen(req, **kwargs) as resp:
         result = json.loads(resp.read())
         return result["choices"][0]["message"]["content"]
 
