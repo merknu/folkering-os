@@ -2394,52 +2394,91 @@ fn main() -> ! {
         if execute_command && text_len > 0 {
             if let Ok(cmd_str) = core::str::from_utf8(&text_buffer[..text_len]) {
 
-                // Special case: `open <app>` creates app window directly (no terminal)
+                // Special case: `open <app>` — try WASM fullscreen first, then FKUI window
                 let is_open_cmd = cmd_str.starts_with("open ");
                 if is_open_cmd {
                     let app_name = cmd_str[5..].trim();
                     if !app_name.is_empty() {
-                        // Build filename: "calc" → "calc.fkui"
-                        let mut fname = [0u8; 64];
-                        let nb = app_name.as_bytes();
-                        let ext = b".fkui";
-                        let mut vfs_loaded = false;
-                        if nb.len() + ext.len() < 64 {
-                            fname[..nb.len()].copy_from_slice(nb);
-                            fname[nb.len()..nb.len()+ext.len()].copy_from_slice(ext);
-                            let fname_str = unsafe { core::str::from_utf8_unchecked(&fname[..nb.len()+ext.len()]) };
+                        let mut opened_wasm = false;
 
-                            // Try VFS first (Synapse read_file_shmem)
-                            match libfolk::sys::synapse::read_file_shmem(fname_str) {
-                                Ok(resp) => {
-                                    deferred_app_handle = resp.shmem_handle;
-                                    vfs_loaded = true;
-                                    write_str("[WM] App loaded from VFS: ");
-                                    write_str(fname_str);
-                                    write_str("\n");
+                        // Try WASM fullscreen first (preferred — no window overlap)
+                        {
+                            let mut wasm_fname = [0u8; 64];
+                            let nb = app_name.as_bytes();
+                            let ext = b".wasm";
+                            if nb.len() + ext.len() < 64 {
+                                wasm_fname[..nb.len()].copy_from_slice(nb);
+                                wasm_fname[nb.len()..nb.len()+ext.len()].copy_from_slice(ext);
+                                let wasm_str = unsafe { core::str::from_utf8_unchecked(&wasm_fname[..nb.len()+ext.len()]) };
+                                const VFS_OPEN_VADDR: usize = 0x50040000;
+                                if let Ok(resp) = libfolk::sys::synapse::read_file_shmem(wasm_str) {
+                                    if shmem_map(resp.shmem_handle, VFS_OPEN_VADDR).is_ok() {
+                                        let data = unsafe {
+                                            core::slice::from_raw_parts(VFS_OPEN_VADDR as *const u8, resp.size as usize)
+                                        };
+                                        let wasm_bytes = alloc::vec::Vec::from(data);
+                                        let _ = shmem_unmap(resp.shmem_handle, VFS_OPEN_VADDR);
+                                        let _ = shmem_destroy(resp.shmem_handle);
+                                        let config = compositor::wasm_runtime::WasmConfig {
+                                            screen_width: fb.width as u32,
+                                            screen_height: fb.height as u32,
+                                            uptime_ms: libfolk::sys::uptime() as u32,
+                                        };
+                                        if let Ok(app) = compositor::wasm_runtime::PersistentWasmApp::new(&wasm_bytes, config) {
+                                            active_wasm_app = Some(app);
+                                            last_wasm_bytes = Some(wasm_bytes);
+                                            last_wasm_interactive = true;
+                                            opened_wasm = true;
+                                            write_str("[WM] Opened WASM fullscreen: ");
+                                            write_str(wasm_str);
+                                            write_str("\n");
+                                        }
+                                    } else {
+                                        let _ = shmem_destroy(resp.shmem_handle);
+                                    }
                                 }
-                                Err(_) => {}
                             }
                         }
 
-                        // Fallback: Shell IPC (M10 path)
-                        if !vfs_loaded {
-                            let name_hash = shell_hash_name(app_name) as u64;
-                            let shell_payload = SHELL_OP_OPEN_APP | (name_hash << 8);
-                            let intent_req = libfolk::sys::intent::INTENT_OP_SUBMIT
-                                | (shell_payload << 8);
-                            let ipc_result = unsafe {
-                                libfolk::syscall::syscall3(
-                                    libfolk::syscall::SYS_IPC_SEND,
-                                    libfolk::sys::intent::INTENT_TASK_ID as u64, intent_req, 0
-                                )
-                            };
-                            let magic = (ipc_result >> 48) as u16;
-                            if magic == 0x5549 {
-                                deferred_app_handle = (ipc_result & 0xFFFFFFFF) as u32;
-                                write_str("[WM] App launch via Shell fallback\n");
-                            } else {
-                                write_str("[WM] Unknown app\n");
+                        // Fallback: FKUI windowed app
+                        if !opened_wasm {
+                            let mut fname = [0u8; 64];
+                            let nb = app_name.as_bytes();
+                            let ext = b".fkui";
+                            let mut vfs_loaded = false;
+                            if nb.len() + ext.len() < 64 {
+                                fname[..nb.len()].copy_from_slice(nb);
+                                fname[nb.len()..nb.len()+ext.len()].copy_from_slice(ext);
+                                let fname_str = unsafe { core::str::from_utf8_unchecked(&fname[..nb.len()+ext.len()]) };
+                                match libfolk::sys::synapse::read_file_shmem(fname_str) {
+                                    Ok(resp) => {
+                                        deferred_app_handle = resp.shmem_handle;
+                                        vfs_loaded = true;
+                                        write_str("[WM] App loaded from VFS: ");
+                                        write_str(fname_str);
+                                        write_str("\n");
+                                    }
+                                    Err(_) => {}
+                                }
+                            }
+                            if !vfs_loaded {
+                                let name_hash = shell_hash_name(app_name) as u64;
+                                let shell_payload = SHELL_OP_OPEN_APP | (name_hash << 8);
+                                let intent_req = libfolk::sys::intent::INTENT_OP_SUBMIT
+                                    | (shell_payload << 8);
+                                let ipc_result = unsafe {
+                                    libfolk::syscall::syscall3(
+                                        libfolk::syscall::SYS_IPC_SEND,
+                                        libfolk::sys::intent::INTENT_TASK_ID as u64, intent_req, 0
+                                    )
+                                };
+                                let magic = (ipc_result >> 48) as u16;
+                                if magic == 0x5549 {
+                                    deferred_app_handle = (ipc_result & 0xFFFFFFFF) as u32;
+                                    write_str("[WM] App launch via Shell fallback\n");
+                                } else {
+                                    write_str("[WM] Unknown app\n");
+                                }
                             }
                         }
                     }
