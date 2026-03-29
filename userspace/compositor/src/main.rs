@@ -1144,6 +1144,7 @@ fn main() -> ! {
     loop {
         // Track if we did any work this iteration
         let mut did_work = false;
+        let frame_start_ms = uptime();
         // Consolidated redraw flag — any subsystem can set this
         // WASM apps need continuous redraws for animation (60fps game loop)
         let mut need_redraw = active_wasm_app.as_ref().map_or(false, |a| a.active);
@@ -4873,8 +4874,16 @@ fn main() -> ! {
             damage.clear();
         }
 
-        // Only yield CPU if we did no work this iteration
-        if !did_work {
+        // Frame rate limiter: cap at ~60fps to prevent VM-Exit flooding.
+        // Under WHPX, each mouse movement = PS/2 IRQ12 = VM-exit.
+        // Without throttling, VNC sends 100+ mouse events/sec, yield_cpu()
+        // returns instantly (pending interrupt), and compositor spins.
+        // By waiting until 16ms have elapsed, mouse events batch in the
+        // kernel buffer and get processed in one sweep next frame.
+        let frame_end = uptime();
+        let frame_ms = frame_end.saturating_sub(frame_start_ms);
+        if frame_ms < 16 {
+            // Sleep remaining time via yield (HLT waits for next interrupt)
             yield_cpu();
         }
     }

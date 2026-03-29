@@ -72,7 +72,7 @@ $qemuArgs = @(
     "-serial", "tcp:127.0.0.1:4567,server,nowait",
     "-serial", "tcp:127.0.0.1:4568,server,nowait",
     "-display", "none",
-    "-vnc", "0.0.0.0:0,non-adaptive",
+    "-vnc", "0.0.0.0:0",
     "-no-reboot"
 )
 
