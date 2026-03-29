@@ -945,13 +945,20 @@ fn main() -> ! {
     const TOOL_OPEN: &[u8] = b"<|tool|>";    // 8 bytes
     const TOOL_CLOSE: &[u8] = b"<|/tool|>";  // 9 bytes
 
-    // ===== Think Tag Filter =====
-    // Hides <think>...</think> reasoning from display (Qwen3 thinking mode)
-    let mut think_state: u8 = 0;     // 0=scanning open, 1=inside think block (hidden)
+    // ===== Think Tag Filter + UI Overlay =====
+    // Captures <think>...</think> reasoning and displays in translucent overlay
+    let mut think_state: u8 = 0;     // 0=scanning open, 1=inside think block
     let mut think_open_match: usize = 0;
     let mut think_close_match: usize = 0;
     let mut think_pending: [u8; 8] = [0; 8]; // max tag length for flush
     let mut think_pending_len: usize = 0;
+
+    // Think display buffer — shows AI reasoning in UI overlay
+    const THINK_BUF_SIZE: usize = 1024;
+    let mut think_display: [u8; THINK_BUF_SIZE] = [0; THINK_BUF_SIZE];
+    let mut think_display_len: usize = 0;
+    let mut think_active: bool = false; // true while inside <think> block
+    let mut think_fade_timer: u32 = 0;  // frames to keep overlay visible after </think>
 
     const THINK_OPEN: &[u8] = b"<think>";    // 7 bytes
     const THINK_CLOSE: &[u8] = b"</think>";  // 8 bytes
@@ -4469,10 +4476,14 @@ fn main() -> ! {
                             think_pending_len += 1;
                             think_open_match += 1;
                             if think_open_match == THINK_OPEN.len() {
-                                // Entered think block — drop all content
+                                // Entered think block — capture to overlay
                                 think_state = 1;
                                 think_open_match = 0;
                                 think_pending_len = 0;
+                                think_active = true;
+                                think_display_len = 0; // clear previous
+                                think_fade_timer = 0;
+                                need_redraw = true;
                             }
                             continue; // Don't pass to tool/visible layer yet
                         } else if think_open_match > 0 {
@@ -4525,14 +4536,30 @@ fn main() -> ! {
                         if byte == THINK_CLOSE[think_close_match] {
                             think_close_match += 1;
                             if think_close_match == THINK_CLOSE.len() {
-                                // Exited think block — resume normal display
+                                // Exited think block — keep overlay visible for 120 frames (~2s)
                                 think_state = 0;
                                 think_close_match = 0;
+                                think_active = false;
+                                think_fade_timer = 120;
+                                need_redraw = true;
                             }
                         } else {
+                            // Flush partial close-match bytes to think buffer
+                            for k in 0..think_close_match {
+                                if think_display_len < THINK_BUF_SIZE {
+                                    think_display[think_display_len] = THINK_CLOSE[k];
+                                    think_display_len += 1;
+                                }
+                            }
                             think_close_match = 0;
+                            // Store current byte in think display buffer
+                            if think_display_len < THINK_BUF_SIZE {
+                                think_display[think_display_len] = byte;
+                                think_display_len += 1;
+                            }
+                            need_redraw = true;
                         }
-                        continue; // Drop ALL bytes inside think block
+                        continue; // Don't pass think bytes to tool/visible layer
                     }
 
                     // ── Layer 1.5: Tool result filter ──
@@ -4680,6 +4707,89 @@ fn main() -> ! {
                     }
                 }
                 need_redraw = true;
+            }
+        }
+
+        // ===== AI Think Overlay =====
+        // Semi-transparent panel showing AI reasoning in real-time
+        if (think_active || think_fade_timer > 0) && think_display_len > 0 {
+            // Overlay dimensions: top-right corner, 400px wide
+            let overlay_w = 400usize;
+            let overlay_x = fb.width.saturating_sub(overlay_w + 16);
+            let overlay_y = 40usize;
+
+            // Extract last N lines from think buffer (show most recent reasoning)
+            let think_text = unsafe {
+                core::str::from_utf8_unchecked(&think_display[..think_display_len])
+            };
+
+            // Count lines and find start of last 8 lines
+            let max_lines = 8usize;
+            let mut line_starts = [0usize; 9]; // up to 8 lines + sentinel
+            let mut line_count = 0usize;
+            let bytes = think_text.as_bytes();
+            line_starts[0] = 0;
+            for i in 0..bytes.len() {
+                if bytes[i] == b'\n' && line_count < max_lines {
+                    line_count += 1;
+                    line_starts[line_count] = i + 1;
+                }
+            }
+            if line_count == 0 { line_count = 1; } // at least 1 line
+
+            // Show last max_lines lines
+            let first_line = if line_count > max_lines { line_count - max_lines } else { 0 };
+            let display_lines = line_count - first_line;
+            let overlay_h = 28 + display_lines * 18;
+
+            // Alpha for fade-out effect
+            let alpha = if think_active { 200u8 } else {
+                (think_fade_timer as u16 * 200 / 120).min(200) as u8
+            };
+
+            // Draw semi-transparent background
+            fb.fill_rect_alpha(overlay_x, overlay_y, overlay_w, overlay_h, 0x0a0a1e, alpha);
+
+            // Header: "AI Thinking..." or "AI Thought"
+            let header = if think_active { "AI Thinking..." } else { "AI Thought" };
+            let header_color = if think_active { 0x00ccff } else { 0x666688 };
+            fb.draw_string(overlay_x + 8, overlay_y + 6, header,
+                fb.color_from_rgb24(header_color), fb.color_from_rgb24(0));
+
+            // Draw reasoning lines
+            let text_color = fb.color_from_rgb24(if think_active { 0xaaaacc } else { 0x666688 });
+            let bg_color = fb.color_from_rgb24(0);
+            for li in 0..display_lines {
+                let idx = first_line + li;
+                let start = line_starts[idx];
+                let end = if idx + 1 <= line_count {
+                    line_starts[idx + 1].min(think_display_len)
+                } else {
+                    think_display_len
+                };
+                if start < end {
+                    // Truncate long lines
+                    let line_end = end.min(start + 48);
+                    let line = unsafe {
+                        core::str::from_utf8_unchecked(&think_display[start..line_end])
+                    };
+                    let line_trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+                    if !line_trimmed.is_empty() {
+                        fb.draw_string(overlay_x + 8, overlay_y + 24 + li * 18,
+                            line_trimmed, text_color, bg_color);
+                    }
+                }
+            }
+
+            damage.damage_full();
+            need_redraw = true;
+        }
+
+        // Decrement fade timer
+        if think_fade_timer > 0 {
+            think_fade_timer -= 1;
+            if think_fade_timer == 0 {
+                need_redraw = true; // final redraw to clear overlay
             }
         }
 
