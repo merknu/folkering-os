@@ -47,53 +47,73 @@ pub enum AgentIntent {
 pub fn parse_intent(response: &str) -> AgentIntent {
     let trimmed = response.trim();
 
+    // Strip <think>...</think> blocks — extract content after closing tag
+    // DeepSeek-R1 wraps reasoning in <think> tags before the JSON action
+    let effective = if let Some(think_start) = trimmed.find("<think>") {
+        if let Some(think_end) = trimmed.find("</think>") {
+            trimmed[think_end + 8..].trim()
+        } else {
+            trimmed // unclosed tag — use full text
+        }
+    } else {
+        trimmed
+    };
+
+    // Debug: log think tag extraction
+    if trimmed.contains("<think>") {
+        use libfolk::sys::io::write_str;
+        write_str("[INTENT] Found <think> in response, effective starts with: ");
+        write_str(&effective[..effective.len().min(30)]);
+        write_str("\n");
+    }
+
     // Check if response is JSON (starts with '{')
-    if !trimmed.starts_with('{') {
+    if !effective.starts_with('{') {
         return AgentIntent::TextResponse { text: String::from(trimmed) };
     }
 
     // Extract "action" field
-    let action = match extract_str(trimmed, "action") {
+    let action = match extract_str(effective, "action") {
         Some(a) => a,
         None => return AgentIntent::TextResponse { text: String::from(trimmed) },
     };
 
     match action.as_str() {
         "move_window" => {
-            let wid = extract_num(trimmed, "window_id").unwrap_or(0);
-            let x = extract_num(trimmed, "x").unwrap_or(0);
-            let y = extract_num(trimmed, "y").unwrap_or(0);
+            let wid = extract_num(effective, "window_id").unwrap_or(0);
+            let x = extract_num(effective, "x").unwrap_or(0);
+            let y = extract_num(effective, "y").unwrap_or(0);
             AgentIntent::MoveWindow { window_id: wid, x, y }
         }
         "resize_window" => {
-            let wid = extract_num(trimmed, "window_id").unwrap_or(0);
-            let w = extract_num(trimmed, "w").unwrap_or(400);
-            let h = extract_num(trimmed, "h").unwrap_or(300);
+            let wid = extract_num(effective, "window_id").unwrap_or(0);
+            let w = extract_num(effective, "w").unwrap_or(400);
+            let h = extract_num(effective, "h").unwrap_or(300);
             AgentIntent::ResizeWindow { window_id: wid, w, h }
         }
         "close_window" => {
-            let wid = extract_num(trimmed, "window_id").unwrap_or(0);
+            let wid = extract_num(effective, "window_id").unwrap_or(0);
             AgentIntent::CloseWindow { window_id: wid }
         }
         "read_file" => {
-            let path = extract_str(trimmed, "path").unwrap_or_default();
+            let path = extract_str(effective, "path").unwrap_or_default();
             AgentIntent::ReadFile { path }
         }
         "write_file" => {
-            let path = extract_str(trimmed, "path").unwrap_or_default();
-            let content = extract_str(trimmed, "content").unwrap_or_default();
+            let path = extract_str(effective, "path").unwrap_or_default();
+            let content = extract_str(effective, "content").unwrap_or_default();
             AgentIntent::WriteFile { path, content }
         }
         "generate_tool" => {
-            let prompt = extract_str(trimmed, "prompt").unwrap_or_default();
+            let prompt = extract_str(effective, "prompt").unwrap_or_default();
             AgentIntent::GenerateTool { prompt }
         }
         "tool_ready" => {
-            let binary = extract_str(trimmed, "binary").unwrap_or_default();
+            let binary = extract_str(effective, "binary").unwrap_or_default();
             AgentIntent::ToolReady { binary_base64: binary }
         }
         "error" => {
-            let msg = extract_str(trimmed, "message").unwrap_or_default();
+            let msg = extract_str(effective, "message").unwrap_or_default();
             AgentIntent::Error { message: msg }
         }
         _ => AgentIntent::TextResponse { text: String::from(trimmed) },

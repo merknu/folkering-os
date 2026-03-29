@@ -413,6 +413,8 @@ def _call_local(prompt: str) -> str:
         msg = result.get("message", {})
         content = msg.get("content", "")
         thinking = msg.get("thinking", "")
+        # Debug: log thinking status
+        print(f"[PROXY] thinking: {len(thinking)} chars, content: {len(content)} chars")
         # Wrap thinking in <think> tags for Folkering OS FSA parser
         if thinking:
             return f"<think>\n{thinking}\n</think>\n{content}"
