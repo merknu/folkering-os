@@ -1707,6 +1707,8 @@ fn main() -> ! {
             }
 
             // Redraw cursor if it moved, button state changed, or background is dirty
+            let old_cx = cursor_x;
+            let old_cy = cursor_y;
             if new_x != cursor_x || new_y != cursor_y || latest_buttons != last_buttons || cursor_bg_dirty {
                 // Erase old cursor by restoring saved background
                 if !cursor_bg_dirty {
@@ -1722,6 +1724,12 @@ fn main() -> ! {
                 // Save background at new position, then draw cursor on top
                 fb.save_rect(cursor_x as usize, cursor_y as usize, CURSOR_W, CURSOR_H, &mut cursor_bg.0);
                 fb.draw_cursor(cursor_x as usize, cursor_y as usize, cursor_fill, cursor_outline);
+
+                // Damage old + new cursor areas for VirtIO-GPU flush
+                damage.add_damage(compositor::damage::Rect::new(
+                    old_cx.max(0) as u32, old_cy.max(0) as u32, CURSOR_W as u32 + 2, CURSOR_H as u32 + 2));
+                damage.add_damage(compositor::damage::Rect::new(
+                    cursor_x.max(0) as u32, cursor_y.max(0) as u32, CURSOR_W as u32 + 2, CURSOR_H as u32 + 2));
             }
         } // end if had_mouse_events
 
@@ -4408,27 +4416,11 @@ fn main() -> ! {
                 }
             }
 
-            // Add targeted damage for rendered areas (instead of damage_full)
-            if !wasm_fullscreen {
-                // Omnibar area
-                if omnibar_visible {
-                    damage.add_damage(compositor::damage::Rect::new(
-                        text_box_x.saturating_sub(4) as u32,
-                        text_box_y.saturating_sub(4) as u32,
-                        (text_box_w + 8) as u32,
-                        (text_box_h + 40) as u32, // include hint text below
-                    ));
-                }
-                // System tray (top bar)
-                damage.add_damage(compositor::damage::Rect::new(0, 0, fb.width as u32, 22));
-                // Windows area (approximate)
-                for w in wm.windows.iter() {
-                    damage.add_damage(compositor::damage::Rect::new(
-                        w.x.max(0) as u32, w.y.max(0) as u32,
-                        (w.width + 20) as u32, (w.height + 40) as u32,
-                    ));
-                }
-            }
+            // Full-screen damage until kernel supports descriptor chaining
+            // (batching multiple rects into one VM-exit). Without chaining,
+            // N targeted rects = N gpu_flush calls = N VM-exits, which is
+            // WORSE than 1 damage_full = 1 VM-exit.
+            damage.damage_full();
 
             // After full redraw: re-save cursor background and redraw cursor on top
             // This ensures cursor is always the topmost element
@@ -4442,6 +4434,10 @@ fn main() -> ! {
                 fb.save_rect(cursor_x as usize, cursor_y as usize, CURSOR_W, CURSOR_H, &mut cursor_bg.0);
                 fb.draw_cursor(cursor_x as usize, cursor_y as usize, cursor_fill, cursor_outline);
                 cursor_bg_dirty = false;
+                // Damage cursor area so it gets flushed to VirtIO-GPU
+                damage.add_damage(compositor::damage::Rect::new(
+                    cursor_x.max(0) as u32, cursor_y.max(0) as u32,
+                    CURSOR_W as u32 + 2, CURSOR_H as u32 + 2));
             }
         }
 
