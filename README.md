@@ -8,11 +8,11 @@ Folkering OS runs on bare-metal x86-64 hardware (via QEMU) with its own kernel, 
 
 | Neural Desktop | Calculator | Paint |
 |:-:|:-:|:-:|
-| ![Desktop](screenshots/neural-desktop.png) | ![Calculator](screenshots/calculator.png) | ![Paint](screenshots/paint.png) |
-| About Dialog | Zero-Copy Gradient | RAM Graph |
-| ![About](screenshots/about-dialog.png) | ![Gradient](screenshots/gradient-surface.png) | ![RAM](screenshots/ram-graph.png) |
+| ![Desktop](screenshots/neural-desktop.png) | ![Calculator](screenshots/calculator.png) | ![Paint](screenshots/paint-app.png) |
+| About Dialog | Zero-Copy Gradient | Bouncing Ball |
+| ![About](screenshots/about-app.png) | ![Gradient](screenshots/gradient-surface.png) | ![Bouncing](screenshots/bouncing-ball.png) |
 
-*Row 1: Neural Desktop with status bar (date + clock + RAM%), interactive Calculator with click-to-compute, Mini Paint with 8-color palette. Row 2: Win3.1 About Dialog with animated starfield, Zero-copy gradient (786K pixels direct from WASM), live RAM usage history graph.*
+*Row 1: Neural Desktop with system tray (date, clock, RAM% graph), interactive Calculator with click-to-compute, Mini Paint with 8-color palette. Row 2: Win3.1-style About Dialog with animated starfield, zero-copy rainbow gradient (786K pixels direct from WASM memory), DVD-style bouncing ball screensaver.*
 
 ## What It Can Do Today
 
@@ -193,7 +193,7 @@ shmem_unmap(handle, 0x30000000)?;      // unmap
 
 | Component | Purpose | Lines |
 |-----------|---------|-------|
-| **Compositor** | Window manager, terminal, omnibar, AI intents, WASM execution | ~3500 |
+| **Compositor** | Window manager, terminal, omnibar, AI intents, WASM execution | ~5000 |
 | **Inference Server** | GGUF model loading, tokenizer, transformer, sampling | ~1000 |
 | **Shell** | Command execution, WASM apps, IPC handlers | ~2400 |
 | **Synapse** | SQLite parser, file cache, VirtIO persistence | ~1100 |

@@ -1138,7 +1138,8 @@ fn main() -> ! {
         // Track if we did any work this iteration
         let mut did_work = false;
         // Consolidated redraw flag — any subsystem can set this
-        let mut need_redraw = false;
+        // WASM apps need continuous redraws for animation (60fps game loop)
+        let mut need_redraw = active_wasm_app.as_ref().map_or(false, |a| a.active);
 
         // Clock tick: redraw once per second for system tray + RAM sampling
         let current_second = (libfolk::sys::get_rtc_packed() & 0x3F) as u8;
@@ -2393,58 +2394,163 @@ fn main() -> ! {
         if execute_command && text_len > 0 {
             if let Ok(cmd_str) = core::str::from_utf8(&text_buffer[..text_len]) {
 
-                // Special case: `open <app>` creates app window directly (no terminal)
+                // Special case: `open <app>` — try WASM fullscreen first, then FKUI window
                 let is_open_cmd = cmd_str.starts_with("open ");
                 if is_open_cmd {
                     let app_name = cmd_str[5..].trim();
                     if !app_name.is_empty() {
-                        // Build filename: "calc" → "calc.fkui"
-                        let mut fname = [0u8; 64];
-                        let nb = app_name.as_bytes();
-                        let ext = b".fkui";
-                        let mut vfs_loaded = false;
-                        if nb.len() + ext.len() < 64 {
-                            fname[..nb.len()].copy_from_slice(nb);
-                            fname[nb.len()..nb.len()+ext.len()].copy_from_slice(ext);
-                            let fname_str = unsafe { core::str::from_utf8_unchecked(&fname[..nb.len()+ext.len()]) };
+                        let mut opened_wasm = false;
 
-                            // Try VFS first (Synapse read_file_shmem)
-                            match libfolk::sys::synapse::read_file_shmem(fname_str) {
-                                Ok(resp) => {
-                                    deferred_app_handle = resp.shmem_handle;
-                                    vfs_loaded = true;
-                                    write_str("[WM] App loaded from VFS: ");
-                                    write_str(fname_str);
-                                    write_str("\n");
+                        // Try WASM fullscreen first (preferred — no window overlap)
+                        {
+                            let mut wasm_fname = [0u8; 64];
+                            let nb = app_name.as_bytes();
+                            let ext = b".wasm";
+                            if nb.len() + ext.len() < 64 {
+                                wasm_fname[..nb.len()].copy_from_slice(nb);
+                                wasm_fname[nb.len()..nb.len()+ext.len()].copy_from_slice(ext);
+                                let wasm_str = unsafe { core::str::from_utf8_unchecked(&wasm_fname[..nb.len()+ext.len()]) };
+                                const VFS_OPEN_VADDR: usize = 0x50040000;
+                                if let Ok(resp) = libfolk::sys::synapse::read_file_shmem(wasm_str) {
+                                    if shmem_map(resp.shmem_handle, VFS_OPEN_VADDR).is_ok() {
+                                        let data = unsafe {
+                                            core::slice::from_raw_parts(VFS_OPEN_VADDR as *const u8, resp.size as usize)
+                                        };
+                                        let wasm_bytes = alloc::vec::Vec::from(data);
+                                        let _ = shmem_unmap(resp.shmem_handle, VFS_OPEN_VADDR);
+                                        let _ = shmem_destroy(resp.shmem_handle);
+                                        let config = compositor::wasm_runtime::WasmConfig {
+                                            screen_width: fb.width as u32,
+                                            screen_height: fb.height as u32,
+                                            uptime_ms: libfolk::sys::uptime() as u32,
+                                        };
+                                        if let Ok(app) = compositor::wasm_runtime::PersistentWasmApp::new(&wasm_bytes, config) {
+                                            active_wasm_app = Some(app);
+                                            last_wasm_bytes = Some(wasm_bytes);
+                                            last_wasm_interactive = true;
+                                            opened_wasm = true;
+                                            write_str("[WM] Opened WASM fullscreen: ");
+                                            write_str(wasm_str);
+                                            write_str("\n");
+                                        }
+                                    } else {
+                                        let _ = shmem_destroy(resp.shmem_handle);
+                                    }
                                 }
-                                Err(_) => {}
                             }
                         }
 
-                        // Fallback: Shell IPC (M10 path)
-                        if !vfs_loaded {
-                            let name_hash = shell_hash_name(app_name) as u64;
-                            let shell_payload = SHELL_OP_OPEN_APP | (name_hash << 8);
-                            let intent_req = libfolk::sys::intent::INTENT_OP_SUBMIT
-                                | (shell_payload << 8);
-                            let ipc_result = unsafe {
-                                libfolk::syscall::syscall3(
-                                    libfolk::syscall::SYS_IPC_SEND,
-                                    libfolk::sys::intent::INTENT_TASK_ID as u64, intent_req, 0
-                                )
-                            };
-                            let magic = (ipc_result >> 48) as u16;
-                            if magic == 0x5549 {
-                                deferred_app_handle = (ipc_result & 0xFFFFFFFF) as u32;
-                                write_str("[WM] App launch via Shell fallback\n");
-                            } else {
-                                write_str("[WM] Unknown app\n");
+                        // Fallback: FKUI windowed app
+                        if !opened_wasm {
+                            let mut fname = [0u8; 64];
+                            let nb = app_name.as_bytes();
+                            let ext = b".fkui";
+                            let mut vfs_loaded = false;
+                            if nb.len() + ext.len() < 64 {
+                                fname[..nb.len()].copy_from_slice(nb);
+                                fname[nb.len()..nb.len()+ext.len()].copy_from_slice(ext);
+                                let fname_str = unsafe { core::str::from_utf8_unchecked(&fname[..nb.len()+ext.len()]) };
+                                match libfolk::sys::synapse::read_file_shmem(fname_str) {
+                                    Ok(resp) => {
+                                        deferred_app_handle = resp.shmem_handle;
+                                        vfs_loaded = true;
+                                        write_str("[WM] App loaded from VFS: ");
+                                        write_str(fname_str);
+                                        write_str("\n");
+                                    }
+                                    Err(_) => {}
+                                }
+                            }
+                            if !vfs_loaded {
+                                let name_hash = shell_hash_name(app_name) as u64;
+                                let shell_payload = SHELL_OP_OPEN_APP | (name_hash << 8);
+                                let intent_req = libfolk::sys::intent::INTENT_OP_SUBMIT
+                                    | (shell_payload << 8);
+                                let ipc_result = unsafe {
+                                    libfolk::syscall::syscall3(
+                                        libfolk::syscall::SYS_IPC_SEND,
+                                        libfolk::sys::intent::INTENT_TASK_ID as u64, intent_req, 0
+                                    )
+                                };
+                                let magic = (ipc_result >> 48) as u16;
+                                if magic == 0x5549 {
+                                    deferred_app_handle = (ipc_result & 0xFFFFFFFF) as u32;
+                                    write_str("[WM] App launch via Shell fallback\n");
+                                } else {
+                                    write_str("[WM] Unknown app\n");
+                                }
                             }
                         }
                     }
                 }
 
-                if !is_open_cmd {
+                // Omnibar `run <app>` — load WASM app in fullscreen
+                let is_run_cmd = cmd_str.starts_with("run ");
+                if is_run_cmd {
+                    let app_name = cmd_str[4..].trim();
+                    if !app_name.is_empty() {
+                        let filename = if app_name.as_bytes().windows(5).any(|w| w == b".wasm") {
+                            let mut f = [0u8; 64];
+                            let n = app_name.len().min(63);
+                            f[..n].copy_from_slice(&app_name.as_bytes()[..n]);
+                            (f, n)
+                        } else {
+                            let mut f = [0u8; 64];
+                            let nb = app_name.as_bytes();
+                            let ext = b".wasm";
+                            if nb.len() + ext.len() < 64 {
+                                f[..nb.len()].copy_from_slice(nb);
+                                f[nb.len()..nb.len()+ext.len()].copy_from_slice(ext);
+                                (f, nb.len() + ext.len())
+                            } else {
+                                (f, 0)
+                            }
+                        };
+                        if filename.1 > 0 {
+                            let fname_str = unsafe { core::str::from_utf8_unchecked(&filename.0[..filename.1]) };
+                            const VFS_RUN_VADDR: usize = 0x50040000;
+                            if let Ok(resp) = libfolk::sys::synapse::read_file_shmem(fname_str) {
+                                if shmem_map(resp.shmem_handle, VFS_RUN_VADDR).is_ok() {
+                                    let data = unsafe {
+                                        core::slice::from_raw_parts(VFS_RUN_VADDR as *const u8, resp.size as usize)
+                                    };
+                                    let wasm_bytes = alloc::vec::Vec::from(data);
+                                    let _ = shmem_unmap(resp.shmem_handle, VFS_RUN_VADDR);
+                                    let _ = shmem_destroy(resp.shmem_handle);
+
+                                    let config = compositor::wasm_runtime::WasmConfig {
+                                        screen_width: fb.width as u32,
+                                        screen_height: fb.height as u32,
+                                        uptime_ms: libfolk::sys::uptime() as u32,
+                                    };
+                                    match compositor::wasm_runtime::PersistentWasmApp::new(&wasm_bytes, config) {
+                                        Ok(app) => {
+                                            active_wasm_app = Some(app);
+                                            last_wasm_bytes = Some(wasm_bytes);
+                                            last_wasm_interactive = true;
+                                            write_str("[WASM] Launched fullscreen: ");
+                                            write_str(fname_str);
+                                            write_str("\n");
+                                        }
+                                        Err(_) => {
+                                            write_str("[WASM] Failed to instantiate: ");
+                                            write_str(fname_str);
+                                            write_str("\n");
+                                        }
+                                    }
+                                } else {
+                                    let _ = shmem_destroy(resp.shmem_handle);
+                                }
+                            } else {
+                                write_str("[WASM] App not found: ");
+                                write_str(fname_str);
+                                write_str("\n");
+                            }
+                        }
+                    }
+                }
+
+                if !is_open_cmd && !is_run_cmd {
                 // M13: Try semantic intent match BEFORE creating terminal window
                 if let Some(app_name) = try_intent_match(cmd_str) {
                     let mut fname = [0u8; 64];
@@ -3740,7 +3846,145 @@ fn main() -> ! {
 
         // Only redraw once after processing all keys
         if need_redraw {
-            if omnibar_visible {
+            // Skip desktop UI when WASM app owns the screen
+            let wasm_fullscreen = active_wasm_app.as_ref().map_or(false, |a| a.active);
+
+            // ===== WASM FULLSCREEN MODE =====
+            // When a WASM app is active, it owns the entire framebuffer.
+            // Skip ALL desktop rendering (omnibar, folders, windows) to prevent
+            // tearing artifacts in the single-buffered framebuffer.
+            if wasm_fullscreen {
+                if let Some(app) = &mut active_wasm_app {
+                    if app.active {
+                        let config = compositor::wasm_runtime::WasmConfig {
+                            screen_width: fb.width as u32,
+                            screen_height: fb.height as u32,
+                            uptime_ms: libfolk::sys::uptime() as u32,
+                        };
+                        let (result, output) = app.run_frame(config);
+
+                        match &result {
+                            compositor::wasm_runtime::WasmResult::OutOfFuel => {
+                                app.active = false;
+                                write_str("[WASM APP] Halted: fuel exhausted\n");
+                            }
+                            compositor::wasm_runtime::WasmResult::Trap(msg) => {
+                                app.active = false;
+                                write_str("[WASM APP] Trap: ");
+                                write_str(&msg[..msg.len().min(80)]);
+                                write_str("\n");
+                            }
+                            _ => {}
+                        }
+
+                        if let Some(color) = output.fill_screen {
+                            fb.clear(fb.color_from_rgb24(color));
+                        }
+                        for cmd in &output.draw_commands {
+                            fb.fill_rect(cmd.x as usize, cmd.y as usize, cmd.w as usize, cmd.h as usize, fb.color_from_rgb24(cmd.color));
+                        }
+                        for cmd in &output.line_commands {
+                            let c = fb.color_from_rgb24(cmd.color);
+                            compositor::graphics::draw_line(&mut fb, cmd.x1, cmd.y1, cmd.x2, cmd.y2, c);
+                        }
+                        for cmd in &output.circle_commands {
+                            let c = fb.color_from_rgb24(cmd.color);
+                            compositor::graphics::draw_circle(&mut fb, cmd.cx, cmd.cy, cmd.r, c);
+                        }
+                        for cmd in &output.text_commands {
+                            fb.draw_string(cmd.x as usize, cmd.y as usize, &cmd.text, fb.color_from_rgb24(cmd.color), fb.color_from_rgb24(0));
+                        }
+
+                        // Phase 3: Surface blit
+                        if output.surface_dirty {
+                            if let Some(mem_data) = app.get_memory_slice() {
+                                let surface_offset = app.surface_offset();
+                                let fb_size = fb.width * fb.height * 4;
+                                if surface_offset + fb_size <= mem_data.len() {
+                                    let surface = &mem_data[surface_offset..surface_offset + fb_size];
+                                    if fb.pitch == fb.width * 4 {
+                                        unsafe {
+                                            core::ptr::copy_nonoverlapping(
+                                                surface.as_ptr(),
+                                                fb.pixel_ptr(0, 0) as *mut u8,
+                                                fb_size,
+                                            );
+                                        }
+                                    } else {
+                                        for y in 0..fb.height {
+                                            let src_off = y * fb.width * 4;
+                                            unsafe {
+                                                core::ptr::copy_nonoverlapping(
+                                                    surface[src_off..].as_ptr(),
+                                                    fb.pixel_ptr(0, y) as *mut u8,
+                                                    fb.width * 4,
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Phase 4: Async asset loading
+                        if !output.asset_requests.is_empty() {
+                            for req in &output.asset_requests {
+                                const VFS_ASSET_VADDR: usize = 0x50060000;
+                                match libfolk::sys::synapse::read_file_shmem(&req.filename) {
+                                    Ok(resp) => {
+                                        if shmem_map(resp.shmem_handle, VFS_ASSET_VADDR).is_ok() {
+                                            let file_data = unsafe {
+                                                core::slice::from_raw_parts(
+                                                    VFS_ASSET_VADDR as *const u8,
+                                                    resp.size as usize
+                                                )
+                                            };
+                                            let copy_len = (resp.size as u32).min(req.dest_len) as usize;
+                                            app.write_memory(
+                                                req.dest_ptr as usize,
+                                                &file_data[..copy_len]
+                                            );
+                                            let _ = shmem_unmap(resp.shmem_handle, VFS_ASSET_VADDR);
+                                            let _ = shmem_destroy(resp.shmem_handle);
+                                            app.push_event(compositor::wasm_runtime::FolkEvent {
+                                                event_type: 4,
+                                                x: req.handle as i32,
+                                                y: 0,
+                                                data: copy_len as i32,
+                                            });
+                                        } else {
+                                            let _ = shmem_destroy(resp.shmem_handle);
+                                            app.push_event(compositor::wasm_runtime::FolkEvent {
+                                                event_type: 4,
+                                                x: req.handle as i32,
+                                                y: 2,
+                                                data: 0,
+                                            });
+                                        }
+                                    }
+                                    Err(_) => {
+                                        app.push_event(compositor::wasm_runtime::FolkEvent {
+                                            event_type: 4,
+                                            x: req.handle as i32,
+                                            y: 1,
+                                            data: 0,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+
+                        did_work = true;
+                        damage.damage_full(); // WASM wrote to fb — flush to VirtIO-GPU
+                    }
+                }
+            }
+
+            // ===== DESKTOP MODE: omnibar, folders, windows =====
+            // Only render desktop elements when NO WASM app is fullscreen.
+            // Entire block is skipped when WASM owns the screen.
+
+            if !wasm_fullscreen && omnibar_visible {
                 // ===== Draw Glass Omnibar (alpha-blended) =====
                 let omnibar_alpha: u8 = 180; // 70% opaque — scene bleeds through
 
@@ -3835,8 +4079,8 @@ fn main() -> ! {
                     // Clear results area when no results to show
                     fb.fill_rect(results_x, results_y, results_w, results_h, folk_dark);
                 }
-            } else {
-                // ===== Omnibar hidden - clear the area =====
+            } else if !wasm_fullscreen {
+                // ===== Omnibar hidden - clear the area (only in desktop mode) =====
                 // Clear omnibar area
                 fb.fill_rect(text_box_x - 2, text_box_y - 2, text_box_w + 4, text_box_h + 4, folk_dark);
                 // Clear results area
@@ -3853,7 +4097,7 @@ fn main() -> ! {
             // (System Tray Clock moved to always-on-top section below)
 
             // ===== App Launcher: Folder grid or app grid =====
-            {
+            if !wasm_fullscreen {
                 let tile_text = fb.color_from_rgb24(0xDDDDDD);
                 let tile_bg = fb.color_from_rgb24(0x222244);
                 let tile_border = fb.color_from_rgb24(0x444477);
@@ -3979,144 +4223,9 @@ fn main() -> ! {
             }
 
             // ===== Composite Windows (Milestone 2.1) =====
-            // Draw all managed windows on top of the desktop/omnibar
-            if wm.has_visible() {
+            // Only show windows in desktop mode (not when WASM app is fullscreen)
+            if !wasm_fullscreen && wm.has_visible() {
                 wm.composite(&mut fb);
-            }
-
-            // ===== WASM App Rendering (ON TOP of windows, below cursor) =====
-            if let Some(app) = &mut active_wasm_app {
-                if app.active {
-                    let config = compositor::wasm_runtime::WasmConfig {
-                        screen_width: fb.width as u32,
-                        screen_height: fb.height as u32,
-                        uptime_ms: libfolk::sys::uptime() as u32,
-                    };
-                    let (result, output) = app.run_frame(config);
-
-                    match &result {
-                        compositor::wasm_runtime::WasmResult::OutOfFuel => {
-                            app.active = false;
-                            write_str("[WASM APP] Halted: fuel exhausted\n");
-                        }
-                        compositor::wasm_runtime::WasmResult::Trap(msg) => {
-                            app.active = false;
-                            write_str("[WASM APP] Trap: ");
-                            write_str(&msg[..msg.len().min(80)]);
-                            write_str("\n");
-                        }
-                        _ => {}
-                    }
-
-                    if let Some(color) = output.fill_screen {
-                        fb.clear(fb.color_from_rgb24(color));
-                    }
-                    for cmd in &output.draw_commands {
-                        fb.fill_rect(cmd.x as usize, cmd.y as usize, cmd.w as usize, cmd.h as usize, fb.color_from_rgb24(cmd.color));
-                    }
-                    for cmd in &output.line_commands {
-                        let c = fb.color_from_rgb24(cmd.color);
-                        compositor::graphics::draw_line(&mut fb, cmd.x1, cmd.y1, cmd.x2, cmd.y2, c);
-                    }
-                    for cmd in &output.circle_commands {
-                        let c = fb.color_from_rgb24(cmd.color);
-                        compositor::graphics::draw_circle(&mut fb, cmd.cx, cmd.cy, cmd.r, c);
-                    }
-                    for cmd in &output.text_commands {
-                        fb.draw_string(cmd.x as usize, cmd.y as usize, &cmd.text, fb.color_from_rgb24(cmd.color), fb.color_from_rgb24(0));
-                    }
-
-                    // Phase 3: Surface blit — WASM wrote pixels directly to linear memory
-                    if output.surface_dirty {
-                        if let Some(mem_data) = app.get_memory_slice() {
-                            let surface_offset = app.surface_offset();
-                            let fb_size = fb.width * fb.height * 4;
-                            // Double bounds check (constraint #7)
-                            if surface_offset + fb_size <= mem_data.len() {
-                                let surface = &mem_data[surface_offset..surface_offset + fb_size];
-                                // Pitch-aware copy (framebuffer pitch may differ from width*4)
-                                if fb.pitch == fb.width * 4 {
-                                    // Fast path: pitches match, bulk copy
-                                    unsafe {
-                                        core::ptr::copy_nonoverlapping(
-                                            surface.as_ptr(),
-                                            fb.pixel_ptr(0, 0) as *mut u8,
-                                            fb_size,
-                                        );
-                                    }
-                                } else {
-                                    // Slow path: per-row copy for pitch mismatch
-                                    for y in 0..fb.height {
-                                        let src_off = y * fb.width * 4;
-                                        unsafe {
-                                            core::ptr::copy_nonoverlapping(
-                                                surface[src_off..].as_ptr(),
-                                                fb.pixel_ptr(0, y) as *mut u8,
-                                                fb.width * 4,
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Phase 4: Async asset loading — process file requests from WASM
-                    if !output.asset_requests.is_empty() {
-                        for req in &output.asset_requests {
-                            // Read file from VFS (non-blocking: happens between frames)
-                            const VFS_ASSET_VADDR: usize = 0x50060000;
-                            match libfolk::sys::synapse::read_file_shmem(&req.filename) {
-                                Ok(resp) => {
-                                    if shmem_map(resp.shmem_handle, VFS_ASSET_VADDR).is_ok() {
-                                        let file_data = unsafe {
-                                            core::slice::from_raw_parts(
-                                                VFS_ASSET_VADDR as *const u8,
-                                                resp.size as usize
-                                            )
-                                        };
-                                        let copy_len = (resp.size as u32).min(req.dest_len) as usize;
-
-                                        // Write file data into WASM linear memory
-                                        app.write_memory(
-                                            req.dest_ptr as usize,
-                                            &file_data[..copy_len]
-                                        );
-                                        let _ = shmem_unmap(resp.shmem_handle, VFS_ASSET_VADDR);
-                                        let _ = shmem_destroy(resp.shmem_handle);
-
-                                        // Push AssetLoaded event for next frame
-                                        app.push_event(compositor::wasm_runtime::FolkEvent {
-                                            event_type: 4, // AssetLoaded
-                                            x: req.handle as i32,
-                                            y: 0, // status: OK
-                                            data: copy_len as i32,
-                                        });
-                                    } else {
-                                        let _ = shmem_destroy(resp.shmem_handle);
-                                        app.push_event(compositor::wasm_runtime::FolkEvent {
-                                            event_type: 4,
-                                            x: req.handle as i32,
-                                            y: 2, // status: map failed
-                                            data: 0,
-                                        });
-                                    }
-                                }
-                                Err(_) => {
-                                    // File not found — push error event
-                                    app.push_event(compositor::wasm_runtime::FolkEvent {
-                                        event_type: 4, // AssetLoaded
-                                        x: req.handle as i32,
-                                        y: 1, // status: not found
-                                        data: 0,
-                                    });
-                                }
-                            }
-                        }
-                    }
-
-                    did_work = true;
-                }
             }
 
             // ===== Alt+Tab HUD overlay =====

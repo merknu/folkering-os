@@ -46,8 +46,8 @@ entry!(main);
 /// Maximum cached directory entries (for FPK fallback)
 const MAX_ENTRIES: usize = 16;
 
-/// Maximum SQLite database size (256KB — must fit files.db with all ELFs + data)
-const MAX_DB_SIZE: usize = 262144;
+/// Maximum SQLite database size (2MB — must fit files.db with all ELFs + data)
+const MAX_DB_SIZE: usize = 2 * 1024 * 1024;
 
 /// SQLite database filename
 const DB_FILENAME: &str = "files.db";

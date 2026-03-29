@@ -1193,67 +1193,75 @@ impl WasmEmitter {
     fn br_if(&mut self, depth: u32) { self.emit(0x0D); self.emit_leb128_u32(depth); }
 }
 
-/// Generate calc.wasm — a valid WASM binary implementing the calculator logic.
+/// Generate calc.wasm — a Folk API WASM calculator with fullscreen rendering.
+///
+/// Exports `run()` (called every frame) and `memory`.
+/// Imports `folk_fill_screen`, `folk_draw_rect`, `folk_draw_text`, `folk_poll_event`.
+/// Draws a 4×4 button grid with colored buttons, title bar, and display.
 fn gen_wasm_calc(output_path: String) {
     let mut wasm = Vec::new();
+    wasm.extend_from_slice(b"\0asm");
+    wasm.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
 
-    // === Header ===
-    wasm.extend_from_slice(b"\0asm"); // magic
-    wasm.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // version 1
-
-    // === Section 1: Type ===
-    // One type: (i32, i32) -> (i32)
+    // === Section 1: Types ===
     {
         let mut sec = Vec::new();
-        sec.push(1); // 1 type
-        sec.push(0x60); // func
-        sec.push(2); // 2 params
-        sec.push(0x7F); // i32
-        sec.push(0x7F); // i32
-        sec.push(1); // 1 result
-        sec.push(0x7F); // i32
+        sec.push(4); // 4 types
+        // Type 0: () -> ()  [run]
+        sec.extend_from_slice(&[0x60, 0x00, 0x00]);
+        // Type 1: (i32) -> ()  [folk_fill_screen]
+        sec.extend_from_slice(&[0x60, 0x01, 0x7F, 0x00]);
+        // Type 2: (i32,i32,i32,i32,i32) -> ()  [folk_draw_rect, folk_draw_text]
+        sec.extend_from_slice(&[0x60, 0x05, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x00]);
+        // Type 3: (i32) -> (i32)  [folk_poll_event]
+        sec.extend_from_slice(&[0x60, 0x01, 0x7F, 0x01, 0x7F]);
         emit_section(&mut wasm, 1, &sec);
     }
 
-    // === Section 3: Function ===
-    // One function, type index 0
+    // === Section 2: Imports ===
+    // func indices: 0=fill_screen, 1=draw_rect, 2=draw_text, 3=poll_event
     {
         let mut sec = Vec::new();
-        sec.push(1); // 1 func
-        sec.push(0); // type idx 0
-        emit_section(&mut wasm, 3, &sec);
+        sec.push(4); // 4 imports
+        for (name, ty) in &[
+            ("folk_fill_screen", 1u8),
+            ("folk_draw_rect", 2),
+            ("folk_draw_text", 2),
+            ("folk_poll_event", 3),
+        ] {
+            // module "env"
+            push_leb128_u32(&mut sec, 3);
+            sec.extend_from_slice(b"env");
+            // field name
+            push_leb128_u32(&mut sec, name.len() as u32);
+            sec.extend_from_slice(name.as_bytes());
+            sec.push(0x00); // func
+            push_leb128_u32(&mut sec, *ty as u32);
+        }
+        emit_section(&mut wasm, 2, &sec);
     }
+
+    // === Section 3: Function ===
+    // func index 4 = run (type 0)
+    emit_section(&mut wasm, 3, &[1, 0]);
 
     // === Section 5: Memory ===
-    // 1 memory, min 1 page
+    emit_section(&mut wasm, 5, &[1, 0, 1]); // 1 mem, no max, min 1 page
+
+    // === Section 7: Exports ===
     {
         let mut sec = Vec::new();
-        sec.push(1); // 1 memory
-        sec.push(0x00); // flags: no max
-        sec.push(1); // min 1 page (64KB)
-        emit_section(&mut wasm, 5, &sec);
-    }
-
-    // === Section 7: Export ===
-    // Export "memory" (memory 0) and "handle_event" (func 0)
-    {
-        let mut sec = Vec::new();
-        sec.push(2); // 2 exports
-
-        // "memory"
-        let name = b"memory";
-        push_leb128_u32(&mut sec, name.len() as u32);
-        sec.extend_from_slice(name);
-        sec.push(0x02); // memory
-        push_leb128_u32(&mut sec, 0); // index 0
-
-        // "handle_event"
-        let name = b"handle_event";
-        push_leb128_u32(&mut sec, name.len() as u32);
-        sec.extend_from_slice(name);
-        sec.push(0x00); // func
-        push_leb128_u32(&mut sec, 0); // index 0
-
+        sec.push(2);
+        // "memory" -> memory 0
+        push_leb128_u32(&mut sec, 6);
+        sec.extend_from_slice(b"memory");
+        sec.push(0x02);
+        push_leb128_u32(&mut sec, 0);
+        // "run" -> func 4
+        push_leb128_u32(&mut sec, 3);
+        sec.extend_from_slice(b"run");
+        sec.push(0x00);
+        push_leb128_u32(&mut sec, 4);
         emit_section(&mut wasm, 7, &sec);
     }
 
@@ -1261,21 +1269,30 @@ fn gen_wasm_calc(output_path: String) {
     {
         let mut sec = Vec::new();
         sec.push(1); // 1 function body
-
-        // Build function body
-        let body = build_calc_wasm_body();
-
+        let body = build_calc_folk_body();
         push_leb128_u32(&mut sec, body.len() as u32);
         sec.extend_from_slice(&body);
-
         emit_section(&mut wasm, 10, &sec);
+    }
+
+    // === Section 11: Data ===
+    // Button labels + title + display initial value at memory offset 0
+    {
+        let mut sec = Vec::new();
+        sec.push(1); // 1 data segment
+        sec.push(0x00); // active, memory 0
+        sec.push(0x41); sec.push(0x00); sec.push(0x0B); // i32.const 0, end
+        let data = b"789/456*123-0C=+Calculator0";
+        push_leb128_u32(&mut sec, data.len() as u32);
+        sec.extend_from_slice(data);
+        emit_section(&mut wasm, 11, &sec);
     }
 
     fs::write(&output_path, &wasm).unwrap_or_else(|e| {
         eprintln!("Error writing '{}': {}", output_path, e);
         process::exit(1);
     });
-    println!("folk-pack: Generated {} ({} bytes, WASM calculator)", output_path, wasm.len());
+    println!("folk-pack: Generated {} ({} bytes, WASM Folk API calculator)", output_path, wasm.len());
 }
 
 fn emit_section(wasm: &mut Vec<u8>, id: u8, payload: &[u8]) {
@@ -1294,184 +1311,103 @@ fn push_leb128_u32(buf: &mut Vec<u8>, mut val: u32) {
     }
 }
 
-/// Build the function body for handle_event(state_ptr: i32, action_id: i32) -> i32
+/// Build the run() function body for the Folk API calculator.
 ///
-/// Params: local 0 = state_ptr (always 1024), local 1 = action_id
-/// Locals: local 2 = display (i64), local 3 = acc (i64), local 4 = op (i32), local 5 = fresh (i32)
-fn build_calc_wasm_body() -> Vec<u8> {
-    let mut body = Vec::new();
-
-    // Local declarations: 2 x i64, 2 x i32
-    push_leb128_u32(&mut body, 2); // 2 local declaration groups
-    push_leb128_u32(&mut body, 2); // 2 locals
-    body.push(0x7E); // i64
-    push_leb128_u32(&mut body, 2); // 2 locals
-    body.push(0x7F); // i32
-
+/// No params, no return. Called every frame by the WASM runtime.
+/// Uses folk_fill_screen, folk_draw_rect, folk_draw_text to render.
+///
+/// Data section layout (offset 0):
+///   0-15: Button labels "789/456*123-0C=+"
+///   16-25: "Calculator"
+///   26: "0" (initial display)
+fn build_calc_folk_body() -> Vec<u8> {
     let mut e = WasmEmitter::new();
 
-    // Load state from memory
-    // display = i64.load(state_ptr + 0)
-    e.local_get(0); e.i64_load(0); e.local_set(2);
-    // acc = i64.load(state_ptr + 8)
-    e.local_get(0); e.i64_load(8); e.local_set(3);
-    // op = i32.load(state_ptr + 16)
-    e.local_get(0); e.i32_load(16); e.local_set(4);
-    // fresh = i32.load(state_ptr + 20)
-    e.local_get(0); e.i32_load(20); e.local_set(5);
+    // No locals needed — all constants
+    e.emit(0); // 0 local declaration groups
 
-    // === Dispatch on action_id ===
+    // func 0 = folk_fill_screen(color)
+    // func 1 = folk_draw_rect(x, y, w, h, color)
+    // func 2 = folk_draw_text(x, y, ptr, len, color)
+    // func 3 = folk_poll_event(event_ptr) -> event_type
 
-    // if action_id < 10 (digit)
-    e.local_get(1); e.i32_const(10); e.i32_lt_s();
-    e.if_void();
-    {
-        // if fresh != 0
-        e.local_get(5);
-        e.if_void();
-        {
-            // display = i64.extend_i32_s(action_id)
-            e.local_get(1); e.i64_extend_i32_s(); e.local_set(2);
-        }
-        e.else_();
-        {
-            // display = display * 10 + i64.extend_i32_s(action_id)
-            e.local_get(2); e.i64_const(10); e.i64_mul();
-            e.local_get(1); e.i64_extend_i32_s();
-            e.i64_add(); e.local_set(2);
-        }
-        e.end(); // end inner if
-        // fresh = 0
-        e.i32_const(0); e.local_set(5);
+    let call_fill = |e: &mut WasmEmitter| { e.emit(0x10); e.emit_leb128_u32(0); };
+    let call_rect = |e: &mut WasmEmitter| { e.emit(0x10); e.emit_leb128_u32(1); };
+    let call_text = |e: &mut WasmEmitter| { e.emit(0x10); e.emit_leb128_u32(2); };
+
+    // 1. Fill screen dark purple (0x1a0a2e)
+    e.i32_const(0x1a0a2e_u32 as i32);
+    call_fill(&mut e);
+
+    // 2. Title bar background
+    e.i32_const(312); e.i32_const(190); e.i32_const(400); e.i32_const(40);
+    e.i32_const(0x3030a0_u32 as i32);
+    call_rect(&mut e);
+
+    // 3. Title text "Calculator" (data offset 16, len 10)
+    e.i32_const(430); e.i32_const(200); e.i32_const(16); e.i32_const(10);
+    e.i32_const(0xe0e0e0_u32 as i32);
+    call_text(&mut e);
+
+    // 4. Display background
+    e.i32_const(312); e.i32_const(240); e.i32_const(400); e.i32_const(50);
+    e.i32_const(0x202040_u32 as i32);
+    call_rect(&mut e);
+
+    // 5. Display "0" (data offset 26, len 1)
+    e.i32_const(680); e.i32_const(255); e.i32_const(26); e.i32_const(1);
+    e.i32_const(0x00ff00_u32 as i32);
+    call_text(&mut e);
+
+    // 6. Draw 16 buttons: (x, y, bg_color, text_color, data_offset)
+    //    Layout: 4×4 grid, each 90×60, starting at (312, 300), spacing 100×70
+    //    Row 0: 7 8 9 /    Row 1: 4 5 6 *    Row 2: 1 2 3 -    Row 3: 0 C = +
+    let digit_bg = 0xe8e8f0_u32 as i32;
+    let op_bg    = 0xff8c00_u32 as i32;
+    let clear_bg = 0xff3333_u32 as i32;
+    let eq_bg    = 0x00cccc_u32 as i32;
+    let dark_txt = 0x1a1a2e_u32 as i32;
+    let white_txt= 0xffffff_u32 as i32;
+
+    let buttons: [(i32, i32, i32, i32, i32); 16] = [
+        (312, 300, digit_bg, dark_txt,  0),  // 7
+        (412, 300, digit_bg, dark_txt,  1),  // 8
+        (512, 300, digit_bg, dark_txt,  2),  // 9
+        (612, 300, op_bg,    white_txt, 3),  // /
+        (312, 370, digit_bg, dark_txt,  4),  // 4
+        (412, 370, digit_bg, dark_txt,  5),  // 5
+        (512, 370, digit_bg, dark_txt,  6),  // 6
+        (612, 370, op_bg,    white_txt, 7),  // *
+        (312, 440, digit_bg, dark_txt,  8),  // 1
+        (412, 440, digit_bg, dark_txt,  9),  // 2
+        (512, 440, digit_bg, dark_txt, 10),  // 3
+        (612, 440, op_bg,    white_txt,11),  // -
+        (312, 510, digit_bg, dark_txt, 12),  // 0
+        (412, 510, clear_bg, white_txt,13),  // C
+        (512, 510, eq_bg,    dark_txt, 14),  // =
+        (612, 510, op_bg,    white_txt,15),  // +
+    ];
+
+    for &(x, y, bg, txt, doff) in &buttons {
+        // Button background
+        e.i32_const(x); e.i32_const(y);
+        e.i32_const(90); e.i32_const(60);
+        e.i32_const(bg);
+        call_rect(&mut e);
+        // Button label (1 char at data_offset)
+        e.i32_const(x + 40); e.i32_const(y + 22);
+        e.i32_const(doff); e.i32_const(1);
+        e.i32_const(txt);
+        call_text(&mut e);
     }
-    e.else_();
-    {
-        // action_id == 10 (+)
-        e.local_get(1); e.i32_const(10); e.i32_eq();
-        e.if_void();
-        {
-            e.local_get(2); e.local_set(3); // acc = display
-            e.i32_const(1); e.local_set(4); // op = 1
-            e.i32_const(1); e.local_set(5); // fresh = 1
-        }
-        e.else_();
-        {
-            // action_id == 11 (-)
-            e.local_get(1); e.i32_const(11); e.i32_eq();
-            e.if_void();
-            {
-                e.local_get(2); e.local_set(3);
-                e.i32_const(2); e.local_set(4);
-                e.i32_const(1); e.local_set(5);
-            }
-            e.else_();
-            {
-                // action_id == 12 (*)
-                e.local_get(1); e.i32_const(12); e.i32_eq();
-                e.if_void();
-                {
-                    e.local_get(2); e.local_set(3);
-                    e.i32_const(3); e.local_set(4);
-                    e.i32_const(1); e.local_set(5);
-                }
-                e.else_();
-                {
-                    // action_id == 13 (/)
-                    e.local_get(1); e.i32_const(13); e.i32_eq();
-                    e.if_void();
-                    {
-                        e.local_get(2); e.local_set(3);
-                        e.i32_const(4); e.local_set(4);
-                        e.i32_const(1); e.local_set(5);
-                    }
-                    e.else_();
-                    {
-                        // action_id == 14 (=)
-                        e.local_get(1); e.i32_const(14); e.i32_eq();
-                        e.if_void();
-                        {
-                            // op == 1: display = acc + display
-                            e.local_get(4); e.i32_const(1); e.i32_eq();
-                            e.if_void();
-                            {
-                                e.local_get(3); e.local_get(2); e.i64_add(); e.local_set(2);
-                            }
-                            e.end();
-                            // op == 2: display = acc - display
-                            e.local_get(4); e.i32_const(2); e.i32_eq();
-                            e.if_void();
-                            {
-                                e.local_get(3); e.local_get(2); e.i64_sub(); e.local_set(2);
-                            }
-                            e.end();
-                            // op == 3: display = acc * display
-                            e.local_get(4); e.i32_const(3); e.i32_eq();
-                            e.if_void();
-                            {
-                                e.local_get(3); e.local_get(2); e.i64_mul(); e.local_set(2);
-                            }
-                            e.end();
-                            // op == 4: display = acc / display (if display != 0)
-                            e.local_get(4); e.i32_const(4); e.i32_eq();
-                            e.if_void();
-                            {
-                                e.local_get(2); e.i64_eqz();
-                                e.if_void();
-                                {
-                                    e.i64_const(0); e.local_set(2);
-                                }
-                                e.else_();
-                                {
-                                    e.local_get(3); e.local_get(2); e.i64_div_s(); e.local_set(2);
-                                }
-                                e.end();
-                            }
-                            e.end();
-                            // op = 0, fresh = 1
-                            e.i32_const(0); e.local_set(4);
-                            e.i32_const(1); e.local_set(5);
-                        }
-                        e.else_();
-                        {
-                            // action_id == 15 (C)
-                            e.local_get(1); e.i32_const(15); e.i32_eq();
-                            e.if_void();
-                            {
-                                e.i64_const(0); e.local_set(2);
-                                e.i64_const(0); e.local_set(3);
-                                e.i32_const(0); e.local_set(4);
-                                e.i32_const(1); e.local_set(5);
-                            }
-                            e.end();
-                        }
-                        e.end(); // else of action_id==14
-                    }
-                    e.end(); // else of action_id==13
-                }
-                e.end(); // else of action_id==12
-            }
-            e.end(); // else of action_id==11
-        }
-        e.end(); // else of action_id==10
-    }
-    e.end(); // end outer if (digit vs operator)
 
-    // Write state back to memory
-    // i64.store(state_ptr + 0, display)
-    e.local_get(0); e.local_get(2); e.i64_store(0);
-    // i64.store(state_ptr + 8, acc)
-    e.local_get(0); e.local_get(3); e.i64_store(8);
-    // i32.store(state_ptr + 16, op)
-    e.local_get(0); e.local_get(4); e.i32_store(16);
-    // i32.store(state_ptr + 20, fresh)
-    e.local_get(0); e.local_get(5); e.i32_store(20);
+    // 7. Poll one event (discard — static display for now)
+    e.i32_const(512); // event buffer at offset 512
+    e.emit(0x10); e.emit_leb128_u32(3); // call folk_poll_event
+    e.drop_(); // discard return value
 
-    // return 0
-    e.i32_const(0);
     e.end(); // function end
-
-    body.extend_from_slice(&e.buf);
-    body
+    e.buf
 }
 
 /// FOLKDISK header offsets
