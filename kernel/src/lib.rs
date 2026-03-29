@@ -209,7 +209,10 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
         // VirtIO GPU (2D scanout — Limine framebuffer fallback on failure)
         serial_strln!("[INIT] Looking for VirtIO GPU device...");
         match drivers::virtio_gpu::init() {
-            Ok(()) => { serial_strln!("[INIT] VirtIO GPU active!"); }
+            Ok(()) => {
+                serial_strln!("[INIT] VirtIO GPU active!");
+                drivers::virtio_gpu::init_cursor();
+            }
             Err(e) => {
                 serial_str!("[INIT] VirtIO GPU: ");
                 serial_strln!(e);

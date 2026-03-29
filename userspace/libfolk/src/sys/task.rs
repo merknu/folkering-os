@@ -97,6 +97,13 @@ pub fn gpu_vsync(x: u32, y: u32, w: u32, h: u32) {
     unsafe { syscall4(0x82, x as u64, y as u64, w as u64, h as u64); }
 }
 
+/// Move hardware cursor to (x, y) via VirtIO-GPU VIRTQ 1.
+/// This bypasses the controlq entirely — cursor position updates at 1000Hz
+/// independently of the 2D render pipeline. No VM-Exit storm.
+pub fn gpu_move_cursor(x: u32, y: u32) {
+    unsafe { syscall2(0x85, x as u64, y as u64); }
+}
+
 /// Read Real-Time Clock (CMOS RTC). Returns packed DateTime.
 /// Unpack: year=2000+(v>>26)&0x3F, month=(v>>22)&0xF, day=(v>>17)&0x1F,
 ///         hour=(v>>12)&0x1F, minute=(v>>6)&0x3F, second=v&0x3F

@@ -985,6 +985,11 @@ extern "C" fn syscall_handler(
             let (total, free) = crate::memory::physical::memory_stats();
             ((total as u64) << 32) | (free as u64 & 0xFFFFFFFF)
         },
+        // Hardware cursor: move cursor via VIRTQ 1 (bypasses controlq, no lag)
+        0x85 => {
+            crate::drivers::virtio_gpu::move_cursor(arg1 as u32, arg2 as u32);
+            0
+        },
         // God Mode Pipe: read byte from COM3
         0x90 => {
             match crate::drivers::serial::com3_read_byte() {
