@@ -1,0 +1,10 @@
+[package]
+name = "folkering-tests"
+version = "0.1.0"
+edition = "2021"
+description = "Host-side unit tests for Folkering OS pure logic"
+
+# Tests run on HOST (standard Rust), not on bare metal.
+# They test pure algorithms: damage tracking, intent parsing, base64.
+
+[dependencies]

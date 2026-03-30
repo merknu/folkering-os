@@ -130,3 +130,157 @@ impl DamageTracker {
         !self.regions.is_empty()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Rect tests ──
+
+    #[test]
+    fn rect_intersects_overlap() {
+        let a = Rect::new(10, 10, 50, 50);
+        let b = Rect::new(30, 30, 50, 50);
+        assert!(a.intersects(&b));
+        assert!(b.intersects(&a));
+    }
+
+    #[test]
+    fn rect_intersects_no_overlap() {
+        let a = Rect::new(0, 0, 10, 10);
+        let b = Rect::new(20, 20, 10, 10);
+        assert!(!a.intersects(&b));
+    }
+
+    #[test]
+    fn rect_intersects_adjacent_no_overlap() {
+        let a = Rect::new(0, 0, 10, 10);
+        let b = Rect::new(10, 0, 10, 10); // touching edge
+        assert!(!a.intersects(&b));
+    }
+
+    #[test]
+    fn rect_intersects_contained() {
+        let outer = Rect::new(0, 0, 100, 100);
+        let inner = Rect::new(25, 25, 50, 50);
+        assert!(outer.intersects(&inner));
+        assert!(inner.intersects(&outer));
+    }
+
+    #[test]
+    fn rect_union_basic() {
+        let a = Rect::new(10, 10, 20, 20);
+        let b = Rect::new(25, 25, 20, 20);
+        let u = a.union(&b);
+        assert_eq!(u.x, 10);
+        assert_eq!(u.y, 10);
+        assert_eq!(u.w, 35); // 10 to 45
+        assert_eq!(u.h, 35); // 10 to 45
+    }
+
+    #[test]
+    fn rect_union_contained() {
+        let outer = Rect::new(0, 0, 100, 100);
+        let inner = Rect::new(25, 25, 10, 10);
+        let u = outer.union(&inner);
+        assert_eq!(u.x, 0);
+        assert_eq!(u.y, 0);
+        assert_eq!(u.w, 100);
+        assert_eq!(u.h, 100);
+    }
+
+    // ── DamageTracker tests ──
+
+    #[test]
+    fn tracker_empty_initially() {
+        let t = DamageTracker::new(1024, 768);
+        assert!(!t.has_damage());
+        assert_eq!(t.regions().len(), 0);
+    }
+
+    #[test]
+    fn tracker_damage_full() {
+        let mut t = DamageTracker::new(1024, 768);
+        t.damage_full();
+        assert!(t.has_damage());
+        assert_eq!(t.regions().len(), 1);
+        let r = &t.regions()[0];
+        assert_eq!(r.x, 0);
+        assert_eq!(r.y, 0);
+        assert_eq!(r.w, 1024);
+        assert_eq!(r.h, 768);
+    }
+
+    #[test]
+    fn tracker_add_single() {
+        let mut t = DamageTracker::new(1024, 768);
+        t.add_damage(Rect::new(100, 200, 50, 30));
+        assert_eq!(t.regions().len(), 1);
+        let r = &t.regions()[0];
+        assert_eq!(r.x, 100);
+        assert_eq!(r.y, 200);
+        assert_eq!(r.w, 50);
+        assert_eq!(r.h, 30);
+    }
+
+    #[test]
+    fn tracker_coalesce_overlapping() {
+        let mut t = DamageTracker::new(1024, 768);
+        t.add_damage(Rect::new(10, 10, 50, 50));
+        t.add_damage(Rect::new(30, 30, 50, 50));
+        // Should coalesce into one rect
+        assert_eq!(t.regions().len(), 1);
+        let r = &t.regions()[0];
+        assert_eq!(r.x, 10);
+        assert_eq!(r.y, 10);
+        assert_eq!(r.w, 70); // 10 to 80
+        assert_eq!(r.h, 70); // 10 to 80
+    }
+
+    #[test]
+    fn tracker_disjoint_kept_separate() {
+        let mut t = DamageTracker::new(1024, 768);
+        t.add_damage(Rect::new(0, 0, 10, 10));
+        t.add_damage(Rect::new(100, 100, 10, 10));
+        assert_eq!(t.regions().len(), 2);
+    }
+
+    #[test]
+    fn tracker_clamp_to_screen() {
+        let mut t = DamageTracker::new(100, 100);
+        t.add_damage(Rect::new(90, 90, 50, 50));
+        let r = &t.regions()[0];
+        assert_eq!(r.w, 10); // clamped to screen
+        assert_eq!(r.h, 10);
+    }
+
+    #[test]
+    fn tracker_zero_size_ignored() {
+        let mut t = DamageTracker::new(1024, 768);
+        t.add_damage(Rect::new(50, 50, 0, 0));
+        assert!(!t.has_damage());
+    }
+
+    #[test]
+    fn tracker_clear() {
+        let mut t = DamageTracker::new(1024, 768);
+        t.damage_full();
+        assert!(t.has_damage());
+        t.clear();
+        assert!(!t.has_damage());
+    }
+
+    #[test]
+    fn tracker_collapse_when_full() {
+        let mut t = DamageTracker::new(1024, 768);
+        // Add 12 disjoint rects (exceeds MAX_RECTS=10)
+        for i in 0..12 {
+            t.add_damage(Rect::new(i * 80, 0, 10, 10));
+        }
+        // Should have collapsed to 1 bounding box
+        assert_eq!(t.regions().len(), 1);
+        let r = &t.regions()[0];
+        assert_eq!(r.x, 0);
+        assert!(r.w >= 880 + 10); // 11*80 + 10
+    }
+}

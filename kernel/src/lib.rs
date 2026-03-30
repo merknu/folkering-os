@@ -20,6 +20,8 @@
 #![feature(abi_x86_interrupt)]
 #![feature(allocator_api)]
 #![feature(alloc_error_handler)]
+
+pub mod test_harness;
 // const_mut_refs is stable since 1.83, panic_info_message since 1.81, naked_functions since 1.88
 
 // Text section anchor - workaround for lld orphaned section bug
@@ -550,6 +552,16 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
         }
 
         serial_strln!("[BOOT] All tasks spawned, starting scheduler...\n");
+
+        // If boot-test feature is enabled, run kernel tests and exit QEMU
+        #[cfg(feature = "boot-test")]
+        {
+            serial_strln!("[BOOT] Boot-test mode — running kernel tests...");
+            unsafe { core::arch::asm!("sti"); }
+            arch::x86_64::enable_timer();
+            test_harness::run_boot_tests();
+            // run_boot_tests calls exit_success/exit_failure → never returns
+        }
 
         // TEMPORARY DIAGNOSTIC: wait 3 seconds so TCP serial logger can connect
         // before the scheduler starts (TCP logger misses early boot output).
