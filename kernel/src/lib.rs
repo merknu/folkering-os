@@ -176,9 +176,6 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
             arch::x86_64::smp::boot_aps_limine(smp);
         }
 
-        // Calibrate TSC against PIT for accurate microsecond timing
-        timer::calibrate_tsc();
-
         // Initialize PCI bus enumeration
         serial_strln!("[INIT] Enumerating PCI bus...");
         drivers::pci::init();
@@ -212,12 +209,7 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
         // VirtIO GPU (2D scanout — Limine framebuffer fallback on failure)
         serial_strln!("[INIT] Looking for VirtIO GPU device...");
         match drivers::virtio_gpu::init() {
-            Ok(()) => {
-                serial_strln!("[INIT] VirtIO GPU active!");
-                // TODO: init_cursor() deadlocks GPU_STATE mutex during
-                // submit_sync_cmd spin-wait. Needs async cursor setup.
-                // drivers::virtio_gpu::init_cursor();
-            }
+            Ok(()) => { serial_strln!("[INIT] VirtIO GPU active!"); }
             Err(e) => {
                 serial_str!("[INIT] VirtIO GPU: ");
                 serial_strln!(e);

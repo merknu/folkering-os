@@ -54,8 +54,6 @@ pub struct MouseEvent {
     pub dx: i16,
     /// Y movement (signed, positive = up in PS/2)
     pub dy: i16,
-    /// TSC timestamp when IRQ12 fired (for IQE latency measurement)
-    pub timestamp_tsc: u64,
 }
 
 /// Mouse event ring buffer
@@ -71,7 +69,7 @@ struct MouseBuffer {
 impl MouseBuffer {
     const fn new() -> Self {
         Self {
-            events: [MouseEvent { buttons: 0, dx: 0, dy: 0, timestamp_tsc: 0 }; MOUSE_BUFFER_SIZE],
+            events: [MouseEvent { buttons: 0, dx: 0, dy: 0 }; MOUSE_BUFFER_SIZE],
             read_pos: 0,
             write_pos: 0,
             count: 0,
@@ -244,8 +242,6 @@ pub fn init_without_pic() {
 
 /// Handle mouse interrupt (called from IDT handler)
 pub fn handle_interrupt() {
-    let irq_tsc = crate::timer::tsc_now(); // IQE: capture TSC at IRQ entry
-
     // Read byte from mouse
     let byte = unsafe {
         let mut data_port = Port::<u8>::new(PS2_DATA_PORT);
@@ -303,16 +299,8 @@ pub fn handle_interrupt() {
             let y_overflow = (packet.byte1 & 0x80) != 0;
 
             if !x_overflow && !y_overflow {
-                let event = MouseEvent { buttons, dx, dy, timestamp_tsc: irq_tsc };
-                let buf = &mut MOUSE_BUFFER.lock();
-                let depth = buf.count as u64;
-                buf.push(event);
-                // IQE: record mouse IRQ with buffer depth
-                crate::drivers::iqe::record(
-                    crate::drivers::iqe::IqeEventType::MouseIrq,
-                    irq_tsc,
-                    depth,
-                );
+                let event = MouseEvent { buttons, dx, dy };
+                MOUSE_BUFFER.lock().push(event);
             }
 
             packet.reset();

@@ -58,10 +58,6 @@ const VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING: u32 = 0x0104;
 const VIRTIO_GPU_CMD_RESOURCE_FLUSH: u32 = 0x0106;
 const VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D: u32 = 0x0105;
 
-// Cursor commands (VIRTQ 1 — independent of controlq)
-const VIRTIO_GPU_CMD_UPDATE_CURSOR: u32 = 0x0300;
-const VIRTIO_GPU_CMD_MOVE_CURSOR: u32 = 0x0301;
-
 const VIRTIO_GPU_RESP_OK_NODATA: u32 = 0x1100;
 const VIRTIO_GPU_RESP_OK_DISPLAY_INFO: u32 = 0x1101;
 
@@ -167,27 +163,6 @@ struct GpuRespHdr {
     _padding: u32,
 }
 
-/// Cursor position (shared between UPDATE_CURSOR and MOVE_CURSOR)
-#[repr(C)]
-struct GpuCursorPos {
-    scanout_id: u32,
-    x: u32,
-    y: u32,
-    _padding: u32,
-}
-
-/// UPDATE_CURSOR: set cursor image + position (VIRTQ 1)
-/// MOVE_CURSOR: only update position (same struct, different cmd_type)
-#[repr(C)]
-struct GpuUpdateCursor {
-    hdr: GpuCtrlHdr,
-    pos: GpuCursorPos,
-    resource_id: u32,
-    hot_x: u32,
-    hot_y: u32,
-    _padding: u32,
-}
-
 // ── Driver State ────────────────────────────────────────────────────────────
 
 /// VirtIO Modern MMIO register access
@@ -269,13 +244,9 @@ const VIRTIO_PCI_COMMON_Q_USEDHI: usize = 0x34;   // u32
 struct GpuState {
     transport: MmioTransport,
     controlq: Virtqueue,
-    cursorq: Option<Virtqueue>,
-    cursor_notify_off: u16,     // Queue 1's notify offset
-    cursor_resource_id: u32,    // Resource ID for hardware cursor (2)
-    cursor_page_phys: usize,    // Physical page for 64x64 ARGB cursor
     width: u32,
     height: u32,
-    fb_phys_pages: alloc::vec::Vec<usize>,
+    fb_phys_pages: alloc::vec::Vec<usize>, // Physical page addresses for backing
     active: bool,
     has_virgl: bool,
     has_edid: bool,
@@ -426,39 +397,6 @@ pub fn init() -> Result<(), &'static str> {
     crate::drivers::serial::write_dec(q_enabled as u32);
     crate::drivers::serial::write_newline();
 
-    // ── Setup cursor queue (queue 1) ──────────────────────────────────────
-    let mut cursorq_opt: Option<Virtqueue> = None;
-    let mut cursor_notify_off: u16 = 0;
-    transport.write_common16(VIRTIO_PCI_COMMON_Q_SELECT, 1);
-    let cq_size = transport.read_common16(VIRTIO_PCI_COMMON_Q_SIZE);
-    if cq_size > 0 {
-        crate::serial_str!("[VIRTIO_GPU] Cursorq size: ");
-        crate::drivers::serial::write_dec(cq_size as u32);
-        crate::drivers::serial::write_newline();
-
-        if let Some(cq) = Virtqueue::new(cq_size) {
-            let dp = cq.desc_phys();
-            let ap = cq.avail_phys();
-            let up = cq.used_phys();
-            transport.write_common32(VIRTIO_PCI_COMMON_Q_DESCLO, dp as u32);
-            transport.write_common32(VIRTIO_PCI_COMMON_Q_DESCHI, (dp >> 32) as u32);
-            transport.write_common32(VIRTIO_PCI_COMMON_Q_AVAILLO, ap as u32);
-            transport.write_common32(VIRTIO_PCI_COMMON_Q_AVAILHI, (ap >> 32) as u32);
-            transport.write_common32(VIRTIO_PCI_COMMON_Q_USEDLO, up as u32);
-            transport.write_common32(VIRTIO_PCI_COMMON_Q_USEDHI, (up >> 32) as u32);
-            cursor_notify_off = transport.read_common16(VIRTIO_PCI_COMMON_Q_NOFF);
-            unsafe {
-                core::ptr::write_volatile(
-                    (transport.common_base + VIRTIO_PCI_COMMON_Q_ENABLE) as *mut u16, 1
-                );
-            }
-            crate::serial_strln!("[VIRTIO_GPU] Cursor queue (VIRTQ 1) enabled!");
-            cursorq_opt = Some(cq);
-        }
-    } else {
-        crate::serial_strln!("[VIRTIO_GPU] No cursor queue available");
-    }
-
     // DRIVER_OK
     transport.write_common8(VIRTIO_PCI_COMMON_STATUS,
         STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK);
@@ -474,10 +412,6 @@ pub fn init() -> Result<(), &'static str> {
     let mut state = GpuState {
         transport,
         controlq,
-        cursorq: cursorq_opt,
-        cursor_notify_off,
-        cursor_resource_id: 0,
-        cursor_page_phys: 0,
         width: 0,
         height: 0,
         fb_phys_pages: Vec::new(),
@@ -571,8 +505,6 @@ static FENCE_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomic
 static FENCE_COMPLETE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 pub fn flush_rect(x: u32, y: u32, w: u32, h: u32) {
-    let submit_tsc = crate::timer::tsc_now(); // IQE: timestamp at submit
-
     let mut guard = GPU_STATE.lock();
     let state = match guard.as_mut() {
         Some(s) if s.active => s,
@@ -653,13 +585,6 @@ pub fn flush_rect(x: u32, y: u32, w: u32, h: u32) {
 
                     // Ring doorbell (async — don't wait)
                     state.transport.notify_queue(0);
-
-                    // IQE: record GPU flush submit event
-                    crate::drivers::iqe::record(
-                        crate::drivers::iqe::IqeEventType::GpuFlushSubmit,
-                        submit_tsc,
-                        FENCE_COUNTER.load(core::sync::atomic::Ordering::Relaxed) - 1,
-                    );
                 } else { q.free_desc(d2); q.free_desc(d1); q.free_desc(d0); }
             } else { q.free_desc(d1); q.free_desc(d0); }
         } else { q.free_desc(d0); }
@@ -726,212 +651,6 @@ pub fn display_size() -> Option<(u32, u32)> {
 pub fn framebuffer_pages() -> Option<alloc::vec::Vec<usize>> {
     let guard = GPU_STATE.lock();
     guard.as_ref().map(|s| s.fb_phys_pages.clone())
-}
-
-// ── Hardware Cursor (VIRTQ 1) ──────────────────────────────────────────────
-
-/// Initialize hardware cursor: create 64x64 ARGB resource, draw arrow, set up.
-/// Called once after GPU init. After this, use `move_cursor(x, y)` for updates.
-pub fn init_cursor() {
-    crate::serial_strln!("[CURSOR] init_cursor() called");
-    let mut guard = GPU_STATE.lock();
-    let state = match guard.as_mut() {
-        Some(s) if s.cursorq.is_some() => s,
-        _ => { crate::serial_strln!("[CURSOR] No cursor queue, aborting"); return; }
-    };
-    crate::serial_strln!("[CURSOR] State locked, allocating pages...");
-
-    // Allocate 4 contiguous pages for 64x64x4 = 16384 bytes cursor
-    // Try single pages if buddy allocator not available
-    let cursor_phys = match physical::alloc_pages(2) {
-        Some(p) => p,
-        None => {
-            crate::serial_strln!("[CURSOR] alloc_pages(2) failed, trying 4x alloc_page");
-            match physical::alloc_page() {
-                Some(p) => p, // Just use 1 page (4096 bytes = 32x32 cursor fits)
-                None => { crate::serial_strln!("[CURSOR] alloc_page failed!"); return; }
-            }
-        }
-    };
-    state.cursor_page_phys = cursor_phys;
-
-    // Map cursor memory and draw a simple arrow cursor
-    let cursor_virt = crate::HHDM_OFFSET.load(Ordering::Relaxed) + cursor_phys;
-    let pixels = unsafe { core::slice::from_raw_parts_mut(cursor_virt as *mut u32, 64 * 64) };
-
-    // Clear to transparent
-    for p in pixels.iter_mut() { *p = 0; }
-
-    // Draw a simple 16x16 arrow cursor (ARGB)
-    const W: u32 = 0xFFFFFFFF; // white opaque
-    const B: u32 = 0xFF000000; // black opaque
-    const T: u32 = 0x00000000; // transparent
-    #[rustfmt::skip]
-    let arrow: [u32; 16 * 16] = [
-        B,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,
-        B,B,T,T,T,T,T,T,T,T,T,T,T,T,T,T,
-        B,W,B,T,T,T,T,T,T,T,T,T,T,T,T,T,
-        B,W,W,B,T,T,T,T,T,T,T,T,T,T,T,T,
-        B,W,W,W,B,T,T,T,T,T,T,T,T,T,T,T,
-        B,W,W,W,W,B,T,T,T,T,T,T,T,T,T,T,
-        B,W,W,W,W,W,B,T,T,T,T,T,T,T,T,T,
-        B,W,W,W,W,W,W,B,T,T,T,T,T,T,T,T,
-        B,W,W,W,W,W,W,W,B,T,T,T,T,T,T,T,
-        B,W,W,W,W,W,W,W,W,B,T,T,T,T,T,T,
-        B,W,W,W,W,W,B,B,B,B,B,T,T,T,T,T,
-        B,W,W,B,W,W,B,T,T,T,T,T,T,T,T,T,
-        B,W,B,T,B,W,W,B,T,T,T,T,T,T,T,T,
-        B,B,T,T,B,W,W,B,T,T,T,T,T,T,T,T,
-        B,T,T,T,T,B,W,W,B,T,T,T,T,T,T,T,
-        T,T,T,T,T,B,B,B,B,T,T,T,T,T,T,T,
-    ];
-    for row in 0..16u32 {
-        for col in 0..16u32 {
-            pixels[(row * 64 + col) as usize] = arrow[(row * 16 + col) as usize];
-        }
-    }
-
-    // Create resource_id 2 for cursor (64x64 BGRA)
-    state.cursor_resource_id = 2;
-    create_cursor_resource(state, cursor_phys);
-
-    crate::serial_strln!("[VIRTIO_GPU] Hardware cursor initialized (VIRTQ 1)");
-}
-
-/// Create cursor resource on controlq, then issue UPDATE_CURSOR on cursorq
-fn create_cursor_resource(state: &mut GpuState, cursor_phys: usize) {
-    let cmd_page = match physical::alloc_page() { Some(p) => p, None => return };
-    let cmd_virt = crate::HHDM_OFFSET.load(Ordering::Relaxed) + cmd_page;
-    let resp_page = match physical::alloc_page() { Some(p) => p, None => return };
-
-    // 1. CREATE_2D for cursor (resource_id = 2, 64x64)
-    let create = unsafe { &mut *(cmd_virt as *mut GpuResourceCreate2D) };
-    *create = GpuResourceCreate2D {
-        hdr: GpuCtrlHdr { cmd_type: VIRTIO_GPU_CMD_RESOURCE_CREATE_2D, flags: 0, fence_id: 0, ctx_id: 0, _padding: 0 },
-        resource_id: 2,
-        format: 1, // B8G8R8A8_UNORM (with alpha!)
-        width: 64,
-        height: 64,
-    };
-    submit_sync_cmd(&mut state.controlq, &state.transport, cmd_page, core::mem::size_of::<GpuResourceCreate2D>(), resp_page);
-
-    // 2. ATTACH_BACKING (4 pages for 16KB cursor data)
-    #[repr(C)]
-    struct AttachWithEntries {
-        hdr: GpuCtrlHdr,
-        resource_id: u32,
-        nr_entries: u32,
-        entries: [GpuMemEntry; 4],
-    }
-    let attach = unsafe { &mut *(cmd_virt as *mut AttachWithEntries) };
-    *attach = AttachWithEntries {
-        hdr: GpuCtrlHdr { cmd_type: VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING, flags: 0, fence_id: 0, ctx_id: 0, _padding: 0 },
-        resource_id: 2,
-        nr_entries: 4,
-        entries: [
-            GpuMemEntry { addr: cursor_phys as u64, length: 4096, padding: 0 },
-            GpuMemEntry { addr: (cursor_phys + 4096) as u64, length: 4096, padding: 0 },
-            GpuMemEntry { addr: (cursor_phys + 8192) as u64, length: 4096, padding: 0 },
-            GpuMemEntry { addr: (cursor_phys + 12288) as u64, length: 4096, padding: 0 },
-        ],
-    };
-    submit_sync_cmd(&mut state.controlq, &state.transport, cmd_page, core::mem::size_of::<AttachWithEntries>(), resp_page);
-
-    // 3. TRANSFER_TO_HOST_2D (upload cursor pixels)
-    let xfer = unsafe { &mut *(cmd_virt as *mut GpuTransferToHost2D) };
-    *xfer = GpuTransferToHost2D {
-        hdr: GpuCtrlHdr { cmd_type: VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D, flags: 0, fence_id: 0, ctx_id: 0, _padding: 0 },
-        r: GpuRect { x: 0, y: 0, width: 64, height: 64 },
-        offset: 0,
-        resource_id: 2,
-        padding: 0,
-    };
-    submit_sync_cmd(&mut state.controlq, &state.transport, cmd_page, core::mem::size_of::<GpuTransferToHost2D>(), resp_page);
-
-    // 4. UPDATE_CURSOR on cursorq (VIRTQ 1) — sets cursor image + initial position
-    let cursor_cmd = unsafe { &mut *(cmd_virt as *mut GpuUpdateCursor) };
-    *cursor_cmd = GpuUpdateCursor {
-        hdr: GpuCtrlHdr { cmd_type: VIRTIO_GPU_CMD_UPDATE_CURSOR, flags: 0, fence_id: 0, ctx_id: 0, _padding: 0 },
-        pos: GpuCursorPos { scanout_id: 0, x: 0, y: 0, _padding: 0 },
-        resource_id: 2,
-        hot_x: 0,
-        hot_y: 0,
-        _padding: 0,
-    };
-
-    if let Some(ref mut cq) = state.cursorq {
-        let idx = cq.alloc_desc().unwrap_or(0);
-        cq.set_desc(idx, cmd_page as u64, core::mem::size_of::<GpuUpdateCursor>() as u32, 0, 0);
-        cq.submit(idx);
-        fence(Ordering::Release);
-        // Notify cursor queue (queue 1)
-        let off = state.cursor_notify_off as usize * state.transport.notify_mul as usize;
-        let addr = state.transport.notify_base + off;
-        unsafe { core::ptr::write_volatile(addr as *mut u32, 1) }
-    }
-
-    physical::free_page(resp_page);
-    // Don't free cmd_page — cursor command memory must persist
-}
-
-/// Move hardware cursor to (x, y) via VIRTQ 1. Instant, no VM-Exit storm.
-/// This bypasses the controlq entirely — cursor updates are independent of rendering.
-pub fn move_cursor(x: u32, y: u32) {
-    let mut guard = GPU_STATE.lock();
-    let state = match guard.as_mut() {
-        Some(s) if s.cursorq.is_some() && s.cursor_resource_id > 0 => s,
-        _ => return,
-    };
-
-    // Reuse a static command page for cursor moves (fire-and-forget)
-    static CURSOR_CMD_PAGE: spin::Once<usize> = spin::Once::new();
-    let cmd_page = *CURSOR_CMD_PAGE.call_once(|| {
-        physical::alloc_page().expect("cursor cmd page")
-    });
-
-    let cmd_virt = crate::HHDM_OFFSET.load(Ordering::Relaxed) + cmd_page;
-    let cmd = unsafe { &mut *(cmd_virt as *mut GpuUpdateCursor) };
-    *cmd = GpuUpdateCursor {
-        hdr: GpuCtrlHdr { cmd_type: VIRTIO_GPU_CMD_MOVE_CURSOR, flags: 0, fence_id: 0, ctx_id: 0, _padding: 0 },
-        pos: GpuCursorPos { scanout_id: 0, x, y, _padding: 0 },
-        resource_id: state.cursor_resource_id,
-        hot_x: 0,
-        hot_y: 0,
-        _padding: 0,
-    };
-
-    let cq = state.cursorq.as_mut().unwrap();
-    // Recycle used descriptors first
-    while cq.has_used() {
-        if let Some((used_head, _len)) = cq.pop_used() {
-            cq.free_desc(used_head);
-        }
-    }
-
-    if let Some(idx) = cq.alloc_desc() {
-        cq.set_desc(idx, cmd_page as u64, core::mem::size_of::<GpuUpdateCursor>() as u32, 0, 0);
-        cq.submit(idx);
-        fence(Ordering::Release);
-        let off = state.cursor_notify_off as usize * state.transport.notify_mul as usize;
-        let addr = state.transport.notify_base + off;
-        unsafe { core::ptr::write_volatile(addr as *mut u32, 1) }
-    }
-}
-
-/// Synchronous controlq command: submit cmd, wait for response
-fn submit_sync_cmd(controlq: &mut Virtqueue, transport: &MmioTransport, cmd_page: usize, cmd_size: usize, resp_page: usize) {
-    let idx0 = controlq.alloc_desc().unwrap_or(0);
-    let idx1 = controlq.alloc_desc().unwrap_or(1);
-    controlq.set_desc(idx0, cmd_page as u64, cmd_size as u32, VRING_DESC_F_NEXT, idx1);
-    controlq.set_desc(idx1, resp_page as u64, 24, VRING_DESC_F_WRITE, 0);
-    controlq.submit(idx0);
-    fence(Ordering::Release);
-    transport.notify_queue(0);
-    // Busy-wait for response
-    for _ in 0..1_000_000 { if controlq.has_used() { break; } core::hint::spin_loop(); }
-    if let Some((used_head, _len)) = controlq.pop_used() {
-        controlq.free_chain(used_head);
-    }
 }
 
 // ── PCI Capabilities Parsing ────────────────────────────────────────────────

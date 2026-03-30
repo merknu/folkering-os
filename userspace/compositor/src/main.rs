@@ -1144,7 +1144,7 @@ fn main() -> ! {
     loop {
         // Track if we did any work this iteration
         let mut did_work = false;
-        let frame_start_ms = uptime();
+
         // Consolidated redraw flag — any subsystem can set this
         // WASM apps need continuous redraws for animation (60fps game loop)
         let mut need_redraw = active_wasm_app.as_ref().map_or(false, |a| a.active);
@@ -1706,19 +1706,30 @@ fn main() -> ! {
                 }
             }
 
-            // Software cursor (hardware cursor disabled — init_cursor deadlocks)
+            // Redraw cursor if it moved, button state changed, or background is dirty
             let old_cx = cursor_x;
             let old_cy = cursor_y;
             if new_x != cursor_x || new_y != cursor_y || latest_buttons != last_buttons || cursor_bg_dirty {
+                // Erase old cursor by restoring saved background
                 if !cursor_bg_dirty {
                     fb.restore_rect(cursor_x as usize, cursor_y as usize, CURSOR_W, CURSOR_H, &cursor_bg.0);
                 }
                 cursor_bg_dirty = false;
+
+                // Update position
                 cursor_x = new_x;
                 cursor_y = new_y;
                 last_buttons = latest_buttons;
+
+                // Save background at new position, then draw cursor on top
                 fb.save_rect(cursor_x as usize, cursor_y as usize, CURSOR_W, CURSOR_H, &mut cursor_bg.0);
                 fb.draw_cursor(cursor_x as usize, cursor_y as usize, cursor_fill, cursor_outline);
+
+                // Damage old + new cursor areas for VirtIO-GPU flush
+                damage.add_damage(compositor::damage::Rect::new(
+                    old_cx.max(0) as u32, old_cy.max(0) as u32, CURSOR_W as u32 + 2, CURSOR_H as u32 + 2));
+                damage.add_damage(compositor::damage::Rect::new(
+                    cursor_x.max(0) as u32, cursor_y.max(0) as u32, CURSOR_W as u32 + 2, CURSOR_H as u32 + 2));
             }
         } // end if had_mouse_events
 
@@ -4349,17 +4360,6 @@ fn main() -> ! {
                 let ram_x = fb.width.saturating_sub(ri * 8 + 8);
                 fb.draw_string(ram_x, 2, ram_str, ram_col, fb.color_from_rgb24(0x0a0a0a));
 
-                // IQE: Frame latency indicator (colored dot)
-                {
-                    let now = uptime();
-                    let frame_ms = now.saturating_sub(frame_start_ms);
-                    let dot_color = if frame_ms < 5 { 0x44FF44 }       // green: <5ms
-                        else if frame_ms < 10 { 0xFFAA00 }              // yellow: 5-10ms
-                        else { 0xFF4444 };                               // red: >10ms
-                    let dot_x = ram_x.saturating_sub(16);
-                    fb.fill_rect(dot_x, 5, 8, 8, fb.color_from_rgb24(dot_color));
-                }
-
                 // RAM history graph (popup when clicked)
                 if show_ram_graph && ram_history_count > 1 {
                     let graph_w: usize = 240;
@@ -4423,6 +4423,7 @@ fn main() -> ! {
             damage.damage_full();
 
             // After full redraw: re-save cursor background and redraw cursor on top
+            // This ensures cursor is always the topmost element
             if cursor_drawn {
                 let cursor_fill = match (last_buttons & 1 != 0, last_buttons & 2 != 0) {
                     (true, true) => cursor_magenta,
@@ -4433,6 +4434,10 @@ fn main() -> ! {
                 fb.save_rect(cursor_x as usize, cursor_y as usize, CURSOR_W, CURSOR_H, &mut cursor_bg.0);
                 fb.draw_cursor(cursor_x as usize, cursor_y as usize, cursor_fill, cursor_outline);
                 cursor_bg_dirty = false;
+                // Damage cursor area so it gets flushed to VirtIO-GPU
+                damage.add_damage(compositor::damage::Rect::new(
+                    cursor_x.max(0) as u32, cursor_y.max(0) as u32,
+                    CURSOR_W as u32 + 2, CURSOR_H as u32 + 2));
             }
         }
 
@@ -4865,16 +4870,7 @@ fn main() -> ! {
             damage.clear();
         }
 
-        // Frame rate limiter: cap at ~60fps to prevent VM-Exit flooding.
-        // Under WHPX, each mouse movement = PS/2 IRQ12 = VM-exit.
-        // Without throttling, VNC sends 100+ mouse events/sec, yield_cpu()
-        // returns instantly (pending interrupt), and compositor spins.
-        // By waiting until 16ms have elapsed, mouse events batch in the
-        // kernel buffer and get processed in one sweep next frame.
-        let frame_end = uptime();
-        let frame_ms = frame_end.saturating_sub(frame_start_ms);
-        if frame_ms < 16 {
-            // Sleep remaining time via yield (HLT waits for next interrupt)
+        if !did_work {
             yield_cpu();
         }
     }
