@@ -214,7 +214,9 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
         match drivers::virtio_gpu::init() {
             Ok(()) => {
                 serial_strln!("[INIT] VirtIO GPU active!");
-                drivers::virtio_gpu::init_cursor();
+                // TODO: init_cursor() deadlocks GPU_STATE mutex during
+                // submit_sync_cmd spin-wait. Needs async cursor setup.
+                // drivers::virtio_gpu::init_cursor();
             }
             Err(e) => {
                 serial_str!("[INIT] VirtIO GPU: ");

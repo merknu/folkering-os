@@ -1706,15 +1706,19 @@ fn main() -> ! {
                 }
             }
 
-            // Update cursor position via hardware cursor (VIRTQ 1)
-            // No framebuffer drawing needed — host renders cursor independently
-            if new_x != cursor_x || new_y != cursor_y || latest_buttons != last_buttons {
+            // Software cursor (hardware cursor disabled — init_cursor deadlocks)
+            let old_cx = cursor_x;
+            let old_cy = cursor_y;
+            if new_x != cursor_x || new_y != cursor_y || latest_buttons != last_buttons || cursor_bg_dirty {
+                if !cursor_bg_dirty {
+                    fb.restore_rect(cursor_x as usize, cursor_y as usize, CURSOR_W, CURSOR_H, &cursor_bg.0);
+                }
+                cursor_bg_dirty = false;
                 cursor_x = new_x;
                 cursor_y = new_y;
                 last_buttons = latest_buttons;
-
-                // Hardware cursor: instant update via VIRTQ 1, no VM-Exit storm
-                libfolk::sys::gpu_move_cursor(cursor_x as u32, cursor_y as u32);
+                fb.save_rect(cursor_x as usize, cursor_y as usize, CURSOR_W, CURSOR_H, &mut cursor_bg.0);
+                fb.draw_cursor(cursor_x as usize, cursor_y as usize, cursor_fill, cursor_outline);
             }
         } // end if had_mouse_events
 
@@ -4418,8 +4422,18 @@ fn main() -> ! {
             // WORSE than 1 damage_full = 1 VM-exit.
             damage.damage_full();
 
-            // Hardware cursor: no software cursor redraw needed.
-            // Host renders cursor via VIRTQ 1 independently of 2D pipeline.
+            // After full redraw: re-save cursor background and redraw cursor on top
+            if cursor_drawn {
+                let cursor_fill = match (last_buttons & 1 != 0, last_buttons & 2 != 0) {
+                    (true, true) => cursor_magenta,
+                    (true, false) => cursor_red,
+                    (false, true) => cursor_blue,
+                    (false, false) => cursor_white,
+                };
+                fb.save_rect(cursor_x as usize, cursor_y as usize, CURSOR_W, CURSOR_H, &mut cursor_bg.0);
+                fb.draw_cursor(cursor_x as usize, cursor_y as usize, cursor_fill, cursor_outline);
+                cursor_bg_dirty = false;
+            }
         }
 
         // ===== Process IPC messages (non-blocking) =====

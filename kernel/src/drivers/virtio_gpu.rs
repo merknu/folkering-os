@@ -733,16 +733,25 @@ pub fn framebuffer_pages() -> Option<alloc::vec::Vec<usize>> {
 /// Initialize hardware cursor: create 64x64 ARGB resource, draw arrow, set up.
 /// Called once after GPU init. After this, use `move_cursor(x, y)` for updates.
 pub fn init_cursor() {
+    crate::serial_strln!("[CURSOR] init_cursor() called");
     let mut guard = GPU_STATE.lock();
     let state = match guard.as_mut() {
         Some(s) if s.cursorq.is_some() => s,
-        _ => return, // No cursor queue
+        _ => { crate::serial_strln!("[CURSOR] No cursor queue, aborting"); return; }
     };
+    crate::serial_strln!("[CURSOR] State locked, allocating pages...");
 
     // Allocate 4 contiguous pages for 64x64x4 = 16384 bytes cursor
-    let cursor_phys = match physical::alloc_pages(2) { // order 2 = 4 pages
+    // Try single pages if buddy allocator not available
+    let cursor_phys = match physical::alloc_pages(2) {
         Some(p) => p,
-        None => return,
+        None => {
+            crate::serial_strln!("[CURSOR] alloc_pages(2) failed, trying 4x alloc_page");
+            match physical::alloc_page() {
+                Some(p) => p, // Just use 1 page (4096 bytes = 32x32 cursor fits)
+                None => { crate::serial_strln!("[CURSOR] alloc_page failed!"); return; }
+            }
+        }
     };
     state.cursor_page_phys = cursor_phys;
 
