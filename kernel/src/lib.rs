@@ -176,6 +176,9 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
             arch::x86_64::smp::boot_aps_limine(smp);
         }
 
+        // Calibrate TSC against PIT for accurate microsecond timing
+        timer::calibrate_tsc();
+
         // Initialize PCI bus enumeration
         serial_strln!("[INIT] Enumerating PCI bus...");
         drivers::pci::init();

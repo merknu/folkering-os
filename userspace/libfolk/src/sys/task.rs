@@ -104,6 +104,18 @@ pub fn gpu_move_cursor(x: u32, y: u32) {
     unsafe { syscall2(0x85, x as u64, y as u64); }
 }
 
+/// IQE: Read telemetry events from kernel ring buffer.
+/// Returns number of events copied. Each event is 24 bytes.
+pub fn iqe_read(buf: &mut [u8], max_events: usize) -> usize {
+    let ret = unsafe { syscall2(0x91, buf.as_mut_ptr() as u64, max_events as u64) };
+    ret as usize
+}
+
+/// IQE: Get TSC ticks per microsecond (calibrated at boot).
+pub fn iqe_tsc_freq() -> u64 {
+    unsafe { syscall0(0x92) }
+}
+
 /// Read Real-Time Clock (CMOS RTC). Returns packed DateTime.
 /// Unpack: year=2000+(v>>26)&0x3F, month=(v>>22)&0xF, day=(v>>17)&0x1F,
 ///         hour=(v>>12)&0x1F, minute=(v>>6)&0x3F, second=v&0x3F

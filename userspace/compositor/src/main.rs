@@ -4345,6 +4345,17 @@ fn main() -> ! {
                 let ram_x = fb.width.saturating_sub(ri * 8 + 8);
                 fb.draw_string(ram_x, 2, ram_str, ram_col, fb.color_from_rgb24(0x0a0a0a));
 
+                // IQE: Frame latency indicator (colored dot)
+                {
+                    let now = uptime();
+                    let frame_ms = now.saturating_sub(frame_start_ms);
+                    let dot_color = if frame_ms < 5 { 0x44FF44 }       // green: <5ms
+                        else if frame_ms < 10 { 0xFFAA00 }              // yellow: 5-10ms
+                        else { 0xFF4444 };                               // red: >10ms
+                    let dot_x = ram_x.saturating_sub(16);
+                    fb.fill_rect(dot_x, 5, 8, 8, fb.color_from_rgb24(dot_color));
+                }
+
                 // RAM history graph (popup when clicked)
                 if show_ram_graph && ram_history_count > 1 {
                     let graph_w: usize = 240;

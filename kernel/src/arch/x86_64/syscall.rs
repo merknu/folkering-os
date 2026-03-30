@@ -985,6 +985,15 @@ extern "C" fn syscall_handler(
             let (total, free) = crate::memory::physical::memory_stats();
             ((total as u64) << 32) | (free as u64 & 0xFFFFFFFF)
         },
+        // IQE: Read telemetry events into userspace buffer
+        // arg1 = buffer vaddr, arg2 = max_events. Returns count.
+        0x91 => {
+            crate::drivers::iqe::read_to_user(arg1 as usize, arg2 as usize) as u64
+        },
+        // IQE: Get TSC ticks per microsecond (for userspace conversion)
+        0x92 => {
+            crate::timer::tsc_frequency_mhz()
+        },
         // Hardware cursor: move cursor via VIRTQ 1 (bypasses controlq, no lag)
         0x85 => {
             crate::drivers::virtio_gpu::move_cursor(arg1 as u32, arg2 as u32);
