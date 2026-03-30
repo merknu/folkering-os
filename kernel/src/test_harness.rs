@@ -105,9 +105,13 @@ pub fn run_boot_tests() {
     crate::drivers::serial::write_dec(failed);
     crate::serial_strln!(" failed ===");
 
-    if failed == 0 {
-        exit_success();
-    } else {
+    if failed > 0 {
         exit_failure();
     }
+    // Continue to benchmarks
+}
+
+/// Run boot tests without exiting (for chaining with benchmarks)
+pub fn run_boot_tests_no_exit() {
+    run_boot_tests();
 }
