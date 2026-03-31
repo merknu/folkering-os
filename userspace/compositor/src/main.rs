@@ -3406,12 +3406,18 @@ fn main() -> ! {
                         write_str("\n");
                         if prompt.is_empty() {
                             win.push_line("Usage: gemini <prompt>");
+                        } else if starts_with_ci(prompt, "generate ") {
+                            // Direct WASM tool generation — skip AI agent, go straight to compiler
+                            let tool_prompt = prompt[9..].trim();
+                            win.push_line(&alloc::format!("[AI] Generating tool: {}...", &tool_prompt[..tool_prompt.len().min(50)]));
+                            deferred_tool_gen = Some((win_id, alloc::string::String::from(tool_prompt)));
+                            damage.damage_full();
                         } else {
                             win.push_line(&alloc::format!("> gemini {}", &prompt[..prompt.len().min(60)]));
 
-                            // Step 1+2: Build augmented prompt with pre-computed UI state
+                            // Agentic AI: serialize UI state → send to proxy → parse intent
                             let full_prompt = alloc::format!(
-                                "You are Folkering OS AI assistant. Current screen state:\n{}\nUser command: {}\n\nRespond with either plain text OR a JSON action:\n{{\"action\": \"move_window\", \"window_id\": N, \"x\": N, \"y\": N}}\n{{\"action\": \"close_window\", \"window_id\": N}}\n{{\"action\": \"generate_tool\", \"prompt\": \"...\"}}\nIf no action needed, respond with plain helpful text.",
+                                "You are Folkering OS AI assistant. Current screen state:\n{}\nUser command: {}\n\nYou MUST respond with ONLY a JSON object. Choose one:\n{{\"action\": \"move_window\", \"window_id\": N, \"x\": N, \"y\": N}}\n{{\"action\": \"close_window\", \"window_id\": N}}\n{{\"action\": \"generate_tool\", \"prompt\": \"description\"}}\n{{\"action\": \"text\", \"content\": \"your answer\"}}\nNEVER respond with plain text. ALWAYS use JSON.",
                                 ui_state_snapshot, prompt
                             );
 

@@ -141,6 +141,16 @@ fn folk_request_file(path_ptr: i32, path_len: i32, dest_ptr: i32, dest_len: i32)
   // Check folk_poll_event for event_type=4 (AssetLoaded):
   //   x=handle, y=status (0=ok, 1=not_found), data=bytes_loaded
 
+OUTPUT FORMAT:
+Wrap your ENTIRE Rust source code in <TOOL_CODE> tags:
+<TOOL_CODE>
+#![no_std]
+#![no_main]
+// ... your code here ...
+</TOOL_CODE>
+
+You may think and explain OUTSIDE the tags, but the code MUST be inside <TOOL_CODE>...</TOOL_CODE>.
+
 TIPS:
 - Use folk_screen_width()/folk_screen_height() to make UIs that adapt to any resolution
 - folk_draw_text ptr must point to static bytes: static TEXT: &[u8] = b"Hello"; then pass TEXT.as_ptr() as i32
@@ -241,12 +251,33 @@ def generate_and_compile_wasm(prompt: str, sock: socket.socket):
         print(f"[SERIAL-PROXY] Gemini error: {source}")
         return
 
-    # Step 2: Strip markdown fences if present
-    if "```rust" in source:
-        source = source.split("```rust")[1].split("```")[0]
+    # Step 2: Robust code extraction — strip thinking + extract code
+    # Priority: <TOOL_CODE>...</TOOL_CODE> → ```rust...``` → ```...```
+    # Also strip <think>...</think> blocks from reasoning models
+    if "<think>" in source and "</think>" in source:
+        source = source[source.index("</think>") + 8:]
+
+    extracted = None
+    if "<TOOL_CODE>" in source and "</TOOL_CODE>" in source:
+        extracted = source.split("<TOOL_CODE>")[1].split("</TOOL_CODE>")[0]
+    elif "```rust" in source:
+        extracted = source.split("```rust")[1].split("```")[0]
     elif "```" in source:
-        source = source.split("```")[1].split("```")[0]
-    source = source.strip()
+        parts = source.split("```")
+        if len(parts) >= 3:
+            extracted = parts[1]  # content between first pair of ```
+
+    if extracted:
+        source = extracted.strip()
+    else:
+        # Last resort: look for #![no_std] as anchor
+        if "#![no_std]" in source:
+            idx = source.index("#![no_std]")
+            source = source[idx:].strip()
+        else:
+            source = source.strip()
+
+    print(f"[SERIAL-PROXY] Extracted {len(source)} chars of Rust source")
 
     print(f"[SERIAL-PROXY] Generated {len(source)} chars of Rust source")
 
