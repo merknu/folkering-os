@@ -253,36 +253,51 @@ def test_keyboard_latency(vnc, com3):
 
 
 def test_mouse_latency(vnc, com3):
-    """Test: Mouse latency via VNC PointerEvent -> PS/2 IRQ12 -> GPU Flush.
-    NOTE: VNC PointerEvent may not generate PS/2 IRQ12 under WHPX.
-    Falls back to reporting existing MOU events from any prior interaction."""
+    """Test: Mouse latency via HMP mouse_button -> PS/2 IRQ12 -> GPU Flush."""
     print("\n[TEST 2] Mouse Latency (IRQ12 -> GPU Flush)")
+    print("  Injecting 10 mouse clicks via QMP HMP mouse_button...")
     com3.clear()
 
-    # Try VNC mouse injection (may not trigger PS/2 IRQ12 under WHPX)
+    import json
+    def hmp(cmd):
+        _qmp.sock.sendall(json.dumps({"execute": "human-monitor-command",
+            "arguments": {"command-line": cmd}}).encode() + b"\n")
+        time.sleep(0.02)
+        try: _qmp.sock.recv(4096)
+        except: pass
+
     try:
-        print("  Injecting 5 mouse movements via VNC RFB...")
-        for x, y in [(200, 300), (400, 300), (600, 300), (400, 500), (200, 500)]:
-            vnc.move_mouse(x, y)
-            time.sleep(0.3)
+        for i in range(10):
+            hmp(f"mouse_move {20 + i*5} 0")
+            hmp("mouse_button 1")
+            time.sleep(0.05)
+            hmp("mouse_button 0")
+            time.sleep(0.5)
     except Exception as e:
-        print(f"  VNC mouse injection failed: {e}")
+        print(f"  QMP mouse error: {e}")
 
-    time.sleep(2)
+    time.sleep(5)
     mou_events = [e for e in com3.events if e["type"] == "MOU"]
+    mw_events = [e for e in com3.events if e["type"] == "MW"]
+    mr_events = [e for e in com3.events if e["type"] == "MR"]
 
-    if mou_events:
-        latencies = [e["latency_us"] for e in mou_events]
-        avg = sum(latencies) // len(latencies)
-        print(f"  Events received: {len(mou_events)}")
-        print(f"  Latency: avg={avg}us  min={min(latencies)}us  max={max(latencies)}us")
-        ok = avg < 50_000
-        print(f"  RESULT: {'PASS' if ok else 'FAIL'} (threshold: <50ms)")
-        return ok
-    else:
-        print("  RESULT: SKIP -- VNC PointerEvent does not trigger PS/2 IRQ12 under WHPX")
-        print("  (Mouse latency requires manual VNC interaction or USB tablet mode)")
-        return True  # Skip = pass (known limitation)
+    if not mou_events:
+        print("  RESULT: FAIL -- no MOU events received on COM3")
+        return False
+
+    latencies = [e["latency_us"] for e in mou_events]
+    avg = sum(latencies) // len(latencies)
+    print(f"  Events received: {len(mou_events)}")
+    print(f"  Total:  avg={avg}us  min={min(latencies)}us  max={max(latencies)}us")
+    if mw_events:
+        wv = [e["latency_us"] for e in mw_events]
+        print(f"  Wakeup: avg={sum(wv)//len(wv)}us  (IRQ12 -> userspace read)")
+    if mr_events:
+        rv = [e["latency_us"] for e in mr_events]
+        print(f"  Render: avg={sum(rv)//len(rv)}us  (read -> GPU flush)")
+    ok = avg < 50_000
+    print(f"  RESULT: {'PASS' if ok else 'FAIL'} (threshold: <50ms)")
+    return ok
 
 
 def test_window_open(vnc, com3):

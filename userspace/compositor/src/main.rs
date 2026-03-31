@@ -1828,6 +1828,7 @@ fn main() -> ! {
                     old_cx.max(0) as u32, old_cy.max(0) as u32, CURSOR_W as u32 + 2, CURSOR_H as u32 + 2));
                 damage.add_damage(compositor::damage::Rect::new(
                     cursor_x.max(0) as u32, cursor_y.max(0) as u32, CURSOR_W as u32 + 2, CURSOR_H as u32 + 2));
+                need_redraw = true; // cursor moved → must redraw + flush for IQE
             }
         } // end if had_mouse_events
 
