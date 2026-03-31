@@ -40,10 +40,9 @@ pub fn calibrate_tsc() {
     const DELAY_MS: u64 = 10;
     const PIT_COUNT: u16 = ((PIT_FREQ * DELAY_MS) / 1000) as u16;
 
+    // Interrupts should already be disabled during early boot.
+    // Do NOT call cli/sti here — caller manages interrupt state.
     unsafe {
-        // Disable interrupts during calibration
-        core::arch::asm!("cli");
-
         // Configure PIT Channel 2: mode 0 (one-shot), lobyte/hibyte
         x86_64::instructions::port::Port::<u8>::new(0x43).write(0b10110000);
         x86_64::instructions::port::Port::<u8>::new(0x42).write((PIT_COUNT & 0xFF) as u8);
@@ -65,9 +64,6 @@ pub fn calibrate_tsc() {
 
         // Restore port 0x61
         x86_64::instructions::port::Port::<u8>::new(0x61).write(port61_val);
-
-        // Re-enable interrupts
-        core::arch::asm!("sti");
 
         let ticks_per_us = (tsc_end - tsc_start) / (DELAY_MS * 1000);
         TSC_TICKS_PER_US.store(ticks_per_us, Ordering::Relaxed);

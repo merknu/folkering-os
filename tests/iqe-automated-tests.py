@@ -178,16 +178,35 @@ class COM3Listener:
 
 # ── Test Cases ──────────────────────────────────────────────────────────
 
+def qmp_send_key(key_name):
+    """Send a keystroke via QMP send-key (reliable under WHPX, unlike VNC RFB)."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(3)
+        s.connect((QMP_HOST, QMP_PORT))
+        s.recv(4096)
+        import json
+        s.sendall(json.dumps({"execute": "qmp_capabilities"}).encode() + b"\n")
+        s.recv(4096)
+        s.sendall(json.dumps({"execute": "send-key", "arguments": {
+            "keys": [{"type": "qcode", "data": key_name}]
+        }}).encode() + b"\n")
+        s.recv(4096)
+        s.close()
+    except Exception as e:
+        print(f"  QMP error: {e}")
+
+
 def test_keyboard_latency(vnc, com3):
     """Test: Type a character, measure guest-side IRQ1->GpuFlush latency."""
     print("\n[TEST 1] Keyboard Latency (IRQ1 -> GPU Flush)")
-    print("  Injecting 5 keystrokes via VNC RFB...")
+    print("  Injecting 5 keystrokes via QMP send-key...")
     com3.clear()
 
     latencies = []
     for ch in "hello":
-        vnc.type_key(ord(ch), delay=0.1)
-        time.sleep(0.3)
+        qmp_send_key(ch)
+        time.sleep(0.5)  # 500ms between keys for reliable delivery
 
     # Wait for COM3 events
     time.sleep(2)
@@ -249,13 +268,15 @@ def test_mouse_latency(vnc, com3):
 def test_window_open(vnc, com3):
     """Test: Type 'open calc' in omnibar, measure time until GPU flush."""
     print("\n[TEST 3] Window Open Latency ('open calc')")
-    print("  Typing 'open calc' + Enter via VNC RFB...")
+    print("  Typing 'open calc' + Enter via QMP...")
     com3.clear()
 
     start = time.time()
-    vnc.type_text("open calc", delay=0.05)
-    time.sleep(0.1)
-    vnc.type_key(0xFF0D, delay=0.05)  # Enter
+    for ch in "open calc":
+        qmp_send_key("spc" if ch == " " else ch)
+        time.sleep(0.1)
+    time.sleep(0.2)
+    qmp_send_key("ret")
 
     # Wait for KBD events (the 'open calc' keystrokes trigger flush)
     time.sleep(5)
