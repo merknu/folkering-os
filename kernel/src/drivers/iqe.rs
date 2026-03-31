@@ -163,8 +163,8 @@ pub fn read_to_user(buf_vaddr: usize, max_count: usize) -> usize {
             let event = &IQE_RING.events[pos];
             let dest = (buf_vaddr + copied * event_size) as *mut IqeEvent;
 
-            // Validate userspace address (basic bounds check)
-            if buf_vaddr < 0x1000 || buf_vaddr > 0x7FFF_FFFF_FFFF {
+            // Validate userspace address (must be in user half, not kernel)
+            if buf_vaddr < 0x1000 || buf_vaddr >= 0xFFFF_8000_0000_0000 {
                 break;
             }
 

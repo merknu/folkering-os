@@ -784,7 +784,10 @@ fn main() -> ! {
     let mut last_mou_tsc: u64 = 0;
     let mut ewma_kbd_us: u64 = 0;
     let mut ewma_mou_us: u64 = 0;
-    let tsc_per_us: u64 = 3394; // hardcoded TSC freq (PIT calibrated)
+    // Use hardcoded TSC freq (PIT calibrated ~3400 ticks/us on this CPU).
+    // Syscall 0x92 works but adds overhead per-frame. Hardcode is safe since
+    // TSC freq doesn't change at runtime.
+    let tsc_per_us: u64 = 3400;
     let mut iqe_buf = [0u8; 24 * 8]; // 8 events per poll (192 bytes)
 
     // ===== App Launcher: Android-style folders + app grid =====
@@ -1156,6 +1159,16 @@ fn main() -> ! {
         // ===== IQE: Poll telemetry events =====
         if tsc_per_us > 0 {
             let n = libfolk::sys::iqe_read(&mut iqe_buf, 8);
+            // Debug: log IQE poll result (first 3 only)
+            static mut IQE_DBG: u32 = 0;
+            if n > 0 { unsafe {
+                if IQE_DBG < 3 {
+                    write_str("[IQE-POLL] n=");
+                    write_char(b'0' + n as u8);
+                    write_str("\n");
+                    IQE_DBG += 1;
+                }
+            }}
             for i in 0..n {
                 let base = i * 24;
                 let etype = iqe_buf[base];
