@@ -216,6 +216,17 @@ pub fn handle_interrupt() {
     crate::drivers::iqe::record(
         crate::drivers::iqe::IqeEventType::KeyboardIrq, irq_tsc, scancode as u64);
 
+    // Debug: log first 5 keystrokes to serial
+    static KEY_DBG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let kc = KEY_DBG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if kc < 5 {
+        crate::serial_str!("[KEY] sc=");
+        crate::drivers::serial::write_dec(scancode as u32);
+        crate::serial_str!(" iqe_avail=");
+        crate::drivers::serial::write_dec(crate::drivers::iqe::available() as u32);
+        crate::serial_strln!("");
+    }
+
     // Send EOI to Local APIC (IOAPIC routes to Local APIC)
     crate::arch::x86_64::apic::send_eoi();
 

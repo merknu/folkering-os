@@ -785,7 +785,7 @@ fn main() -> ! {
     let mut ewma_kbd_us: u64 = 0;
     let mut ewma_mou_us: u64 = 0;
     let tsc_per_us: u64 = libfolk::sys::iqe_tsc_freq();
-    let mut iqe_buf = [0u8; 24 * 32]; // 32 events max per poll
+    let mut iqe_buf = [0u8; 24 * 8]; // 8 events per poll (192 bytes, stack safe)
 
     // ===== App Launcher: Android-style folders + app grid =====
     const MAX_CATEGORIES: usize = 6;
@@ -1155,7 +1155,7 @@ fn main() -> ! {
 
         // ===== IQE: Poll telemetry events =====
         if tsc_per_us > 0 {
-            let n = libfolk::sys::iqe_read(&mut iqe_buf, 32);
+            let n = libfolk::sys::iqe_read(&mut iqe_buf, 8);
             for i in 0..n {
                 let base = i * 24;
                 let event_type = iqe_buf[base];
@@ -1169,8 +1169,12 @@ fn main() -> ! {
                     1 => {                             // GpuFlushSubmit
                         if last_kbd_tsc > 0 && tsc > last_kbd_tsc {
                             let delta = (tsc - last_kbd_tsc) / tsc_per_us;
-                            if delta < 100_000 { // sanity: <100ms
+                            if delta < 100_000 {
                                 ewma_kbd_us = ewma_kbd_us - (ewma_kbd_us >> 3) + (delta >> 3);
+                                // Export to COM3 for automated testing
+                                let mut line = [0u8; 32];
+                                let n = fmt_iqe_line(&mut line, b"KBD", delta);
+                                libfolk::sys::com3_write(&line[..n]);
                             }
                             last_kbd_tsc = 0;
                         }
@@ -1178,6 +1182,9 @@ fn main() -> ! {
                             let delta = (tsc - last_mou_tsc) / tsc_per_us;
                             if delta < 100_000 {
                                 ewma_mou_us = ewma_mou_us - (ewma_mou_us >> 3) + (delta >> 3);
+                                let mut line = [0u8; 32];
+                                let n = fmt_iqe_line(&mut line, b"MOU", delta);
+                                libfolk::sys::com3_write(&line[..n]);
                             }
                             last_mou_tsc = 0;
                         }
@@ -5334,6 +5341,21 @@ fn format_hash_name(hash: u32) -> alloc::string::String {
     // Use 6 hex digits to match the 24-bit truncated hash from IPC
     let _ = write!(s, "__hash_{:06x}", hash & 0xFF_FFFF);
     s
+}
+
+/// Format IQE telemetry line: "IQE,KBD,1234\n" — for COM3 export to host.
+fn fmt_iqe_line(buf: &mut [u8], tag: &[u8], val: u64) -> usize {
+    let mut i = 0;
+    // "IQE,"
+    buf[i] = b'I'; i += 1; buf[i] = b'Q'; i += 1;
+    buf[i] = b'E'; i += 1; buf[i] = b','; i += 1;
+    // tag (e.g., "KBD" or "MOU")
+    for &b in tag { buf[i] = b; i += 1; }
+    buf[i] = b','; i += 1;
+    // value
+    i += fmt_u64_into(&mut buf[i..], val);
+    buf[i] = b'\n'; i += 1;
+    i
 }
 
 /// Format u64 as decimal ASCII into buffer, return number of bytes written.

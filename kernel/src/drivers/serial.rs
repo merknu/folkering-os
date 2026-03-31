@@ -35,6 +35,24 @@ pub fn com3_read_byte() -> Option<u8> {
     })
 }
 
+/// Write a byte to COM3 (blocking — waits for TX ready).
+pub fn com3_write_byte(byte: u8) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut serial = SERIAL3.lock();
+        serial.send(byte);
+    });
+}
+
+/// Write a slice of bytes to COM3.
+pub fn com3_write(data: &[u8]) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut serial = SERIAL3.lock();
+        for &byte in data {
+            serial.send(byte);
+        }
+    });
+}
+
 // ── COM2 (Gemini Proxy Channel) ─────────────────────────────────────────
 
 /// Write bytes to COM2 (Gemini proxy channel)

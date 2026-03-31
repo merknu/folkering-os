@@ -116,6 +116,11 @@ pub fn iqe_tsc_freq() -> u64 {
     unsafe { syscall0(0x92) }
 }
 
+/// Write bytes to COM3 (IQE telemetry export to host).
+pub fn com3_write(data: &[u8]) {
+    unsafe { syscall2(0x94, data.as_ptr() as u64, data.len() as u64); }
+}
+
 /// Read Real-Time Clock (CMOS RTC). Returns packed DateTime.
 /// Unpack: year=2000+(v>>26)&0x3F, month=(v>>22)&0xF, day=(v>>17)&0x1F,
 ///         hour=(v>>12)&0x1F, minute=(v>>6)&0x3F, second=v&0x3F

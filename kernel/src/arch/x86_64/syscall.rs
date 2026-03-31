@@ -995,6 +995,16 @@ extern "C" fn syscall_handler(
         // IQE: Interaction Quality Engine telemetry
         0x91 => crate::drivers::iqe::read_to_user(arg1 as usize, arg2 as usize) as u64,
         0x92 => crate::drivers::iqe::tsc_ticks_per_us(),
+        // COM3 write: export telemetry to host (arg1=buf_ptr, arg2=len)
+        0x94 => {
+            let len = (arg2 as usize).min(256);
+            let ptr = arg1 as *const u8;
+            if !ptr.is_null() && arg1 >= 0x200000 {
+                let data = unsafe { core::slice::from_raw_parts(ptr, len) };
+                crate::drivers::serial::com3_write(data);
+            }
+            len as u64
+        },
         _ => {
             crate::drivers::serial::write_str("[HANDLER] Invalid syscall!\n");
             u64::MAX // Return error
