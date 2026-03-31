@@ -587,17 +587,17 @@ pub fn flush_rect(x: u32, y: u32, w: u32, h: u32) {
 
                     // Ring doorbell (async — don't wait)
                     state.transport.notify_queue(0);
-
-                    // IQE: record GPU flush submit
-                    crate::drivers::iqe::record(
-                        crate::drivers::iqe::IqeEventType::GpuFlushSubmit,
-                        submit_tsc,
-                        FENCE_COUNTER.load(core::sync::atomic::Ordering::Relaxed) - 1,
-                    );
                 } else { q.free_desc(d2); q.free_desc(d1); q.free_desc(d0); }
             } else { q.free_desc(d1); q.free_desc(d0); }
         } else { q.free_desc(d0); }
     }
+
+    // IQE: always record flush submit (even if descriptors exhausted)
+    crate::drivers::iqe::record(
+        crate::drivers::iqe::IqeEventType::GpuFlushSubmit,
+        submit_tsc,
+        0,
+    );
 }
 
 /// Flush and wait for VSync (fence completion).
