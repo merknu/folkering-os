@@ -4545,11 +4545,24 @@ fn main() -> ! {
                 }
             }
 
-            // Full-screen damage until kernel supports descriptor chaining
-            // (batching multiple rects into one VM-exit). Without chaining,
-            // N targeted rects = N gpu_flush calls = N VM-exits, which is
-            // WORSE than 1 damage_full = 1 VM-exit.
-            damage.damage_full();
+            // Targeted damage per UI element (coalesced into minimal rects)
+            if !wasm_fullscreen {
+                damage.add_damage(compositor::damage::Rect::new(0, 0, fb.width as u32, 22));
+                if omnibar_visible {
+                    damage.add_damage(compositor::damage::Rect::new(
+                        text_box_x.saturating_sub(4) as u32,
+                        text_box_y.saturating_sub(4) as u32,
+                        (text_box_w + 8) as u32,
+                        (text_box_h + 60) as u32));
+                }
+                for w in wm.windows.iter() {
+                    damage.add_damage(compositor::damage::Rect::new(
+                        w.x.max(0) as u32, w.y.max(0) as u32,
+                        (w.width + 20) as u32, (w.height + 40) as u32));
+                }
+            } else {
+                damage.damage_full();
+            }
 
             // After full redraw: re-save cursor background and redraw cursor on top
             // This ensures cursor is always the topmost element
@@ -4991,8 +5004,20 @@ fn main() -> ! {
         // VirtIO-GPU interrupt routing which isn't set up yet. Using fire-and-forget
         // flush for now. VSync will be enabled when ISR handling is implemented.
         if use_gpu && damage.has_damage() {
-            for rect in damage.regions() {
-                libfolk::sys::gpu_flush(rect.x, rect.y, rect.w, rect.h);
+            // Batched flush: N rects → N transfers + 1 flush → 1 doorbell → 1 VM-exit
+            let regions = damage.regions();
+            if regions.len() == 1 {
+                // Fast path: single rect (most common)
+                let r = &regions[0];
+                libfolk::sys::gpu_flush(r.x, r.y, r.w, r.h);
+            } else {
+                // Batch path: multiple rects in 1 VM-exit
+                let mut batch = [[0u32; 4]; 4];
+                let n = regions.len().min(4);
+                for i in 0..n {
+                    batch[i] = [regions[i].x, regions[i].y, regions[i].w, regions[i].h];
+                }
+                libfolk::sys::gpu_flush_batch(&batch[..n]);
             }
             damage.clear();
         } else {

@@ -121,6 +121,13 @@ pub fn com3_write(data: &[u8]) {
     unsafe { syscall2(0x94, data.as_ptr() as u64, data.len() as u64); }
 }
 
+/// Batched GPU flush: transfer N rects with 1 doorbell (1 VM-exit).
+/// Each rect is (x, y, w, h) as u32. Max 4 rects.
+pub fn gpu_flush_batch(rects: &[[u32; 4]]) {
+    if rects.is_empty() { return; }
+    unsafe { syscall2(0x95, rects.as_ptr() as u64, rects.len() as u64); }
+}
+
 /// Read Real-Time Clock (CMOS RTC). Returns packed DateTime.
 /// Unpack: year=2000+(v>>26)&0x3F, month=(v>>22)&0xF, day=(v>>17)&0x1F,
 ///         hour=(v>>12)&0x1F, minute=(v>>6)&0x3F, second=v&0x3F

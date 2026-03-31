@@ -129,6 +129,15 @@ impl DamageTracker {
     pub fn has_damage(&self) -> bool {
         !self.regions.is_empty()
     }
+
+    /// Get single bounding box of all damage (for 1-flush optimization).
+    /// Returns None if no damage.
+    pub fn bounding_box(&self) -> Option<Rect> {
+        if self.regions.is_empty() { return None; }
+        let mut bbox = self.regions[0];
+        for r in &self.regions[1..] { bbox = bbox.union(r); }
+        Some(bbox)
+    }
 }
 
 #[cfg(test)]

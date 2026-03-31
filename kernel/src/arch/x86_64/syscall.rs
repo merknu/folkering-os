@@ -995,6 +995,27 @@ extern "C" fn syscall_handler(
         // IQE: Interaction Quality Engine telemetry
         0x91 => crate::drivers::iqe::read_to_user(arg1 as usize, arg2 as usize) as u64,
         0x92 => crate::drivers::iqe::tsc_ticks_per_us(),
+        // Batched GPU flush: transfer N rects with 1 doorbell (1 VM-exit)
+        // arg1 = ptr to [(x,y,w,h); N] as [u32; N*4], arg2 = N (max 4)
+        0x95 => {
+            let n = (arg2 as usize).min(4);
+            let ptr = arg1 as *const u32;
+            if !ptr.is_null() && arg1 >= 0x200000 && arg1 < 0xFFFF_8000_0000_0000 && n > 0 {
+                let mut rects = [(0u32, 0u32, 0u32, 0u32); 4];
+                for i in 0..n {
+                    unsafe {
+                        rects[i] = (
+                            core::ptr::read_volatile(ptr.add(i * 4)),
+                            core::ptr::read_volatile(ptr.add(i * 4 + 1)),
+                            core::ptr::read_volatile(ptr.add(i * 4 + 2)),
+                            core::ptr::read_volatile(ptr.add(i * 4 + 3)),
+                        );
+                    }
+                }
+                crate::drivers::virtio_gpu::flush_rects_batched(&rects[..n]);
+            }
+            0
+        },
         // COM3 write: export telemetry to host (arg1=buf_ptr, arg2=len)
         0x94 => {
             let len = (arg2 as usize).min(64); // cap at 64 bytes for safety
