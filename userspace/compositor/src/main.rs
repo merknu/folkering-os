@@ -1621,13 +1621,14 @@ fn main() -> ! {
                     match zone {
                         HitZone::CloseButton => {
                             wm.close_window(win_id);
-                            // Prevent token stream from hijacking a recycled window ID
                             if win_id == inference_win_id {
                                 inference_win_id = 0;
                             }
                             need_redraw = true;
                             cursor_bg_dirty = true;
                             handled = true;
+                            // IQE: window close event
+                            libfolk::sys::com3_write(b"IQE,WIN_CLOSE,0\n");
                         }
                         HitZone::TitleBar => {
                             wm.focus(win_id);
@@ -1636,6 +1637,8 @@ fn main() -> ! {
                             drag_last_y = new_y;
                             need_redraw = true;
                             handled = true;
+                            // IQE: window drag start
+                            libfolk::sys::com3_write(b"IQE,WIN_DRAG,0\n");
                         }
                         HitZone::Content => {
                             wm.focus(win_id);
@@ -2549,6 +2552,8 @@ fn main() -> ! {
                                             write_str("[WM] Opened WASM fullscreen: ");
                                             write_str(wasm_str);
                                             write_str("\n");
+                                            // IQE: window open event
+                                            libfolk::sys::com3_write(b"IQE,WIN_OPEN,0\n");
                                         }
                                     } else {
                                         let _ = shmem_destroy(resp.shmem_handle);

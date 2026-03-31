@@ -94,6 +94,8 @@ pub enum IqeEventType {
     KeyboardRead = 6,
     /// Userspace read a mouse event from kernel buffer (syscall_read_mouse). data = 0.
     MouseRead = 7,
+    /// Window operation started (open/close/drag). data = window_id.
+    WindowOp = 8,
 }
 
 /// Raw telemetry event — 24 bytes, no derived metrics.

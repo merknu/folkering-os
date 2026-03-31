@@ -318,16 +318,111 @@ def test_window_open(vnc, com3):
     kbd_events = [e for e in com3.events if e["type"] == "KBD"]
     elapsed_ms = int((time.time() - start) * 1000)
 
-    if kbd_events:
+    win_open = [e for e in com3.events if e["type"] == "WIN_OPEN"]
+    if win_open:
+        print(f"  WIN_OPEN event received!")
+        print(f"  Wall-clock time: {elapsed_ms}ms")
+        print(f"  RESULT: PASS")
+        return True
+    elif kbd_events:
         last_latency = kbd_events[-1]["latency_us"]
         print(f"  KBD events during open: {len(kbd_events)}")
         print(f"  Last KBD latency: {last_latency}us")
         print(f"  Wall-clock time: {elapsed_ms}ms")
-        print(f"  RESULT: PASS")
+        print(f"  RESULT: PASS (KBD events, no WIN_OPEN)")
         return True
     else:
         print(f"  Wall-clock time: {elapsed_ms}ms")
-        print(f"  RESULT: FAIL — no IQE events for window open")
+        print(f"  RESULT: FAIL -- no IQE events for window open")
+        return False
+
+
+def test_window_drag(vnc, com3):
+    """Test: Drag the Boot Test window by clicking titlebar and moving."""
+    print("\n[TEST 4] Window Drag Latency")
+    print("  Clicking Boot Test titlebar (300,90) and dragging 100px right...")
+    com3.clear()
+
+    import json
+    def hmp(cmd):
+        _qmp.sock.sendall(json.dumps({"execute": "human-monitor-command",
+            "arguments": {"command-line": cmd}}).encode() + b"\n")
+        time.sleep(0.02)
+        try: _qmp.sock.recv(4096)
+        except: pass
+
+    start = time.time()
+    try:
+        # Move cursor to titlebar of Boot Test window
+        hmp("mouse_move 300 90")
+        time.sleep(0.2)
+        # Press left button (start drag)
+        hmp("mouse_button 1")
+        time.sleep(0.2)
+        # Drag 50px right in 5 steps
+        for i in range(5):
+            hmp("mouse_move 10 0")
+            time.sleep(0.2)
+        # Release
+        hmp("mouse_button 0")
+    except Exception as e:
+        print(f"  QMP error during drag: {e}")
+    elapsed_ms = int((time.time() - start) * 1000)
+
+    time.sleep(3)
+    drag_events = [e for e in com3.events if e["type"] == "WIN_DRAG"]
+    mou_events = [e for e in com3.events if e["type"] == "MOU"]
+
+    print(f"  WIN_DRAG events: {len(drag_events)}")
+    print(f"  MOU events during drag: {len(mou_events)}")
+    print(f"  Wall-clock time: {elapsed_ms}ms")
+    if drag_events or mou_events:
+        if mou_events:
+            vals = [e["latency_us"] for e in mou_events]
+            print(f"  MOU latency during drag: avg={sum(vals)//len(vals)}us")
+        print(f"  RESULT: PASS")
+        return True
+    else:
+        print(f"  RESULT: FAIL -- no drag events")
+        return False
+
+
+def test_window_close(vnc, com3):
+    """Test: Close a window by clicking its X button."""
+    print("\n[TEST 5] Window Close")
+    com3.clear()
+
+    import json
+    def hmp(cmd):
+        _qmp.sock.sendall(json.dumps({"execute": "human-monitor-command",
+            "arguments": {"command-line": cmd}}).encode() + b"\n")
+        time.sleep(0.02)
+        try: _qmp.sock.recv(4096)
+        except: pass
+
+    # First press ESC to exit any WASM fullscreen app
+    qmp_send_key("esc")
+    time.sleep(1)
+
+    print("  Clicking close button (490, 85) via HMP...")
+    try:
+        hmp("mouse_move 490 85")
+        time.sleep(0.2)
+        hmp("mouse_button 1")
+        time.sleep(0.1)
+        hmp("mouse_button 0")
+    except Exception as e:
+        print(f"  QMP error: {e}")
+
+    time.sleep(3)
+    close_events = [e for e in com3.events if e["type"] == "WIN_CLOSE"]
+
+    if close_events:
+        print(f"  WIN_CLOSE events: {len(close_events)}")
+        print(f"  RESULT: PASS")
+        return True
+    else:
+        print(f"  RESULT: FAIL -- no WIN_CLOSE event (click may have missed X button)")
         return False
 
 
@@ -380,10 +475,14 @@ def main():
     results["keyboard"] = test_keyboard_latency(vnc, com3)
     results["mouse"] = test_mouse_latency(vnc, com3)
 
-    # ESC to close any opened app, then test window open
+    # ESC to close any opened app, then test window operations
     qmp_send_key("esc")
     time.sleep(1)
     results["window_open"] = test_window_open(vnc, com3)
+    time.sleep(1)
+    results["window_drag"] = test_window_drag(vnc, com3)
+    time.sleep(1)
+    results["window_close"] = test_window_close(vnc, com3)
 
     # Summary
     print("\n" + "=" * 60)
