@@ -1884,10 +1884,16 @@ fn syscall_yield() -> u64 {
 fn syscall_read_key() -> u64 {
     // First, check the PS/2 keyboard buffer
     if let Some(key) = crate::drivers::keyboard::read_key() {
+        // IQE: record the moment userspace pulls a key from the buffer
+        crate::drivers::iqe::record(
+            crate::drivers::iqe::IqeEventType::KeyboardRead,
+            crate::drivers::iqe::rdtsc(),
+            key as u64,
+        );
         // Check for Ctrl+C (ASCII 0x03)
         if key == 0x03 {
             set_current_task_interrupt();
-            return 0x03; // Return Ctrl+C so shell can also handle it
+            return 0x03;
         }
         return key as u64;
     }
@@ -1915,6 +1921,12 @@ fn syscall_read_key() -> u64 {
 /// High bit (63) set indicates valid event
 fn syscall_read_mouse() -> u64 {
     if let Some(event) = crate::drivers::mouse::read_event() {
+        // IQE: record the moment userspace pulls a mouse event
+        crate::drivers::iqe::record(
+            crate::drivers::iqe::IqeEventType::MouseRead,
+            crate::drivers::iqe::rdtsc(),
+            0,
+        );
         let buttons = event.buttons as u64;
         let dx = (event.dx as u16) as u64;
         let dy = (event.dy as u16) as u64;

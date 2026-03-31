@@ -235,9 +235,19 @@ def test_keyboard_latency(vnc, com3):
     min_l = min(latencies)
     max_l = max(latencies)
 
+    # Split times
+    kw_events = [e for e in com3.events if e["type"] == "KW"]
+    kr_events = [e for e in com3.events if e["type"] == "KR"]
+    kw_avg = sum(e["latency_us"] for e in kw_events) // max(len(kw_events), 1) if kw_events else 0
+    kr_avg = sum(e["latency_us"] for e in kr_events) // max(len(kr_events), 1) if kr_events else 0
+
     print(f"  Events received: {len(kbd_events)}")
-    print(f"  Latency: avg={avg}us  min={min_l}us  max={max_l}us")
-    ok = avg < 50_000  # <50ms is acceptable
+    print(f"  Total:  avg={avg}us  min={min_l}us  max={max_l}us")
+    if kw_events:
+        print(f"  Wakeup: avg={kw_avg}us  (IRQ -> userspace read)")
+    if kr_events:
+        print(f"  Render: avg={kr_avg}us  (read -> GPU flush)")
+    ok = avg < 50_000
     print(f"  RESULT: {'PASS' if ok else 'FAIL'} (threshold: <50ms)")
     return ok
 

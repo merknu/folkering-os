@@ -90,6 +90,10 @@ pub enum IqeEventType {
     FrameEnd = 4,
     /// Keyboard scancode received. data = scancode.
     KeyboardIrq = 5,
+    /// Userspace read a key from kernel buffer (syscall_read_key). data = key.
+    KeyboardRead = 6,
+    /// Userspace read a mouse event from kernel buffer (syscall_read_mouse). data = 0.
+    MouseRead = 7,
 }
 
 /// Raw telemetry event — 24 bytes, no derived metrics.

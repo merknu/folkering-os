@@ -780,15 +780,21 @@ fn main() -> ! {
     let mut show_ram_graph: bool = false; // Toggle with G key or click RAM%
 
     // ===== IQE Latency Tracking =====
-    let mut last_kbd_tsc: u64 = 0;
-    let mut last_mou_tsc: u64 = 0;
-    let mut ewma_kbd_us: u64 = 0;
-    let mut ewma_mou_us: u64 = 0;
+    let mut last_kbd_tsc: u64 = 0;      // KeyboardIrq TSC
+    let mut last_kbd_read_tsc: u64 = 0; // KeyboardRead TSC (userspace pulled from buffer)
+    let mut last_mou_tsc: u64 = 0;      // MouseIrq TSC
+    let mut last_mou_read_tsc: u64 = 0; // MouseRead TSC
+    let mut ewma_kbd_us: u64 = 0;       // total KBD latency (IRQ -> flush)
+    let mut ewma_mou_us: u64 = 0;       // total MOU latency
+    let mut ewma_kbd_wake: u64 = 0;     // KBD wakeup (IRQ -> read)
+    let mut ewma_kbd_rend: u64 = 0;     // KBD render (read -> flush)
+    let mut ewma_mou_wake: u64 = 0;
+    let mut ewma_mou_rend: u64 = 0;
     // Use hardcoded TSC freq (PIT calibrated ~3400 ticks/us on this CPU).
     // Syscall 0x92 works but adds overhead per-frame. Hardcode is safe since
     // TSC freq doesn't change at runtime.
     let tsc_per_us: u64 = 3400;
-    let mut iqe_buf = [0u8; 24 * 8]; // 8 events per poll (192 bytes)
+    let mut iqe_buf = [0u8; 24 * 12]; // 12 events per poll (288 bytes, stack safe)
 
     // ===== App Launcher: Android-style folders + app grid =====
     const MAX_CATEGORIES: usize = 6;
@@ -1158,7 +1164,7 @@ fn main() -> ! {
 
         // ===== IQE: Poll telemetry events =====
         if tsc_per_us > 0 {
-            let n = libfolk::sys::iqe_read(&mut iqe_buf, 8);
+            let n = libfolk::sys::iqe_read(&mut iqe_buf, 12);
             // Debug: log IQE poll result (first 3 only)
             static mut IQE_DBG: u32 = 0;
             if n > 0 { unsafe {
@@ -1177,28 +1183,59 @@ fn main() -> ! {
                     iqe_buf[base+12], iqe_buf[base+13], iqe_buf[base+14], iqe_buf[base+15],
                 ]);
                 match etype {
-                    5 => { last_kbd_tsc = tsc; }  // KeyboardIrq
-                    0 => { last_mou_tsc = tsc; }  // MouseIrq
-                    1 => {                         // GpuFlushSubmit
+                    5 => { last_kbd_tsc = tsc; }       // KeyboardIrq
+                    0 => { last_mou_tsc = tsc; }       // MouseIrq
+                    6 => { last_kbd_read_tsc = tsc; }   // KeyboardRead
+                    7 => { last_mou_read_tsc = tsc; }   // MouseRead
+                    1 => {                               // GpuFlushSubmit
+                        // Keyboard split times
                         if last_kbd_tsc > 0 && tsc > last_kbd_tsc {
-                            let d = (tsc - last_kbd_tsc) / tsc_per_us;
-                            if d < 100_000 {
-                                ewma_kbd_us = ewma_kbd_us - (ewma_kbd_us >> 3) + (d >> 3);
-                                let mut line = [0u8; 32];
-                                let ln = fmt_iqe_line(&mut line, b"KBD", d);
-                                libfolk::sys::com3_write(&line[..ln]);
+                            let total = (tsc - last_kbd_tsc) / tsc_per_us;
+                            if total < 100_000 {
+                                ewma_kbd_us = ewma_kbd_us - (ewma_kbd_us >> 3) + (total >> 3);
+                                let mut l = [0u8; 32];
+                                let n = fmt_iqe_line(&mut l, b"KBD", total);
+                                libfolk::sys::com3_write(&l[..n]);
+                                // Split: wakeup (IRQ -> read)
+                                if last_kbd_read_tsc > last_kbd_tsc {
+                                    let wake = (last_kbd_read_tsc - last_kbd_tsc) / tsc_per_us;
+                                    let rend = if tsc > last_kbd_read_tsc { (tsc - last_kbd_read_tsc) / tsc_per_us } else { 0 };
+                                    ewma_kbd_wake = ewma_kbd_wake - (ewma_kbd_wake >> 3) + (wake >> 3);
+                                    ewma_kbd_rend = ewma_kbd_rend - (ewma_kbd_rend >> 3) + (rend >> 3);
+                                    let mut l2 = [0u8; 32];
+                                    let n2 = fmt_iqe_line(&mut l2, b"KW", wake);
+                                    libfolk::sys::com3_write(&l2[..n2]);
+                                    let mut l3 = [0u8; 32];
+                                    let n3 = fmt_iqe_line(&mut l3, b"KR", rend);
+                                    libfolk::sys::com3_write(&l3[..n3]);
+                                }
                             }
                             last_kbd_tsc = 0;
+                            last_kbd_read_tsc = 0;
                         }
+                        // Mouse split times
                         if last_mou_tsc > 0 && tsc > last_mou_tsc {
-                            let d = (tsc - last_mou_tsc) / tsc_per_us;
-                            if d < 100_000 {
-                                ewma_mou_us = ewma_mou_us - (ewma_mou_us >> 3) + (d >> 3);
-                                let mut line = [0u8; 32];
-                                let ln = fmt_iqe_line(&mut line, b"MOU", d);
-                                libfolk::sys::com3_write(&line[..ln]);
+                            let total = (tsc - last_mou_tsc) / tsc_per_us;
+                            if total < 100_000 {
+                                ewma_mou_us = ewma_mou_us - (ewma_mou_us >> 3) + (total >> 3);
+                                let mut l = [0u8; 32];
+                                let n = fmt_iqe_line(&mut l, b"MOU", total);
+                                libfolk::sys::com3_write(&l[..n]);
+                                if last_mou_read_tsc > last_mou_tsc {
+                                    let wake = (last_mou_read_tsc - last_mou_tsc) / tsc_per_us;
+                                    let rend = if tsc > last_mou_read_tsc { (tsc - last_mou_read_tsc) / tsc_per_us } else { 0 };
+                                    ewma_mou_wake = ewma_mou_wake - (ewma_mou_wake >> 3) + (wake >> 3);
+                                    ewma_mou_rend = ewma_mou_rend - (ewma_mou_rend >> 3) + (rend >> 3);
+                                    let mut l2 = [0u8; 32];
+                                    let n2 = fmt_iqe_line(&mut l2, b"MW", wake);
+                                    libfolk::sys::com3_write(&l2[..n2]);
+                                    let mut l3 = [0u8; 32];
+                                    let n3 = fmt_iqe_line(&mut l3, b"MR", rend);
+                                    libfolk::sys::com3_write(&l3[..n3]);
+                                }
                             }
                             last_mou_tsc = 0;
+                            last_mou_read_tsc = 0;
                         }
                     }
                     _ => {}
@@ -4423,19 +4460,24 @@ fn main() -> ! {
 
                 // IQE latency display + colored dot
                 if ewma_kbd_us > 0 || ewma_mou_us > 0 {
-                    let mut lbuf = [0u8; 30];
+                    let mut lbuf = [0u8; 48];
                     let mut li = 0usize;
+                    // K:total(w+r) | M:total
                     lbuf[li]=b'K'; li+=1; lbuf[li]=b':'; li+=1;
                     li += fmt_u64_into(&mut lbuf[li..], ewma_kbd_us);
-                    lbuf[li]=b'u'; li+=1; lbuf[li]=b's'; li+=1;
-                    lbuf[li]=b' '; li+=1; lbuf[li]=b'|'; li+=1; lbuf[li]=b' '; li+=1;
-                    lbuf[li]=b'M'; li+=1; lbuf[li]=b':'; li+=1;
-                    li += fmt_u64_into(&mut lbuf[li..], ewma_mou_us);
-                    lbuf[li]=b'u'; li+=1; lbuf[li]=b's'; li+=1;
-                    let s = unsafe { core::str::from_utf8_unchecked(&lbuf[..li]) };
+                    if ewma_kbd_wake > 0 {
+                        lbuf[li]=b'('; li+=1;
+                        li += fmt_u64_into(&mut lbuf[li..], ewma_kbd_wake);
+                        lbuf[li]=b'+'; li+=1;
+                        li += fmt_u64_into(&mut lbuf[li..], ewma_kbd_rend);
+                        lbuf[li]=b')'; li+=1;
+                    }
+                    if li < 44 { lbuf[li]=b' '; li+=1; lbuf[li]=b'M'; li+=1; lbuf[li]=b':'; li+=1;
+                        li += fmt_u64_into(&mut lbuf[li..], ewma_mou_us);
+                    }
+                    let s = unsafe { core::str::from_utf8_unchecked(&lbuf[..li.min(48)]) };
                     fb.draw_string(90, 2, s, fb.color_from_rgb24(0x88AACC), fb.color_from_rgb24(0x0a0a0a));
 
-                    // Colored dot: green <5ms, yellow <16ms, red >=16ms
                     let worst = ewma_kbd_us.max(ewma_mou_us);
                     let dot = if worst < 5000 { 0x44FF44 } else if worst < 16000 { 0xFFAA00 } else { 0xFF4444 };
                     fb.fill_rect(ram_x.saturating_sub(14), 5, 8, 8, fb.color_from_rgb24(dot));
