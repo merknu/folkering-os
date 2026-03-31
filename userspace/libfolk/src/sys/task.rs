@@ -97,6 +97,37 @@ pub fn gpu_vsync(x: u32, y: u32, w: u32, h: u32) {
     unsafe { syscall4(0x82, x as u64, y as u64, w as u64, h as u64); }
 }
 
+/// Move hardware cursor to (x, y) via VirtIO-GPU VIRTQ 1.
+/// This bypasses the controlq entirely — cursor position updates at 1000Hz
+/// independently of the 2D render pipeline. No VM-Exit storm.
+pub fn gpu_move_cursor(x: u32, y: u32) {
+    unsafe { syscall2(0x85, x as u64, y as u64); }
+}
+
+/// IQE: Read telemetry events from kernel ring buffer.
+/// Returns number of events copied. Each event is 24 bytes.
+pub fn iqe_read(buf: &mut [u8], max_events: usize) -> usize {
+    let ret = unsafe { syscall2(0x91, buf.as_mut_ptr() as u64, max_events as u64) };
+    ret as usize
+}
+
+/// IQE: Get TSC ticks per microsecond (calibrated at boot).
+pub fn iqe_tsc_freq() -> u64 {
+    unsafe { syscall0(0x92) }
+}
+
+/// Write bytes to COM3 via syscall 0x94.
+pub fn com3_write(data: &[u8]) {
+    unsafe { syscall2(0x94, data.as_ptr() as u64, data.len() as u64); }
+}
+
+/// Batched GPU flush: transfer N rects with 1 doorbell (1 VM-exit).
+/// Each rect is (x, y, w, h) as u32. Max 4 rects.
+pub fn gpu_flush_batch(rects: &[[u32; 4]]) {
+    if rects.is_empty() { return; }
+    unsafe { syscall2(0x95, rects.as_ptr() as u64, rects.len() as u64); }
+}
+
 /// Read Real-Time Clock (CMOS RTC). Returns packed DateTime.
 /// Unpack: year=2000+(v>>26)&0x3F, month=(v>>22)&0xF, day=(v>>17)&0x1F,
 ///         hour=(v>>12)&0x1F, minute=(v>>6)&0x3F, second=v&0x3F

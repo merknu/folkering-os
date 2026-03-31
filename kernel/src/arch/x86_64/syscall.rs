@@ -992,6 +992,43 @@ extern "C" fn syscall_handler(
                 None => u64::MAX,
             }
         },
+        // IQE: Interaction Quality Engine telemetry
+        0x91 => crate::drivers::iqe::read_to_user(arg1 as usize, arg2 as usize) as u64,
+        0x92 => crate::drivers::iqe::tsc_ticks_per_us(),
+        // Batched GPU flush: transfer N rects with 1 doorbell (1 VM-exit)
+        // arg1 = ptr to [(x,y,w,h); N] as [u32; N*4], arg2 = N (max 4)
+        0x95 => {
+            let n = (arg2 as usize).min(4);
+            let ptr = arg1 as *const u32;
+            if !ptr.is_null() && arg1 >= 0x200000 && arg1 < 0xFFFF_8000_0000_0000 && n > 0 {
+                let mut rects = [(0u32, 0u32, 0u32, 0u32); 4];
+                for i in 0..n {
+                    unsafe {
+                        rects[i] = (
+                            core::ptr::read_volatile(ptr.add(i * 4)),
+                            core::ptr::read_volatile(ptr.add(i * 4 + 1)),
+                            core::ptr::read_volatile(ptr.add(i * 4 + 2)),
+                            core::ptr::read_volatile(ptr.add(i * 4 + 3)),
+                        );
+                    }
+                }
+                crate::drivers::virtio_gpu::flush_rects_batched(&rects[..n]);
+            }
+            0
+        },
+        // COM3 write: export telemetry to host (arg1=buf_ptr, arg2=len)
+        0x94 => {
+            let len = (arg2 as usize).min(64); // cap at 64 bytes for safety
+            let ptr = arg1 as *const u8;
+            if !ptr.is_null() && arg1 >= 0x200000 && arg1 < 0xFFFF_8000_0000_0000 {
+                // Read bytes one at a time from userspace (safe, no bulk copy)
+                for i in 0..len {
+                    let byte = unsafe { core::ptr::read_volatile(ptr.add(i)) };
+                    crate::drivers::serial::com3_write_byte(byte);
+                }
+            }
+            len as u64
+        },
         _ => {
             crate::drivers::serial::write_str("[HANDLER] Invalid syscall!\n");
             u64::MAX // Return error
@@ -1871,10 +1908,16 @@ fn syscall_yield() -> u64 {
 fn syscall_read_key() -> u64 {
     // First, check the PS/2 keyboard buffer
     if let Some(key) = crate::drivers::keyboard::read_key() {
+        // IQE: record the moment userspace pulls a key from the buffer
+        crate::drivers::iqe::record(
+            crate::drivers::iqe::IqeEventType::KeyboardRead,
+            crate::drivers::iqe::rdtsc(),
+            key as u64,
+        );
         // Check for Ctrl+C (ASCII 0x03)
         if key == 0x03 {
             set_current_task_interrupt();
-            return 0x03; // Return Ctrl+C so shell can also handle it
+            return 0x03;
         }
         return key as u64;
     }
@@ -1902,6 +1945,12 @@ fn syscall_read_key() -> u64 {
 /// High bit (63) set indicates valid event
 fn syscall_read_mouse() -> u64 {
     if let Some(event) = crate::drivers::mouse::read_event() {
+        // IQE: record the moment userspace pulls a mouse event
+        crate::drivers::iqe::record(
+            crate::drivers::iqe::IqeEventType::MouseRead,
+            crate::drivers::iqe::rdtsc(),
+            0,
+        );
         let buttons = event.buttons as u64;
         let dx = (event.dx as u16) as u64;
         let dy = (event.dy as u16) as u64;

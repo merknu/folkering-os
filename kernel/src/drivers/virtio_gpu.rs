@@ -201,20 +201,9 @@ impl MmioTransport {
         unsafe { core::ptr::read_volatile((self.common_base + off) as *const u64) }
     }
     fn notify_queue(&self, _queue_idx: u16) {
-        // Modern VirtIO: notify address = notify_base + Q_NOFF * notify_off_multiplier
         let off = self.notify_off as usize * self.notify_mul as usize;
         let addr = self.notify_base + off;
-        // Log BEFORE write in case MMIO write triggers page fault
-        crate::serial_str!("[VIRTIO_GPU] notify_write @ ");
-        crate::drivers::serial::write_hex(addr as u64);
-        crate::serial_str!(" (base=");
-        crate::drivers::serial::write_hex(self.notify_base as u64);
-        crate::serial_str!(" off=");
-        crate::drivers::serial::write_dec(off as u32);
-        crate::serial_str!(")\n");
-        // Modern VirtIO: notify register is le32 (NOT le16 like Legacy!)
         unsafe { core::ptr::write_volatile(addr as *mut u32, 0) }
-        crate::serial_str!("[VIRTIO_GPU] notify_write done\n");
     }
 }
 
@@ -505,6 +494,15 @@ static FENCE_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomic
 static FENCE_COMPLETE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 pub fn flush_rect(x: u32, y: u32, w: u32, h: u32) {
+    let submit_tsc = crate::drivers::iqe::rdtsc();
+
+    // Debug: count flushes (first 3 only)
+    static FLUSH_N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let fc = FLUSH_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if fc < 3 {
+        crate::drivers::serial::com3_write(b"IQE,FLUSH,1\n");
+    }
+
     let mut guard = GPU_STATE.lock();
     let state = match guard.as_mut() {
         Some(s) if s.active => s,
@@ -589,6 +587,120 @@ pub fn flush_rect(x: u32, y: u32, w: u32, h: u32) {
             } else { q.free_desc(d1); q.free_desc(d0); }
         } else { q.free_desc(d0); }
     }
+
+    // IQE: always record flush submit (even if descriptors exhausted)
+    crate::drivers::iqe::record(
+        crate::drivers::iqe::IqeEventType::GpuFlushSubmit,
+        submit_tsc,
+        0,
+    );
+}
+
+/// Batched flush: transfer + flush multiple rects with ONE doorbell (ONE VM-exit).
+/// Each rect gets its own TRANSFER_TO_HOST_2D, all share one RESOURCE_FLUSH.
+/// Max 4 rects per batch (limited by command page layout).
+pub fn flush_rects_batched(rects: &[(u32, u32, u32, u32)]) {
+    if rects.is_empty() { return; }
+    let submit_tsc = crate::drivers::iqe::rdtsc();
+
+    let mut guard = GPU_STATE.lock();
+    let state = match guard.as_mut() {
+        Some(s) if s.active => s,
+        _ => return,
+    };
+    recycle_used(&mut state.controlq);
+
+    let cmd_phys = {
+        let mut pg = FLUSH_CMD_PAGE.lock();
+        if pg.is_none() { *pg = physical::alloc_page(); }
+        match *pg { Some(p) => p, None => return }
+    };
+    let hhdm = crate::memory::paging::hhdm_offset();
+    let cmd = (hhdm + cmd_phys) as *mut u8;
+
+    let n = rects.len().min(4); // max 4 rects per batch
+
+    // Compute union bounding box for the final RESOURCE_FLUSH
+    let mut ux = rects[0].0;
+    let mut uy = rects[0].1;
+    let mut ur = ux + rects[0].2;
+    let mut ub = uy + rects[0].3;
+    for r in &rects[1..n] {
+        ux = ux.min(r.0);
+        uy = uy.min(r.1);
+        ur = ur.max(r.0 + r.2);
+        ub = ub.max(r.1 + r.3);
+    }
+
+    // Layout: for each rect i:
+    //   [i*80 + 0..56]  = TRANSFER_TO_HOST_2D
+    //   [i*80 + 56..80] = Response (24 bytes)
+    // After all rects:
+    //   [n*80 + 0..48]  = RESOURCE_FLUSH
+    //   [n*80 + 48..72] = Response
+    unsafe {
+        for i in 0..n {
+            let off = i * 80;
+            let xfer = cmd.add(off) as *mut GpuTransferToHost2D;
+            (*xfer).hdr = make_hdr(VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D);
+            (*xfer).r = GpuRect { x: rects[i].0, y: rects[i].1, width: rects[i].2, height: rects[i].3 };
+            (*xfer).offset = 0;
+            (*xfer).resource_id = 1;
+            (*xfer).padding = 0;
+            // Zero response
+            core::ptr::write_bytes(cmd.add(off + 56), 0, 24);
+        }
+
+        let flush_off = n * 80;
+        let fence_id = FENCE_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let flush = cmd.add(flush_off) as *mut GpuResourceFlush;
+        (*flush).hdr = GpuCtrlHdr {
+            cmd_type: VIRTIO_GPU_CMD_RESOURCE_FLUSH,
+            flags: VIRTIO_GPU_FLAG_FENCE,
+            fence_id,
+            ctx_id: 0,
+            _padding: 0,
+        };
+        (*flush).r = GpuRect { x: ux, y: uy, width: ur - ux, height: ub - uy };
+        (*flush).resource_id = 1;
+        (*flush).padding = 0;
+        core::ptr::write_bytes(cmd.add(flush_off + 48), 0, 24);
+    }
+
+    // Chain all descriptors: [xfer0→resp0] [xfer1→resp1] ... [flush→resp]
+    // Submit each transfer pair separately, then flush pair last.
+    // All use ONE doorbell notification at the end.
+    let q = &mut state.controlq;
+    let mut submitted = false;
+
+    for i in 0..n {
+        let off = i * 80;
+        if let (Some(d_cmd), Some(d_resp)) = (q.alloc_desc(), q.alloc_desc()) {
+            q.set_desc(d_cmd, (cmd_phys + off) as u64, 56, VRING_DESC_F_NEXT, d_resp);
+            q.set_desc(d_resp, (cmd_phys + off + 56) as u64, 24, VRING_DESC_F_WRITE, 0);
+            q.submit(d_cmd);
+            submitted = true;
+        }
+    }
+
+    // Flush command
+    let flush_off = n * 80;
+    if let (Some(d_cmd), Some(d_resp)) = (q.alloc_desc(), q.alloc_desc()) {
+        q.set_desc(d_cmd, (cmd_phys + flush_off) as u64, 48, VRING_DESC_F_NEXT, d_resp);
+        q.set_desc(d_resp, (cmd_phys + flush_off + 48) as u64, 24, VRING_DESC_F_WRITE, 0);
+        q.submit(d_cmd);
+        submitted = true;
+    }
+
+    // ONE doorbell for ALL commands
+    if submitted {
+        state.transport.notify_queue(0);
+    }
+
+    drop(guard);
+
+    crate::drivers::iqe::record(
+        crate::drivers::iqe::IqeEventType::GpuFlushSubmit, submit_tsc, 0);
 }
 
 /// Flush and wait for VSync (fence completion).

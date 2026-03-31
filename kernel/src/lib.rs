@@ -20,6 +20,9 @@
 #![feature(abi_x86_interrupt)]
 #![feature(allocator_api)]
 #![feature(alloc_error_handler)]
+
+pub mod test_harness;
+pub mod benchmark;
 // const_mut_refs is stable since 1.83, panic_info_message since 1.81, naked_functions since 1.88
 
 // Text section anchor - workaround for lld orphaned section bug
@@ -166,6 +169,12 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
             pic2_data.write(0xFF); // Mask all IRQs on PIC2
         }
         serial_strln!("[INIT] PIC disabled (all IRQs masked)");
+
+        // Calibrate TSC via PIT Channel 2 (hardware polling, no interrupts needed)
+        drivers::iqe::calibrate_tsc();
+
+        // COM3 boot marker for IQE test suite
+        drivers::serial::com3_write(b"IQE,BOOT,0\n");
 
         // Initialize ACPI (for future use)
         arch::x86_64::acpi_init(boot_info.rsdp_addr);
@@ -461,7 +470,14 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
                 let is_shell = name.as_bytes() == b"shell";
                 let is_synapse = name.as_bytes() == b"synapse";
                 let is_compositor = name.as_bytes() == b"compositor";
+                let is_inference = name.as_bytes() == b"inference";
                 if is_shell || is_synapse {
+                    continue;
+                }
+                // Phase 5 Hybrid AI: skip built-in inference server to save ~400MB RAM.
+                // AI runs on host via LM Studio/llama.cpp, proxied through COM2.
+                if is_inference {
+                    serial_strln!("[BOOT] Skipping inference server (Phase 5 Hybrid AI mode)");
                     continue;
                 }
                 if entry.is_elf() {
@@ -543,6 +559,20 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
         }
 
         serial_strln!("[BOOT] All tasks spawned, starting scheduler...\n");
+
+        // If boot-test feature is enabled, run kernel tests and exit QEMU
+        #[cfg(feature = "boot-test")]
+        {
+            unsafe { core::arch::asm!("sti"); }
+            arch::x86_64::enable_timer();
+
+            serial_strln!("[BOOT] Boot-test mode — running kernel tests...");
+            test_harness::run_boot_tests_no_exit();
+
+            serial_strln!("[BOOT] Running benchmarks...");
+            benchmark::run_benchmarks();
+            // run_benchmarks calls exit_success → never returns
+        }
 
         // TEMPORARY DIAGNOSTIC: wait 3 seconds so TCP serial logger can connect
         // before the scheduler starts (TCP logger misses early boot output).

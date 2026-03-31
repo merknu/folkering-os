@@ -779,6 +779,23 @@ fn main() -> ! {
     let mut ram_history_count: usize = 0;
     let mut show_ram_graph: bool = false; // Toggle with G key or click RAM%
 
+    // ===== IQE Latency Tracking =====
+    let mut last_kbd_tsc: u64 = 0;      // KeyboardIrq TSC
+    let mut last_kbd_read_tsc: u64 = 0; // KeyboardRead TSC (userspace pulled from buffer)
+    let mut last_mou_tsc: u64 = 0;      // MouseIrq TSC
+    let mut last_mou_read_tsc: u64 = 0; // MouseRead TSC
+    let mut ewma_kbd_us: u64 = 0;       // total KBD latency (IRQ -> flush)
+    let mut ewma_mou_us: u64 = 0;       // total MOU latency
+    let mut ewma_kbd_wake: u64 = 0;     // KBD wakeup (IRQ -> read)
+    let mut ewma_kbd_rend: u64 = 0;     // KBD render (read -> flush)
+    let mut ewma_mou_wake: u64 = 0;
+    let mut ewma_mou_rend: u64 = 0;
+    // Use hardcoded TSC freq (PIT calibrated ~3400 ticks/us on this CPU).
+    // Syscall 0x92 works but adds overhead per-frame. Hardcode is safe since
+    // TSC freq doesn't change at runtime.
+    let tsc_per_us: u64 = 3400;
+    let mut iqe_buf = [0u8; 24 * 12]; // 12 events per poll (288 bytes, stack safe)
+
     // ===== App Launcher: Android-style folders + app grid =====
     const MAX_CATEGORIES: usize = 6;
     const MAX_APPS_PER_CAT: usize = 20;
@@ -945,13 +962,20 @@ fn main() -> ! {
     const TOOL_OPEN: &[u8] = b"<|tool|>";    // 8 bytes
     const TOOL_CLOSE: &[u8] = b"<|/tool|>";  // 9 bytes
 
-    // ===== Think Tag Filter =====
-    // Hides <think>...</think> reasoning from display (Qwen3 thinking mode)
-    let mut think_state: u8 = 0;     // 0=scanning open, 1=inside think block (hidden)
+    // ===== Think Tag Filter + UI Overlay =====
+    // Captures <think>...</think> reasoning and displays in translucent overlay
+    let mut think_state: u8 = 0;     // 0=scanning open, 1=inside think block
     let mut think_open_match: usize = 0;
     let mut think_close_match: usize = 0;
     let mut think_pending: [u8; 8] = [0; 8]; // max tag length for flush
     let mut think_pending_len: usize = 0;
+
+    // Think display buffer — shows AI reasoning in UI overlay
+    const THINK_BUF_SIZE: usize = 1024;
+    let mut think_display: [u8; THINK_BUF_SIZE] = [0; THINK_BUF_SIZE];
+    let mut think_display_len: usize = 0;
+    let mut think_active: bool = false; // true while inside <think> block
+    let mut think_fade_timer: u32 = 0;  // frames to keep overlay visible after </think>
 
     const THINK_OPEN: &[u8] = b"<think>";    // 7 bytes
     const THINK_CLOSE: &[u8] = b"</think>";  // 8 bytes
@@ -1137,6 +1161,88 @@ fn main() -> ! {
     loop {
         // Track if we did any work this iteration
         let mut did_work = false;
+
+        // ===== IQE: Poll telemetry events =====
+        if tsc_per_us > 0 {
+            let n = libfolk::sys::iqe_read(&mut iqe_buf, 12);
+            // Debug: log IQE poll result (first 3 only)
+            static mut IQE_DBG: u32 = 0;
+            if n > 0 { unsafe {
+                if IQE_DBG < 3 {
+                    write_str("[IQE-POLL] n=");
+                    write_char(b'0' + n as u8);
+                    write_str("\n");
+                    IQE_DBG += 1;
+                }
+            }}
+            for i in 0..n {
+                let base = i * 24;
+                let etype = iqe_buf[base];
+                let tsc = u64::from_le_bytes([
+                    iqe_buf[base+8], iqe_buf[base+9], iqe_buf[base+10], iqe_buf[base+11],
+                    iqe_buf[base+12], iqe_buf[base+13], iqe_buf[base+14], iqe_buf[base+15],
+                ]);
+                match etype {
+                    5 => { last_kbd_tsc = tsc; }       // KeyboardIrq
+                    0 => { last_mou_tsc = tsc; }       // MouseIrq
+                    6 => { last_kbd_read_tsc = tsc; }   // KeyboardRead
+                    7 => { last_mou_read_tsc = tsc; }   // MouseRead
+                    1 => {                               // GpuFlushSubmit
+                        // Keyboard split times
+                        if last_kbd_tsc > 0 && tsc > last_kbd_tsc {
+                            let total = (tsc - last_kbd_tsc) / tsc_per_us;
+                            if total < 100_000 {
+                                ewma_kbd_us = ewma_kbd_us - (ewma_kbd_us >> 3) + (total >> 3);
+                                let mut l = [0u8; 32];
+                                let n = fmt_iqe_line(&mut l, b"KBD", total);
+                                libfolk::sys::com3_write(&l[..n]);
+                                // Split: wakeup (IRQ -> read)
+                                if last_kbd_read_tsc > last_kbd_tsc {
+                                    let wake = (last_kbd_read_tsc - last_kbd_tsc) / tsc_per_us;
+                                    let rend = if tsc > last_kbd_read_tsc { (tsc - last_kbd_read_tsc) / tsc_per_us } else { 0 };
+                                    ewma_kbd_wake = ewma_kbd_wake - (ewma_kbd_wake >> 3) + (wake >> 3);
+                                    ewma_kbd_rend = ewma_kbd_rend - (ewma_kbd_rend >> 3) + (rend >> 3);
+                                    let mut l2 = [0u8; 32];
+                                    let n2 = fmt_iqe_line(&mut l2, b"KW", wake);
+                                    libfolk::sys::com3_write(&l2[..n2]);
+                                    let mut l3 = [0u8; 32];
+                                    let n3 = fmt_iqe_line(&mut l3, b"KR", rend);
+                                    libfolk::sys::com3_write(&l3[..n3]);
+                                }
+                            }
+                            last_kbd_tsc = 0;
+                            last_kbd_read_tsc = 0;
+                        }
+                        // Mouse split times
+                        if last_mou_tsc > 0 && tsc > last_mou_tsc {
+                            let total = (tsc - last_mou_tsc) / tsc_per_us;
+                            if total < 100_000 {
+                                ewma_mou_us = ewma_mou_us - (ewma_mou_us >> 3) + (total >> 3);
+                                let mut l = [0u8; 32];
+                                let n = fmt_iqe_line(&mut l, b"MOU", total);
+                                libfolk::sys::com3_write(&l[..n]);
+                                if last_mou_read_tsc > last_mou_tsc {
+                                    let wake = (last_mou_read_tsc - last_mou_tsc) / tsc_per_us;
+                                    let rend = if tsc > last_mou_read_tsc { (tsc - last_mou_read_tsc) / tsc_per_us } else { 0 };
+                                    ewma_mou_wake = ewma_mou_wake - (ewma_mou_wake >> 3) + (wake >> 3);
+                                    ewma_mou_rend = ewma_mou_rend - (ewma_mou_rend >> 3) + (rend >> 3);
+                                    let mut l2 = [0u8; 32];
+                                    let n2 = fmt_iqe_line(&mut l2, b"MW", wake);
+                                    libfolk::sys::com3_write(&l2[..n2]);
+                                    let mut l3 = [0u8; 32];
+                                    let n3 = fmt_iqe_line(&mut l3, b"MR", rend);
+                                    libfolk::sys::com3_write(&l3[..n3]);
+                                }
+                            }
+                            last_mou_tsc = 0;
+                            last_mou_read_tsc = 0;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         // Consolidated redraw flag — any subsystem can set this
         // WASM apps need continuous redraws for animation (60fps game loop)
         let mut need_redraw = active_wasm_app.as_ref().map_or(false, |a| a.active);
@@ -1146,6 +1252,8 @@ fn main() -> ! {
         if current_second != last_clock_second {
             last_clock_second = current_second;
             need_redraw = true;
+            // Only damage system tray area (top bar, ~30px high)
+            damage.add_damage(compositor::damage::Rect::new(0, 0, fb.width as u32, 30));
 
             // Sample RAM usage for history graph
             let (_, _, mem_pct) = libfolk::sys::memory_stats();
@@ -1513,13 +1621,14 @@ fn main() -> ! {
                     match zone {
                         HitZone::CloseButton => {
                             wm.close_window(win_id);
-                            // Prevent token stream from hijacking a recycled window ID
                             if win_id == inference_win_id {
                                 inference_win_id = 0;
                             }
                             need_redraw = true;
                             cursor_bg_dirty = true;
                             handled = true;
+                            // IQE: window close event
+                            libfolk::sys::com3_write(b"IQE,WIN_CLOSE,0\n");
                         }
                         HitZone::TitleBar => {
                             wm.focus(win_id);
@@ -1528,6 +1637,8 @@ fn main() -> ! {
                             drag_last_y = new_y;
                             need_redraw = true;
                             handled = true;
+                            // IQE: window drag start
+                            libfolk::sys::com3_write(b"IQE,WIN_DRAG,0\n");
                         }
                         HitZone::Content => {
                             wm.focus(win_id);
@@ -1697,6 +1808,8 @@ fn main() -> ! {
             }
 
             // Redraw cursor if it moved, button state changed, or background is dirty
+            let old_cx = cursor_x;
+            let old_cy = cursor_y;
             if new_x != cursor_x || new_y != cursor_y || latest_buttons != last_buttons || cursor_bg_dirty {
                 // Erase old cursor by restoring saved background
                 if !cursor_bg_dirty {
@@ -1712,6 +1825,13 @@ fn main() -> ! {
                 // Save background at new position, then draw cursor on top
                 fb.save_rect(cursor_x as usize, cursor_y as usize, CURSOR_W, CURSOR_H, &mut cursor_bg.0);
                 fb.draw_cursor(cursor_x as usize, cursor_y as usize, cursor_fill, cursor_outline);
+
+                // Damage old + new cursor areas for VirtIO-GPU flush
+                damage.add_damage(compositor::damage::Rect::new(
+                    old_cx.max(0) as u32, old_cy.max(0) as u32, CURSOR_W as u32 + 2, CURSOR_H as u32 + 2));
+                damage.add_damage(compositor::damage::Rect::new(
+                    cursor_x.max(0) as u32, cursor_y.max(0) as u32, CURSOR_W as u32 + 2, CURSOR_H as u32 + 2));
+                need_redraw = true; // cursor moved → must redraw + flush for IQE
             }
         } // end if had_mouse_events
 
@@ -1784,7 +1904,7 @@ fn main() -> ! {
             if key == 0x07 || (active_wasm_app.is_none() && (key == b'G' || key == b'g') && !omnibar_visible) {
                 show_ram_graph = !show_ram_graph;
                 need_redraw = true;
-                damage.damage_full();
+                damage.damage_full(); // RAM graph covers large area
                 continue;
             }
 
@@ -1793,7 +1913,7 @@ fn main() -> ! {
             if key == 0x1B && open_folder >= 0 && active_wasm_app.is_none() {
                 open_folder = -1;
                 need_redraw = true;
-                damage.damage_full();
+                damage.damage_full(); // folder covers large area, full redraw needed
                 continue;
             }
             if let Some(app) = &mut active_wasm_app {
@@ -2432,6 +2552,8 @@ fn main() -> ! {
                                             write_str("[WM] Opened WASM fullscreen: ");
                                             write_str(wasm_str);
                                             write_str("\n");
+                                            // IQE: window open event
+                                            libfolk::sys::com3_write(b"IQE,WIN_OPEN,0\n");
                                         }
                                     } else {
                                         let _ = shmem_destroy(resp.shmem_handle);
@@ -3344,10 +3466,50 @@ fn main() -> ! {
                                             damage.damage_full();
                                         }
                                         AgentIntent::TextResponse { text: resp } => {
+                                            // Filter <think>...</think> from response → overlay
+                                            let mut visible = alloc::string::String::new();
+                                            let mut in_think = false;
+                                            let mut rest = resp.as_str();
+                                            while !rest.is_empty() {
+                                                if !in_think {
+                                                    if let Some(pos) = rest.find("<think>") {
+                                                        visible.push_str(&rest[..pos]);
+                                                        rest = &rest[pos + 7..];
+                                                        in_think = true;
+                                                        think_active = true;
+                                                        think_display_len = 0;
+                                                    } else {
+                                                        visible.push_str(rest);
+                                                        break;
+                                                    }
+                                                } else {
+                                                    if let Some(pos) = rest.find("</think>") {
+                                                        // Store think content in overlay buffer
+                                                        let think_text = &rest[..pos];
+                                                        let copy_len = think_text.len().min(THINK_BUF_SIZE - think_display_len);
+                                                        think_display[think_display_len..think_display_len + copy_len]
+                                                            .copy_from_slice(&think_text.as_bytes()[..copy_len]);
+                                                        think_display_len += copy_len;
+                                                        think_active = false;
+                                                        think_fade_timer = 180; // 3 seconds visible
+                                                        need_redraw = true;
+                                                        rest = &rest[pos + 8..];
+                                                        in_think = false;
+                                                    } else {
+                                                        // Unclosed think — store all, show nothing
+                                                        let copy_len = rest.len().min(THINK_BUF_SIZE - think_display_len);
+                                                        think_display[think_display_len..think_display_len + copy_len]
+                                                            .copy_from_slice(&rest.as_bytes()[..copy_len]);
+                                                        think_display_len += copy_len;
+                                                        break;
+                                                    }
+                                                }
+                                            }
                                             win.push_line("[Gemini]:");
-                                            for line in resp.split('\n') {
-                                                if !line.is_empty() {
-                                                    win.push_line(line);
+                                            for line in visible.split('\n') {
+                                                let trimmed = line.trim();
+                                                if !trimmed.is_empty() {
+                                                    win.push_line(trimmed);
                                                 }
                                             }
                                         }
@@ -3975,7 +4137,8 @@ fn main() -> ! {
                         }
 
                         did_work = true;
-                        damage.damage_full(); // WASM wrote to fb — flush to VirtIO-GPU
+                        // WASM owns fullscreen — damage entire screen
+                        damage.damage_full();
                     }
                 }
             }
@@ -4301,6 +4464,31 @@ fn main() -> ! {
                 let ram_x = fb.width.saturating_sub(ri * 8 + 8);
                 fb.draw_string(ram_x, 2, ram_str, ram_col, fb.color_from_rgb24(0x0a0a0a));
 
+                // IQE latency display + colored dot
+                if ewma_kbd_us > 0 || ewma_mou_us > 0 {
+                    let mut lbuf = [0u8; 48];
+                    let mut li = 0usize;
+                    // K:total(w+r) | M:total
+                    lbuf[li]=b'K'; li+=1; lbuf[li]=b':'; li+=1;
+                    li += fmt_u64_into(&mut lbuf[li..], ewma_kbd_us);
+                    if ewma_kbd_wake > 0 {
+                        lbuf[li]=b'('; li+=1;
+                        li += fmt_u64_into(&mut lbuf[li..], ewma_kbd_wake);
+                        lbuf[li]=b'+'; li+=1;
+                        li += fmt_u64_into(&mut lbuf[li..], ewma_kbd_rend);
+                        lbuf[li]=b')'; li+=1;
+                    }
+                    if li < 44 { lbuf[li]=b' '; li+=1; lbuf[li]=b'M'; li+=1; lbuf[li]=b':'; li+=1;
+                        li += fmt_u64_into(&mut lbuf[li..], ewma_mou_us);
+                    }
+                    let s = unsafe { core::str::from_utf8_unchecked(&lbuf[..li.min(48)]) };
+                    fb.draw_string(90, 2, s, fb.color_from_rgb24(0x88AACC), fb.color_from_rgb24(0x0a0a0a));
+
+                    let worst = ewma_kbd_us.max(ewma_mou_us);
+                    let dot = if worst < 5000 { 0x44FF44 } else if worst < 16000 { 0xFFAA00 } else { 0xFF4444 };
+                    fb.fill_rect(ram_x.saturating_sub(14), 5, 8, 8, fb.color_from_rgb24(dot));
+                }
+
                 // RAM history graph (popup when clicked)
                 if show_ram_graph && ram_history_count > 1 {
                     let graph_w: usize = 240;
@@ -4357,6 +4545,25 @@ fn main() -> ! {
                 }
             }
 
+            // Targeted damage per UI element (coalesced into minimal rects)
+            if !wasm_fullscreen {
+                damage.add_damage(compositor::damage::Rect::new(0, 0, fb.width as u32, 22));
+                if omnibar_visible {
+                    damage.add_damage(compositor::damage::Rect::new(
+                        text_box_x.saturating_sub(4) as u32,
+                        text_box_y.saturating_sub(4) as u32,
+                        (text_box_w + 8) as u32,
+                        (text_box_h + 60) as u32));
+                }
+                for w in wm.windows.iter() {
+                    damage.add_damage(compositor::damage::Rect::new(
+                        w.x.max(0) as u32, w.y.max(0) as u32,
+                        (w.width + 20) as u32, (w.height + 40) as u32));
+                }
+            } else {
+                damage.damage_full();
+            }
+
             // After full redraw: re-save cursor background and redraw cursor on top
             // This ensures cursor is always the topmost element
             if cursor_drawn {
@@ -4369,6 +4576,10 @@ fn main() -> ! {
                 fb.save_rect(cursor_x as usize, cursor_y as usize, CURSOR_W, CURSOR_H, &mut cursor_bg.0);
                 fb.draw_cursor(cursor_x as usize, cursor_y as usize, cursor_fill, cursor_outline);
                 cursor_bg_dirty = false;
+                // Damage cursor area so it gets flushed to VirtIO-GPU
+                damage.add_damage(compositor::damage::Rect::new(
+                    cursor_x.max(0) as u32, cursor_y.max(0) as u32,
+                    CURSOR_W as u32 + 2, CURSOR_H as u32 + 2));
             }
         }
 
@@ -4469,10 +4680,14 @@ fn main() -> ! {
                             think_pending_len += 1;
                             think_open_match += 1;
                             if think_open_match == THINK_OPEN.len() {
-                                // Entered think block — drop all content
+                                // Entered think block — capture to overlay
                                 think_state = 1;
                                 think_open_match = 0;
                                 think_pending_len = 0;
+                                think_active = true;
+                                think_display_len = 0; // clear previous
+                                think_fade_timer = 0;
+                                need_redraw = true;
                             }
                             continue; // Don't pass to tool/visible layer yet
                         } else if think_open_match > 0 {
@@ -4525,14 +4740,30 @@ fn main() -> ! {
                         if byte == THINK_CLOSE[think_close_match] {
                             think_close_match += 1;
                             if think_close_match == THINK_CLOSE.len() {
-                                // Exited think block — resume normal display
+                                // Exited think block — keep overlay visible for 120 frames (~2s)
                                 think_state = 0;
                                 think_close_match = 0;
+                                think_active = false;
+                                think_fade_timer = 120;
+                                need_redraw = true;
                             }
                         } else {
+                            // Flush partial close-match bytes to think buffer
+                            for k in 0..think_close_match {
+                                if think_display_len < THINK_BUF_SIZE {
+                                    think_display[think_display_len] = THINK_CLOSE[k];
+                                    think_display_len += 1;
+                                }
+                            }
                             think_close_match = 0;
+                            // Store current byte in think display buffer
+                            if think_display_len < THINK_BUF_SIZE {
+                                think_display[think_display_len] = byte;
+                                think_display_len += 1;
+                            }
+                            need_redraw = true;
                         }
-                        continue; // Drop ALL bytes inside think block
+                        continue; // Don't pass think bytes to tool/visible layer
                     }
 
                     // ── Layer 1.5: Tool result filter ──
@@ -4683,20 +4914,116 @@ fn main() -> ! {
             }
         }
 
+        // ===== AI Think Overlay =====
+        // Semi-transparent panel showing AI reasoning in real-time
+        if (think_active || think_fade_timer > 0) && think_display_len > 0 {
+            // Overlay dimensions: top-right corner, 400px wide
+            let overlay_w = 400usize;
+            let overlay_x = fb.width.saturating_sub(overlay_w + 16);
+            let overlay_y = 40usize;
+
+            // Extract last N lines from think buffer (show most recent reasoning)
+            let think_text = unsafe {
+                core::str::from_utf8_unchecked(&think_display[..think_display_len])
+            };
+
+            // Count lines and find start of last 8 lines
+            let max_lines = 8usize;
+            let mut line_starts = [0usize; 9]; // up to 8 lines + sentinel
+            let mut line_count = 0usize;
+            let bytes = think_text.as_bytes();
+            line_starts[0] = 0;
+            for i in 0..bytes.len() {
+                if bytes[i] == b'\n' && line_count < max_lines {
+                    line_count += 1;
+                    line_starts[line_count] = i + 1;
+                }
+            }
+            if line_count == 0 { line_count = 1; } // at least 1 line
+
+            // Show last max_lines lines
+            let first_line = if line_count > max_lines { line_count - max_lines } else { 0 };
+            let display_lines = line_count - first_line;
+            let overlay_h = 28 + display_lines * 18;
+
+            // Alpha for fade-out effect
+            let alpha = if think_active { 200u8 } else {
+                (think_fade_timer as u16 * 200 / 120).min(200) as u8
+            };
+
+            // Draw semi-transparent background
+            fb.fill_rect_alpha(overlay_x, overlay_y, overlay_w, overlay_h, 0x0a0a1e, alpha);
+
+            // Header: "AI Thinking..." or "AI Thought"
+            let header = if think_active { "AI Thinking..." } else { "AI Thought" };
+            let header_color = if think_active { 0x00ccff } else { 0x666688 };
+            fb.draw_string(overlay_x + 8, overlay_y + 6, header,
+                fb.color_from_rgb24(header_color), fb.color_from_rgb24(0));
+
+            // Draw reasoning lines
+            let text_color = fb.color_from_rgb24(if think_active { 0xaaaacc } else { 0x666688 });
+            let bg_color = fb.color_from_rgb24(0);
+            for li in 0..display_lines {
+                let idx = first_line + li;
+                let start = line_starts[idx];
+                let end = if idx + 1 <= line_count {
+                    line_starts[idx + 1].min(think_display_len)
+                } else {
+                    think_display_len
+                };
+                if start < end {
+                    // Truncate long lines
+                    let line_end = end.min(start + 48);
+                    let line = unsafe {
+                        core::str::from_utf8_unchecked(&think_display[start..line_end])
+                    };
+                    let line_trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+                    if !line_trimmed.is_empty() {
+                        fb.draw_string(overlay_x + 8, overlay_y + 24 + li * 18,
+                            line_trimmed, text_color, bg_color);
+                    }
+                }
+            }
+
+            let overlay_w_u32 = 400;
+            damage.add_damage(compositor::damage::Rect::new(
+                overlay_x as u32, overlay_y as u32, overlay_w_u32, overlay_h as u32));
+            need_redraw = true;
+        }
+
+        // Decrement fade timer
+        if think_fade_timer > 0 {
+            think_fade_timer -= 1;
+            if think_fade_timer == 0 {
+                need_redraw = true; // final redraw to clear overlay
+            }
+        }
+
         // Flush dirty regions to VirtIO-GPU
         // NOTE: gpu_vsync() is available (syscall 0x82) but requires proper
         // VirtIO-GPU interrupt routing which isn't set up yet. Using fire-and-forget
         // flush for now. VSync will be enabled when ISR handling is implemented.
         if use_gpu && damage.has_damage() {
-            for rect in damage.regions() {
-                libfolk::sys::gpu_flush(rect.x, rect.y, rect.w, rect.h);
+            // Batched flush: N rects → N transfers + 1 flush → 1 doorbell → 1 VM-exit
+            let regions = damage.regions();
+            if regions.len() == 1 {
+                // Fast path: single rect (most common)
+                let r = &regions[0];
+                libfolk::sys::gpu_flush(r.x, r.y, r.w, r.h);
+            } else {
+                // Batch path: multiple rects in 1 VM-exit
+                let mut batch = [[0u32; 4]; 4];
+                let n = regions.len().min(4);
+                for i in 0..n {
+                    batch[i] = [regions[i].x, regions[i].y, regions[i].w, regions[i].h];
+                }
+                libfolk::sys::gpu_flush_batch(&batch[..n]);
             }
             damage.clear();
         } else {
             damage.clear();
         }
 
-        // Only yield CPU if we did no work this iteration
         if !did_work {
             yield_cpu();
         }
@@ -5097,4 +5424,27 @@ fn format_hash_name(hash: u32) -> alloc::string::String {
     // Use 6 hex digits to match the 24-bit truncated hash from IPC
     let _ = write!(s, "__hash_{:06x}", hash & 0xFF_FFFF);
     s
+}
+
+/// Format IQE telemetry line for COM3 export: "IQE,KBD,1234\n"
+fn fmt_iqe_line(buf: &mut [u8], tag: &[u8], val: u64) -> usize {
+    let mut i = 0;
+    buf[i]=b'I'; i+=1; buf[i]=b'Q'; i+=1; buf[i]=b'E'; i+=1; buf[i]=b','; i+=1;
+    for &b in tag { if i < buf.len() { buf[i] = b; i += 1; } }
+    if i < buf.len() { buf[i] = b','; i += 1; }
+    i += fmt_u64_into(&mut buf[i..], val);
+    if i < buf.len() { buf[i] = b'\n'; i += 1; }
+    i
+}
+
+/// Format u64 as decimal ASCII into buffer, return bytes written.
+fn fmt_u64_into(buf: &mut [u8], mut val: u64) -> usize {
+    if buf.is_empty() { return 0; }
+    if val == 0 { buf[0] = b'0'; return 1; }
+    let mut tmp = [0u8; 20];
+    let mut i = 0;
+    while val > 0 && i < 20 { tmp[i] = b'0' + (val % 10) as u8; val /= 10; i += 1; }
+    let len = i.min(buf.len());
+    for j in 0..len { buf[j] = tmp[i - 1 - j]; }
+    len
 }

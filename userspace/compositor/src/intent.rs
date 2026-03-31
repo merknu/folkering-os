@@ -47,53 +47,73 @@ pub enum AgentIntent {
 pub fn parse_intent(response: &str) -> AgentIntent {
     let trimmed = response.trim();
 
+    // Strip <think>...</think> blocks — extract content after closing tag
+    // DeepSeek-R1 wraps reasoning in <think> tags before the JSON action
+    let effective = if let Some(think_start) = trimmed.find("<think>") {
+        if let Some(think_end) = trimmed.find("</think>") {
+            trimmed[think_end + 8..].trim()
+        } else {
+            trimmed // unclosed tag — use full text
+        }
+    } else {
+        trimmed
+    };
+
+    // Debug: log think tag extraction
+    if trimmed.contains("<think>") {
+        use libfolk::sys::io::write_str;
+        write_str("[INTENT] Found <think> in response, effective starts with: ");
+        write_str(&effective[..effective.len().min(30)]);
+        write_str("\n");
+    }
+
     // Check if response is JSON (starts with '{')
-    if !trimmed.starts_with('{') {
+    if !effective.starts_with('{') {
         return AgentIntent::TextResponse { text: String::from(trimmed) };
     }
 
     // Extract "action" field
-    let action = match extract_str(trimmed, "action") {
+    let action = match extract_str(effective, "action") {
         Some(a) => a,
         None => return AgentIntent::TextResponse { text: String::from(trimmed) },
     };
 
     match action.as_str() {
         "move_window" => {
-            let wid = extract_num(trimmed, "window_id").unwrap_or(0);
-            let x = extract_num(trimmed, "x").unwrap_or(0);
-            let y = extract_num(trimmed, "y").unwrap_or(0);
+            let wid = extract_num(effective, "window_id").unwrap_or(0);
+            let x = extract_num(effective, "x").unwrap_or(0);
+            let y = extract_num(effective, "y").unwrap_or(0);
             AgentIntent::MoveWindow { window_id: wid, x, y }
         }
         "resize_window" => {
-            let wid = extract_num(trimmed, "window_id").unwrap_or(0);
-            let w = extract_num(trimmed, "w").unwrap_or(400);
-            let h = extract_num(trimmed, "h").unwrap_or(300);
+            let wid = extract_num(effective, "window_id").unwrap_or(0);
+            let w = extract_num(effective, "w").unwrap_or(400);
+            let h = extract_num(effective, "h").unwrap_or(300);
             AgentIntent::ResizeWindow { window_id: wid, w, h }
         }
         "close_window" => {
-            let wid = extract_num(trimmed, "window_id").unwrap_or(0);
+            let wid = extract_num(effective, "window_id").unwrap_or(0);
             AgentIntent::CloseWindow { window_id: wid }
         }
         "read_file" => {
-            let path = extract_str(trimmed, "path").unwrap_or_default();
+            let path = extract_str(effective, "path").unwrap_or_default();
             AgentIntent::ReadFile { path }
         }
         "write_file" => {
-            let path = extract_str(trimmed, "path").unwrap_or_default();
-            let content = extract_str(trimmed, "content").unwrap_or_default();
+            let path = extract_str(effective, "path").unwrap_or_default();
+            let content = extract_str(effective, "content").unwrap_or_default();
             AgentIntent::WriteFile { path, content }
         }
         "generate_tool" => {
-            let prompt = extract_str(trimmed, "prompt").unwrap_or_default();
+            let prompt = extract_str(effective, "prompt").unwrap_or_default();
             AgentIntent::GenerateTool { prompt }
         }
         "tool_ready" => {
-            let binary = extract_str(trimmed, "binary").unwrap_or_default();
+            let binary = extract_str(effective, "binary").unwrap_or_default();
             AgentIntent::ToolReady { binary_base64: binary }
         }
         "error" => {
-            let msg = extract_str(trimmed, "message").unwrap_or_default();
+            let msg = extract_str(effective, "message").unwrap_or_default();
             AgentIntent::Error { message: msg }
         }
         _ => AgentIntent::TextResponse { text: String::from(trimmed) },
@@ -190,4 +210,157 @@ pub fn base64_decode(input: &str) -> Option<Vec<u8>> {
     }
 
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── parse_intent tests ──
+
+    #[test]
+    fn parse_text_response() {
+        let r = parse_intent("Hello, how can I help?");
+        match r {
+            AgentIntent::TextResponse { text } => assert_eq!(text, "Hello, how can I help?"),
+            _ => panic!("Expected TextResponse"),
+        }
+    }
+
+    #[test]
+    fn parse_move_window() {
+        let r = parse_intent(r#"{"action": "move_window", "window_id": 3, "x": 100, "y": 200}"#);
+        match r {
+            AgentIntent::MoveWindow { window_id, x, y } => {
+                assert_eq!(window_id, 3);
+                assert_eq!(x, 100);
+                assert_eq!(y, 200);
+            }
+            _ => panic!("Expected MoveWindow"),
+        }
+    }
+
+    #[test]
+    fn parse_close_window() {
+        let r = parse_intent(r#"{"action": "close_window", "window_id": 5}"#);
+        match r {
+            AgentIntent::CloseWindow { window_id } => assert_eq!(window_id, 5),
+            _ => panic!("Expected CloseWindow"),
+        }
+    }
+
+    #[test]
+    fn parse_generate_tool() {
+        let r = parse_intent(r#"{"action": "generate_tool", "prompt": "draw a circle"}"#);
+        match r {
+            AgentIntent::GenerateTool { prompt } => assert_eq!(prompt, "draw a circle"),
+            _ => panic!("Expected GenerateTool"),
+        }
+    }
+
+    #[test]
+    fn parse_think_tags_stripped_for_json() {
+        // DeepSeek-R1 response: <think>...</think> followed by JSON
+        let input = "<think>\nI should move window 2\n</think>\n{\"action\": \"move_window\", \"window_id\": 2, \"x\": 50, \"y\": 50}";
+        let r = parse_intent(input);
+        match r {
+            AgentIntent::MoveWindow { window_id, x, y } => {
+                assert_eq!(window_id, 2);
+                assert_eq!(x, 50);
+                assert_eq!(y, 50);
+            }
+            _ => panic!("Expected MoveWindow after think stripping, got {:?}",
+                        match r { AgentIntent::TextResponse { text } => text, _ => String::from("other") }),
+        }
+    }
+
+    #[test]
+    fn parse_think_tags_unclosed_falls_through() {
+        let input = "<think>\nstill thinking...";
+        let r = parse_intent(input);
+        match r {
+            AgentIntent::TextResponse { .. } => {} // expected
+            _ => panic!("Unclosed think should fallback to TextResponse"),
+        }
+    }
+
+    // ── extract_str tests ──
+
+    #[test]
+    fn extract_str_basic() {
+        let json = r#"{"name": "hello", "value": 42}"#;
+        assert_eq!(extract_str(json, "name"), Some(String::from("hello")));
+    }
+
+    #[test]
+    fn extract_str_with_spaces() {
+        let json = r#"{"action":  "move_window"}"#;
+        assert_eq!(extract_str(json, "action"), Some(String::from("move_window")));
+    }
+
+    #[test]
+    fn extract_str_missing() {
+        let json = r#"{"action": "test"}"#;
+        assert_eq!(extract_str(json, "missing"), None);
+    }
+
+    #[test]
+    fn extract_str_escaped_quote() {
+        let json = r#"{"msg": "say \"hello\""}"#;
+        assert_eq!(extract_str(json, "msg"), Some(String::from(r#"say \"hello\""#)));
+    }
+
+    // ── extract_num tests ──
+
+    #[test]
+    fn extract_num_basic() {
+        let json = r#"{"x": 42, "y": 100}"#;
+        assert_eq!(extract_num(json, "x"), Some(42));
+        assert_eq!(extract_num(json, "y"), Some(100));
+    }
+
+    #[test]
+    fn extract_num_zero() {
+        assert_eq!(extract_num(r#"{"val": 0}"#, "val"), Some(0));
+    }
+
+    #[test]
+    fn extract_num_missing() {
+        assert_eq!(extract_num(r#"{"x": 1}"#, "z"), None);
+    }
+
+    // ── base64_decode tests ──
+
+    #[test]
+    fn base64_empty() {
+        assert_eq!(base64_decode(""), Some(vec![]));
+    }
+
+    #[test]
+    fn base64_hello() {
+        // "Hello" = SGVsbG8=
+        assert_eq!(base64_decode("SGVsbG8="), Some(b"Hello".to_vec()));
+    }
+
+    #[test]
+    fn base64_padding_two() {
+        // "Hi" = SGk=
+        assert_eq!(base64_decode("SGk="), Some(b"Hi".to_vec()));
+    }
+
+    #[test]
+    fn base64_no_padding() {
+        // "Hey!" = SGV5IQ==
+        assert_eq!(base64_decode("SGV5IQ=="), Some(b"Hey!".to_vec()));
+    }
+
+    #[test]
+    fn base64_invalid_length() {
+        assert_eq!(base64_decode("ABC"), None); // not multiple of 4
+    }
+
+    #[test]
+    fn base64_with_whitespace() {
+        assert_eq!(base64_decode("SGVs\nbG8="), Some(b"Hello".to_vec()));
+    }
 }

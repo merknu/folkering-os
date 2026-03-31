@@ -35,6 +35,25 @@ pub fn com3_read_byte() -> Option<u8> {
     })
 }
 
+/// Write a byte to COM3 via raw port I/O (uart_16550 send() is broken for COM3).
+pub fn com3_write_byte(byte: u8) {
+    unsafe {
+        // Wait for TX buffer empty (LSR bit 5)
+        loop {
+            let lsr: u8 = x86_64::instructions::port::Port::<u8>::new(0x3E8 + 5).read();
+            if lsr & 0x20 != 0 { break; }
+        }
+        x86_64::instructions::port::Port::<u8>::new(0x3E8).write(byte);
+    }
+}
+
+/// Write a slice of bytes to COM3 via raw port I/O.
+pub fn com3_write(data: &[u8]) {
+    for &byte in data {
+        com3_write_byte(byte);
+    }
+}
+
 // ── COM2 (Gemini Proxy Channel) ─────────────────────────────────────────
 
 /// Write bytes to COM2 (Gemini proxy channel)
