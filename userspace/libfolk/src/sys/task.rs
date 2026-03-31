@@ -116,7 +116,7 @@ pub fn iqe_tsc_freq() -> u64 {
     unsafe { syscall0(0x92) }
 }
 
-/// Write bytes to COM3 (IQE telemetry export to host).
+/// Write bytes to COM3 via syscall 0x94.
 pub fn com3_write(data: &[u8]) {
     unsafe { syscall2(0x94, data.as_ptr() as u64, data.len() as u64); }
 }

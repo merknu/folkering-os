@@ -997,15 +997,14 @@ extern "C" fn syscall_handler(
         0x92 => crate::drivers::iqe::tsc_ticks_per_us(),
         // COM3 write: export telemetry to host (arg1=buf_ptr, arg2=len)
         0x94 => {
-            let len = (arg2 as usize).min(256);
+            let len = (arg2 as usize).min(64); // cap at 64 bytes for safety
             let ptr = arg1 as *const u8;
             if !ptr.is_null() && arg1 >= 0x200000 && arg1 < 0xFFFF_8000_0000_0000 {
-                // Copy from userspace to kernel stack buffer first
-                let mut kbuf = [0u8; 256];
-                unsafe {
-                    core::ptr::copy_nonoverlapping(ptr, kbuf.as_mut_ptr(), len);
+                // Read bytes one at a time from userspace (safe, no bulk copy)
+                for i in 0..len {
+                    let byte = unsafe { core::ptr::read_volatile(ptr.add(i)) };
+                    crate::drivers::serial::com3_write_byte(byte);
                 }
-                crate::drivers::serial::com3_write(&kbuf[..len]);
             }
             len as u64
         },

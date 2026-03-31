@@ -494,7 +494,14 @@ static FENCE_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomic
 static FENCE_COMPLETE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 pub fn flush_rect(x: u32, y: u32, w: u32, h: u32) {
-    let submit_tsc = crate::drivers::iqe::rdtsc(); // IQE: TSC at flush entry
+    let submit_tsc = crate::drivers::iqe::rdtsc();
+
+    // Debug: count flushes (first 3 only)
+    static FLUSH_N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let fc = FLUSH_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if fc < 3 {
+        crate::drivers::serial::com3_write(b"IQE,FLUSH,1\n");
+    }
 
     let mut guard = GPU_STATE.lock();
     let state = match guard.as_mut() {
