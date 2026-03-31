@@ -779,6 +779,14 @@ fn main() -> ! {
     let mut ram_history_count: usize = 0;
     let mut show_ram_graph: bool = false; // Toggle with G key or click RAM%
 
+    // ===== IQE Latency Tracking =====
+    let mut last_kbd_tsc: u64 = 0;
+    let mut last_mou_tsc: u64 = 0;
+    let mut ewma_kbd_us: u64 = 0;
+    let mut ewma_mou_us: u64 = 0;
+    let tsc_per_us: u64 = libfolk::sys::iqe_tsc_freq();
+    let mut iqe_buf = [0u8; 24 * 32]; // 32 events max per poll
+
     // ===== App Launcher: Android-style folders + app grid =====
     const MAX_CATEGORIES: usize = 6;
     const MAX_APPS_PER_CAT: usize = 20;
@@ -1144,6 +1152,40 @@ fn main() -> ! {
     loop {
         // Track if we did any work this iteration
         let mut did_work = false;
+
+        // ===== IQE: Poll telemetry events =====
+        if tsc_per_us > 0 {
+            let n = libfolk::sys::iqe_read(&mut iqe_buf, 32);
+            for i in 0..n {
+                let base = i * 24;
+                let event_type = iqe_buf[base];
+                let tsc = u64::from_le_bytes([
+                    iqe_buf[base+8], iqe_buf[base+9], iqe_buf[base+10], iqe_buf[base+11],
+                    iqe_buf[base+12], iqe_buf[base+13], iqe_buf[base+14], iqe_buf[base+15],
+                ]);
+                match event_type {
+                    5 => { last_kbd_tsc = tsc; }     // KeyboardIrq
+                    0 => { last_mou_tsc = tsc; }     // MouseIrq
+                    1 => {                             // GpuFlushSubmit
+                        if last_kbd_tsc > 0 && tsc > last_kbd_tsc {
+                            let delta = (tsc - last_kbd_tsc) / tsc_per_us;
+                            if delta < 100_000 { // sanity: <100ms
+                                ewma_kbd_us = ewma_kbd_us - (ewma_kbd_us >> 3) + (delta >> 3);
+                            }
+                            last_kbd_tsc = 0;
+                        }
+                        if last_mou_tsc > 0 && tsc > last_mou_tsc {
+                            let delta = (tsc - last_mou_tsc) / tsc_per_us;
+                            if delta < 100_000 {
+                                ewma_mou_us = ewma_mou_us - (ewma_mou_us >> 3) + (delta >> 3);
+                            }
+                            last_mou_tsc = 0;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
 
         // Consolidated redraw flag — any subsystem can set this
         // WASM apps need continuous redraws for animation (60fps game loop)
@@ -4360,6 +4402,28 @@ fn main() -> ! {
                 let ram_x = fb.width.saturating_sub(ri * 8 + 8);
                 fb.draw_string(ram_x, 2, ram_str, ram_col, fb.color_from_rgb24(0x0a0a0a));
 
+                // IQE latency display: "KBD:XXXus | MOU:XXXus"
+                if ewma_kbd_us > 0 || ewma_mou_us > 0 {
+                    let mut lbuf = [0u8; 32];
+                    let mut li = 0usize;
+                    // KBD
+                    lbuf[li] = b'K'; li += 1; lbuf[li] = b'B'; li += 1;
+                    lbuf[li] = b'D'; li += 1; lbuf[li] = b':'; li += 1;
+                    li += fmt_u64_into(&mut lbuf[li..], ewma_kbd_us);
+                    lbuf[li] = b'u'; li += 1; lbuf[li] = b's'; li += 1;
+                    lbuf[li] = b' '; li += 1;
+                    lbuf[li] = b'|'; li += 1;
+                    lbuf[li] = b' '; li += 1;
+                    // MOU
+                    lbuf[li] = b'M'; li += 1; lbuf[li] = b'O'; li += 1;
+                    lbuf[li] = b'U'; li += 1; lbuf[li] = b':'; li += 1;
+                    li += fmt_u64_into(&mut lbuf[li..], ewma_mou_us);
+                    lbuf[li] = b'u'; li += 1; lbuf[li] = b's'; li += 1;
+                    let lat_str = unsafe { core::str::from_utf8_unchecked(&lbuf[..li]) };
+                    let lat_col = fb.color_from_rgb24(0x88AACC);
+                    fb.draw_string(90, 2, lat_str, lat_col, fb.color_from_rgb24(0x0a0a0a));
+                }
+
                 // RAM history graph (popup when clicked)
                 if show_ram_graph && ram_history_count > 1 {
                     let graph_w: usize = 240;
@@ -5270,4 +5334,15 @@ fn format_hash_name(hash: u32) -> alloc::string::String {
     // Use 6 hex digits to match the 24-bit truncated hash from IPC
     let _ = write!(s, "__hash_{:06x}", hash & 0xFF_FFFF);
     s
+}
+
+/// Format u64 as decimal ASCII into buffer, return number of bytes written.
+fn fmt_u64_into(buf: &mut [u8], mut val: u64) -> usize {
+    if val == 0 && !buf.is_empty() { buf[0] = b'0'; return 1; }
+    let mut tmp = [0u8; 20];
+    let mut i = 0;
+    while val > 0 && i < 20 { tmp[i] = b'0' + (val % 10) as u8; val /= 10; i += 1; }
+    let len = i.min(buf.len());
+    for j in 0..len { buf[j] = tmp[i - 1 - j]; }
+    len
 }

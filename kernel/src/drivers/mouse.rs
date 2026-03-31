@@ -242,6 +242,8 @@ pub fn init_without_pic() {
 
 /// Handle mouse interrupt (called from IDT handler)
 pub fn handle_interrupt() {
+    let irq_tsc = crate::drivers::iqe::rdtsc(); // IQE: capture TSC at IRQ12 entry
+
     // Read byte from mouse
     let byte = unsafe {
         let mut data_port = Port::<u8>::new(PS2_DATA_PORT);
@@ -301,6 +303,9 @@ pub fn handle_interrupt() {
             if !x_overflow && !y_overflow {
                 let event = MouseEvent { buttons, dx, dy };
                 MOUSE_BUFFER.lock().push(event);
+                // IQE: record complete mouse event with ISR entry TSC
+                crate::drivers::iqe::record(
+                    crate::drivers::iqe::IqeEventType::MouseIrq, irq_tsc, 0);
             }
 
             packet.reset();

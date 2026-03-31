@@ -204,11 +204,17 @@ pub fn init_without_pic() {
 
 /// Handle keyboard interrupt (called from IDT handler)
 pub fn handle_interrupt() {
+    let irq_tsc = crate::drivers::iqe::rdtsc(); // IQE: capture TSC at IRQ1 entry
+
     // Always read scancode from port 0x60 to clear the keyboard controller
     let scancode = unsafe {
         let mut data_port = Port::<u8>::new(KEYBOARD_DATA_PORT);
         data_port.read()
     };
+
+    // IQE: record keyboard event (all scancodes, userspace filters key-ups)
+    crate::drivers::iqe::record(
+        crate::drivers::iqe::IqeEventType::KeyboardIrq, irq_tsc, scancode as u64);
 
     // Send EOI to Local APIC (IOAPIC routes to Local APIC)
     crate::arch::x86_64::apic::send_eoi();

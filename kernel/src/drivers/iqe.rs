@@ -7,7 +7,76 @@
 //! Producer: ISR/kernel code (mouse IRQ, GPU flush, fence complete)
 //! Consumer: userspace via SYS_IQE_READ syscall (0x91)
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+// ── TSC (Time Stamp Counter) ────────────────────────────────────────────────
+
+/// TSC ticks per microsecond, calibrated at boot via PIT Channel 2.
+static TSC_TICKS_PER_US: AtomicU64 = AtomicU64::new(0);
+
+/// Read TSC — CPU-cycle precision, ~0.5ns per tick.
+#[inline(always)]
+pub fn rdtsc() -> u64 {
+    let lo: u32;
+    let hi: u32;
+    unsafe {
+        core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack));
+    }
+    ((hi as u64) << 32) | (lo as u64)
+}
+
+/// Get calibrated TSC ticks per microsecond (0 if not yet calibrated).
+pub fn tsc_ticks_per_us() -> u64 {
+    TSC_TICKS_PER_US.load(Ordering::Relaxed)
+}
+
+/// Calibrate TSC frequency using PIT Channel 2 (hardware polling, no interrupts).
+///
+/// PIT Channel 2 is used because it can be polled via port 0x61 bit 5,
+/// requiring NO interrupt delivery — bypassing the WHPX "Timer Death Bug"
+/// where APIC timer stops after one tick.
+pub fn calibrate_tsc() {
+    const PIT_FREQ: u64 = 1_193_182;
+    const DELAY_MS: u64 = 10;
+    const PIT_COUNT: u16 = ((PIT_FREQ * DELAY_MS) / 1000) as u16;
+
+    unsafe {
+        // Disable interrupts during calibration
+        core::arch::asm!("cli");
+
+        // Configure PIT Channel 2: mode 0 (one-shot), lobyte/hibyte
+        x86_64::instructions::port::Port::<u8>::new(0x43).write(0b10110000);
+        x86_64::instructions::port::Port::<u8>::new(0x42).write((PIT_COUNT & 0xFF) as u8);
+        x86_64::instructions::port::Port::<u8>::new(0x42).write((PIT_COUNT >> 8) as u8);
+
+        // Start PIT Channel 2: set GATE high (bit 0 of port 0x61)
+        let port61_val = x86_64::instructions::port::Port::<u8>::new(0x61).read();
+        x86_64::instructions::port::Port::<u8>::new(0x61).write((port61_val & 0xFC) | 0x01);
+
+        let tsc_start = rdtsc();
+
+        // Poll PIT Channel 2 output (bit 5 of port 0x61 goes high when done)
+        loop {
+            let status = x86_64::instructions::port::Port::<u8>::new(0x61).read();
+            if status & 0x20 != 0 { break; }
+        }
+
+        let tsc_end = rdtsc();
+
+        // Restore port 0x61
+        x86_64::instructions::port::Port::<u8>::new(0x61).write(port61_val);
+
+        // Re-enable interrupts
+        core::arch::asm!("sti");
+
+        let ticks_per_us = (tsc_end - tsc_start) / (DELAY_MS * 1000);
+        TSC_TICKS_PER_US.store(ticks_per_us, Ordering::Relaxed);
+    }
+
+    crate::serial_str!("[IQE] TSC calibrated: ");
+    crate::drivers::serial::write_dec(TSC_TICKS_PER_US.load(Ordering::Relaxed) as u32);
+    crate::serial_strln!(" ticks/us");
+}
 
 /// IQE event types — what happened
 #[repr(u8)]

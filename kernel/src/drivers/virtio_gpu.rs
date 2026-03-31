@@ -505,6 +505,8 @@ static FENCE_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomic
 static FENCE_COMPLETE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 pub fn flush_rect(x: u32, y: u32, w: u32, h: u32) {
+    let submit_tsc = crate::drivers::iqe::rdtsc(); // IQE: TSC at flush entry
+
     let mut guard = GPU_STATE.lock();
     let state = match guard.as_mut() {
         Some(s) if s.active => s,
@@ -585,6 +587,13 @@ pub fn flush_rect(x: u32, y: u32, w: u32, h: u32) {
 
                     // Ring doorbell (async — don't wait)
                     state.transport.notify_queue(0);
+
+                    // IQE: record GPU flush submit
+                    crate::drivers::iqe::record(
+                        crate::drivers::iqe::IqeEventType::GpuFlushSubmit,
+                        submit_tsc,
+                        FENCE_COUNTER.load(core::sync::atomic::Ordering::Relaxed) - 1,
+                    );
                 } else { q.free_desc(d2); q.free_desc(d1); q.free_desc(d0); }
             } else { q.free_desc(d1); q.free_desc(d0); }
         } else { q.free_desc(d0); }

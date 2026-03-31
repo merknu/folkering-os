@@ -992,6 +992,9 @@ extern "C" fn syscall_handler(
                 None => u64::MAX,
             }
         },
+        // IQE: Interaction Quality Engine telemetry
+        0x91 => crate::drivers::iqe::read_to_user(arg1 as usize, arg2 as usize) as u64,
+        0x92 => crate::drivers::iqe::tsc_ticks_per_us(),
         _ => {
             crate::drivers::serial::write_str("[HANDLER] Invalid syscall!\n");
             u64::MAX // Return error
