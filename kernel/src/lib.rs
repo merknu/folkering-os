@@ -173,6 +173,9 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
         // Calibrate TSC via PIT Channel 2 (hardware polling, no interrupts needed)
         drivers::iqe::calibrate_tsc();
 
+        // COM3 boot marker for IQE test suite
+        drivers::serial::com3_write(b"IQE,BOOT,0\n");
+
         // Initialize ACPI (for future use)
         arch::x86_64::acpi_init(boot_info.rsdp_addr);
 

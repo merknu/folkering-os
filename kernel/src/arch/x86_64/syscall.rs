@@ -999,9 +999,13 @@ extern "C" fn syscall_handler(
         0x94 => {
             let len = (arg2 as usize).min(256);
             let ptr = arg1 as *const u8;
-            if !ptr.is_null() && arg1 >= 0x200000 {
-                let data = unsafe { core::slice::from_raw_parts(ptr, len) };
-                crate::drivers::serial::com3_write(data);
+            if !ptr.is_null() && arg1 >= 0x200000 && arg1 < 0xFFFF_8000_0000_0000 {
+                // Copy from userspace to kernel stack buffer first
+                let mut kbuf = [0u8; 256];
+                unsafe {
+                    core::ptr::copy_nonoverlapping(ptr, kbuf.as_mut_ptr(), len);
+                }
+                crate::drivers::serial::com3_write(&kbuf[..len]);
             }
             len as u64
         },

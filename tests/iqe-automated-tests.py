@@ -436,13 +436,25 @@ def main():
     global _qmp
 
     # Check connectivity
+    # CRITICAL: COM3 must connect FIRST (before guest sends boot marker)
     print("\n[SETUP] Connecting to QEMU services...")
+
+    try:
+        com3 = COM3Listener()
+        print(f"  COM3: Connected (TCP:{COM3_PORT}) [connected early to catch boot data]")
+    except Exception as e:
+        print(f"  COM3: FAILED -- {e}")
+        sys.exit(1)
+
+    # Wait for QMP and VNC to become available (QEMU needs a moment)
+    time.sleep(2)
 
     try:
         _qmp = QMPSession()
         print(f"  QMP: Connected (TCP:{QMP_PORT})")
     except Exception as e:
         print(f"  QMP: FAILED -- {e}")
+        com3.close()
         sys.exit(1)
 
     try:
@@ -450,25 +462,18 @@ def main():
         print(f"  VNC: Connected ({vnc.width}x{vnc.height}, '{vnc.name}')")
     except Exception as e:
         print(f"  VNC: FAILED -- {e}")
-        print("  Make sure QEMU is running with -vnc 0.0.0.0:0")
         _qmp.close()
+        com3.close()
         sys.exit(1)
 
-    try:
-        com3 = COM3Listener()
-        print(f"  COM3: Connected (TCP:{COM3_PORT})")
-    except Exception as e:
-        print(f"  COM3: FAILED — {e}")
-        print("  Make sure QEMU has -serial tcp:127.0.0.1:4568,server,nowait")
-        vnc.close()
-        sys.exit(1)
-
-    # Wait for OS to boot
-    print("\n[SETUP] Waiting 3s for Folkering OS to boot...")
-    time.sleep(3)
-
-    # No warmup — boot already triggers initial GPU flush.
-    # COM3 is fresh, no stale events.
+    # Wait for OS to boot (COM3 listener is already running, catching boot data)
+    print("\n[SETUP] Waiting for boot (COM3 catching IQE,BOOT marker)...")
+    boot_event = com3.wait_for_event("BOOT", timeout=15)
+    if boot_event:
+        print(f"  Boot marker received! OS is alive.")
+    else:
+        print(f"  No boot marker — waiting 5s extra...")
+        time.sleep(5)
 
     # Run tests
     results = {}

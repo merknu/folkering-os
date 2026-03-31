@@ -201,20 +201,9 @@ impl MmioTransport {
         unsafe { core::ptr::read_volatile((self.common_base + off) as *const u64) }
     }
     fn notify_queue(&self, _queue_idx: u16) {
-        // Modern VirtIO: notify address = notify_base + Q_NOFF * notify_off_multiplier
         let off = self.notify_off as usize * self.notify_mul as usize;
         let addr = self.notify_base + off;
-        // Log BEFORE write in case MMIO write triggers page fault
-        crate::serial_str!("[VIRTIO_GPU] notify_write @ ");
-        crate::drivers::serial::write_hex(addr as u64);
-        crate::serial_str!(" (base=");
-        crate::drivers::serial::write_hex(self.notify_base as u64);
-        crate::serial_str!(" off=");
-        crate::drivers::serial::write_dec(off as u32);
-        crate::serial_str!(")\n");
-        // Modern VirtIO: notify register is le32 (NOT le16 like Legacy!)
         unsafe { core::ptr::write_volatile(addr as *mut u32, 0) }
-        crate::serial_str!("[VIRTIO_GPU] notify_write done\n");
     }
 }
 
