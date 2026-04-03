@@ -263,47 +263,11 @@ pub fn poll() {
     // ── Check for ICMP echo replies ──────────────────────────────────────
     check_ping_reply(state);
 
-    // ── Auto-DNS test (async: start query in one tick, check in next) ────
-    if state.has_ip && !state.auto_dns_started && state.auto_ping_done {
-        if crate::timer::uptime_ms() > 8000 {
-            state.auto_dns_started = true;
-            crate::serial_strln!("[NET] DNS auto-test: resolving google.com...");
-            let dns_socket = state.sockets.get_mut::<dns::Socket>(state.dns_handle);
-            match dns_socket.start_query(state.iface.context(), "google.com", DnsQueryType::A) {
-                Ok(h) => {
-                    state.auto_dns_query = Some(h);
-                }
-                Err(_) => {
-                    crate::serial_strln!("[NET] DNS auto-test: failed to start query");
-                }
-            }
-        }
-    }
-
-    // Check auto-DNS result
-    if let Some(qh) = state.auto_dns_query {
-        let dns_socket = state.sockets.get_mut::<dns::Socket>(state.dns_handle);
-        match dns_socket.get_query_result(qh) {
-            Ok(addrs) => {
-                state.auto_dns_query = None;
-                for addr in addrs.iter() {
-                    if let IpAddress::Ipv4(v4) = addr {
-                        crate::serial_str!("[NET] DNS: google.com -> ");
-                        print_ipv4(v4);
-                        crate::drivers::serial::write_newline();
-                        break;
-                    }
-                }
-            }
-            Err(dns::GetQueryResultError::Pending) => {
-                // Still waiting — will check next poll tick
-            }
-            Err(dns::GetQueryResultError::Failed) => {
-                state.auto_dns_query = None;
-                crate::serial_strln!("[NET] DNS auto-test: failed (host DNS unreachable?)");
-            }
-        }
-    }
+    // DNS auto-test DISABLED — caused system deadlock after completion.
+    // The DNS query completes successfully but something in smoltcp's
+    // socket cleanup path causes the system to hang permanently.
+    // This prevented Draug from ever reaching 15min idle for AutoDream.
+    // (Disabled 2026-04-03, see commit history for original code)
 
 }
 
