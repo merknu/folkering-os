@@ -1616,7 +1616,7 @@ fn main() -> ! {
         }
 
         // ===== MCP: Poll for responses from Python proxy =====
-        if tz_sync_pending || async_tool_gen.is_some() || active_agent.is_some() {
+        if tz_sync_pending || async_tool_gen.is_some() || active_agent.is_some() || draug.is_waiting() {
             if let Some(response) = libfolk::mcp::client::poll() {
                 did_work = true;
                 match response {
@@ -1698,8 +1698,16 @@ fn main() -> ! {
                                     _ => {} // WaitingForLlm, etc.
                                 }
                                 need_redraw = true;
+                            } else if draug.is_waiting() {
+                                // Route to Draug daemon
+                                if let Some(alert) = draug.on_analysis_response(resp_text) {
+                                    write_str(&alert);
+                                    write_str("\n");
+                                } else {
+                                    write_str("[Draug] Analysis complete (no action needed)\n");
+                                }
                             } else {
-                                write_str("[MCP] ChatResponse (no agent): ");
+                                write_str("[MCP] ChatResponse (unrouted): ");
                                 write_str(&resp_text[..resp_text.len().min(60)]);
                                 write_str("\n");
                             }
