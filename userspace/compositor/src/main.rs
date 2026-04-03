@@ -1523,21 +1523,44 @@ fn main() -> ! {
             }
         }
 
-        // ===== AutoDream: Self-improving software during deep idle =====
+        // ===== AutoDream: Two-Hemisphere Self-Improving Software =====
         let dream_ms = if tsc_per_us > 0 { rdtsc() / tsc_per_us / 1000 } else { 0 };
         if draug.should_dream(dream_ms) && active_agent.is_none() && async_tool_gen.is_none() {
-            // Collect cache keys
             let keys: alloc::vec::Vec<&str> = wasm_cache.keys().map(|k| k.as_str()).collect();
-            if let Some(target) = draug.start_dream(&keys) {
-                write_str("[AutoDream] Entering dream mode for: ");
+            if let Some((target, mode)) = draug.start_dream(&keys) {
+                let mode_str = match mode {
+                    compositor::draug::DreamMode::Refactor => "Refactor",
+                    compositor::draug::DreamMode::Creative => "Creative",
+                };
+                write_str("[AutoDream] Mode: ");
+                write_str(mode_str);
+                write_str(" | Target: ");
                 write_str(&target[..target.len().min(40)]);
                 write_str("\n");
-                // Send the cached source to LLM for optimization via MCP WasmGenRequest
-                // The proxy will check cache, find the source, ask LLM to improve it
-                let dream_desc = alloc::format!("--tweak \"optimize for fewer CPU cycles\" {}", target);
-                if libfolk::mcp::client::send_wasm_gen(&dream_desc) {
-                    async_tool_gen = Some((0, target)); // 0 = no window, internal dream
-                    write_str("[AutoDream] Optimization request sent\n");
+
+                let tweak = match mode {
+                    compositor::draug::DreamMode::Refactor =>
+                        alloc::format!("--tweak \"refactor for fewer CPU cycles, no new features\" {}", target),
+                    compositor::draug::DreamMode::Creative => {
+                        // For Creative mode: run the app headless to get render summary
+                        let render_desc = if let Some(cached_wasm) = wasm_cache.get(&target) {
+                            let cfg = compositor::wasm_runtime::WasmConfig {
+                                screen_width: fb.width as u32,
+                                screen_height: fb.height as u32,
+                                uptime_ms: 0,
+                            };
+                            let (_, output) = compositor::wasm_runtime::execute_wasm(cached_wasm, cfg);
+                            compositor::wasm_runtime::render_summary(&output)
+                        } else {
+                            alloc::string::String::from("(no cached binary)")
+                        };
+                        alloc::format!("--tweak \"add one visual improvement. Current output: {}\" {}", render_desc, target)
+                    }
+                };
+
+                if libfolk::mcp::client::send_wasm_gen(&tweak) {
+                    async_tool_gen = Some((0, target));
+                    write_str("[AutoDream] Request sent\n");
                 }
             }
         }
@@ -1545,7 +1568,7 @@ fn main() -> ! {
         // Wake Draug from dream if user interacts
         if did_work && draug.is_dreaming() {
             draug.wake_up();
-            write_str("[AutoDream] User activity — dream interrupted\n");
+            write_str("[AutoDream] User woke up — dream cancelled\n");
         }
 
         // ===== MCP: Poll for responses from Python proxy =====
@@ -1672,55 +1695,59 @@ fn main() -> ! {
                         };
                         last_wasm_bytes = Some(wasm_bytes.clone());
 
-                        // AutoDream: if Draug is dreaming, benchmark V1 vs V2
+                        // AutoDream: two-hemisphere evaluation
                         if draug.is_dreaming() && !tool_prompt.is_empty() {
-                            // Strip --tweak prefix to get original cache key
-                            let orig_key = if tool_prompt.contains("optimize") {
-                                tool_prompt.rsplit(' ').next().unwrap_or(&tool_prompt)
-                            } else { &tool_prompt };
+                            let orig_key = tool_prompt.rsplit(' ').next().unwrap_or(&tool_prompt);
+                            let dream_mode = draug.current_dream_mode();
+                            let mut nb = [0u8; 16];
 
-                            if let Some(v1_wasm) = wasm_cache.get(orig_key) {
-                                let bench_config = compositor::wasm_runtime::WasmConfig {
-                                    screen_width: fb.width as u32,
-                                    screen_height: fb.height as u32,
-                                    uptime_ms: 0,
-                                };
-                                // Benchmark V1
-                                let t1_start = rdtsc();
-                                for _ in 0..10 {
-                                    let _ = compositor::wasm_runtime::execute_wasm(v1_wasm, bench_config.clone());
+                            match dream_mode {
+                                compositor::draug::DreamMode::Refactor => {
+                                    // Hemisphere 1: Benchmark V1 vs V2
+                                    if let Some(v1_wasm) = wasm_cache.get(orig_key) {
+                                        let bench_config = compositor::wasm_runtime::WasmConfig {
+                                            screen_width: fb.width as u32, screen_height: fb.height as u32, uptime_ms: 0,
+                                        };
+                                        let t1 = rdtsc();
+                                        for _ in 0..10 { let _ = compositor::wasm_runtime::execute_wasm(v1_wasm, bench_config.clone()); }
+                                        let v1_us = (rdtsc() - t1) / tsc_per_us / 10;
+                                        let t2 = rdtsc();
+                                        for _ in 0..10 { let _ = compositor::wasm_runtime::execute_wasm(&wasm_bytes, bench_config.clone()); }
+                                        let v2_us = (rdtsc() - t2) / tsc_per_us / 10;
+
+                                        write_str("[AutoDream/Refactor] V1:");
+                                        write_str(format_usize(v1_us as usize, &mut nb));
+                                        write_str("us V2:");
+                                        write_str(format_usize(v2_us as usize, &mut nb));
+                                        write_str("us");
+
+                                        if v2_us < v1_us {
+                                            let pct = ((v1_us - v2_us) * 100 / v1_us.max(1)) as usize;
+                                            write_str(" -> evolved! (");
+                                            write_str(format_usize(pct, &mut nb));
+                                            write_str("% faster)\n");
+                                            wasm_cache.insert(alloc::string::String::from(orig_key), wasm_bytes.clone());
+                                            draug.reset_strikes(orig_key);
+                                        } else {
+                                            write_str(" -> strike (V2 not faster)\n");
+                                            draug.add_strike(orig_key);
+                                            if draug.is_perfected(orig_key) {
+                                                write_str("[AutoDream] App perfected — no more refactoring\n");
+                                            }
+                                        }
+                                    }
                                 }
-                                let v1_cycles = (rdtsc() - t1_start) / 10;
-
-                                // Benchmark V2
-                                let t2_start = rdtsc();
-                                for _ in 0..10 {
-                                    let _ = compositor::wasm_runtime::execute_wasm(&wasm_bytes, bench_config.clone());
-                                }
-                                let v2_cycles = (rdtsc() - t2_start) / 10;
-
-                                let mut nb = [0u8; 16];
-                                write_str("[AutoDream] V1: ");
-                                write_str(format_usize((v1_cycles / tsc_per_us) as usize, &mut nb));
-                                write_str("us  V2: ");
-                                write_str(format_usize((v2_cycles / tsc_per_us) as usize, &mut nb));
-                                write_str("us");
-
-                                if v2_cycles < v1_cycles {
-                                    let pct = ((v1_cycles - v2_cycles) * 100 / v1_cycles.max(1)) as usize;
-                                    write_str(" -> V2 wins! (");
-                                    write_str(format_usize(pct, &mut nb));
-                                    write_str("% faster)\n");
-                                    // Replace cache with improved version
+                                compositor::draug::DreamMode::Creative => {
+                                    // Hemisphere 2: Accept if it compiles (V2 has new features)
+                                    write_str("[AutoDream/Creative] New version compiled (");
+                                    write_str(format_usize(wasm_bytes.len(), &mut nb));
+                                    write_str(" bytes) — accepting as candidate\n");
                                     wasm_cache.insert(alloc::string::String::from(orig_key), wasm_bytes.clone());
-                                    write_str("[AutoDream] Cache evolved!\n");
-                                } else {
-                                    write_str(" -> V1 kept (V2 not faster)\n");
                                 }
                             }
 
-                            let dream_ms = if tsc_per_us > 0 { rdtsc() / tsc_per_us / 1000 } else { 0 };
-                            draug.on_dream_complete(dream_ms);
+                            let done_ms = if tsc_per_us > 0 { rdtsc() / tsc_per_us / 1000 } else { 0 };
+                            draug.on_dream_complete(done_ms);
                         }
                         // Normal cache storage (non-dream)
                         else if !tool_prompt.is_empty() {

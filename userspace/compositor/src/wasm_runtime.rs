@@ -100,6 +100,39 @@ pub struct WasmOutput {
     pub asset_requests: Vec<PendingAssetRequest>,
 }
 
+/// Generate a text description of what a WASM app renders.
+/// Used by AutoDream Creative mode — sent to LLM instead of raw pixels.
+pub fn render_summary(output: &WasmOutput) -> String {
+    let mut s = String::new();
+    if let Some(color) = output.fill_screen {
+        s.push_str(&alloc::format!("Background: #{:06X}\n", color));
+    }
+    if !output.draw_commands.is_empty() {
+        s.push_str(&alloc::format!("{} rectangles:\n", output.draw_commands.len()));
+        for (i, cmd) in output.draw_commands.iter().take(5).enumerate() {
+            s.push_str(&alloc::format!("  [{}] {}x{} at ({},{}) color=#{:06X}\n", i, cmd.w, cmd.h, cmd.x, cmd.y, cmd.color));
+        }
+        if output.draw_commands.len() > 5 { s.push_str("  ...\n"); }
+    }
+    if !output.circle_commands.is_empty() {
+        s.push_str(&alloc::format!("{} circles:\n", output.circle_commands.len()));
+        for (i, cmd) in output.circle_commands.iter().take(3).enumerate() {
+            s.push_str(&alloc::format!("  [{}] r={} at ({},{}) color=#{:06X}\n", i, cmd.r, cmd.cx, cmd.cy, cmd.color));
+        }
+    }
+    if !output.line_commands.is_empty() {
+        s.push_str(&alloc::format!("{} lines\n", output.line_commands.len()));
+    }
+    if !output.text_commands.is_empty() {
+        s.push_str(&alloc::format!("{} text labels:\n", output.text_commands.len()));
+        for cmd in output.text_commands.iter().take(3) {
+            s.push_str(&alloc::format!("  \"{}\" at ({},{}) color=#{:06X}\n", &cmd.text[..cmd.text.len().min(30)], cmd.x, cmd.y, cmd.color));
+        }
+    }
+    if s.is_empty() { s.push_str("(empty output)"); }
+    s
+}
+
 // ── Internal State ───────────────────────────────────────────────────────
 
 /// State shared between host functions and the WASM module

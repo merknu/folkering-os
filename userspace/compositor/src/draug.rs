@@ -44,6 +44,18 @@ pub const DREAM_COOLDOWN_MS: u64 = 600_000;
 /// AutoDream: max dreams per session
 pub const DREAM_MAX_PER_SESSION: u32 = 5;
 
+/// AutoDream: max refactoring failures before marking as "perfected"
+pub const DREAM_STRIKE_LIMIT: u8 = 3;
+
+/// Dream modes
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DreamMode {
+    /// Mode 1: CPU cycle reduction — headless benchmark V1 vs V2
+    Refactor,
+    /// Mode 2: Creative GUI vision — LLM sees render output + suggests features
+    Creative,
+}
+
 /// System observation snapshot
 pub struct Observation {
     pub timestamp_ms: u64,
@@ -96,7 +108,12 @@ pub struct DraugDaemon {
     dream_count: u32,
     last_dream_ms: u64,
     dreaming: bool,
-    dream_target: Option<alloc::string::String>, // cache key of app being optimized
+    dream_target: Option<alloc::string::String>,
+    dream_mode: DreamMode,
+
+    /// Strike tracker: cache_key_hash → failure count
+    /// Apps with 3 strikes are "perfected" and skipped
+    strikes: [Option<(u32, u8)>; 8], // (key_hash, strike_count)
 }
 
 /// Compact observation summary for the log
@@ -125,6 +142,8 @@ impl DraugDaemon {
             last_dream_ms: 0,
             dreaming: false,
             dream_target: None,
+            dream_mode: DreamMode::Refactor,
+            strikes: [const { None }; 8],
         }
     }
 
@@ -294,10 +313,14 @@ impl DraugDaemon {
         self.log_count
     }
 
-    // ═══════ AutoDream: Self-Improving Software ═══════════════════════
+    // ═══════ AutoDream: Two-Hemisphere Self-Improving Software ════════
+    //
+    // Mode 1 (Refactor): CPU cycle reduction — headless benchmark V1 vs V2
+    // Mode 2 (Creative): GUI vision — LLM sees render output + adds features
+    //
+    // Three Strikes Rule: after 3 failed refactor attempts, app is "perfected"
 
     /// Check if the system should enter dream mode.
-    /// Requires: 15 min idle, not already dreaming, cooldown passed, quota remaining.
     pub fn should_dream(&self, now_ms: u64) -> bool {
         self.active
             && !self.dreaming
@@ -307,36 +330,109 @@ impl DraugDaemon {
             && now_ms.saturating_sub(self.last_dream_ms) > DREAM_COOLDOWN_MS
     }
 
-    /// Pick a cached WASM app to optimize and build the dream prompt.
-    /// Returns the cache key of the target, or None if nothing to dream about.
-    pub fn start_dream(&mut self, cache_keys: &[&str]) -> Option<String> {
+    /// Simple hash for strike tracking
+    fn key_hash(key: &str) -> u32 {
+        let mut h: u32 = 5381;
+        for b in key.bytes() { h = h.wrapping_mul(33).wrapping_add(b as u32); }
+        h
+    }
+
+    /// Check if an app has been "perfected" (3 failed refactors)
+    pub fn is_perfected(&self, key: &str) -> bool {
+        let h = Self::key_hash(key);
+        self.strikes.iter().any(|s| matches!(s, Some((k, c)) if *k == h && *c >= DREAM_STRIKE_LIMIT))
+    }
+
+    /// Record a refactoring failure (strike)
+    pub fn add_strike(&mut self, key: &str) {
+        let h = Self::key_hash(key);
+        // Find existing entry or empty slot
+        for slot in &mut self.strikes {
+            if let Some((k, c)) = slot {
+                if *k == h { *c += 1; return; }
+            }
+        }
+        // Insert new
+        for slot in &mut self.strikes {
+            if slot.is_none() { *slot = Some((h, 1)); return; }
+        }
+    }
+
+    /// Reset strikes for an app (e.g., after user tweaks it)
+    pub fn reset_strikes(&mut self, key: &str) {
+        let h = Self::key_hash(key);
+        for slot in &mut self.strikes {
+            if let Some((k, _)) = slot {
+                if *k == h { *slot = None; return; }
+            }
+        }
+    }
+
+    /// Pick a cached WASM app and choose dream mode.
+    /// Skips "perfected" apps for Refactor mode.
+    /// Alternates between Refactor and Creative.
+    pub fn start_dream(&mut self, cache_keys: &[&str]) -> Option<(String, DreamMode)> {
         if cache_keys.is_empty() { return None; }
 
-        // Pick one: round-robin based on dream_count
-        let idx = (self.dream_count as usize) % cache_keys.len();
-        let target = String::from(cache_keys[idx]);
-        self.dream_target = Some(target.clone());
-        self.dreaming = true;
-        Some(target)
+        // Alternate modes: even = Refactor, odd = Creative
+        let mode = if self.dream_count % 2 == 0 { DreamMode::Refactor } else { DreamMode::Creative };
+
+        // Find a suitable target
+        for i in 0..cache_keys.len() {
+            let idx = ((self.dream_count as usize) + i) % cache_keys.len();
+            let key = cache_keys[idx];
+            // Skip perfected apps for Refactor mode
+            if mode == DreamMode::Refactor && self.is_perfected(key) {
+                continue;
+            }
+            let target = String::from(key);
+            self.dream_target = Some(target.clone());
+            self.dream_mode = mode;
+            self.dreaming = true;
+            return Some((target, mode));
+        }
+
+        // All apps perfected for Refactor? Try Creative instead
+        if mode == DreamMode::Refactor && !cache_keys.is_empty() {
+            let idx = (self.dream_count as usize) % cache_keys.len();
+            let target = String::from(cache_keys[idx]);
+            self.dream_target = Some(target.clone());
+            self.dream_mode = DreamMode::Creative;
+            self.dreaming = true;
+            return Some((target, DreamMode::Creative));
+        }
+        None
     }
 
-    /// Build the dream optimization prompt for a cached source file.
-    pub fn build_dream_prompt(&self, source_code: &str, app_name: &str) -> String {
-        format!(
-            "You are Draug, the self-improving daemon of Folkering OS.\n\
-             The system is idle and you are dreaming — optimizing existing programs.\n\n\
-             Here is a WASM app called '{}':\n\
-             ```rust\n{}\n```\n\n\
-             Improve this code. Focus on:\n\
-             - Fewer CPU cycles (remove unnecessary calculations)\n\
-             - Better visual quality (smoother animations, nicer colors)\n\
-             - Smaller binary size (remove dead code)\n\n\
-             Return ONLY the improved Rust code. No explanation.",
-            app_name, source_code
-        )
+    /// Build the dream prompt based on current mode.
+    pub fn build_dream_prompt(&self, source_code: &str, app_name: &str, render_summary: &str) -> String {
+        match self.dream_mode {
+            DreamMode::Refactor => format!(
+                "You are Draug, optimizing WASM apps for Folkering OS.\n\
+                 The system is idle. Refactor this app for FEWER CPU CYCLES.\n\n\
+                 App: '{}'\n```rust\n{}\n```\n\n\
+                 Rules:\n\
+                 - Remove unnecessary calculations\n\
+                 - Use simpler math where possible\n\
+                 - Do NOT add new features\n\
+                 - Return ONLY the improved Rust code",
+                app_name, source_code
+            ),
+            DreamMode::Creative => format!(
+                "You are Draug, the creative daemon of Folkering OS.\n\
+                 The system is idle. Improve the VISUAL QUALITY of this app.\n\n\
+                 App: '{}'\n```rust\n{}\n```\n\n\
+                 Current render output:\n{}\n\n\
+                 Rules:\n\
+                 - Add ONE meaningful visual improvement (better colors, animation, layout)\n\
+                 - Keep the core functionality the same\n\
+                 - Return ONLY the improved Rust code",
+                app_name, source_code, render_summary
+            ),
+        }
     }
 
-    /// Record that a dream cycle completed.
+    /// Record dream completion.
     pub fn on_dream_complete(&mut self, now_ms: u64) {
         self.dreaming = false;
         self.dream_count += 1;
@@ -352,20 +448,10 @@ impl DraugDaemon {
         }
     }
 
-    /// Get current dream target.
-    pub fn dream_target(&self) -> Option<&str> {
-        self.dream_target.as_deref()
-    }
-
-    /// Is Draug currently dreaming?
-    pub fn is_dreaming(&self) -> bool {
-        self.dreaming
-    }
-
-    /// How many dreams this session?
-    pub fn dream_count(&self) -> u32 {
-        self.dream_count
-    }
+    pub fn dream_target(&self) -> Option<&str> { self.dream_target.as_deref() }
+    pub fn is_dreaming(&self) -> bool { self.dreaming }
+    pub fn dream_count(&self) -> u32 { self.dream_count }
+    pub fn current_dream_mode(&self) -> DreamMode { self.dream_mode }
 }
 
 /// Extract a string value from JSON — delegates to shared libfolk::json parser.
