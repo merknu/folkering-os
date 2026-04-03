@@ -183,6 +183,42 @@ pub fn gpu_info(virt_addr: usize) -> Option<(u32, u32)> {
     }
 }
 
+/// Halt CPU until next interrupt (HLT). Wakes instantly on mouse/keyboard/timer IRQ.
+/// Under WHPX, this causes a VM-exit so the hypervisor can inject pending interrupts.
+/// Much better than spin_loop() which prevents interrupt delivery.
+pub fn wait_for_irq() {
+    unsafe { syscall0(0x99); }
+}
+
+/// Raw COM2 TX write — does NOT reset async RX state.
+/// Used for ACK/NACK frames during active async sessions.
+pub fn com2_write_raw(data: &[u8]) {
+    unsafe { syscall2(0x9A, data.as_ptr() as u64, data.len() as u64); }
+}
+
+/// Async COM2: send request bytes (non-blocking). Starts async session.
+pub fn com2_async_send(data: &[u8]) {
+    unsafe { syscall2(0x96, data.as_ptr() as u64, data.len() as u64); }
+}
+
+/// Async COM2: poll for COBS frame (0x00 sentinel). Returns Some(len) if complete, None if waiting.
+pub fn com2_async_poll() -> Option<usize> {
+    let ret = unsafe { syscall1(0x97, 0) }; // 0 = COBS sentinel mode
+    if ret == 0 { None } else { Some(ret as usize) }
+}
+
+/// Async COM2: poll for legacy @@END@@ delimiter. Returns Some(len) if complete, None if waiting.
+pub fn com2_async_poll_legacy() -> Option<usize> {
+    let ret = unsafe { syscall1(0x97, 1) }; // 1 = legacy mode
+    if ret == 0 { None } else { Some(ret as usize) }
+}
+
+/// Async COM2: read completed response into buffer. Returns bytes copied.
+pub fn com2_async_read(buf: &mut [u8]) -> usize {
+    let ret = unsafe { syscall2(0x98, buf.as_mut_ptr() as u64, buf.len() as u64) };
+    if ret == u64::MAX { 0 } else { ret as usize }
+}
+
 /// Read a byte from COM3 God Mode Pipe (non-blocking).
 pub fn com3_read() -> Option<u8> {
     let ret = unsafe { syscall0(SYS_COM3_READ) };

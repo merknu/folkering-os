@@ -1016,6 +1016,73 @@ extern "C" fn syscall_handler(
             }
             0
         },
+        // Async COM2: send + activate RX polling. len=0 activates polling without sending.
+        0x96 => {
+            let len = (arg2 as usize).min(8192);
+            if len == 0 {
+                // Activate RX polling only (no TX)
+                crate::drivers::serial::com2_async_send(&[]);
+                0
+            } else {
+                let ptr = arg1 as *const u8;
+                if !ptr.is_null() && arg1 >= 0x200000 && arg1 < 0xFFFF_8000_0000_0000 {
+                    let data = unsafe { core::slice::from_raw_parts(ptr, len) };
+                    crate::drivers::serial::com2_async_send(data);
+                    0
+                } else {
+                    u64::MAX
+                }
+            }
+        },
+        // Async COM2: poll for RX bytes + check for 0x00 COBS sentinel
+        // arg1: 0 = COBS sentinel (0x00), 1 = legacy @@END@@ delimiter
+        // Returns: 0 = still waiting, >0 = frame length before delimiter
+        0x97 => {
+            crate::drivers::serial::com2_async_poll();
+            let use_legacy = arg1 == 1;
+            let result = if use_legacy {
+                crate::drivers::serial::com2_async_check_legacy()
+            } else {
+                crate::drivers::serial::com2_async_check_sentinel()
+            };
+            match result {
+                Some(len) => len as u64,
+                None => 0,
+            }
+        },
+        // Async COM2: read response into userspace buffer, arg1=buf_ptr, arg2=max_len
+        // Returns bytes copied
+        0x98 => {
+            let max_len = arg2 as usize;
+            let ptr = arg1 as *mut u8;
+            if !ptr.is_null() && arg1 >= 0x200000 && arg1 < 0xFFFF_8000_0000_0000 && max_len > 0 {
+                let buf = unsafe { core::slice::from_raw_parts_mut(ptr, max_len.min(131072)) };
+                crate::drivers::serial::com2_async_read(buf, max_len) as u64
+            } else {
+                u64::MAX
+            }
+        },
+        // Wait for interrupt (HLT). Enables interrupts, halts CPU, wakes on ANY IRQ.
+        // This is the correct idle primitive under WHPX: causes VM-exit so hypervisor
+        // can inject pending interrupts (mouse, keyboard, timer).
+        0x99 => {
+            unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)); }
+            0
+        },
+        // COM2 raw TX write (does NOT reset async RX state).
+        // Used for MCP frames (send without disrupting RX polling).
+        // arg1=buf_ptr, arg2=len (max 8KB)
+        0x9A => {
+            let len = (arg2 as usize).min(8192);
+            let ptr = arg1 as *const u8;
+            if !ptr.is_null() && arg1 >= 0x200000 && arg1 < 0xFFFF_8000_0000_0000 && len > 0 {
+                let data = unsafe { core::slice::from_raw_parts(ptr, len) };
+                crate::drivers::serial::com2_write(data);
+                len as u64
+            } else {
+                u64::MAX
+            }
+        },
         // COM3 write: export telemetry to host (arg1=buf_ptr, arg2=len)
         0x94 => {
             let len = (arg2 as usize).min(64); // cap at 64 bytes for safety

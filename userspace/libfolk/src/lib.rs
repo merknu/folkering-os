@@ -41,6 +41,7 @@ pub mod syscall;
 pub mod fmt;
 pub mod sys;
 pub mod ui;
+pub mod mcp;
 
 // Re-export print macros at crate root
 pub use fmt::_print;

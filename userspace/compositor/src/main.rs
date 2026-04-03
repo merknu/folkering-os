@@ -731,23 +731,49 @@ fn main() -> ! {
     const GPU_FB_VADDR: usize = 0x0000_0002_0000_0000; // 8GB mark for GPU FB
     let mut use_gpu = false;
 
-    if let Some((gpu_w, gpu_h)) = libfolk::sys::gpu_info(GPU_FB_VADDR) {
+    let mut gpu_w_saved: u32 = 0;
+    let mut gpu_h_saved: u32 = 0;
+    if let Some((gw, gh)) = libfolk::sys::gpu_info(GPU_FB_VADDR) {
+        gpu_w_saved = gw;
+        gpu_h_saved = gh;
         write_str("[COMPOSITOR] VirtIO-GPU: ");
-        if gpu_w >= 1000 { write_char(b'0' + ((gpu_w / 1000) % 10) as u8); }
-        if gpu_w >= 100 { write_char(b'0' + ((gpu_w / 100) % 10) as u8); }
-        write_char(b'0' + ((gpu_w / 10) % 10) as u8);
-        write_char(b'0' + (gpu_w % 10) as u8);
+        if gw >= 1000 { write_char(b'0' + ((gw / 1000) % 10) as u8); }
+        if gw >= 100 { write_char(b'0' + ((gw / 100) % 10) as u8); }
+        write_char(b'0' + ((gw / 10) % 10) as u8);
+        write_char(b'0' + (gw % 10) as u8);
         write_str("x");
-        if gpu_h >= 100 { write_char(b'0' + ((gpu_h / 100) % 10) as u8); }
-        write_char(b'0' + ((gpu_h / 10) % 10) as u8);
-        write_char(b'0' + (gpu_h % 10) as u8);
+        if gh >= 100 { write_char(b'0' + ((gh / 100) % 10) as u8); }
+        write_char(b'0' + ((gh / 10) % 10) as u8);
+        write_char(b'0' + (gh % 10) as u8);
         write_str(" mapped at GPU_FB_VADDR\n");
         use_gpu = true;
     }
 
-    // Use Limine framebuffer for rendering (always visible via VNC).
-    let mut fb = unsafe {
-        FramebufferView::new(FRAMEBUFFER_VADDR as *mut u8, fb_config)
+    // Use VirtIO-GPU framebuffer when available — gpu_flush() sends THIS memory
+    // to the display via TRANSFER_TO_HOST_2D + RESOURCE_FLUSH (instant update).
+    // Falling back to Limine VGA FB means VNC only polls VGA memory every ~3s.
+    let mut fb = if use_gpu && gpu_w_saved > 0 {
+        let gpu_config = libfolk::sys::boot_info::FramebufferConfig {
+            physical_address: 0,
+            width: gpu_w_saved,
+            height: gpu_h_saved,
+            pitch: gpu_w_saved * 4,  // 32bpp, tightly packed
+            bpp: 32,
+            memory_model: 1, // RGB
+            red_mask_size: fb_config.red_mask_size,
+            red_mask_shift: fb_config.red_mask_shift,
+            green_mask_size: fb_config.green_mask_size,
+            green_mask_shift: fb_config.green_mask_shift,
+            blue_mask_size: fb_config.blue_mask_size,
+            blue_mask_shift: fb_config.blue_mask_shift,
+            _reserved: [0; 3],
+        };
+        write_str("[COMPOSITOR] Rendering to VirtIO-GPU FB (instant flush)\n");
+        unsafe { FramebufferView::new(GPU_FB_VADDR as *mut u8, &gpu_config) }
+    } else {
+        write_str("[COMPOSITOR] No VirtIO-GPU, using Limine FB\n");
+        use_gpu = false;
+        unsafe { FramebufferView::new(FRAMEBUFFER_VADDR as *mut u8, fb_config) }
     };
 
     // Initialize damage tracker for dirty rectangle optimization
@@ -760,10 +786,12 @@ fn main() -> ! {
     let mut com3_len = 0usize;
     let mut com3_inject: Option<alloc::string::String> = None;
 
-    // WASM JIT Toolsmithing — deferred tool generation (2-frame pattern)
-    // Frame 1: show "[AI] Generating tool...", mark damage_full → renders + flushes
-    // Frame 2: make second ask_gemini call, decode WASM, execute, render results
-    let mut deferred_tool_gen: Option<(u32, alloc::string::String)> = None; // (win_id, prompt)
+    // WASM JIT Toolsmithing — async generation (non-blocking)
+    // Phase 1: "gemini generate X" → send [GENERATE_TOOL] via async COM2
+    // Phase 2: poll COM2 each frame until response arrives
+    // Phase 3: decode WASM, execute, render results
+    let mut deferred_tool_gen: Option<(u32, alloc::string::String)> = None; // (win_id, prompt) — Frame 1 only
+    let mut async_tool_gen: Option<(u32, alloc::string::String)> = None; // (win_id, prompt) — active async session
 
     // Phase 2: Persistent interactive WASM app (game loop)
     let mut active_wasm_app: Option<compositor::wasm_runtime::PersistentWasmApp> = None;
@@ -1008,7 +1036,18 @@ fn main() -> ! {
 
     write_str("[COMPOSITOR] Omnibar ready\n");
 
-    write_str("[COMPOSITOR] Entering main loop...\n");
+    // Initialize MCP session with random session_id
+    libfolk::mcp::client::init_session();
+    write_str("[COMPOSITOR] MCP session: 0x");
+    {
+        let sid = libfolk::mcp::client::session_id();
+        let hex_chars = b"0123456789abcdef";
+        for i in (0..8).rev() {
+            write_char(hex_chars[((sid >> (i * 4)) & 0xF) as usize]);
+        }
+    }
+    write_str("\n");
+    write_str("[COMPOSITOR] Entering main loop v3 (Layer4 transport)...\n");
 
     // ===== BOOT-TIME TEST WINDOW =====
     // Diagnose compositing pipeline: if this window appears, compositing works.
@@ -1022,6 +1061,11 @@ fn main() -> ! {
         }
         // Draw immediately (before first event)
         wm.composite(&mut fb);
+        fb.present_full(); // Copy shadow→FB for initial display
+        // Flush to VirtIO-GPU so VNC shows the initial frame immediately
+        if use_gpu {
+            libfolk::sys::gpu_flush(0, 0, fb.width as u32, fb.height as u32);
+        }
         write_str("[WM] Boot test window drawn\n");
         // Pixel probe: verify compositor actually painted non-black pixels
         let probe = fb.get_pixel(300, 155); // center of test window
@@ -1030,6 +1074,8 @@ fn main() -> ! {
         } else {
             write_str("[FB_PROBE] FAIL: pixel at (300,155) is black - compositing broken\n");
         }
+        // Close boot test window — it served its diagnostic purpose
+        wm.close_window(test_id);
     }
 
     // ===== M12: Restore saved app states from previous session =====
@@ -1157,10 +1203,32 @@ fn main() -> ! {
     let mut last_clock_second: u8 = 255; // Force first draw
     let mut tz_offset_minutes: i32 = 0; // UTC offset from host time sync
     let mut tz_synced = false;
+    let mut tz_sync_pending = false; // MCP TimeSyncRequest sent, waiting for response
+    let mut active_agent: Option<compositor::agent::AgentSession> = None; // ReAct agentic loop
+    let mut draug = compositor::draug::DraugDaemon::new(); // Background AI daemon
+
+    // Timing instrumentation — find the freeze
+    #[inline(always)]
+    fn rdtsc() -> u64 {
+        let lo: u32; let hi: u32;
+        unsafe { core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack)); }
+        ((hi as u64) << 32) | lo as u64
+    }
+    let tsc_per_us = libfolk::sys::iqe_tsc_freq().max(1);
+    let mut timing_samples: u32 = 0;
+    let mut heartbeat_tsc: u64 = 0;
+    let mut heartbeat_count: u32 = 0;
 
     loop {
         // Track if we did any work this iteration
         let mut did_work = false;
+        let t_loop_start: u64 = rdtsc();
+
+        // One-shot: confirm loop is alive
+        if heartbeat_count == 0 {
+            heartbeat_count = 1;
+            write_str("[LOOP ALIVE]\n");
+        }
 
         // ===== IQE: Poll telemetry events =====
         if tsc_per_us > 0 {
@@ -1247,13 +1315,13 @@ fn main() -> ! {
         // WASM apps need continuous redraws for animation (60fps game loop)
         let mut need_redraw = active_wasm_app.as_ref().map_or(false, |a| a.active);
 
-        // Clock tick: redraw once per second for system tray + RAM sampling
+        // Clock tick: targeted status bar redraw (NO full desktop redraw!)
+        // Renders only the 20px status bar directly to shadow buffer.
+        // This costs ~50µs instead of 150ms+ for a full desktop redraw.
         let current_second = (libfolk::sys::get_rtc_packed() & 0x3F) as u8;
         if current_second != last_clock_second {
             last_clock_second = current_second;
-            need_redraw = true;
-            // Only damage system tray area (top bar, ~30px high)
-            damage.add_damage(compositor::damage::Rect::new(0, 0, fb.width as u32, 30));
+            did_work = true;
 
             // Sample RAM usage for history graph
             let (_, _, mem_pct) = libfolk::sys::memory_stats();
@@ -1261,204 +1329,339 @@ fn main() -> ! {
             ram_history_idx = (ram_history_idx + 1) % RAM_HISTORY_LEN;
             if ram_history_count < RAM_HISTORY_LEN { ram_history_count += 1; }
 
-            // Lazy timezone sync: try once when clock first ticks (proxy should be ready)
-            if !tz_synced {
-                const TIME_BUF_VADDR: usize = 0x50080000;
-                const TIME_BUF_SIZE: usize = 4096;
-                if libfolk::sys::mmap_at(TIME_BUF_VADDR, TIME_BUF_SIZE, 3).is_ok() {
-                    let time_buf = unsafe {
-                        core::slice::from_raw_parts_mut(TIME_BUF_VADDR as *mut u8, TIME_BUF_SIZE)
-                    };
-                    let resp_len = libfolk::sys::ask_gemini("[TIME_SYNC]", time_buf);
-                    if resp_len > 0 {
-                        if let Ok(text) = core::str::from_utf8(&time_buf[..resp_len]) {
-                            if let Some(pos) = text.find("utc_offset_minutes") {
-                                let rest = &text[pos..];
-                                if let Some(colon) = rest.find(':') {
-                                    let num_start = &rest[colon + 1..].trim_start();
-                                    let mut val: i32 = 0;
-                                    let mut neg = false;
-                                    let mut started = false;
-                                    for c in num_start.chars() {
-                                        if c == '-' && !started { neg = true; continue; }
-                                        if c.is_ascii_digit() {
-                                            val = val * 10 + (c as i32 - '0' as i32);
-                                            started = true;
-                                        } else if started { break; }
-                                    }
-                                    if neg { val = -val; }
-                                    tz_offset_minutes = val;
-                                    tz_synced = true;
-                                    write_str("[COMPOSITOR] Time sync: UTC+");
-                                    let mut nbuf = [0u8; 16];
-                                    write_str(format_usize((val / 60) as usize, &mut nbuf));
-                                    write_str("\n");
-                                }
-                            }
-                        }
+            // === TARGETED STATUS BAR RENDER (inline, no need_redraw) ===
+            // Only overwrite text positions — NO fill_rect for the entire bar.
+            // fill_rect(1280×20) takes 125ms under WHPX due to per-pixel emulation.
+            {
+                let bar_bg = fb.color_from_rgb24(0x0a0a0a);
+
+                // Clock (center) — clear only the clock text area (8chars × 8px = 64px wide, 16px tall)
+                let time_x = (fb.width.saturating_sub(8 * 8)) / 2;
+                fb.fill_rect(time_x, 0, 68, 18, bar_bg);
+                // Date (left) — clear only date area
+                fb.fill_rect(4, 0, 84, 18, bar_bg);
+                // RAM (right) — clear only RAM area
+                let ram_clear_x = fb.width.saturating_sub(70);
+                fb.fill_rect(ram_clear_x, 0, 70, 18, bar_bg);
+
+                let dt = libfolk::sys::get_rtc();
+                let mut total_minutes = dt.hour as i32 * 60 + dt.minute as i32 + tz_offset_minutes;
+                let mut day = dt.day as i32;
+                let mut month = dt.month;
+                let mut year = dt.year;
+                if total_minutes >= 24 * 60 {
+                    total_minutes -= 24 * 60; day += 1;
+                    let dim = match month { 2 => 28, 4|6|9|11 => 30, _ => 31 };
+                    if day > dim { day = 1; month += 1; if month > 12 { month = 1; year += 1; } }
+                } else if total_minutes < 0 {
+                    total_minutes += 24 * 60; day -= 1;
+                    if day < 1 { month -= 1; if month < 1 { month = 12; year -= 1; } day = 28; }
+                }
+                let lh = (total_minutes / 60) as u8;
+                let lm = (total_minutes % 60) as u8;
+                let ls = dt.second;
+                let mut t = [0u8; 8];
+                t[0] = b'0' + lh / 10; t[1] = b'0' + lh % 10;
+                t[2] = b':';
+                t[3] = b'0' + lm / 10; t[4] = b'0' + lm % 10;
+                t[5] = b':';
+                t[6] = b'0' + ls / 10; t[7] = b'0' + ls % 10;
+                let time_str = unsafe { core::str::from_utf8_unchecked(&t) };
+                let time_x = (fb.width.saturating_sub(8 * 8)) / 2;
+                fb.draw_string(time_x, 2, time_str, white, bar_bg);
+
+                // Date (left)
+                let mut d = [0u8; 10];
+                d[0] = b'0' + ((year/1000)%10) as u8; d[1] = b'0' + ((year/100)%10) as u8;
+                d[2] = b'0' + ((year/10)%10) as u8; d[3] = b'0' + (year%10) as u8;
+                d[4] = b'-'; d[5] = b'0' + month/10; d[6] = b'0' + month%10;
+                d[7] = b'-'; d[8] = b'0' + day as u8/10; d[9] = b'0' + day as u8%10;
+                let date_str = unsafe { core::str::from_utf8_unchecked(&d) };
+                fb.draw_string(8, 2, date_str, gray, bar_bg);
+
+                // RAM% (right)
+                let mut rbuf = [0u8; 8];
+                let mut ri = 0usize;
+                rbuf[ri] = b'R'; ri += 1; rbuf[ri] = b'A'; ri += 1; rbuf[ri] = b'M'; ri += 1; rbuf[ri] = b' '; ri += 1;
+                if mem_pct >= 100 { rbuf[ri] = b'1'; ri += 1; rbuf[ri] = b'0'; ri += 1; rbuf[ri] = b'0'; ri += 1; }
+                else { if mem_pct >= 10 { rbuf[ri] = b'0' + (mem_pct / 10) as u8; ri += 1; }
+                    rbuf[ri] = b'0' + (mem_pct % 10) as u8; ri += 1; }
+                rbuf[ri] = b'%'; ri += 1;
+                let ram_str = unsafe { core::str::from_utf8_unchecked(&rbuf[..ri]) };
+                let ram_col = if mem_pct > 80 { fb.color_from_rgb24(0xFF4444) }
+                    else if mem_pct > 50 { fb.color_from_rgb24(0xFFAA00) }
+                    else { fb.color_from_rgb24(0x44FF44) };
+                let ram_x = fb.width.saturating_sub(ri * 8 + 8);
+                fb.draw_string(ram_x, 2, ram_str, ram_col, bar_bg);
+
+                // IQE latency (between date and clock)
+                if ewma_kbd_us > 0 || ewma_mou_us > 0 {
+                    let mut lbuf = [0u8; 48];
+                    let mut li = 0usize;
+                    lbuf[li]=b'K'; li+=1; lbuf[li]=b':'; li+=1;
+                    li += fmt_u64_into(&mut lbuf[li..], ewma_kbd_us);
+                    if ewma_kbd_wake > 0 {
+                        lbuf[li]=b'('; li+=1;
+                        li += fmt_u64_into(&mut lbuf[li..], ewma_kbd_wake);
+                        lbuf[li]=b'+'; li+=1;
+                        li += fmt_u64_into(&mut lbuf[li..], ewma_kbd_rend);
+                        lbuf[li]=b')'; li+=1;
                     }
-                    let _ = libfolk::sys::munmap(TIME_BUF_VADDR as *mut u8, TIME_BUF_SIZE);
+                    if li < 44 { lbuf[li]=b' '; li+=1; lbuf[li]=b'M'; li+=1; lbuf[li]=b':'; li+=1;
+                        li += fmt_u64_into(&mut lbuf[li..], ewma_mou_us);
+                    }
+                    let s = unsafe { core::str::from_utf8_unchecked(&lbuf[..li.min(48)]) };
+                    fb.draw_string(90, 2, s, fb.color_from_rgb24(0x88AACC), bar_bg);
+
+                    let worst = ewma_kbd_us.max(ewma_mou_us);
+                    let dot = if worst < 5000 { 0x44FF44 } else if worst < 16000 { 0xFFAA00 } else { 0xFF4444 };
+                    fb.fill_rect(ram_x.saturating_sub(14), 5, 8, 8, fb.color_from_rgb24(dot));
+                }
+
+                // Damage only the text areas (3 small rects instead of full width)
+                damage.add_damage(compositor::damage::Rect::new(4, 0, 84, 20));         // date
+                damage.add_damage(compositor::damage::Rect::new(time_x as u32, 0, 68, 20)); // clock
+                damage.add_damage(compositor::damage::Rect::new(ram_clear_x as u32, 0, 70, 20)); // RAM
+            }
+
+            // Lazy timezone sync via MCP: send TimeSyncRequest, poll for TimeSync response
+            if !tz_synced && !tz_sync_pending {
+                if libfolk::mcp::client::send_time_sync() {
+                    tz_sync_pending = true;
+                    write_str("[MCP] TimeSyncRequest sent\n");
                 }
             }
         }
 
-        // ===== WASM JIT TOOLSMITHING — Deferred tool generation (Frame 2) =====
-        // Previous frame rendered "[AI] Generating tool..." and flushed to GPU.
-        // Now make the second ask_gemini call with [GENERATE_TOOL] prefix.
+        // ===== WASM JIT TOOLSMITHING — MCP-based async generation =====
+        // Frame 1: deferred_tool_gen set → send McpResponse::WasmGenRequest via COBS
+        // Frame N: MCP poll returns McpRequest::WasmBinary → execute directly (no base64!)
         if let Some((tool_win_id, tool_prompt)) = deferred_tool_gen.take() {
             did_work = true;
-            write_str("[COMPOSITOR] WASM tool generation starting...\n");
-
-            let tool_request = alloc::format!("[GENERATE_TOOL] {}", tool_prompt);
-            // 128KB via mmap (bump allocator is only 64KB, never frees)
-            const WASM_BUF_VADDR: usize = 0x50020000; // Must be >= 0x40000000 (MMAP_BASE)
-            const WASM_BUF_SIZE: usize = 131072;
-            let wasm_resp_len = if libfolk::sys::mmap_at(WASM_BUF_VADDR, WASM_BUF_SIZE, 3).is_ok() {
-                let wasm_buf = unsafe {
-                    core::slice::from_raw_parts_mut(WASM_BUF_VADDR as *mut u8, WASM_BUF_SIZE)
-                };
-                libfolk::sys::ask_gemini(&tool_request, wasm_buf)
-            } else { 0 };
-            let wasm_buf = unsafe {
-                core::slice::from_raw_parts(WASM_BUF_VADDR as *const u8, WASM_BUF_SIZE)
-            };
-
-            if wasm_resp_len > 0 {
-                if let Ok(text) = core::str::from_utf8(&wasm_buf[..wasm_resp_len]) {
-                    use compositor::intent::AgentIntent;
-                    let wasm_intent = compositor::intent::parse_intent(text);
-
-                    match wasm_intent {
-                        AgentIntent::ToolReady { binary_base64 } => {
-                            write_str("[COMPOSITOR] ToolReady received, decoding base64...\n");
-                            if let Some(wasm_bytes) = compositor::intent::base64_decode(&binary_base64) {
-                                let mut nbuf = [0u8; 16];
-                                let nstr = format_usize(wasm_bytes.len(), &mut nbuf);
-                                write_str("[COMPOSITOR] WASM decoded: ");
-                                write_str(nstr);
-                                write_str(" bytes, executing...\n");
-
-                                // Cache WASM bytes for "save app" command
-                                last_wasm_bytes = Some(wasm_bytes.clone());
-
-                                let config = compositor::wasm_runtime::WasmConfig {
-                                    screen_width: fb.width as u32,
-                                    screen_height: fb.height as u32,
-                                    uptime_ms: libfolk::sys::uptime() as u32,
-                                };
-
-                                // Detect interactive app (game/app/mouse keywords)
-                                let interactive = {
-                                    let p = tool_prompt.as_bytes();
-                                    find_ci(p, b"interactive") || find_ci(p, b"game")
-                                        || find_ci(p, b"app") || find_ci(p, b"click")
-                                        || find_ci(p, b"mouse") || find_ci(p, b"tetris")
-                                        || find_ci(p, b"follow") || find_ci(p, b"cursor")
-                                };
-
-                                last_wasm_interactive = interactive;
-
-                                if interactive {
-                                    // Launch as persistent app (game loop)
-                                    match compositor::wasm_runtime::PersistentWasmApp::new(&wasm_bytes, config) {
-                                        Ok(app) => {
-                                            write_str("[COMPOSITOR] Launched interactive WASM app!\n");
-                                            if let Some(win) = wm.get_window_mut(tool_win_id) {
-                                                win.push_line("[AI] Interactive app launched! Press ESC to exit.");
-                                            }
-                                            active_wasm_app = Some(app);
-                                        }
-                                        Err(e) => {
-                                            if let Some(win) = wm.get_window_mut(tool_win_id) {
-                                                win.push_line(&alloc::format!("[AI] App load error: {}", &e[..e.len().min(80)]));
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    // One-shot tool execution
-                                    let (result, output) =
-                                        compositor::wasm_runtime::execute_wasm(&wasm_bytes, config);
-
-                                    let total_cmds = output.draw_commands.len()
-                                        + output.line_commands.len()
-                                        + output.circle_commands.len()
-                                        + output.text_commands.len()
-                                        + if output.fill_screen.is_some() { 1 } else { 0 };
-                                    if let Some(win) = wm.get_window_mut(tool_win_id) {
-                                        match &result {
-                                            compositor::wasm_runtime::WasmResult::Ok => {
-                                                win.push_line(&alloc::format!("[AI] Tool executed: {} commands", total_cmds));
-                                            }
-                                            compositor::wasm_runtime::WasmResult::OutOfFuel => {
-                                                win.push_line("[AI] Tool halted: fuel exhausted");
-                                            }
-                                            compositor::wasm_runtime::WasmResult::Trap(msg) => {
-                                                win.push_line(&alloc::format!("[AI] Trap: {}", &msg[..msg.len().min(80)]));
-                                            }
-                                            compositor::wasm_runtime::WasmResult::LoadError(msg) => {
-                                                win.push_line(&alloc::format!("[AI] Load: {}", &msg[..msg.len().min(80)]));
-                                            }
-                                        }
-                                    }
-
-                                    // Render one-shot output
-                                    if let Some(color) = output.fill_screen {
-                                        fb.clear(fb.color_from_rgb24(color));
-                                    }
-                                    for cmd in &output.draw_commands {
-                                        fb.fill_rect(cmd.x as usize, cmd.y as usize, cmd.w as usize, cmd.h as usize, fb.color_from_rgb24(cmd.color));
-                                    }
-                                    for cmd in &output.line_commands {
-                                        let c = fb.color_from_rgb24(cmd.color);
-                                        compositor::graphics::draw_line(&mut fb, cmd.x1, cmd.y1, cmd.x2, cmd.y2, c);
-                                    }
-                                    for cmd in &output.circle_commands {
-                                        let c = fb.color_from_rgb24(cmd.color);
-                                        compositor::graphics::draw_circle(&mut fb, cmd.cx, cmd.cy, cmd.r, c);
-                                    }
-                                    for cmd in &output.text_commands {
-                                        fb.draw_string(cmd.x as usize, cmd.y as usize, &cmd.text, fb.color_from_rgb24(cmd.color), fb.color_from_rgb24(0));
-                                    }
-
-                                    if total_cmds > 0 { damage.damage_full(); }
-                                }
-                            } else {
-                                if let Some(win) = wm.get_window_mut(tool_win_id) {
-                                    win.push_line("[AI] Error: invalid base64 in WASM response");
-                                }
-                            }
-                        }
-                        AgentIntent::TextResponse { text: resp } => {
-                            // Proxy sent error as plain text (compile failure etc.)
-                            if let Some(win) = wm.get_window_mut(tool_win_id) {
-                                win.push_line("[AI Tool Error]:");
-                                for line in resp.split('\n') {
-                                    if !line.is_empty() {
-                                        win.push_line(&line[..line.len().min(100)]);
-                                    }
-                                }
-                            }
-                        }
-                        _ => {
-                            if let Some(win) = wm.get_window_mut(tool_win_id) {
-                                win.push_line("[AI] Unexpected response from tool pipeline");
-                            }
-                        }
-                    }
-                } else {
-                    if let Some(win) = wm.get_window_mut(tool_win_id) {
-                        win.push_line("[AI] Tool response not valid UTF-8");
-                    }
-                }
+            if libfolk::mcp::client::send_wasm_gen(&tool_prompt) {
+                async_tool_gen = Some((tool_win_id, tool_prompt));
+                write_str("[MCP] WasmGenRequest sent\n");
             } else {
                 if let Some(win) = wm.get_window_mut(tool_win_id) {
-                    win.push_line("[AI] Error: no response from tool pipeline (timeout?)");
+                    win.push_line("[AI] Error: failed to send WASM gen request");
                 }
             }
-            // Free mmap'd buffer
-            let _ = libfolk::sys::munmap(WASM_BUF_VADDR as *mut u8, WASM_BUF_SIZE);
-            need_redraw = true;
-            damage.damage_full();
+        }
+
+        // ===== Agent timeout check =====
+        if let Some(agent) = &mut active_agent {
+            if agent.check_timeout(libfolk::sys::uptime()) {
+                if let Some(win) = wm.get_window_mut(agent.window_id) {
+                    win.push_line("[Agent] Timeout: LLM did not respond in 120s");
+                }
+                active_agent = None;
+                need_redraw = true;
+            }
+        }
+
+        // ===== Draug: Background AI daemon tick =====
+        {
+            let now_ms = libfolk::sys::uptime();
+            if did_work {
+                draug.on_user_input(now_ms);
+            }
+            if draug.should_tick(now_ms) {
+                draug.tick(now_ms);
+            }
+            if draug.should_analyze(now_ms) && active_agent.is_none() {
+                if draug.start_analysis() {
+                    write_str("[Draug] Analysis started\n");
+                }
+            }
+        }
+
+        // ===== MCP: Poll for responses from Python proxy =====
+        if tz_sync_pending || async_tool_gen.is_some() || active_agent.is_some() {
+            if let Some(response) = libfolk::mcp::client::poll() {
+                did_work = true;
+                match response {
+                    libfolk::mcp::types::McpRequest::TimeSync {
+                        year: _, month: _, day: _,
+                        hour: _, minute: _, second: _,
+                        utc_offset_minutes,
+                    } => {
+                        tz_offset_minutes = utc_offset_minutes as i32;
+                        tz_synced = true;
+                        tz_sync_pending = false;
+                        write_str("[MCP] TimeSync: UTC+");
+                        let mut nbuf = [0u8; 16];
+                        write_str(format_usize((utc_offset_minutes / 60) as usize, &mut nbuf));
+                        write_str("\n");
+                    }
+                    libfolk::mcp::types::McpRequest::ChatResponse { text } => {
+                        if let Ok(resp_text) = core::str::from_utf8(&text) {
+                            // Route to active agent if present
+                            if let Some(agent) = &mut active_agent {
+                                write_str("[Agent] LLM responded\n");
+                                agent.on_llm_response(resp_text);
+
+                                // Process agent state
+                                match &agent.state {
+                                    compositor::agent::AgentState::ExecutingTool { tool_name, tool_args } => {
+                                        let tname = tool_name.clone();
+                                        let targs = tool_args.clone();
+                                        if let Some(win) = wm.get_window_mut(agent.window_id) {
+                                            win.push_line(&alloc::format!("[Agent] Tool: {} {}", &tname, &targs[..targs.len().min(40)]));
+                                        }
+
+                                        // Check for WASM gen (special case — async)
+                                        if tname == "generate_wasm" {
+                                            deferred_tool_gen = Some((agent.window_id, alloc::string::String::from(targs.as_str())));
+                                            // Agent stays active, WASM result will be handled separately
+                                        } else {
+                                            // Execute tool synchronously
+                                            let result = compositor::agent::execute_tool(&tname, &targs);
+                                            if let Some(win) = wm.get_window_mut(agent.window_id) {
+                                                let preview = &result[..result.len().min(80)];
+                                                win.push_line(&alloc::format!("[Tool] {}", preview));
+                                            }
+                                            // Feed result back to LLM
+                                            agent.on_tool_result(&result);
+                                            if let Some(win) = wm.get_window_mut(agent.window_id) {
+                                                win.push_line("[Agent] Thinking...");
+                                            }
+                                        }
+                                    }
+                                    compositor::agent::AgentState::Done { answer } => {
+                                        if let Some(win) = wm.get_window_mut(agent.window_id) {
+                                            win.push_line("[Agent] Done:");
+                                            for line in answer.split('\n') {
+                                                if !line.is_empty() {
+                                                    win.push_line(&line[..line.len().min(100)]);
+                                                }
+                                            }
+                                        }
+                                        active_agent = None;
+                                    }
+                                    compositor::agent::AgentState::Failed { reason } => {
+                                        if let Some(win) = wm.get_window_mut(agent.window_id) {
+                                            win.push_line(&alloc::format!("[Agent] Failed: {}", &reason[..reason.len().min(80)]));
+                                        }
+                                        active_agent = None;
+                                    }
+                                    _ => {} // WaitingForLlm, etc.
+                                }
+                                need_redraw = true;
+                            } else {
+                                write_str("[MCP] ChatResponse (no agent): ");
+                                write_str(&resp_text[..resp_text.len().min(60)]);
+                                write_str("\n");
+                            }
+                        }
+                    }
+                    libfolk::mcp::types::McpRequest::WasmChunk { total_chunks, chunk_index, data } => {
+                        let mut nbuf = [0u8; 16];
+                        // client::poll() handles reassembly. The last chunk triggers this match.
+                        // Get assembled WASM data from client
+                        let assembled = if libfolk::mcp::client::wasm_assembly_complete() {
+                            let d = libfolk::mcp::client::wasm_assembly_data();
+                            write_str("[MCP] WASM assembled: ");
+                            write_str(format_usize(d.len(), &mut nbuf));
+                            write_str(" bytes (");
+                            write_str(format_usize(total_chunks as usize, &mut nbuf));
+                            write_str(" chunks)\n");
+                            Some(alloc::vec::Vec::from(d))
+                        } else {
+                            // Single chunk (total=1) — use data directly
+                            write_str("[MCP] WASM single chunk: ");
+                            write_str(format_usize(data.len(), &mut nbuf));
+                            write_str(" bytes\n");
+                            Some(alloc::vec::Vec::from(data.as_slice()))
+                        };
+                        libfolk::mcp::client::wasm_assembly_reset();
+
+                        let wasm_bytes = match assembled {
+                            Some(v) => v,
+                            None => { continue; } // shouldn't happen
+                        };
+
+                        // Extract tool context if this was from async_tool_gen
+                        let (tool_win_id, tool_prompt) = if let Some(ctx) = async_tool_gen.take() {
+                            ctx
+                        } else {
+                            (0u32, alloc::string::String::new())
+                        };
+                        last_wasm_bytes = Some(wasm_bytes.clone());
+
+                        let config = compositor::wasm_runtime::WasmConfig {
+                            screen_width: fb.width as u32,
+                            screen_height: fb.height as u32,
+                            uptime_ms: libfolk::sys::uptime() as u32,
+                        };
+
+                        let interactive = {
+                            let p = tool_prompt.as_bytes();
+                            find_ci(p, b"interactive") || find_ci(p, b"game")
+                                || find_ci(p, b"app") || find_ci(p, b"click")
+                                || find_ci(p, b"mouse") || find_ci(p, b"tetris")
+                                || find_ci(p, b"follow") || find_ci(p, b"cursor")
+                        };
+                        last_wasm_interactive = interactive;
+
+                        if interactive {
+                            match compositor::wasm_runtime::PersistentWasmApp::new(&wasm_bytes, config) {
+                                Ok(app) => {
+                                    write_str("[MCP] Interactive WASM app launched!\n");
+                                    if let Some(win) = wm.get_window_mut(tool_win_id) {
+                                        win.push_line("[AI] Interactive app launched! Press ESC to exit.");
+                                    }
+                                    active_wasm_app = Some(app);
+                                }
+                                Err(e) => {
+                                    if let Some(win) = wm.get_window_mut(tool_win_id) {
+                                        win.push_line(&alloc::format!("[AI] App error: {}", &e[..e.len().min(80)]));
+                                    }
+                                }
+                            }
+                        } else {
+                            let (result, output) = compositor::wasm_runtime::execute_wasm(&wasm_bytes, config);
+                            let total_cmds = output.draw_commands.len()
+                                + output.line_commands.len()
+                                + output.circle_commands.len()
+                                + output.text_commands.len()
+                                + if output.fill_screen.is_some() { 1 } else { 0 };
+                            if let Some(win) = wm.get_window_mut(tool_win_id) {
+                                match &result {
+                                    compositor::wasm_runtime::WasmResult::Ok =>
+                                        win.push_line(&alloc::format!("[AI] Tool: {} cmds", total_cmds)),
+                                    compositor::wasm_runtime::WasmResult::OutOfFuel =>
+                                        win.push_line("[AI] Halted: fuel exhausted"),
+                                    compositor::wasm_runtime::WasmResult::Trap(msg) =>
+                                        win.push_line(&alloc::format!("[AI] Trap: {}", &msg[..msg.len().min(80)])),
+                                    compositor::wasm_runtime::WasmResult::LoadError(msg) =>
+                                        win.push_line(&alloc::format!("[AI] Load: {}", &msg[..msg.len().min(80)])),
+                                }
+                            }
+                            if let Some(color) = output.fill_screen { fb.clear(fb.color_from_rgb24(color)); }
+                            for cmd in &output.draw_commands {
+                                fb.fill_rect(cmd.x as usize, cmd.y as usize, cmd.w as usize, cmd.h as usize, fb.color_from_rgb24(cmd.color));
+                            }
+                            for cmd in &output.line_commands {
+                                let c = fb.color_from_rgb24(cmd.color);
+                                compositor::graphics::draw_line(&mut fb, cmd.x1, cmd.y1, cmd.x2, cmd.y2, c);
+                            }
+                            for cmd in &output.circle_commands {
+                                let c = fb.color_from_rgb24(cmd.color);
+                                compositor::graphics::draw_circle(&mut fb, cmd.cx, cmd.cy, cmd.r, c);
+                            }
+                            for cmd in &output.text_commands {
+                                fb.draw_string(cmd.x as usize, cmd.y as usize, &cmd.text, fb.color_from_rgb24(cmd.color), fb.color_from_rgb24(0));
+                            }
+                            if total_cmds > 0 { damage.damage_full(); }
+                        }
+                        need_redraw = true;
+                        damage.damage_full();
+                    }
+                    _ => {
+                        write_str("[MCP] Unhandled response\n");
+                    }
+                }
+            }
         }
 
         // ===== GOD MODE PIPE (COM3) — Poll for injected commands =====
@@ -1501,6 +1704,10 @@ fn main() -> ! {
 
         while let Some(event) = read_mouse() {
             did_work = true;
+            if !had_mouse_events {
+                // Log first mouse event per batch to serial
+                write_str("[M]\n");
+            }
             had_mouse_events = true;
             accumulated_dx += event.dx as i32;
             accumulated_dy -= event.dy as i32; // Invert Y (mouse up = negative dy in PS/2)
@@ -1529,7 +1736,13 @@ fn main() -> ! {
                     }
                     vi += 1;
                 }
-                if hover_folder != old_hover { need_redraw = true; }
+                // Hover change: just damage the folder area, don't full-redraw
+                if hover_folder != old_hover {
+                    // Damage old and new folder rectangles
+                    // (folders render will happen in next full redraw; for now just mark cursor_bg_dirty)
+                    cursor_bg_dirty = true;
+                    did_work = true;
+                }
             }
 
             // Route mouse events to active WASM app (Phase 2)
@@ -1831,19 +2044,34 @@ fn main() -> ! {
                     old_cx.max(0) as u32, old_cy.max(0) as u32, CURSOR_W as u32 + 2, CURSOR_H as u32 + 2));
                 damage.add_damage(compositor::damage::Rect::new(
                     cursor_x.max(0) as u32, cursor_y.max(0) as u32, CURSOR_W as u32 + 2, CURSOR_H as u32 + 2));
-                need_redraw = true; // cursor moved → must redraw + flush for IQE
+                // Cursor-only movement: DON'T set need_redraw (avoids full desktop re-render).
+                // The damage tracker + GPU flush handle the cursor update efficiently.
+                did_work = true;
             }
         } // end if had_mouse_events
 
 
         // ===== Blink caret =====
-        // Toggle caret every CARET_BLINK_MS; force redraw when it flips
+        // Toggle caret every CARET_BLINK_MS — targeted redraw of just the caret pixel area
         {
             let now = uptime();
             if now.saturating_sub(last_caret_flip_ms) >= CARET_BLINK_MS {
                 caret_visible = !caret_visible;
                 last_caret_flip_ms = now;
-                if omnibar_visible { need_redraw = true; }
+                if omnibar_visible {
+                    // Targeted caret redraw: just the caret character area (~8x16 pixels)
+                    let caret_x_pos = text_box_x + TEXT_PADDING + (cursor_pos.min(chars_per_line) * 8);
+                    if caret_x_pos < text_box_x + text_box_w - 30 {
+                        // Clear caret area with omnibar background
+                        fb.fill_rect(caret_x_pos, text_box_y + 8, 8, 20, fb.color_from_rgb24(0x1a1a2e));
+                        if caret_visible {
+                            fb.draw_string(caret_x_pos, text_box_y + 10, "|", folk_accent, fb.color_from_rgb24(0x1a1a2e));
+                        }
+                        damage.add_damage(compositor::damage::Rect::new(
+                            caret_x_pos as u32, text_box_y as u32 + 8, 10, 22));
+                        did_work = true;
+                    }
+                }
             }
         }
 
@@ -3398,8 +3626,28 @@ fn main() -> ! {
                                 }
                             }
                         }
+                    } else if cmd_str.starts_with("agent ") {
+                        // === NEW: Agentic ReAct loop via MCP ===
+                        let prompt = cmd_str[6..].trim();
+                        write_str("[AGENT] Command received: ");
+                        write_str(prompt);
+                        write_str("\n");
+                        if prompt.is_empty() {
+                            win.push_line("Usage: agent <task>");
+                        } else {
+                            win.push_line(&alloc::format!("[Agent] Task: {}", &prompt[..prompt.len().min(60)]));
+                            let mut session = compositor::agent::AgentSession::new(prompt, win_id);
+                            if session.start() {
+                                write_str("[AGENT] Session started, waiting for LLM\n");
+                                win.push_line("[Agent] Thinking...");
+                                active_agent = Some(session);
+                            } else {
+                                write_str("[AGENT] Session start FAILED\n");
+                                win.push_line("[Agent] Error: failed to start");
+                            }
+                        }
                     } else if cmd_str.starts_with("gemini ") {
-                        // Agentic AI: serialize UI state → send to proxy → parse intent → execute
+                        // Legacy: direct LLM query (blocking, no tool chaining)
                         let prompt = cmd_str[7..].trim();
                         write_str("[COMPOSITOR] gemini command: ");
                         write_str(prompt);
@@ -4570,19 +4818,11 @@ fn main() -> ! {
                 damage.damage_full();
             }
 
-            // After full redraw: re-save cursor background and redraw cursor on top
-            // This ensures cursor is always the topmost element
+            // After full redraw: save fresh scene under cursor and mark cursor bg dirty.
+            // Cursor itself is drawn AFTER present_region (below), so it's on top of FB.
             if cursor_drawn {
-                let cursor_fill = match (last_buttons & 1 != 0, last_buttons & 2 != 0) {
-                    (true, true) => cursor_magenta,
-                    (true, false) => cursor_red,
-                    (false, true) => cursor_blue,
-                    (false, false) => cursor_white,
-                };
                 fb.save_rect(cursor_x as usize, cursor_y as usize, CURSOR_W, CURSOR_H, &mut cursor_bg.0);
-                fb.draw_cursor(cursor_x as usize, cursor_y as usize, cursor_fill, cursor_outline);
                 cursor_bg_dirty = false;
-                // Damage cursor area so it gets flushed to VirtIO-GPU
                 damage.add_damage(compositor::damage::Rect::new(
                     cursor_x.max(0) as u32, cursor_y.max(0) as u32,
                     CURSOR_W as u32 + 2, CURSOR_H as u32 + 2));
@@ -5005,19 +5245,55 @@ fn main() -> ! {
             }
         }
 
-        // Flush dirty regions to VirtIO-GPU
-        // NOTE: gpu_vsync() is available (syscall 0x82) but requires proper
-        // VirtIO-GPU interrupt routing which isn't set up yet. Using fire-and-forget
-        // flush for now. VSync will be enabled when ISR handling is implemented.
+        let t_before_present: u64 = rdtsc();
+
+        // Present: copy shadow→FB for dirty regions that were rendered to shadow.
+        // Cursor-only movement writes directly to FB (set_pixel_overlay), so we
+        // track whether shadow was modified separately.
+        let shadow_dirty = need_redraw || (current_second != last_clock_second + 1); // clock tick rendered to shadow
+        if damage.has_damage() {
+            // Present shadow→FB for all damage EXCEPT pure cursor damage.
+            // When need_redraw or clock tick happened, shadow was written and needs copying.
+            // For cursor-only frames, FB was already written directly.
+            if need_redraw {
+                // Full redraw: present everything then redraw cursor on top
+                for r in damage.regions() {
+                    fb.present_region(r.x, r.y, r.w, r.h);
+                }
+                if cursor_drawn {
+                    let cursor_fill = match (last_buttons & 1 != 0, last_buttons & 2 != 0) {
+                        (true, true) => cursor_magenta,
+                        (true, false) => cursor_red,
+                        (false, true) => cursor_blue,
+                        _ => cursor_white,
+                    };
+                    fb.draw_cursor(cursor_x as usize, cursor_y as usize, cursor_fill, cursor_outline);
+                }
+            } else if did_work && !had_mouse_events {
+                // Non-mouse work (clock tick, etc.): present status bar damage
+                for r in damage.regions() {
+                    fb.present_region(r.x, r.y, r.w, r.h);
+                }
+                // Redraw cursor if it overlaps the presented region
+                if cursor_drawn && cursor_y < 22 {
+                    let cursor_fill = match (last_buttons & 1 != 0, last_buttons & 2 != 0) {
+                        (true, true) => cursor_magenta,
+                        (true, false) => cursor_red,
+                        (false, true) => cursor_blue,
+                        _ => cursor_white,
+                    };
+                    fb.draw_cursor(cursor_x as usize, cursor_y as usize, cursor_fill, cursor_outline);
+                }
+            }
+            // else: cursor-only movement — FB already has correct pixels
+        }
+
         if use_gpu && damage.has_damage() {
-            // Batched flush: N rects → N transfers + 1 flush → 1 doorbell → 1 VM-exit
             let regions = damage.regions();
             if regions.len() == 1 {
-                // Fast path: single rect (most common)
                 let r = &regions[0];
                 libfolk::sys::gpu_flush(r.x, r.y, r.w, r.h);
             } else {
-                // Batch path: multiple rects in 1 VM-exit
                 let mut batch = [[0u32; 4]; 4];
                 let n = regions.len().min(4);
                 for i in 0..n {
@@ -5030,8 +5306,39 @@ fn main() -> ! {
             damage.clear();
         }
 
+        // Timing report: print if any frame took > 1ms (= potential freeze source)
+        let t_end: u64 = rdtsc();
+        let frame_us = (t_end - t_loop_start) / tsc_per_us;
+        if frame_us > 1000 && timing_samples < 30 && need_redraw {
+            // Log that need_redraw was set (helps find the trigger)
+            write_str("[SLOW REDRAW]\n");
+        }
+        if frame_us > 1000 && timing_samples < 30 {
+            timing_samples += 1;
+            // Format: TIMING,<total_us>,<render_us>,<present_us>
+            let render_us = (t_before_present - t_loop_start) / tsc_per_us;
+            let present_us = (t_end - t_before_present) / tsc_per_us;
+            let mut tbuf = [0u8; 64];
+            let mut ti = 0usize;
+            // "TIMING,"
+            for &b in b"TIMING," { tbuf[ti] = b; ti += 1; }
+            ti += fmt_u64_into(&mut tbuf[ti..], frame_us);
+            tbuf[ti] = b','; ti += 1;
+            ti += fmt_u64_into(&mut tbuf[ti..], render_us);
+            tbuf[ti] = b','; ti += 1;
+            ti += fmt_u64_into(&mut tbuf[ti..], present_us);
+            tbuf[ti] = b'\n'; ti += 1;
+            libfolk::sys::com3_write(&tbuf[..ti]);
+            // Also to serial
+            write_str("[");
+            if let Ok(s) = core::str::from_utf8(&tbuf[..ti-1]) { write_str(s); }
+            write_str("]\n");
+        }
+
         if !did_work {
-            yield_cpu();
+            // Brief spin then HLT: spin handles polled I/O (COM3, async COM2),
+            // HLT handles interrupt-driven I/O (keyboard, mouse, timer).
+            for _ in 0..5_000 { core::hint::spin_loop(); }
         }
     }
 }

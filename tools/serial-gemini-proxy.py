@@ -24,6 +24,12 @@ import os
 import base64
 import shutil
 
+# Add tools/ directory to path for mcp_bridge import
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from context_manager import ContextManager
+from mcp_bridge import _retx_queue  # Retransmission queue (global, used in handle_serial timeout check)
+_context_mgr = ContextManager(max_tokens=4096)  # Match LLM context window
+
 # ── Configuration (from .env or environment variables) ────────────────────
 
 def load_env():
@@ -49,6 +55,7 @@ LLM_PROVIDER = cfg("LLM_PROVIDER", "gemini")
 LLM_API_KEY = cfg("LLM_API_KEY", "") or cfg("GEMINI_API_KEY", "")
 LLM_MODEL = cfg("LLM_MODEL", "")
 LLM_BASE_URL = cfg("LLM_BASE_URL", "")
+LLM_CODE_MODEL = cfg("LLM_CODE_MODEL", "")  # Separate model for code generation
 
 # "local" provider needs no API key (LM Studio, Ollama, llama.cpp --server)
 if not LLM_API_KEY and LLM_PROVIDER not in ("local",):
@@ -94,6 +101,124 @@ LOAD_WASM_PREFIX = "[LOAD_WASM:"  # [LOAD_WASM:/path/to/file.wasm]
 # Maximum compiled WASM size (64KB) — prevents COM2 buffer overflow
 MAX_WASM_SIZE = 64 * 1024
 
+# Complete registry of all folk_* host functions available to WASM tools.
+# Used to auto-inject missing extern declarations after LLM code generation.
+FOLK_EXTERNS = {
+    # Drawing
+    "folk_draw_rect": "fn folk_draw_rect(x: i32, y: i32, w: i32, h: i32, color: i32);",
+    "folk_draw_line": "fn folk_draw_line(x1: i32, y1: i32, x2: i32, y2: i32, color: i32);",
+    "folk_draw_circle": "fn folk_draw_circle(cx: i32, cy: i32, r: i32, color: i32);",
+    "folk_draw_text": "fn folk_draw_text(x: i32, y: i32, ptr: i32, len: i32, color: i32);",
+    "folk_fill_screen": "fn folk_fill_screen(color: i32);",
+    # System Metrics
+    "folk_get_time": "fn folk_get_time() -> i32;",
+    "folk_screen_width": "fn folk_screen_width() -> i32;",
+    "folk_screen_height": "fn folk_screen_height() -> i32;",
+    "folk_random": "fn folk_random() -> i32;",
+    "folk_get_datetime": "fn folk_get_datetime(ptr: i32) -> i32;",
+    # Input
+    "folk_poll_event": "fn folk_poll_event(event_ptr: i32) -> i32;",
+    # Direct Pixel Access
+    "folk_get_surface": "fn folk_get_surface() -> i32;",
+    "folk_surface_pitch": "fn folk_surface_pitch() -> i32;",
+    "folk_surface_present": "fn folk_surface_present();",
+    # Async File
+    "folk_request_file": "fn folk_request_file(path_ptr: i32, path_len: i32, dest_ptr: i32, dest_len: i32) -> i32;",
+}
+
+import re
+
+def fix_missing_externs(source: str) -> str:
+    """Scan for folk_* calls not declared in extern blocks. Inject missing ones."""
+    # Find all folk_* function calls in the source
+    used = set(re.findall(r'\bfolk_\w+', source))
+
+    # Find which ones are already declared in an extern "C" block
+    declared = set()
+    for m in re.finditer(r'extern\s+"C"\s*\{([^}]*)\}', source, re.DOTALL):
+        block = m.group(1)
+        declared.update(re.findall(r'\bfolk_\w+', block))
+
+    # Find missing declarations
+    missing = []
+    for name in sorted(used - declared):
+        if name in FOLK_EXTERNS:
+            missing.append(f"    {FOLK_EXTERNS[name]}")
+
+    if not missing:
+        return source
+
+    print(f"[SERIAL-PROXY] Auto-injecting {len(missing)} missing extern(s): {', '.join(n for n in sorted(used - declared) if n in FOLK_EXTERNS)}")
+
+    # Strategy: append missing declarations into the FIRST extern "C" block
+    first_extern = re.search(r'(extern\s+"C"\s*\{)', source)
+    if first_extern:
+        insert_pos = first_extern.end()
+        injection = "\n" + "\n".join(missing) + "\n"
+        source = source[:insert_pos] + injection + source[insert_pos:]
+    else:
+        # No extern block exists — create one after #![no_main]
+        anchor = source.find("#![no_main]")
+        if anchor != -1:
+            insert_pos = source.index("\n", anchor) + 1
+        else:
+            insert_pos = 0
+        block = 'extern "C" {\n' + "\n".join(missing) + "\n}\n"
+        source = source[:insert_pos] + block + source[insert_pos:]
+
+    return source
+
+
+def fix_unsafe_calls(source: str) -> str:
+    """If run() body has bare extern calls (no unsafe block), wrap the body in unsafe { }."""
+    # Check if there's already an unsafe block inside run()
+    run_match = re.search(r'pub\s+extern\s+"C"\s+fn\s+run\s*\(\s*\)\s*\{', source)
+    if not run_match:
+        return source
+
+    # Check if unsafe already present after run() opening
+    after_run = source[run_match.end():]
+    stripped = after_run.lstrip()
+    if stripped.startswith("unsafe"):
+        return source  # Already has unsafe
+
+    # Check if any folk_ calls exist in the function (indicating extern calls)
+    if not re.search(r'\bfolk_\w+\s*\(', after_run.split("\n#")[0]):
+        return source  # No extern calls in run()
+
+    # Wrap the body: insert "unsafe {" after opening brace, and "}" before closing brace
+    # Find the matching closing brace by counting braces
+    depth = 1
+    pos = run_match.end()
+    while pos < len(source) and depth > 0:
+        if source[pos] == '{':
+            depth += 1
+        elif source[pos] == '}':
+            depth -= 1
+        pos += 1
+
+    if depth != 0:
+        return source  # Can't find matching brace
+
+    closing_pos = pos - 1  # Position of the closing '}'
+    insert_after = run_match.end()
+
+    source = (source[:insert_after] + "\n    unsafe {" +
+              source[insert_after:closing_pos] + "    }\n" +
+              source[closing_pos:])
+    print("[SERIAL-PROXY] Auto-wrapped run() body in unsafe { }")
+    return source
+
+
+def fix_infinite_loop(source: str) -> str:
+    """Remove infinite loops with spin_loop — WASM tools must be run-to-completion."""
+    # Remove `loop { ... core::hint::spin_loop(); }` at the end of run()
+    source = re.sub(r'\s*core::hint::spin_loop\(\);\s*', '\n', source)
+    # Replace bare `loop {` wrapping the entire run body with just the body
+    # This is a common LLM mistake — they use loop {} instead of relying on frame-based calls
+    return source
+
+
 # The Master Prompt — strict no_std WASM code generation
 WASM_SYSTEM_PROMPT = """You are a code generator for Folkering OS (bare-metal Rust, no_std).
 Generate a SINGLE Rust file that compiles to wasm32-unknown-unknown.
@@ -102,7 +227,9 @@ STRICT RULES:
 - #![no_std] and #![no_main] are REQUIRED
 - Export: #[no_mangle] pub extern "C" fn run()
 - Include: #[panic_handler] fn panic(_: &core::panic::PanicInfo) -> ! { loop {} }
-- NO infinite loops, NO yielding, NO sleeping — run-to-completion per frame
+- The ENTIRE body of run() MUST be wrapped in unsafe { } — ALL extern calls require it!
+- NO infinite loops (no `loop {}`), NO yielding, NO sleeping — run() is called every frame
+- Use `static mut` variables for state that persists between frames (position, velocity, etc)
 - Event polling loops (while folk_poll_event() != 0) are OK
 - NO println!, NO std, NO allocation, NO extern crate
 - Color format: 0x00RRGGBB (alpha channel is IGNORED, use solid colors only)
@@ -236,27 +363,20 @@ extern "C" {
 Output ONLY the Rust code. No explanation, no markdown fences."""
 
 
-def generate_and_compile_wasm(prompt: str, sock: socket.socket):
-    """Generate Rust code via Gemini, compile to WASM, send base64 binary back."""
-    print(f"[SERIAL-PROXY] Tool request: {prompt[:80]}...")
-
-    # Step 1: Call Gemini with code-gen system prompt
+def _llm_to_wasm(prompt: str) -> tuple:
+    """Shared WASM pipeline: LLM → extract code → fix → compile → (wasm_bytes, error).
+    Returns (bytes, None) on success, (None, str) on failure."""
     full_prompt = f"{WASM_SYSTEM_PROMPT}\n\nGenerate: {prompt}"
-    print(f"[SERIAL-PROXY] Calling {LLM_PROVIDER} for code generation...")
-    source = call_llm(full_prompt)
+    code_model = LLM_CODE_MODEL or LLM_MODEL
+    print(f"[WASM] Calling {LLM_PROVIDER} ({code_model})...")
+    source = call_llm(full_prompt, model_override=code_model)
 
     if source.startswith("Error:"):
-        error_resp = RESP_START + source.encode() + RESP_END + b"\n"
-        sock.sendall(error_resp)
-        print(f"[SERIAL-PROXY] Gemini error: {source}")
-        return
+        return None, source
 
-    # Step 2: Robust code extraction — strip thinking + extract code
-    # Priority: <TOOL_CODE>...</TOOL_CODE> → ```rust...``` → ```...```
-    # Also strip <think>...</think> blocks from reasoning models
+    # Extract code from LLM response
     if "<think>" in source and "</think>" in source:
         source = source[source.index("</think>") + 8:]
-
     extracted = None
     if "<TOOL_CODE>" in source and "</TOOL_CODE>" in source:
         extracted = source.split("<TOOL_CODE>")[1].split("</TOOL_CODE>")[0]
@@ -264,136 +384,88 @@ def generate_and_compile_wasm(prompt: str, sock: socket.socket):
         extracted = source.split("```rust")[1].split("```")[0]
     elif "```" in source:
         parts = source.split("```")
-        if len(parts) >= 3:
-            extracted = parts[1]  # content between first pair of ```
+        if len(parts) >= 3: extracted = parts[1]
+    if extracted: source = extracted.strip()
+    elif "#![no_std]" in source: source = source[source.index("#![no_std]"):].strip()
+    else: source = source.strip()
 
-    if extracted:
-        source = extracted.strip()
-    else:
-        # Last resort: look for #![no_std] as anchor
-        if "#![no_std]" in source:
-            idx = source.index("#![no_std]")
-            source = source[idx:].strip()
-        else:
-            source = source.strip()
+    # Fix common LLM mistakes
+    source = fix_missing_externs(source)
+    source = fix_unsafe_calls(source)
+    source = fix_infinite_loop(source)
+    print(f"[WASM] Source: {len(source)} chars")
 
-    print(f"[SERIAL-PROXY] Extracted {len(source)} chars of Rust source")
-
-    print(f"[SERIAL-PROXY] Generated {len(source)} chars of Rust source")
-
-    # Step 3: Create temp Cargo project
+    # Compile
     tmp_dir = tempfile.mkdtemp(prefix="folkwasm_")
     try:
-        # cargo new --lib
         proj_dir = os.path.join(tmp_dir, "wasm_tool")
         subprocess.run(["cargo", "new", "--lib", proj_dir], capture_output=True, timeout=10)
-
-        # Write Cargo.toml with aggressive optimization
-        cargo_toml = f"""[package]
-name = "wasm_tool"
-version = "0.1.0"
-edition = "2021"
-
-[lib]
-crate-type = ["cdylib"]
-
-[profile.release]
-opt-level = "z"
-lto = true
-strip = true
-codegen-units = 1
-panic = "abort"
-"""
         with open(os.path.join(proj_dir, "Cargo.toml"), "w") as f:
-            f.write(cargo_toml)
-
-        # Write source
-        src_path = os.path.join(proj_dir, "src", "lib.rs")
-        with open(src_path, "w") as f:
+            f.write('[package]\nname = "wasm_tool"\nversion = "0.1.0"\nedition = "2021"\n'
+                    '[lib]\ncrate-type = ["cdylib"]\n[profile.release]\n'
+                    'opt-level = "z"\nlto = true\nstrip = true\npanic = "abort"\n')
+        with open(os.path.join(proj_dir, "src", "lib.rs"), "w") as f:
             f.write(source)
-
-        # Step 4: Compile
-        print("[SERIAL-PROXY] Compiling WASM...")
         result = subprocess.run(
             ["cargo", "build", "--target", "wasm32-unknown-unknown", "--release"],
-            capture_output=True, text=True, timeout=60,
-            cwd=proj_dir,
-        )
-
+            capture_output=True, text=True, timeout=60, cwd=proj_dir)
         if result.returncode != 0:
-            error = f"Compile error: {result.stderr[:400]}"
-            print(f"[SERIAL-PROXY] {error}")
-            error_resp = RESP_START + error.encode() + RESP_END + b"\n"
-            sock.sendall(error_resp)
-            return
-
-        # Find compiled WASM
-        wasm_path = os.path.join(
-            proj_dir, "target", "wasm32-unknown-unknown", "release", "wasm_tool.wasm"
-        )
+            return None, f"Compile error: {result.stderr[:400]}"
+        wasm_path = os.path.join(proj_dir, "target", "wasm32-unknown-unknown", "release", "wasm_tool.wasm")
         if not os.path.exists(wasm_path):
-            error_resp = RESP_START + b"Compile error: WASM output not found" + RESP_END + b"\n"
-            sock.sendall(error_resp)
-            return
-
+            return None, "WASM output not found"
         with open(wasm_path, "rb") as f:
             wasm_binary = f.read()
-
-        print(f"[SERIAL-PROXY] WASM compiled: {len(wasm_binary)} bytes")
-
-        # Step 5: Size check
         if len(wasm_binary) > MAX_WASM_SIZE:
-            error = f"WASM too large: {len(wasm_binary)} bytes (max {MAX_WASM_SIZE})"
-            error_resp = RESP_START + error.encode() + RESP_END + b"\n"
-            sock.sendall(error_resp)
-            return
-
-        # Step 6: Base64 encode
-        b64_data = base64.b64encode(wasm_binary).decode("ascii")
-
-        # Step 7: Send response
-        resp_json = json.dumps({"action": "tool_ready", "binary": b64_data})
-        response = RESP_START + resp_json.encode() + RESP_END + b"\n"
-        sock.sendall(response)
-        print(f"[SERIAL-PROXY] Sent tool_ready: {len(wasm_binary)} bytes WASM, {len(b64_data)} chars base64")
-
+            return None, f"WASM too large: {len(wasm_binary)} bytes"
+        print(f"[WASM] Compiled: {len(wasm_binary)} bytes")
+        return wasm_binary, None
     except subprocess.TimeoutExpired:
-        error_resp = RESP_START + b"Compile timeout (60s)" + RESP_END + b"\n"
-        sock.sendall(error_resp)
-        print("[SERIAL-PROXY] Compile timeout")
+        return None, "Compile timeout (60s)"
     except Exception as e:
-        error = f"Tool generation error: {e}"
-        print(f"[SERIAL-PROXY] {error}")
+        return None, f"Build error: {e}"
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def generate_and_compile_wasm(prompt: str, sock: socket.socket):
+    """Legacy path: Generate WASM and send via @@GEMINI_RESP@@ protocol."""
+    print(f"[SERIAL-PROXY] Tool request (legacy): {prompt[:80]}...")
+    wasm_binary, error = _llm_to_wasm(prompt)
+    if error:
         error_resp = RESP_START + error.encode() + RESP_END + b"\n"
         sock.sendall(error_resp)
-    finally:
-        # Cleanup temp directory
-        try:
-            shutil.rmtree(tmp_dir)
-        except Exception:
-            pass
+        print(f"[SERIAL-PROXY] Error: {error[:100]}")
+        return
+    b64_data = base64.b64encode(wasm_binary).decode("ascii")
+    resp_json = json.dumps({"action": "tool_ready", "binary": b64_data})
+    response = RESP_START + resp_json.encode() + RESP_END + b"\n"
+    sock.sendall(response)
+    print(f"[SERIAL-PROXY] Sent tool_ready: {len(wasm_binary)} bytes WASM")
 
 
-def call_llm(prompt: str) -> str:
+def call_llm(prompt: str, model_override: str = "") -> str:
     """Call the configured LLM provider and return response text."""
+    model = model_override or LLM_MODEL
     try:
         if LLM_PROVIDER == "gemini":
-            return _call_gemini(prompt)
+            return _call_gemini(prompt, model)
         elif LLM_PROVIDER == "local":
-            return _call_local(prompt)
+            return _call_local(prompt, model)
         elif LLM_PROVIDER == "openai":
-            return _call_openai(prompt)
+            return _call_openai(prompt, model)
         elif LLM_PROVIDER == "claude":
-            return _call_claude(prompt)
+            return _call_claude(prompt, model)
         else:
             return f"Error: Unknown provider '{LLM_PROVIDER}'"
     except Exception as e:
         return f"Error: {e}"
 
 
-def _call_gemini(prompt: str) -> str:
+def _call_gemini(prompt: str, model: str = "") -> str:
     """Google Gemini API."""
-    url = f"{LLM_BASE_URL}/models/{LLM_MODEL}:generateContent?key={LLM_API_KEY}"
+    m = model or LLM_MODEL
+    url = f"{LLM_BASE_URL}/models/{m}:generateContent?key={LLM_API_KEY}"
     body = json.dumps({
         "contents": [{"parts": [{"text": prompt}]}]
     }).encode()
@@ -405,11 +477,12 @@ def _call_gemini(prompt: str) -> str:
         return result["candidates"][0]["content"]["parts"][0]["text"]
 
 
-def _call_openai(prompt: str) -> str:
+def _call_openai(prompt: str, model: str = "") -> str:
     """OpenAI-compatible API (OpenAI, LM Studio, Ollama, llama.cpp server)."""
+    m = model or LLM_MODEL
     url = f"{LLM_BASE_URL}/chat/completions"
     body = json.dumps({
-        "model": LLM_MODEL,
+        "model": m,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": 4096,
         "temperature": 0.7,
@@ -427,13 +500,14 @@ def _call_openai(prompt: str) -> str:
         return result["choices"][0]["message"]["content"]
 
 
-def _call_local(prompt: str) -> str:
+def _call_local(prompt: str, model: str = "") -> str:
     """Local Ollama API — uses native /api/chat to capture <think> reasoning."""
+    m = model or LLM_MODEL
     # Use Ollama native API (not OpenAI compat) to get 'thinking' field
     base = LLM_BASE_URL.rstrip("/v1").rstrip("/")  # http://localhost:11434
     url = f"{base}/api/chat"
     body = json.dumps({
-        "model": LLM_MODEL,
+        "model": m,
         "messages": [{"role": "user", "content": prompt}],
         "stream": False,
     }).encode()
@@ -445,18 +519,19 @@ def _call_local(prompt: str) -> str:
         content = msg.get("content", "")
         thinking = msg.get("thinking", "")
         # Debug: log thinking status
-        print(f"[PROXY] thinking: {len(thinking)} chars, content: {len(content)} chars")
+        print(f"[PROXY] model={m}, thinking: {len(thinking)} chars, content: {len(content)} chars")
         # Wrap thinking in <think> tags for Folkering OS FSA parser
         if thinking:
             return f"<think>\n{thinking}\n</think>\n{content}"
         return content
 
 
-def _call_claude(prompt: str) -> str:
+def _call_claude(prompt: str, model: str = "") -> str:
     """Anthropic Claude API."""
+    m = model or LLM_MODEL
     url = f"{LLM_BASE_URL}/messages"
     body = json.dumps({
-        "model": LLM_MODEL,
+        "model": m,
         "max_tokens": 4096,
         "messages": [{"role": "user", "content": prompt}],
     }).encode()
@@ -471,10 +546,123 @@ def _call_claude(prompt: str) -> str:
         return result["content"][0]["text"]
 
 
+def handle_mcp_frame(frame_bytes: bytes, sock: socket.socket):
+    """Process a complete MCP frame (COBS-encoded, CRC-verified, Postcard-serialized)."""
+    from mcp_bridge import (parse_frame, decode_mcp_response, make_frame, send_reliable,
+        encode_chat_response, encode_time_sync, encode_wasm_chunk, encode_ping,
+        _retx_queue, _session, send_wasm_chunked)
+
+    try:
+        sid, seq, payload = parse_frame(frame_bytes)
+        msg = decode_mcp_response(payload)
+    except Exception:
+        # Silently drop unparseable frames (ACK/NACK are tiny, may fragment)
+        return
+
+    # Session lock: first frame locks the session, subsequent frames are validated
+    if not _session.locked:
+        _session.lock_to(sid)
+        print(f"[MCP] Session locked to 0x{sid:08X}")
+    elif not _session.validate(sid):
+        print(f"[MCP] DROPPED: wrong session 0x{sid:08X} (expected 0x{_session.session_id:08X})")
+        return
+
+    msg_type = msg.get('type', 'unknown')
+    print(f"[MCP] Received: {msg_type} (seq={seq})")
+
+    if msg_type == 'chat_request':
+        # OS wants to talk to the LLM — route through Context Manager
+        prompt = msg['prompt']
+        print(f"[MCP] Chat: {prompt[:80]}...")
+
+        # Context management: check compaction thresholds
+        if _context_mgr.needs_full_compact():
+            print(f"[CTX] FULL COMPACT ({_context_mgr.usage_pct():.0f}%)")
+            _context_mgr.full_compact()
+        elif _context_mgr.needs_auto_compact():
+            print(f"[CTX] AUTO COMPACT ({_context_mgr.usage_pct():.0f}%)")
+            _context_mgr.auto_compact(lambda text: call_llm(text))
+
+        _context_mgr.add_message("user", prompt)
+        # Send accumulated context to LLM (not just latest prompt)
+        full_context = _context_mgr.get_prompt_text()
+        response_text = call_llm(full_context)
+
+        # Strip <think>...</think> tags to reduce wire size
+        clean_text = response_text
+        if "<think>" in clean_text and "</think>" in clean_text:
+            think_end = clean_text.index("</think>") + len("</think>")
+            clean_text = clean_text[think_end:].strip()
+            print(f"[MCP] Think stripped: {len(response_text)} -> {len(clean_text)} chars")
+        _context_mgr.add_message("assistant", clean_text)
+
+        # Send MCP ChatResponse reliably (enqueued for retransmission)
+        payload = encode_chat_response(clean_text)
+        seq = send_reliable(payload, sock, session_id=_session.session_id)
+        print(f"[MCP] Sent ChatResponse seq={seq}: {len(clean_text)} chars (ctx: {_context_mgr.usage_pct():.0f}%)")
+
+    elif msg_type == 'time_sync_request':
+        import datetime
+        now_local = datetime.datetime.now()
+        utc_offset = datetime.datetime.now(datetime.timezone.utc).astimezone().utcoffset()
+        offset_minutes = int(utc_offset.total_seconds() / 60) if utc_offset else 0
+        offset_minutes = round(offset_minutes / 15) * 15
+        payload = encode_time_sync(
+            now_local.year, now_local.month, now_local.day,
+            now_local.hour, now_local.minute, now_local.second,
+            offset_minutes
+        )
+        seq = send_reliable(payload, sock, session_id=_session.session_id)
+        print(f"[MCP] Sent TimeSync seq={seq}: {now_local.hour}:{now_local.minute:02d} UTC+{offset_minutes//60}")
+
+    elif msg_type == 'wasm_gen_request':
+        desc = msg.get('description', '')
+        print(f"[MCP] WASM gen: {desc[:60]}...")
+        wasm_binary, error = _llm_to_wasm(desc)
+        if error:
+            error_frame = make_frame(encode_chat_response(f"Error: {error}"))
+            sock.sendall(error_frame)
+        else:
+            # Send as chunks (≤3KB each) for reliable transport
+            send_wasm_chunked(wasm_binary, sock, session_id=_session.session_id)
+
+    elif msg_type == 'pong':
+        print(f"[MCP] Pong seq={msg.get('seq', 0)}")
+
+    elif msg_type == 'ack':
+        # OS acknowledged our frame — clear from retransmission queue
+        _retx_queue.on_ack(seq)
+        # Don't print for every ACK (too noisy)
+
+    elif msg_type == 'nack':
+        reason = msg.get('reason', 0)
+        reasons = {1: 'CRC', 2: 'PARSE', 3: 'SESSION', 4: 'CHUNK_ORDER'}
+        print(f"[MCP] NACK seq={seq} reason={reasons.get(reason, reason)}")
+        _retx_queue.on_nack(seq, sock)
+
+    elif msg_type == 'sampling_request':
+        prompt = msg['prompt']
+        max_tokens = msg.get('max_tokens', 4096)
+        print(f"[MCP] Sampling: {prompt[:60]}... (max {max_tokens})")
+        response_text = call_llm(prompt)
+        response_frame = make_frame(encode_chat_response(response_text))
+        sock.sendall(response_frame)
+
+    else:
+        print(f"[MCP] Unknown message type: {msg}")
+
+
 def handle_serial(sock: socket.socket):
-    """Read from COM2, process requests, write responses."""
+    """Read from COM2, process requests, write responses.
+    Dual-mode: supports both MCP (COBS frames with 0x00 sentinel) and
+    legacy (@@GEMINI_REQ@@...@@END@@) protocols simultaneously."""
     buf = b""
-    print("[SERIAL-PROXY] Connected to COM2, listening for requests...")
+    # Reset session on new connection (OS may have rebooted)
+    from mcp_bridge import _session as bridge_session
+    bridge_session.locked = False
+    bridge_session.session_id = 0
+    bridge_session.seq_counter = 0
+    print("[SERIAL-PROXY] Connected to COM2 (dual-mode: MCP + legacy, session reset)...")
 
     while True:
         try:
@@ -485,7 +673,24 @@ def handle_serial(sock: socket.socket):
 
             buf += data
 
-            # Look for complete request: @@GEMINI_REQ@@{...}@@END@@
+            # === MCP Protocol: check for COBS frames (0x00 sentinel) ===
+            while b'\x00' in buf:
+                sentinel_pos = buf.index(b'\x00')
+                if sentinel_pos > 0:
+                    frame = buf[:sentinel_pos]
+                    buf = buf[sentinel_pos + 1:]
+                    # Verify this looks like a COBS frame (no 0x00 inside)
+                    if b'\x00' not in frame and len(frame) >= 3:
+                        try:
+                            handle_mcp_frame(frame, sock)
+                        except Exception as e:
+                            # Silently drop malformed frames (ACKs, partial data)
+                            pass
+                else:
+                    # Leading 0x00 — skip it
+                    buf = buf[1:]
+
+            # === Legacy Protocol: @@GEMINI_REQ@@...@@END@@ ===
             while REQ_START in buf and REQ_END in buf:
                 start = buf.index(REQ_START) + len(REQ_START)
                 end = buf.index(REQ_END)
@@ -568,6 +773,9 @@ def handle_serial(sock: socket.socket):
                 print(f"[SERIAL-PROXY] Sent {len(response)} bytes back to OS")
 
         except socket.timeout:
+            # Check retransmission timeouts on every socket timeout (1s)
+            if not _retx_queue.is_empty():
+                _retx_queue.check_timeouts(sock)
             continue
         except Exception as e:
             print(f"[SERIAL-PROXY] Error: {e}")
