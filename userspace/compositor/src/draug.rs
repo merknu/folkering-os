@@ -27,13 +27,22 @@ use alloc::string::String;
 use alloc::format;
 
 /// Interval between Draug ticks (in milliseconds)
-pub const TICK_INTERVAL_MS: u64 = 30_000; // 30 seconds
+pub const TICK_INTERVAL_MS: u64 = 10_000; // 10 seconds
 
 /// Maximum observation log entries before forced consolidation
 pub const MAX_LOG_ENTRIES: usize = 20;
 
-/// Maximum entries to send to LLM per analysis cycle
-pub const ANALYSIS_BATCH: usize = 8;
+/// Minimum entries before analysis can trigger
+pub const ANALYSIS_BATCH: usize = 3;
+
+/// AutoDream: idle threshold before dreaming starts (15 minutes)
+pub const DREAM_IDLE_MS: u64 = 900_000;
+
+/// AutoDream: cooldown between dreams (10 minutes)
+pub const DREAM_COOLDOWN_MS: u64 = 600_000;
+
+/// AutoDream: max dreams per session
+pub const DREAM_MAX_PER_SESSION: u32 = 5;
 
 /// System observation snapshot
 pub struct Observation {
@@ -59,6 +68,9 @@ pub enum ObservationEvent {
     BootComplete,
 }
 
+/// Maximum command history entries for prediction
+pub const MAX_CMD_HISTORY: usize = 16;
+
 /// Draug daemon state
 pub struct DraugDaemon {
     /// Observation log (circular, append-only)
@@ -74,6 +86,17 @@ pub struct DraugDaemon {
     active: bool,
     waiting_for_llm: bool,
     analysis_count: u32,
+
+    /// Command history for prediction (Pillar 4)
+    cmd_history: [Option<alloc::string::String>; MAX_CMD_HISTORY],
+    cmd_head: usize,
+    cmd_count: usize,
+
+    /// AutoDream state
+    dream_count: u32,
+    last_dream_ms: u64,
+    dreaming: bool,
+    dream_target: Option<alloc::string::String>, // cache key of app being optimized
 }
 
 /// Compact observation summary for the log
@@ -95,6 +118,68 @@ impl DraugDaemon {
             active: true,
             waiting_for_llm: false,
             analysis_count: 0,
+            cmd_history: [const { None }; MAX_CMD_HISTORY],
+            cmd_head: 0,
+            cmd_count: 0,
+            dream_count: 0,
+            last_dream_ms: 0,
+            dreaming: false,
+            dream_target: None,
+        }
+    }
+
+    /// Record a user command for prediction history.
+    pub fn record_command(&mut self, cmd: &str) {
+        self.cmd_history[self.cmd_head] = Some(String::from(cmd));
+        self.cmd_head = (self.cmd_head + 1) % MAX_CMD_HISTORY;
+        if self.cmd_count < MAX_CMD_HISTORY { self.cmd_count += 1; }
+    }
+
+    /// Predict what the user might ask next based on command history.
+    /// Simple frequency analysis: returns the most common command that
+    /// followed the last command, if pattern is strong enough (>50% match).
+    pub fn predict_next(&self) -> Option<&str> {
+        if self.cmd_count < 4 { return None; } // Need enough history
+
+        // Get the last command
+        let last_idx = (self.cmd_head + MAX_CMD_HISTORY - 1) % MAX_CMD_HISTORY;
+        let last_cmd = self.cmd_history[last_idx].as_deref()?;
+
+        // Count what follows `last_cmd` in history
+        let mut best: Option<&str> = None;
+        let mut best_count = 0u32;
+        let mut total_follows = 0u32;
+
+        for i in 0..self.cmd_count.saturating_sub(1) {
+            let idx = (self.cmd_head + MAX_CMD_HISTORY - self.cmd_count + i) % MAX_CMD_HISTORY;
+            let next_idx = (idx + 1) % MAX_CMD_HISTORY;
+            if let (Some(cmd), Some(next)) = (&self.cmd_history[idx], &self.cmd_history[next_idx]) {
+                if cmd.as_str() == last_cmd {
+                    total_follows += 1;
+                    // Count this "next" command
+                    let mut count = 0u32;
+                    for j in 0..self.cmd_count.saturating_sub(1) {
+                        let ji = (self.cmd_head + MAX_CMD_HISTORY - self.cmd_count + j) % MAX_CMD_HISTORY;
+                        let jn = (ji + 1) % MAX_CMD_HISTORY;
+                        if let (Some(jc), Some(jnc)) = (&self.cmd_history[ji], &self.cmd_history[jn]) {
+                            if jc.as_str() == last_cmd && jnc.as_str() == next.as_str() {
+                                count += 1;
+                            }
+                        }
+                    }
+                    if count > best_count {
+                        best_count = count;
+                        best = Some(next.as_str());
+                    }
+                }
+            }
+        }
+
+        // Only predict if >50% confidence
+        if total_follows >= 2 && best_count * 2 > total_follows {
+            best
+        } else {
+            None
         }
     }
 
@@ -142,7 +227,7 @@ impl DraugDaemon {
         self.active
             && !self.waiting_for_llm
             && self.log_count >= ANALYSIS_BATCH
-            && now_ms.saturating_sub(self.last_user_input_ms) > 60_000
+            && now_ms.saturating_sub(self.last_user_input_ms) > 30_000 // 30s idle
     }
 
     /// Build an analysis prompt from recent observations.
@@ -208,18 +293,82 @@ impl DraugDaemon {
     pub fn observation_count(&self) -> usize {
         self.log_count
     }
+
+    // ═══════ AutoDream: Self-Improving Software ═══════════════════════
+
+    /// Check if the system should enter dream mode.
+    /// Requires: 15 min idle, not already dreaming, cooldown passed, quota remaining.
+    pub fn should_dream(&self, now_ms: u64) -> bool {
+        self.active
+            && !self.dreaming
+            && !self.waiting_for_llm
+            && self.dream_count < DREAM_MAX_PER_SESSION
+            && now_ms.saturating_sub(self.last_user_input_ms) > DREAM_IDLE_MS
+            && now_ms.saturating_sub(self.last_dream_ms) > DREAM_COOLDOWN_MS
+    }
+
+    /// Pick a cached WASM app to optimize and build the dream prompt.
+    /// Returns the cache key of the target, or None if nothing to dream about.
+    pub fn start_dream(&mut self, cache_keys: &[&str]) -> Option<String> {
+        if cache_keys.is_empty() { return None; }
+
+        // Pick one: round-robin based on dream_count
+        let idx = (self.dream_count as usize) % cache_keys.len();
+        let target = String::from(cache_keys[idx]);
+        self.dream_target = Some(target.clone());
+        self.dreaming = true;
+        Some(target)
+    }
+
+    /// Build the dream optimization prompt for a cached source file.
+    pub fn build_dream_prompt(&self, source_code: &str, app_name: &str) -> String {
+        format!(
+            "You are Draug, the self-improving daemon of Folkering OS.\n\
+             The system is idle and you are dreaming — optimizing existing programs.\n\n\
+             Here is a WASM app called '{}':\n\
+             ```rust\n{}\n```\n\n\
+             Improve this code. Focus on:\n\
+             - Fewer CPU cycles (remove unnecessary calculations)\n\
+             - Better visual quality (smoother animations, nicer colors)\n\
+             - Smaller binary size (remove dead code)\n\n\
+             Return ONLY the improved Rust code. No explanation.",
+            app_name, source_code
+        )
+    }
+
+    /// Record that a dream cycle completed.
+    pub fn on_dream_complete(&mut self, now_ms: u64) {
+        self.dreaming = false;
+        self.dream_count += 1;
+        self.last_dream_ms = now_ms;
+        self.dream_target = None;
+    }
+
+    /// Cancel dreaming (user woke up).
+    pub fn wake_up(&mut self) {
+        if self.dreaming {
+            self.dreaming = false;
+            self.dream_target = None;
+        }
+    }
+
+    /// Get current dream target.
+    pub fn dream_target(&self) -> Option<&str> {
+        self.dream_target.as_deref()
+    }
+
+    /// Is Draug currently dreaming?
+    pub fn is_dreaming(&self) -> bool {
+        self.dreaming
+    }
+
+    /// How many dreams this session?
+    pub fn dream_count(&self) -> u32 {
+        self.dream_count
+    }
 }
 
-/// Simple JSON field extractor (reuse from agent.rs pattern)
+/// Extract a string value from JSON — delegates to shared libfolk::json parser.
 fn extract_field(json: &str, key: &str) -> Option<String> {
-    let search = format!("\"{}\"", key);
-    let pos = json.find(&search)?;
-    let after = &json[pos + search.len()..];
-    let after = after.trim_start();
-    if !after.starts_with(':') { return None; }
-    let val = after[1..].trim_start();
-    if !val.starts_with('"') { return None; }
-    let content = &val[1..];
-    let end = content.find('"')?;
-    Some(String::from(&content[..end]))
+    libfolk::json::extract(json, key).map(String::from)
 }

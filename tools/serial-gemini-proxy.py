@@ -50,40 +50,55 @@ def cfg(key, default=""):
     """Get config from env var or .env file."""
     return os.environ.get(key, _env.get(key, default))
 
-# Provider: "gemini", "openai", "claude", or "local" (LM Studio / llama.cpp / Ollama)
-LLM_PROVIDER = cfg("LLM_PROVIDER", "gemini")
-LLM_API_KEY = cfg("LLM_API_KEY", "") or cfg("GEMINI_API_KEY", "")
-LLM_MODEL = cfg("LLM_MODEL", "")
-LLM_BASE_URL = cfg("LLM_BASE_URL", "")
-LLM_CODE_MODEL = cfg("LLM_CODE_MODEL", "")  # Separate model for code generation
+# ── Hybrid Model Router ──────────────────────────────────────────────────
+# Three tiers: FAST (local, cheap), MEDIUM (cloud lite), HEAVY (cloud smart)
+# Each task is routed to the cheapest tier that can handle it.
 
-# "local" provider needs no API key (LM Studio, Ollama, llama.cpp --server)
-if not LLM_API_KEY and LLM_PROVIDER not in ("local",):
-    print("[PROXY] ERROR: Set LLM_API_KEY (or GEMINI_API_KEY) in .env or environment")
-    print("[PROXY] TIP: Use LLM_PROVIDER=local for LM Studio (no key needed)")
-    sys.exit(1)
+# FAST tier: local Ollama — free, instant, but limited reasoning
+FAST_PROVIDER = cfg("FAST_LLM_PROVIDER", "local")
+FAST_MODEL = cfg("FAST_LLM_MODEL", "qwen2.5-coder:7b")
+FAST_URL = cfg("FAST_LLM_URL", "http://localhost:11434/v1")
 
-# Default models per provider
-DEFAULT_MODELS = {
-    "gemini": "gemini-3.1-flash-lite-preview",
-    "openai": "gpt-4o-mini",
-    "claude": "claude-sonnet-4-20250514",
-    "local": "default",  # LM Studio uses whichever model is loaded
-}
-if not LLM_MODEL:
-    LLM_MODEL = DEFAULT_MODELS.get(LLM_PROVIDER, "gemini-2.5-flash")
+# MEDIUM tier: cloud lite — cheap, good for code gen + simple tool calls
+MEDIUM_PROVIDER = cfg("MEDIUM_LLM_PROVIDER", "gemini")
+MEDIUM_MODEL = cfg("MEDIUM_LLM_MODEL", "gemini-3.1-flash-lite-preview")
+MEDIUM_URL = cfg("MEDIUM_LLM_URL", "https://generativelanguage.googleapis.com/v1beta")
 
-# Default base URLs per provider
+# HEAVY tier: cloud smart — expensive, for complex multi-step reasoning
+HEAVY_PROVIDER = cfg("HEAVY_LLM_PROVIDER", "gemini")
+HEAVY_MODEL = cfg("HEAVY_LLM_MODEL", "gemini-3-flash-preview")
+HEAVY_URL = cfg("HEAVY_LLM_URL", "https://generativelanguage.googleapis.com/v1beta")
+
+# ULTRA tier: last resort — only when all other tiers fail, very expensive
+ULTRA_PROVIDER = cfg("ULTRA_LLM_PROVIDER", "gemini")
+ULTRA_MODEL = cfg("ULTRA_LLM_MODEL", "gemini-3.1-pro-preview-customtools")
+ULTRA_URL = cfg("ULTRA_LLM_URL", "https://generativelanguage.googleapis.com/v1beta")
+
+# API key for cloud providers
+GOOGLE_API_KEY = cfg("GOOGLE_API_KEY", "") or cfg("GEMINI_API_KEY", "") or cfg("LLM_API_KEY", "")
+
+# Legacy compat
+LLM_PROVIDER = FAST_PROVIDER
+LLM_MODEL = FAST_MODEL
+LLM_BASE_URL = FAST_URL
+LLM_API_KEY = GOOGLE_API_KEY
+LLM_CODE_MODEL = cfg("LLM_CODE_MODEL", FAST_MODEL)
+
 DEFAULT_URLS = {
     "gemini": "https://generativelanguage.googleapis.com/v1beta",
     "openai": "https://api.openai.com/v1",
     "claude": "https://api.anthropic.com/v1",
-    "local": "http://localhost:1234/v1",  # LM Studio default port
+    "local": "http://localhost:11434/v1",
 }
-if not LLM_BASE_URL:
-    LLM_BASE_URL = DEFAULT_URLS.get(LLM_PROVIDER, DEFAULT_URLS["gemini"])
 
-print(f"[PROXY] Provider: {LLM_PROVIDER} | Model: {LLM_MODEL} | URL: {LLM_BASE_URL}")
+print(f"[PROXY] FAST:   {FAST_PROVIDER}/{FAST_MODEL}")
+print(f"[PROXY] MEDIUM: {MEDIUM_PROVIDER}/{MEDIUM_MODEL}")
+print(f"[PROXY] HEAVY:  {HEAVY_PROVIDER}/{HEAVY_MODEL}")
+print(f"[PROXY] ULTRA:  {ULTRA_PROVIDER}/{ULTRA_MODEL}")
+if GOOGLE_API_KEY:
+    print(f"[PROXY] Cloud API key: ...{GOOGLE_API_KEY[-8:]}")
+else:
+    print(f"[PROXY] No cloud API key — cloud tiers will fall back to FAST")
 
 COM2_HOST = "127.0.0.1"
 COM2_PORT = 4567
@@ -363,13 +378,65 @@ extern "C" {
 Output ONLY the Rust code. No explanation, no markdown fences."""
 
 
-def _llm_to_wasm(prompt: str) -> tuple:
-    """Shared WASM pipeline: LLM → extract code → fix → compile → (wasm_bytes, error).
+import hashlib
+
+# WASM source cache directory
+_WASM_CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "wasm_cache")
+os.makedirs(_WASM_CACHE_DIR, exist_ok=True)
+
+def _cache_key(prompt: str) -> str:
+    """Generate a filesystem-safe cache key from a prompt."""
+    h = hashlib.sha256(prompt.strip().lower().encode()).hexdigest()[:16]
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in prompt.strip()[:40])
+    return f"{safe}_{h}"
+
+def _cache_check(prompt: str) -> tuple:
+    """Check if cached WASM + source exists. Returns (wasm_bytes, source_str) or (None, None)."""
+    key = _cache_key(prompt)
+    wasm_path = os.path.join(_WASM_CACHE_DIR, f"{key}.wasm")
+    src_path = os.path.join(_WASM_CACHE_DIR, f"{key}.rs")
+    if os.path.exists(wasm_path):
+        with open(wasm_path, "rb") as f:
+            wasm = f.read()
+        src = ""
+        if os.path.exists(src_path):
+            with open(src_path, "r") as f:
+                src = f.read()
+        print(f"[CACHE] Hit: {key} ({len(wasm)} bytes)")
+        return wasm, src
+    return None, None
+
+def _cache_store(prompt: str, source: str, wasm_bytes: bytes):
+    """Store compiled WASM + source code in cache."""
+    key = _cache_key(prompt)
+    with open(os.path.join(_WASM_CACHE_DIR, f"{key}.rs"), "w") as f:
+        f.write(source)
+    with open(os.path.join(_WASM_CACHE_DIR, f"{key}.wasm"), "wb") as f:
+        f.write(wasm_bytes)
+    print(f"[CACHE] Stored: {key} ({len(source)} chars source, {len(wasm_bytes)} bytes wasm)")
+
+
+def _llm_to_wasm(prompt: str, force: bool = False, tweak: str = "") -> tuple:
+    """Shared WASM pipeline: cache check → LLM → extract → fix → compile → cache store.
     Returns (bytes, None) on success, (None, str) on failure."""
-    full_prompt = f"{WASM_SYSTEM_PROMPT}\n\nGenerate: {prompt}"
-    code_model = LLM_CODE_MODEL or LLM_MODEL
-    print(f"[WASM] Calling {LLM_PROVIDER} ({code_model})...")
-    source = call_llm(full_prompt, model_override=code_model)
+    # Check cache first (unless --force)
+    if not force and not tweak:
+        cached_wasm, _ = _cache_check(prompt)
+        if cached_wasm:
+            return cached_wasm, None
+
+    # If --tweak, load existing source and ask LLM to modify it
+    if tweak:
+        _, existing_src = _cache_check(prompt)
+        if existing_src:
+            full_prompt = f"{WASM_SYSTEM_PROMPT}\n\nHere is existing code:\n```rust\n{existing_src}\n```\n\nModify it: {tweak}"
+        else:
+            full_prompt = f"{WASM_SYSTEM_PROMPT}\n\nGenerate: {prompt}\nAlso apply this tweak: {tweak}"
+    else:
+        full_prompt = f"{WASM_SYSTEM_PROMPT}\n\nGenerate: {prompt}"
+
+    print(f"[WASM] Generating code via MEDIUM tier...")
+    source = call_llm(full_prompt, tier="medium")
 
     if source.startswith("Error:"):
         return None, source
@@ -419,6 +486,8 @@ def _llm_to_wasm(prompt: str) -> tuple:
         if len(wasm_binary) > MAX_WASM_SIZE:
             return None, f"WASM too large: {len(wasm_binary)} bytes"
         print(f"[WASM] Compiled: {len(wasm_binary)} bytes")
+        # Cache the source + binary for future reuse
+        _cache_store(prompt, source, wasm_binary)
         return wasm_binary, None
     except subprocess.TimeoutExpired:
         return None, "Compile timeout (60s)"
@@ -444,28 +513,129 @@ def generate_and_compile_wasm(prompt: str, sock: socket.socket):
     print(f"[SERIAL-PROXY] Sent tool_ready: {len(wasm_binary)} bytes WASM")
 
 
-def call_llm(prompt: str, model_override: str = "") -> str:
-    """Call the configured LLM provider and return response text."""
-    model = model_override or LLM_MODEL
-    try:
-        if LLM_PROVIDER == "gemini":
-            return _call_gemini(prompt, model)
-        elif LLM_PROVIDER == "local":
-            return _call_local(prompt, model)
-        elif LLM_PROVIDER == "openai":
-            return _call_openai(prompt, model)
-        elif LLM_PROVIDER == "claude":
-            return _call_claude(prompt, model)
-        else:
-            return f"Error: Unknown provider '{LLM_PROVIDER}'"
-    except Exception as e:
-        return f"Error: {e}"
+def _dispatch(provider: str, url: str, model: str, prompt: str) -> str:
+    """Route to the correct provider backend."""
+    if provider == "gemini":
+        return _call_gemini(prompt, model, url)
+    elif provider == "local":
+        return _call_local(prompt, model, url)
+    elif provider == "openai":
+        return _call_openai(prompt, model, url)
+    elif provider == "claude":
+        return _call_claude(prompt, model)
+    else:
+        return f"Error: Unknown provider '{provider}'"
 
 
-def _call_gemini(prompt: str, model: str = "") -> str:
+_TIER_CHAIN = [
+    ("fast",   lambda: (FAST_PROVIDER,   FAST_MODEL,   FAST_URL)),
+    ("medium", lambda: (MEDIUM_PROVIDER, MEDIUM_MODEL, MEDIUM_URL)),
+    ("heavy",  lambda: (HEAVY_PROVIDER,  HEAVY_MODEL,  HEAVY_URL)),
+    ("ultra",  lambda: (ULTRA_PROVIDER,  ULTRA_MODEL,  ULTRA_URL)),
+]
+
+# Ultra tier rate limiter — prevents runaway costs
+ULTRA_MAX_PER_SESSION = 3          # max ultra calls per proxy session
+ULTRA_COOLDOWN_S = 300             # 5 min cooldown between ultra calls
+_ultra_count = 0
+_ultra_last_ts = 0.0
+
+def _ultra_allowed() -> bool:
+    """Check if ultra tier is allowed right now."""
+    global _ultra_count, _ultra_last_ts
+    if _ultra_count >= ULTRA_MAX_PER_SESSION:
+        print(f"[ROUTER] ULTRA blocked: {_ultra_count}/{ULTRA_MAX_PER_SESSION} calls used this session")
+        return False
+    now = time.time()
+    if _ultra_last_ts > 0 and now - _ultra_last_ts < ULTRA_COOLDOWN_S:
+        remaining = int(ULTRA_COOLDOWN_S - (now - _ultra_last_ts))
+        print(f"[ROUTER] ULTRA blocked: cooldown ({remaining}s remaining)")
+        return False
+    return True
+
+def _ultra_record():
+    """Record an ultra tier call."""
+    global _ultra_count, _ultra_last_ts
+    _ultra_count += 1
+    _ultra_last_ts = time.time()
+    print(f"[ROUTER] ULTRA used: {_ultra_count}/{ULTRA_MAX_PER_SESSION} this session")
+
+
+def call_llm(prompt: str, model_override: str = "", tier: str = "fast") -> str:
+    """Call LLM using the hybrid router with auto-escalation on failure.
+
+    Tiers: fast → medium → heavy → ultra
+    On failure, escalates to the next tier automatically.
+    Ultra is rate-limited: max 3 calls per session, 5 min cooldown.
+    """
+    tier_names = [t[0] for t in _TIER_CHAIN]
+    start_idx = tier_names.index(tier) if tier in tier_names else 0
+
+    for i in range(start_idx, len(_TIER_CHAIN)):
+        tier_name, get_config = _TIER_CHAIN[i]
+
+        # Ultra rate limiter
+        if tier_name == "ultra" and not _ultra_allowed():
+            return "Error: ultra tier rate-limited (max 3/session, 5min cooldown)"
+
+        provider, model, url = get_config()
+
+        if model_override and i == start_idx:
+            model = model_override
+
+        # Skip cloud tiers without API key
+        if provider != "local" and not GOOGLE_API_KEY:
+            if i == start_idx:
+                print(f"[ROUTER] No API key for {tier_name}/{provider}, falling back to FAST")
+            provider, model, url = FAST_PROVIDER, FAST_MODEL, FAST_URL
+
+        print(f"[ROUTER] tier={tier_name} -> {provider}/{model}")
+        try:
+            result = _dispatch(provider, url, model, prompt)
+            if result and not result.startswith("Error:"):
+                if tier_name == "ultra":
+                    _ultra_record()
+                return result
+            raise ValueError(result)
+        except Exception as e:
+            if i < len(_TIER_CHAIN) - 1:
+                print(f"[ROUTER] {tier_name} failed ({e}), escalating...")
+            else:
+                return f"Error: all tiers exhausted ({e})"
+
+    return "Error: no tiers available"
+
+
+def route_for_task(msg_type: str, prompt: str = "") -> str:
+    """Decide which tier to use based on task type and prompt content.
+
+    Returns: 'fast', 'medium', or 'heavy'
+    """
+    # Draug background analysis — always fast (cheap, non-critical)
+    if "draug" in prompt.lower() or "background daemon" in prompt.lower():
+        return "fast"
+
+    # WASM code generation — medium (needs decent code output)
+    if msg_type == "wasm_gen_request" or "generate_wasm" in prompt.lower():
+        return "medium"
+
+    # Agent tool calls — medium (needs structured JSON output)
+    if msg_type == "chat_request" and ("tool" in prompt.lower() or "agent" in prompt.lower()):
+        return "medium"
+
+    # Complex multi-step reasoning (long prompts with history)
+    if len(prompt) > 4000:
+        return "medium"
+
+    # Default: fast
+    return "fast"
+
+
+def _call_gemini(prompt: str, model: str = "", base_url: str = "") -> str:
     """Google Gemini API."""
-    m = model or LLM_MODEL
-    url = f"{LLM_BASE_URL}/models/{m}:generateContent?key={LLM_API_KEY}"
+    m = model or MEDIUM_MODEL
+    base = base_url or MEDIUM_URL
+    url = f"{base}/models/{m}:generateContent?key={GOOGLE_API_KEY}"
     body = json.dumps({
         "contents": [{"parts": [{"text": prompt}]}]
     }).encode()
@@ -477,10 +647,11 @@ def _call_gemini(prompt: str, model: str = "") -> str:
         return result["candidates"][0]["content"]["parts"][0]["text"]
 
 
-def _call_openai(prompt: str, model: str = "") -> str:
+def _call_openai(prompt: str, model: str = "", base_url: str = "") -> str:
     """OpenAI-compatible API (OpenAI, LM Studio, Ollama, llama.cpp server)."""
-    m = model or LLM_MODEL
-    url = f"{LLM_BASE_URL}/chat/completions"
+    m = model or FAST_MODEL
+    base = base_url or FAST_URL
+    url = f"{base}/chat/completions"
     body = json.dumps({
         "model": m,
         "messages": [{"role": "user", "content": prompt}],
@@ -500,11 +671,12 @@ def _call_openai(prompt: str, model: str = "") -> str:
         return result["choices"][0]["message"]["content"]
 
 
-def _call_local(prompt: str, model: str = "") -> str:
+def _call_local(prompt: str, model: str = "", base_url: str = "") -> str:
     """Local Ollama API — uses native /api/chat to capture <think> reasoning."""
-    m = model or LLM_MODEL
+    m = model or FAST_MODEL
     # Use Ollama native API (not OpenAI compat) to get 'thinking' field
-    base = LLM_BASE_URL.rstrip("/v1").rstrip("/")  # http://localhost:11434
+    raw_url = base_url or FAST_URL
+    base = raw_url.rstrip("/v1").rstrip("/")  # http://localhost:11434
     url = f"{base}/api/chat"
     body = json.dumps({
         "model": m,
@@ -571,9 +743,10 @@ def handle_mcp_frame(frame_bytes: bytes, sock: socket.socket):
     print(f"[MCP] Received: {msg_type} (seq={seq})")
 
     if msg_type == 'chat_request':
-        # OS wants to talk to the LLM — route through Context Manager
+        # OS wants to talk to the LLM — route through hybrid router + context manager
         prompt = msg['prompt']
-        print(f"[MCP] Chat: {prompt[:80]}...")
+        tier = route_for_task(msg_type, prompt)
+        print(f"[MCP] Chat ({tier}): {prompt[:80]}...")
 
         # Context management: check compaction thresholds
         if _context_mgr.needs_full_compact():
@@ -581,12 +754,11 @@ def handle_mcp_frame(frame_bytes: bytes, sock: socket.socket):
             _context_mgr.full_compact()
         elif _context_mgr.needs_auto_compact():
             print(f"[CTX] AUTO COMPACT ({_context_mgr.usage_pct():.0f}%)")
-            _context_mgr.auto_compact(lambda text: call_llm(text))
+            _context_mgr.auto_compact(lambda text: call_llm(text, tier="fast"))
 
         _context_mgr.add_message("user", prompt)
-        # Send accumulated context to LLM (not just latest prompt)
         full_context = _context_mgr.get_prompt_text()
-        response_text = call_llm(full_context)
+        response_text = call_llm(full_context, tier=tier)
 
         # Strip <think>...</think> tags to reduce wire size
         clean_text = response_text

@@ -73,6 +73,15 @@ pub fn build_system_prompt() -> String {
         prompt.push('\n');
     }
     prompt.push_str("\nExample: {\"tool\": \"system_info\", \"args\": \"\"}\n");
+    prompt.push_str("\nEPHEMERAL UI:\n\
+        - For simple questions (math, conversions, quick facts), use generate_wasm\n\
+          to create a micro-widget that shows the answer visually.\n\
+        - These widgets are disposable — they vanish when the user closes them.\n\
+        - Example: user asks 'what is 45*340?' → generate_wasm a calculator widget\n\
+          showing the result 15300 in large text.\n");
+    prompt.push_str("\nPERFORMANCE:\n\
+        - When asked to optimize something, generate multiple versions and compare.\n\
+        - Always explain which version you chose and why.\n");
     prompt
 }
 
@@ -174,24 +183,25 @@ impl AgentSession {
 
     /// Process an LLM response. Parses for tool calls or final answer.
     pub fn on_llm_response(&mut self, response: &str) {
-        // Add assistant response to history
         self.history.push(HistoryEntry {
             role: "assistant",
             content: String::from(response),
         });
 
-        // Try to parse as JSON tool call or answer
+        // Strip whitespace and find the JSON object within the response.
+        // LLMs often wrap JSON in markdown or add explanatory text around it.
         let trimmed = response.trim();
 
-        // Check for {"answer": "..."} — final answer
-        if let Some(answer) = extract_json_field(trimmed, "answer") {
-            self.state = AgentState::Done { answer };
-            return;
-        }
+        // Try to find a JSON object anywhere in the response (not just at the start)
+        let json_str = if let Some(start) = trimmed.find('{') {
+            if let Some(end) = trimmed.rfind('}') {
+                &trimmed[start..=end]
+            } else { trimmed }
+        } else { trimmed };
 
-        // Check for {"tool": "...", "args": "..."} — tool call
-        if let Some(tool_name) = extract_json_field(trimmed, "tool") {
-            let tool_args = extract_json_field(trimmed, "args").unwrap_or_default();
+        // Check for {"tool": "...", "args": "..."} — tool call (check FIRST)
+        if let Some(tool_name) = extract_json_field(json_str, "tool") {
+            let tool_args = extract_json_field(json_str, "args").unwrap_or_default();
             self.tool_calls += 1;
 
             if self.tool_calls > MAX_TOOL_CALLS {
@@ -205,7 +215,14 @@ impl AgentSession {
             return;
         }
 
-        // No JSON structure — treat as final answer (LLM responded in plain text)
+        // Check for {"answer": "..."} — final answer
+        if let Some(answer) = extract_json_field(json_str, "answer") {
+            self.state = AgentState::Done { answer };
+            return;
+        }
+
+        // No JSON found — treat the entire response as plain text answer.
+        // This handles cases where the LLM ignores JSON formatting instructions.
         self.state = AgentState::Done {
             answer: String::from(trimmed),
         };
@@ -279,45 +296,7 @@ pub fn execute_tool(name: &str, args: &str) -> String {
 
 // ── JSON Parsing (minimal, no_std) ──────────────────────────────────────
 
-/// Extract a string value for a given key from simple JSON.
-/// Handles: {"key": "value"} and {"key": "value", ...}
+/// Extract a string value from JSON — delegates to shared libfolk::json parser.
 fn extract_json_field(json: &str, key: &str) -> Option<String> {
-    // Find "key": pattern
-    let search = format!("\"{}\"", key);
-    let key_pos = json.find(&search)?;
-    let after_key = &json[key_pos + search.len()..];
-
-    // Skip whitespace and colon
-    let after_colon = after_key.trim_start();
-    if !after_colon.starts_with(':') {
-        return None;
-    }
-    let value_start = after_colon[1..].trim_start();
-
-    if !value_start.starts_with('"') {
-        return None;
-    }
-
-    // Extract string value (handle escaped quotes)
-    let content = &value_start[1..];
-    let mut result = String::new();
-    let mut chars = content.chars();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            if let Some(escaped) = chars.next() {
-                match escaped {
-                    'n' => result.push('\n'),
-                    't' => result.push('\t'),
-                    '"' => result.push('"'),
-                    '\\' => result.push('\\'),
-                    _ => { result.push('\\'); result.push(escaped); }
-                }
-            }
-        } else if c == '"' {
-            break;
-        } else {
-            result.push(c);
-        }
-    }
-    Some(result)
+    libfolk::json::extract(json, key).map(String::from)
 }

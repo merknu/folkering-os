@@ -15,7 +15,7 @@ path = "src/lib.rs"
 
 [dependencies]
 # Core Folkering userspace library
-libfolk = { path = "../libfolk" }
+libfolk = { path = "../libfolk", features = ["mcp"] }
 
 # AccessKit schema for UI tree
 libaccesskit-folk = { path = "../libaccesskit-folk" }

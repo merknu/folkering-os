@@ -136,6 +136,44 @@ fn starts_with_ci(haystack: &str, needle: &str) -> bool {
     true
 }
 
+/// Flags parsed from agent command line
+struct AgentFlags<'a> {
+    force: bool,                        // --force: skip cache
+    tweak_msg: Option<&'a str>,         // --tweak "modification": modify cached version
+}
+
+/// Parse agent flags from command string.
+/// Returns (flags, remaining_prompt).
+fn parse_agent_flags(input: &str) -> (AgentFlags<'_>, &str) {
+    let mut force = false;
+    let mut tweak_msg: Option<&str> = None;
+    let mut rest = input;
+
+    // Parse --force
+    if rest.starts_with("--force ") {
+        force = true;
+        rest = rest[8..].trim_start();
+    }
+
+    // Parse --tweak "msg"
+    if rest.starts_with("--tweak ") {
+        let after = rest[8..].trim_start();
+        if after.starts_with('"') {
+            if let Some(end) = after[1..].find('"') {
+                tweak_msg = Some(&after[1..1 + end]);
+                rest = after[2 + end..].trim_start();
+            }
+        } else {
+            // No quotes — take first word as tweak message
+            let end = after.find(' ').unwrap_or(after.len());
+            tweak_msg = Some(&after[..end]);
+            rest = if end < after.len() { after[end..].trim_start() } else { "" };
+        }
+    }
+
+    (AgentFlags { force, tweak_msg }, rest)
+}
+
 struct IntentEntry {
     app: &'static str,
     keywords: &'static [&'static str],
@@ -1207,6 +1245,10 @@ fn main() -> ! {
     let mut active_agent: Option<compositor::agent::AgentSession> = None; // ReAct agentic loop
     let mut draug = compositor::draug::DraugDaemon::new(); // Background AI daemon
 
+    // Pillar 4: WASM warm cache — pre-compiled modules for instant response
+    let mut wasm_cache: alloc::collections::BTreeMap<alloc::string::String, alloc::vec::Vec<u8>> = alloc::collections::BTreeMap::new();
+    const MAX_CACHE_ENTRIES: usize = 4;
+
     // Timing instrumentation — find the freeze
     #[inline(always)]
     fn rdtsc() -> u64 {
@@ -1450,7 +1492,8 @@ fn main() -> ! {
 
         // ===== Agent timeout check =====
         if let Some(agent) = &mut active_agent {
-            if agent.check_timeout(libfolk::sys::uptime()) {
+            let timeout_ms = if tsc_per_us > 0 { rdtsc() / tsc_per_us / 1000 } else { libfolk::sys::uptime() };
+            if agent.check_timeout(timeout_ms) {
                 if let Some(win) = wm.get_window_mut(agent.window_id) {
                     win.push_line("[Agent] Timeout: LLM did not respond in 120s");
                 }
@@ -1461,18 +1504,48 @@ fn main() -> ! {
 
         // ===== Draug: Background AI daemon tick =====
         {
-            let now_ms = libfolk::sys::uptime();
-            if did_work {
-                draug.on_user_input(now_ms);
-            }
+            // Use RDTSC for timing (uptime_ms is broken under WHPX — APIC timer death)
+            let now_ms = if tsc_per_us > 0 { rdtsc() / tsc_per_us / 1000 } else { libfolk::sys::uptime() };
+            // Only count actual user input (mouse/keyboard) as activity, not rendering
+            // did_work is too broad — clock ticks, MCP polls, etc. are not user input
             if draug.should_tick(now_ms) {
                 draug.tick(now_ms);
+                // Debug: log every tick
+                write_str("[Draug] Tick #");
+                let mut nb = [0u8; 16];
+                write_str(format_usize(draug.observation_count(), &mut nb));
+                write_str("\n");
             }
             if draug.should_analyze(now_ms) && active_agent.is_none() {
                 if draug.start_analysis() {
                     write_str("[Draug] Analysis started\n");
                 }
             }
+        }
+
+        // ===== AutoDream: Self-improving software during deep idle =====
+        let dream_ms = if tsc_per_us > 0 { rdtsc() / tsc_per_us / 1000 } else { 0 };
+        if draug.should_dream(dream_ms) && active_agent.is_none() && async_tool_gen.is_none() {
+            // Collect cache keys
+            let keys: alloc::vec::Vec<&str> = wasm_cache.keys().map(|k| k.as_str()).collect();
+            if let Some(target) = draug.start_dream(&keys) {
+                write_str("[AutoDream] Entering dream mode for: ");
+                write_str(&target[..target.len().min(40)]);
+                write_str("\n");
+                // Send the cached source to LLM for optimization via MCP WasmGenRequest
+                // The proxy will check cache, find the source, ask LLM to improve it
+                let dream_desc = alloc::format!("--tweak \"optimize for fewer CPU cycles\" {}", target);
+                if libfolk::mcp::client::send_wasm_gen(&dream_desc) {
+                    async_tool_gen = Some((0, target)); // 0 = no window, internal dream
+                    write_str("[AutoDream] Optimization request sent\n");
+                }
+            }
+        }
+
+        // Wake Draug from dream if user interacts
+        if did_work && draug.is_dreaming() {
+            draug.wake_up();
+            write_str("[AutoDream] User activity — dream interrupted\n");
         }
 
         // ===== MCP: Poll for responses from Python proxy =====
@@ -1505,6 +1578,11 @@ fn main() -> ! {
                                     compositor::agent::AgentState::ExecutingTool { tool_name, tool_args } => {
                                         let tname = tool_name.clone();
                                         let targs = tool_args.clone();
+                                        write_str("[Agent] Tool: ");
+                                        write_str(&tname);
+                                        write_str(" ");
+                                        write_str(&targs[..targs.len().min(40)]);
+                                        write_str("\n");
                                         if let Some(win) = wm.get_window_mut(agent.window_id) {
                                             win.push_line(&alloc::format!("[Agent] Tool: {} {}", &tname, &targs[..targs.len().min(40)]));
                                         }
@@ -1528,6 +1606,9 @@ fn main() -> ! {
                                         }
                                     }
                                     compositor::agent::AgentState::Done { answer } => {
+                                        write_str("[Agent] Done: ");
+                                        write_str(&answer[..answer.len().min(80)]);
+                                        write_str("\n");
                                         if let Some(win) = wm.get_window_mut(agent.window_id) {
                                             win.push_line("[Agent] Done:");
                                             for line in answer.split('\n') {
@@ -1539,6 +1620,9 @@ fn main() -> ! {
                                         active_agent = None;
                                     }
                                     compositor::agent::AgentState::Failed { reason } => {
+                                        write_str("[Agent] Failed: ");
+                                        write_str(&reason[..reason.len().min(80)]);
+                                        write_str("\n");
                                         if let Some(win) = wm.get_window_mut(agent.window_id) {
                                             win.push_line(&alloc::format!("[Agent] Failed: {}", &reason[..reason.len().min(80)]));
                                         }
@@ -1587,6 +1671,69 @@ fn main() -> ! {
                             (0u32, alloc::string::String::new())
                         };
                         last_wasm_bytes = Some(wasm_bytes.clone());
+
+                        // AutoDream: if Draug is dreaming, benchmark V1 vs V2
+                        if draug.is_dreaming() && !tool_prompt.is_empty() {
+                            // Strip --tweak prefix to get original cache key
+                            let orig_key = if tool_prompt.contains("optimize") {
+                                tool_prompt.rsplit(' ').next().unwrap_or(&tool_prompt)
+                            } else { &tool_prompt };
+
+                            if let Some(v1_wasm) = wasm_cache.get(orig_key) {
+                                let bench_config = compositor::wasm_runtime::WasmConfig {
+                                    screen_width: fb.width as u32,
+                                    screen_height: fb.height as u32,
+                                    uptime_ms: 0,
+                                };
+                                // Benchmark V1
+                                let t1_start = rdtsc();
+                                for _ in 0..10 {
+                                    let _ = compositor::wasm_runtime::execute_wasm(v1_wasm, bench_config.clone());
+                                }
+                                let v1_cycles = (rdtsc() - t1_start) / 10;
+
+                                // Benchmark V2
+                                let t2_start = rdtsc();
+                                for _ in 0..10 {
+                                    let _ = compositor::wasm_runtime::execute_wasm(&wasm_bytes, bench_config.clone());
+                                }
+                                let v2_cycles = (rdtsc() - t2_start) / 10;
+
+                                let mut nb = [0u8; 16];
+                                write_str("[AutoDream] V1: ");
+                                write_str(format_usize((v1_cycles / tsc_per_us) as usize, &mut nb));
+                                write_str("us  V2: ");
+                                write_str(format_usize((v2_cycles / tsc_per_us) as usize, &mut nb));
+                                write_str("us");
+
+                                if v2_cycles < v1_cycles {
+                                    let pct = ((v1_cycles - v2_cycles) * 100 / v1_cycles.max(1)) as usize;
+                                    write_str(" -> V2 wins! (");
+                                    write_str(format_usize(pct, &mut nb));
+                                    write_str("% faster)\n");
+                                    // Replace cache with improved version
+                                    wasm_cache.insert(alloc::string::String::from(orig_key), wasm_bytes.clone());
+                                    write_str("[AutoDream] Cache evolved!\n");
+                                } else {
+                                    write_str(" -> V1 kept (V2 not faster)\n");
+                                }
+                            }
+
+                            let dream_ms = if tsc_per_us > 0 { rdtsc() / tsc_per_us / 1000 } else { 0 };
+                            draug.on_dream_complete(dream_ms);
+                        }
+                        // Normal cache storage (non-dream)
+                        else if !tool_prompt.is_empty() {
+                            if wasm_cache.len() >= MAX_CACHE_ENTRIES {
+                                if let Some(oldest) = wasm_cache.keys().next().cloned() {
+                                    wasm_cache.remove(&oldest);
+                                }
+                            }
+                            wasm_cache.insert(tool_prompt.clone(), wasm_bytes.clone());
+                            write_str("[Cache] Stored WASM for: ");
+                            write_str(&tool_prompt[..tool_prompt.len().min(40)]);
+                            write_str("\n");
+                        }
 
                         let config = compositor::wasm_runtime::WasmConfig {
                             screen_width: fb.width as u32,
@@ -1715,6 +1862,9 @@ fn main() -> ! {
         }
 
         if had_mouse_events {
+            // Tell Draug the user is actively interacting
+            let input_ms = if tsc_per_us > 0 { rdtsc() / tsc_per_us / 1000 } else { 0 };
+            draug.on_user_input(input_ms);
             // Hover detection for folder preview (home view)
             if open_folder < 0 && active_wasm_app.is_none() {
                 let old_hover = hover_folder;
@@ -2127,6 +2277,8 @@ fn main() -> ! {
         let mut win_execute_command: Option<u32> = None; // window id to execute from
         while let Some(key) = read_key() {
             did_work = true;
+            let input_ms = if tsc_per_us > 0 { rdtsc() / tsc_per_us / 1000 } else { 0 };
+            draug.on_user_input(input_ms);
 
             // Ctrl+G (0x07) or 'G'/'g': toggle RAM graph
             if key == 0x07 || (active_wasm_app.is_none() && (key == b'G' || key == b'g') && !omnibar_visible) {
@@ -3627,23 +3779,68 @@ fn main() -> ! {
                             }
                         }
                     } else if cmd_str.starts_with("agent ") {
-                        // === NEW: Agentic ReAct loop via MCP ===
-                        let prompt = cmd_str[6..].trim();
-                        write_str("[AGENT] Command received: ");
+                        // Agentic ReAct loop via MCP
+                        // Flags: --force (skip cache), --tweak "mod" (modify existing)
+                        let raw = cmd_str[6..].trim();
+                        let (flags, prompt) = parse_agent_flags(raw);
+                        write_str("[AGENT] Command: ");
                         write_str(prompt);
+                        if flags.force { write_str(" [--force]"); }
+                        if flags.tweak_msg.is_some() { write_str(" [--tweak]"); }
                         write_str("\n");
                         if prompt.is_empty() {
                             win.push_line("Usage: agent <task>");
+                            win.push_line("  --force: skip WASM cache");
+                            win.push_line("  --tweak \"change\": modify cached version");
                         } else {
-                            win.push_line(&alloc::format!("[Agent] Task: {}", &prompt[..prompt.len().min(60)]));
-                            let mut session = compositor::agent::AgentSession::new(prompt, win_id);
-                            if session.start() {
-                                write_str("[AGENT] Session started, waiting for LLM\n");
-                                win.push_line("[Agent] Thinking...");
-                                active_agent = Some(session);
+                            // Record command for Draug prediction
+                            draug.record_command(prompt);
+
+                            // Check WASM cache (Pillar 4)
+                            if !flags.force {
+                                if let Some(cached_wasm) = wasm_cache.get(prompt) {
+                                    win.push_line(&alloc::format!("[Cache] Hit: {} bytes", cached_wasm.len()));
+                                    // Use cached WASM directly
+                                    last_wasm_bytes = Some(cached_wasm.clone());
+                                    let config = compositor::wasm_runtime::WasmConfig {
+                                        screen_width: fb.width as u32,
+                                        screen_height: fb.height as u32,
+                                        uptime_ms: libfolk::sys::uptime() as u32,
+                                    };
+                                    let (result, output) = compositor::wasm_runtime::execute_wasm(cached_wasm, config);
+                                    if let compositor::wasm_runtime::WasmResult::Ok = &result {
+                                        win.push_line("[Cache] Executed from cache (instant)");
+                                    }
+                                    if let Some(color) = output.fill_screen { fb.clear(fb.color_from_rgb24(color)); }
+                                    for cmd in &output.draw_commands {
+                                        fb.fill_rect(cmd.x as usize, cmd.y as usize, cmd.w as usize, cmd.h as usize, fb.color_from_rgb24(cmd.color));
+                                    }
+                                    damage.damage_full();
+                                    need_redraw = true;
+                                    // Skip agent — served from cache
+                                } else {
+                                    // No cache hit — run agent
+                                    win.push_line(&alloc::format!("[Agent] Task: {}", &prompt[..prompt.len().min(60)]));
+                                    let mut session = compositor::agent::AgentSession::new(prompt, win_id);
+                                    if session.start() {
+                                        write_str("[AGENT] Session started\n");
+                                        win.push_line("[Agent] Thinking...");
+                                        active_agent = Some(session);
+                                    } else {
+                                        win.push_line("[Agent] Error: failed to start");
+                                    }
+                                }
                             } else {
-                                write_str("[AGENT] Session start FAILED\n");
-                                win.push_line("[Agent] Error: failed to start");
+                                // --force: skip cache, always ask LLM
+                                win.push_line(&alloc::format!("[Agent] Task (forced): {}", &prompt[..prompt.len().min(50)]));
+                                let mut session = compositor::agent::AgentSession::new(prompt, win_id);
+                                if session.start() {
+                                    write_str("[AGENT] Session started (forced)\n");
+                                    win.push_line("[Agent] Thinking...");
+                                    active_agent = Some(session);
+                                } else {
+                                    win.push_line("[Agent] Error: failed to start");
+                                }
                             }
                         }
                     } else if cmd_str.starts_with("gemini ") {

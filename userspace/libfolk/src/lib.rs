@@ -41,7 +41,9 @@ pub mod syscall;
 pub mod fmt;
 pub mod sys;
 pub mod ui;
+#[cfg(feature = "mcp")]
 pub mod mcp;
+pub mod json;
 
 // Re-export print macros at crate root
 pub use fmt::_print;
