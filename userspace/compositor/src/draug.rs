@@ -47,13 +47,15 @@ pub const DREAM_MAX_PER_SESSION: u32 = 5;
 /// AutoDream: max refactoring failures before marking as "perfected"
 pub const DREAM_STRIKE_LIMIT: u8 = 3;
 
-/// Dream modes
+/// Dream modes — three hemispheres
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum DreamMode {
-    /// Mode 1: CPU cycle reduction — headless benchmark V1 vs V2
+    /// Left brain: CPU cycle reduction — headless benchmark V1 vs V2
     Refactor,
-    /// Mode 2: Creative GUI vision — LLM sees render output + suggests features
+    /// Right brain: GUI vision — LLM sees render output + adds features
     Creative,
+    /// Immune system: fuzzing — inject extreme inputs to find crashes
+    Nightmare,
 }
 
 /// System observation snapshot
@@ -374,8 +376,12 @@ impl DraugDaemon {
     pub fn start_dream(&mut self, cache_keys: &[&str]) -> Option<(String, DreamMode)> {
         if cache_keys.is_empty() { return None; }
 
-        // Alternate modes: even = Refactor, odd = Creative
-        let mode = if self.dream_count % 2 == 0 { DreamMode::Refactor } else { DreamMode::Creative };
+        // Rotate modes: 0=Refactor, 1=Creative, 2=Nightmare
+        let mode = match self.dream_count % 3 {
+            0 => DreamMode::Refactor,
+            1 => DreamMode::Creative,
+            _ => DreamMode::Nightmare,
+        };
 
         // Find a suitable target
         for i in 0..cache_keys.len() {
@@ -429,6 +435,23 @@ impl DraugDaemon {
                  - Return ONLY the improved Rust code",
                 app_name, source_code, render_summary
             ),
+            DreamMode::Nightmare => format!(
+                "You are Draug in Nightmare mode — the immune system of Folkering OS.\n\
+                 Your job is to find and FIX vulnerabilities in this WASM app.\n\n\
+                 App: '{}'\n```rust\n{}\n```\n\n\
+                 Think like a fuzzer:\n\
+                 - What happens with screen_width=0? Division by zero?\n\
+                 - What if folk_random() returns i32::MIN or i32::MAX?\n\
+                 - What if folk_poll_event returns 1000 events per frame?\n\
+                 - Are there array index overflows with extreme coordinates?\n\n\
+                 Add defensive checks:\n\
+                 - Clamp values to safe ranges\n\
+                 - Avoid division by zero\n\
+                 - Bounds-check array indices\n\
+                 - Handle edge cases gracefully\n\n\
+                 Return ONLY the hardened Rust code. No explanation.",
+                app_name, source_code
+            ),
         }
     }
 
@@ -452,6 +475,21 @@ impl DraugDaemon {
     pub fn is_dreaming(&self) -> bool { self.dreaming }
     pub fn dream_count(&self) -> u32 { self.dream_count }
     pub fn current_dream_mode(&self) -> DreamMode { self.dream_mode }
+
+    // ═══════ Token Scheduler: Attention-Based LLM Priority ══════════
+    //
+    // The most precious resource isn't CPU time — it's LLM tokens.
+    // Draug yields to user-facing tasks, only consuming tokens during idle.
+
+    /// Check if Draug should suppress LLM calls to preserve tokens for the user.
+    /// Returns true if Draug should stay silent.
+    pub fn should_yield_tokens(&self, active_agent: bool, now_ms: u64) -> bool {
+        // Always yield if user has an active agent session
+        if active_agent { return true; }
+        // Yield if user was active in last 30s
+        if now_ms.saturating_sub(self.last_user_input_ms) < 30_000 { return true; }
+        false
+    }
 }
 
 /// Extract a string value from JSON — delegates to shared libfolk::json parser.

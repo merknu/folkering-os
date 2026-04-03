@@ -1525,12 +1525,14 @@ fn main() -> ! {
 
         // ===== AutoDream: Two-Hemisphere Self-Improving Software =====
         let dream_ms = if tsc_per_us > 0 { rdtsc() / tsc_per_us / 1000 } else { 0 };
-        if draug.should_dream(dream_ms) && active_agent.is_none() && async_tool_gen.is_none() {
+        if draug.should_dream(dream_ms) && active_agent.is_none() && async_tool_gen.is_none()
+            && !draug.should_yield_tokens(active_agent.is_some(), dream_ms) {
             let keys: alloc::vec::Vec<&str> = wasm_cache.keys().map(|k| k.as_str()).collect();
             if let Some((target, mode)) = draug.start_dream(&keys) {
                 let mode_str = match mode {
                     compositor::draug::DreamMode::Refactor => "Refactor",
                     compositor::draug::DreamMode::Creative => "Creative",
+                    compositor::draug::DreamMode::Nightmare => "Nightmare",
                 };
                 write_str("[AutoDream] Mode: ");
                 write_str(mode_str);
@@ -1541,6 +1543,10 @@ fn main() -> ! {
                 let tweak = match mode {
                     compositor::draug::DreamMode::Refactor =>
                         alloc::format!("--tweak \"refactor for fewer CPU cycles, no new features\" {}", target),
+                    compositor::draug::DreamMode::Nightmare => {
+                        // Nightmare: ask LLM to harden the code against edge cases
+                        alloc::format!("--tweak \"harden against edge cases: zero division, overflow, OOB\" {}", target)
+                    }
                     compositor::draug::DreamMode::Creative => {
                         // For Creative mode: run the app headless to get render summary
                         let render_desc = if let Some(cached_wasm) = wasm_cache.get(&target) {
@@ -1738,11 +1744,36 @@ fn main() -> ! {
                                     }
                                 }
                                 compositor::draug::DreamMode::Creative => {
-                                    // Hemisphere 2: Accept if it compiles (V2 has new features)
-                                    write_str("[AutoDream/Creative] New version compiled (");
+                                    // Hemisphere 2: Accept if it compiles (new features)
+                                    write_str("[AutoDream/Creative] Candidate (");
                                     write_str(format_usize(wasm_bytes.len(), &mut nb));
-                                    write_str(" bytes) — accepting as candidate\n");
+                                    write_str(" bytes) — accepted\n");
                                     wasm_cache.insert(alloc::string::String::from(orig_key), wasm_bytes.clone());
+                                }
+                                compositor::draug::DreamMode::Nightmare => {
+                                    // Immune system: run hardened version with extreme inputs
+                                    // If it survives, replace. If it crashes, keep original.
+                                    let fuzz_config = compositor::wasm_runtime::WasmConfig {
+                                        screen_width: 0, // Edge case: zero-size screen
+                                        screen_height: 0,
+                                        uptime_ms: u32::MAX, // Edge case: max uptime
+                                    };
+                                    let (fuzz_result, _) = compositor::wasm_runtime::execute_wasm(&wasm_bytes, fuzz_config);
+                                    match fuzz_result {
+                                        compositor::wasm_runtime::WasmResult::Ok |
+                                        compositor::wasm_runtime::WasmResult::OutOfFuel => {
+                                            write_str("[AutoDream/Nightmare] Hardened version survived fuzzing — accepted\n");
+                                            wasm_cache.insert(alloc::string::String::from(orig_key), wasm_bytes.clone());
+                                        }
+                                        compositor::wasm_runtime::WasmResult::Trap(ref msg) => {
+                                            write_str("[AutoDream/Nightmare] Hardened version CRASHED: ");
+                                            write_str(&msg[..msg.len().min(60)]);
+                                            write_str(" — rejected\n");
+                                        }
+                                        _ => {
+                                            write_str("[AutoDream/Nightmare] Hardened version failed — rejected\n");
+                                        }
+                                    }
                                 }
                             }
 

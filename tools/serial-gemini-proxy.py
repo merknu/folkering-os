@@ -406,14 +406,85 @@ def _cache_check(prompt: str) -> tuple:
         return wasm, src
     return None, None
 
+def _cache_meta_path(prompt: str) -> str:
+    return os.path.join(_WASM_CACHE_DIR, f"{_cache_key(prompt)}.meta.json")
+
+def _cache_get_meta(prompt: str) -> dict:
+    """Read cache metadata (strikes, perfected status, version history)."""
+    path = _cache_meta_path(prompt)
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                return json.loads(f.read())
+        except Exception:
+            pass
+    return {"strikes": 0, "perfected": False, "version": 1, "dreams": 0, "created": ""}
+
+def _cache_set_meta(prompt: str, meta: dict):
+    """Write cache metadata."""
+    with open(_cache_meta_path(prompt), "w") as f:
+        f.write(json.dumps(meta, indent=2))
+
 def _cache_store(prompt: str, source: str, wasm_bytes: bytes):
-    """Store compiled WASM + source code in cache."""
+    """Store compiled WASM + source code + metadata in cache."""
     key = _cache_key(prompt)
     with open(os.path.join(_WASM_CACHE_DIR, f"{key}.rs"), "w") as f:
         f.write(source)
     with open(os.path.join(_WASM_CACHE_DIR, f"{key}.wasm"), "wb") as f:
         f.write(wasm_bytes)
-    print(f"[CACHE] Stored: {key} ({len(source)} chars source, {len(wasm_bytes)} bytes wasm)")
+    # Update metadata
+    import datetime
+    meta = _cache_get_meta(prompt)
+    meta["version"] = meta.get("version", 0) + 1
+    if not meta.get("created"):
+        meta["created"] = datetime.datetime.now().isoformat()
+    meta["last_updated"] = datetime.datetime.now().isoformat()
+    _cache_set_meta(prompt, meta)
+    print(f"[CACHE] Stored: {key} v{meta['version']} ({len(source)} chars, {len(wasm_bytes)} bytes)")
+
+
+# ── Daily Dream Budget ──────────────────────────────────────────────────
+# Prevents AutoDream from burning through API credits overnight.
+
+DREAM_MAX_PER_DAY = int(cfg("DREAM_MAX_CALLS_PER_DAY", "10"))
+_DREAM_BUDGET_PATH = os.path.join(_WASM_CACHE_DIR, "dream_budget.json")
+
+def _dream_budget_check() -> bool:
+    """Check if today's dream budget is available. Returns True if allowed."""
+    import datetime
+    today = datetime.date.today().isoformat()
+    budget = {"date": "", "calls": 0}
+    if os.path.exists(_DREAM_BUDGET_PATH):
+        try:
+            with open(_DREAM_BUDGET_PATH, "r") as f:
+                budget = json.loads(f.read())
+        except Exception:
+            pass
+    # Reset counter if new day
+    if budget.get("date") != today:
+        budget = {"date": today, "calls": 0}
+    if budget["calls"] >= DREAM_MAX_PER_DAY:
+        print(f"[DREAM-BUDGET] Blocked: {budget['calls']}/{DREAM_MAX_PER_DAY} calls used today")
+        return False
+    return True
+
+def _dream_budget_record():
+    """Record a dream API call."""
+    import datetime
+    today = datetime.date.today().isoformat()
+    budget = {"date": today, "calls": 0}
+    if os.path.exists(_DREAM_BUDGET_PATH):
+        try:
+            with open(_DREAM_BUDGET_PATH, "r") as f:
+                budget = json.loads(f.read())
+        except Exception:
+            pass
+    if budget.get("date") != today:
+        budget = {"date": today, "calls": 0}
+    budget["calls"] += 1
+    with open(_DREAM_BUDGET_PATH, "w") as f:
+        f.write(json.dumps(budget))
+    print(f"[DREAM-BUDGET] Used: {budget['calls']}/{DREAM_MAX_PER_DAY} today")
 
 
 def _llm_to_wasm(prompt: str, force: bool = False, tweak: str = "") -> tuple:
@@ -789,14 +860,30 @@ def handle_mcp_frame(frame_bytes: bytes, sock: socket.socket):
 
     elif msg_type == 'wasm_gen_request':
         desc = msg.get('description', '')
-        print(f"[MCP] WASM gen: {desc[:60]}...")
-        wasm_binary, error = _llm_to_wasm(desc)
-        if error:
-            error_frame = make_frame(encode_chat_response(f"Error: {error}"))
+        is_dream = "--tweak" in desc and ("refactor" in desc.lower() or "optimize" in desc.lower() or "visual" in desc.lower())
+        print(f"[MCP] WASM gen{'(dream)' if is_dream else ''}: {desc[:60]}...")
+
+        # Dream budget check — reject if daily quota exhausted
+        if is_dream and not _dream_budget_check():
+            error_frame = make_frame(encode_chat_response("Error: dream budget exhausted for today"))
             sock.sendall(error_frame)
         else:
-            # Send as chunks (≤3KB each) for reliable transport
-            send_wasm_chunked(wasm_binary, sock, session_id=_session.session_id)
+            # Check if app is "perfected" (three strikes) — skip refactor dreams
+            base_key = desc.rsplit(' ', 1)[-1] if ' ' in desc else desc
+            meta = _cache_get_meta(base_key)
+            if is_dream and meta.get("perfected") and "refactor" in desc.lower():
+                error_frame = make_frame(encode_chat_response("Error: app perfected — skipping refactor"))
+                sock.sendall(error_frame)
+                print(f"[CACHE] Skipped perfected app: {base_key}")
+            else:
+                wasm_binary, error = _llm_to_wasm(desc)
+                if error:
+                    error_frame = make_frame(encode_chat_response(f"Error: {error}"))
+                    sock.sendall(error_frame)
+                else:
+                    if is_dream:
+                        _dream_budget_record()
+                    send_wasm_chunked(wasm_binary, sock, session_id=_session.session_id)
 
     elif msg_type == 'pong':
         print(f"[MCP] Pong seq={msg.get('seq', 0)}")
