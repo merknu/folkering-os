@@ -301,6 +301,26 @@ impl DraugDaemon {
         }
     }
 
+    /// Check if Draug has been waiting too long for LLM and should give up.
+    /// Returns true if timed out (caller should log and continue).
+    pub fn check_waiting_timeout(&mut self, now_ms: u64) -> bool {
+        if self.waiting_for_llm && self.last_analysis_ms > 0
+            && now_ms.saturating_sub(self.last_analysis_ms) > 60_000 // 60s timeout
+        {
+            self.waiting_for_llm = false;
+            return true;
+        }
+        // Also timeout dreams
+        if self.dreaming && self.last_dream_ms > 0
+            && now_ms.saturating_sub(self.last_dream_ms) > 120_000 // 2 min for dreams
+        {
+            self.dreaming = false;
+            self.dream_target = None;
+            return true;
+        }
+        false
+    }
+
     /// Handle LLM response to analysis
     pub fn on_analysis_response(&mut self, response: &str) -> Option<String> {
         self.waiting_for_llm = false;

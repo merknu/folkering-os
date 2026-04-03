@@ -1535,6 +1535,14 @@ fn main() -> ! {
             }
         }
 
+        // ===== Draug/Dream timeout — prevent permanent waiting_for_llm =====
+        {
+            let timeout_ms = if tsc_per_us > 0 { rdtsc() / tsc_per_us / 1000 } else { 0 };
+            if draug.check_waiting_timeout(timeout_ms) {
+                write_str("[Draug] Timeout — giving up on LLM response\n");
+            }
+        }
+
         // ===== AutoDream: Two-Hemisphere Self-Improving Software =====
         let dream_ms = if tsc_per_us > 0 { rdtsc() / tsc_per_us / 1000 } else { 0 };
         if draug.should_dream(dream_ms) && active_agent.is_none() && async_tool_gen.is_none()
