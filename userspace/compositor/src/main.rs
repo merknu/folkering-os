@@ -1510,11 +1510,20 @@ fn main() -> ! {
             // did_work is too broad — clock ticks, MCP polls, etc. are not user input
             if draug.should_tick(now_ms) {
                 draug.tick(now_ms);
-                // Debug: log every tick
-                write_str("[Draug] Tick #");
                 let mut nb = [0u8; 16];
-                write_str(format_usize(draug.observation_count(), &mut nb));
-                write_str("\n");
+                // Log every 6th tick (~1 min) to avoid spam but show liveness
+                if draug.observation_count() % 6 == 1 || draug.observation_count() <= 3 {
+                    write_str("[Draug] Tick #");
+                    write_str(format_usize(draug.observation_count(), &mut nb));
+                    let idle_ms = now_ms.saturating_sub(draug.last_input_ms());
+                    write_str(" | idle: ");
+                    write_str(format_usize((idle_ms / 1000) as usize, &mut nb));
+                    write_str("s | dreams: ");
+                    write_str(format_usize(draug.dream_count() as usize, &mut nb));
+                    write_str("/");
+                    write_str(format_usize(compositor::draug::DREAM_MAX_PER_SESSION as usize, &mut nb));
+                    write_str("\n");
+                }
             }
             if draug.should_analyze(now_ms) && active_agent.is_none() {
                 if draug.start_analysis() {
@@ -1534,10 +1543,39 @@ fn main() -> ! {
                     compositor::draug::DreamMode::Creative => "Creative",
                     compositor::draug::DreamMode::Nightmare => "Nightmare",
                 };
-                write_str("[AutoDream] Mode: ");
+
+                // Log dream start to both serial AND COM3 telemetry
+                write_str("[AutoDream] ========================================\n");
+                write_str("[AutoDream] DREAM #");
+                let mut nb = [0u8; 16];
+                write_str(format_usize(draug.dream_count() as usize, &mut nb));
+                write_str(" | Mode: ");
                 write_str(mode_str);
                 write_str(" | Target: ");
                 write_str(&target[..target.len().min(40)]);
+                write_str("\n");
+                // RTC timestamp for overnight log correlation
+                {
+                    let dt = libfolk::sys::get_rtc();
+                    let mut ts = [0u8; 19]; // "2026-04-03 02:15:30"
+                    ts[0] = b'0'+((dt.year/1000)%10) as u8; ts[1] = b'0'+((dt.year/100)%10) as u8;
+                    ts[2] = b'0'+((dt.year/10)%10) as u8; ts[3] = b'0'+(dt.year%10) as u8;
+                    ts[4] = b'-'; ts[5] = b'0'+dt.month/10; ts[6] = b'0'+dt.month%10;
+                    ts[7] = b'-'; ts[8] = b'0'+dt.day/10; ts[9] = b'0'+dt.day%10;
+                    ts[10] = b' '; ts[11] = b'0'+dt.hour/10; ts[12] = b'0'+dt.hour%10;
+                    ts[13] = b':'; ts[14] = b'0'+dt.minute/10; ts[15] = b'0'+dt.minute%10;
+                    ts[16] = b':'; ts[17] = b'0'+dt.second/10; ts[18] = b'0'+dt.second%10;
+                    write_str("[AutoDream] Time: ");
+                    if let Ok(s) = core::str::from_utf8(&ts) { write_str(s); }
+                    write_str("\n");
+                }
+                // Cache size
+                write_str("[AutoDream] Cache: ");
+                write_str(format_usize(wasm_cache.len(), &mut nb));
+                write_str(" apps | Draug dreams: ");
+                write_str(format_usize(draug.dream_count() as usize, &mut nb));
+                write_str("/");
+                write_str(format_usize(compositor::draug::DREAM_MAX_PER_SESSION as usize, &mut nb));
                 write_str("\n");
 
                 let tweak = match mode {
@@ -1709,74 +1747,96 @@ fn main() -> ! {
 
                             match dream_mode {
                                 compositor::draug::DreamMode::Refactor => {
-                                    // Hemisphere 1: Benchmark V1 vs V2
+                                    write_str("[AutoDream] ---- REFACTOR RESULT ----\n");
                                     if let Some(v1_wasm) = wasm_cache.get(orig_key) {
                                         let bench_config = compositor::wasm_runtime::WasmConfig {
                                             screen_width: fb.width as u32, screen_height: fb.height as u32, uptime_ms: 0,
                                         };
+                                        write_str("[AutoDream] Benchmarking V1 (10 iterations)...\n");
                                         let t1 = rdtsc();
                                         for _ in 0..10 { let _ = compositor::wasm_runtime::execute_wasm(v1_wasm, bench_config.clone()); }
                                         let v1_us = (rdtsc() - t1) / tsc_per_us / 10;
+                                        write_str("[AutoDream] Benchmarking V2 (10 iterations)...\n");
                                         let t2 = rdtsc();
                                         for _ in 0..10 { let _ = compositor::wasm_runtime::execute_wasm(&wasm_bytes, bench_config.clone()); }
                                         let v2_us = (rdtsc() - t2) / tsc_per_us / 10;
 
-                                        write_str("[AutoDream/Refactor] V1:");
+                                        write_str("[AutoDream] V1: ");
                                         write_str(format_usize(v1_us as usize, &mut nb));
-                                        write_str("us V2:");
+                                        write_str("us | V2: ");
                                         write_str(format_usize(v2_us as usize, &mut nb));
-                                        write_str("us");
+                                        write_str("us | V1 size: ");
+                                        write_str(format_usize(v1_wasm.len(), &mut nb));
+                                        write_str("B | V2 size: ");
+                                        write_str(format_usize(wasm_bytes.len(), &mut nb));
+                                        write_str("B\n");
 
                                         if v2_us < v1_us {
                                             let pct = ((v1_us - v2_us) * 100 / v1_us.max(1)) as usize;
-                                            write_str(" -> evolved! (");
+                                            write_str("[AutoDream] VERDICT: EVOLVED! ");
                                             write_str(format_usize(pct, &mut nb));
-                                            write_str("% faster)\n");
+                                            write_str("% faster\n");
                                             wasm_cache.insert(alloc::string::String::from(orig_key), wasm_bytes.clone());
                                             draug.reset_strikes(orig_key);
                                         } else {
-                                            write_str(" -> strike (V2 not faster)\n");
+                                            write_str("[AutoDream] VERDICT: STRIKE (V2 not faster)\n");
                                             draug.add_strike(orig_key);
                                             if draug.is_perfected(orig_key) {
-                                                write_str("[AutoDream] App perfected — no more refactoring\n");
+                                                write_str("[AutoDream] STATUS: PERFECTED — no more refactoring for this app\n");
                                             }
                                         }
+                                    } else {
+                                        write_str("[AutoDream] ERROR: V1 not in cache, cannot compare\n");
                                     }
                                 }
                                 compositor::draug::DreamMode::Creative => {
-                                    // Hemisphere 2: Accept if it compiles (new features)
-                                    write_str("[AutoDream/Creative] Candidate (");
+                                    write_str("[AutoDream] ---- CREATIVE RESULT ----\n");
+                                    write_str("[AutoDream] New version: ");
                                     write_str(format_usize(wasm_bytes.len(), &mut nb));
-                                    write_str(" bytes) — accepted\n");
+                                    write_str(" bytes\n");
+                                    // Run headless to describe what changed
+                                    let preview_cfg = compositor::wasm_runtime::WasmConfig {
+                                        screen_width: fb.width as u32, screen_height: fb.height as u32, uptime_ms: 0,
+                                    };
+                                    let (_, preview_out) = compositor::wasm_runtime::execute_wasm(&wasm_bytes, preview_cfg);
+                                    let summary = compositor::wasm_runtime::render_summary(&preview_out);
+                                    write_str("[AutoDream] New render: ");
+                                    write_str(&summary[..summary.len().min(200)]);
+                                    write_str("\n");
+                                    write_str("[AutoDream] VERDICT: ACCEPTED as candidate\n");
                                     wasm_cache.insert(alloc::string::String::from(orig_key), wasm_bytes.clone());
                                 }
                                 compositor::draug::DreamMode::Nightmare => {
-                                    // Immune system: run hardened version with extreme inputs
-                                    // If it survives, replace. If it crashes, keep original.
+                                    write_str("[AutoDream] ---- NIGHTMARE RESULT ----\n");
+                                    write_str("[AutoDream] Fuzzing hardened version (w=0,h=0,t=MAX)...\n");
                                     let fuzz_config = compositor::wasm_runtime::WasmConfig {
-                                        screen_width: 0, // Edge case: zero-size screen
-                                        screen_height: 0,
-                                        uptime_ms: u32::MAX, // Edge case: max uptime
+                                        screen_width: 0, screen_height: 0, uptime_ms: u32::MAX,
                                     };
                                     let (fuzz_result, _) = compositor::wasm_runtime::execute_wasm(&wasm_bytes, fuzz_config);
                                     match fuzz_result {
-                                        compositor::wasm_runtime::WasmResult::Ok |
+                                        compositor::wasm_runtime::WasmResult::Ok => {
+                                            write_str("[AutoDream] VERDICT: SURVIVED (Ok) — app vaccinated!\n");
+                                            wasm_cache.insert(alloc::string::String::from(orig_key), wasm_bytes.clone());
+                                        }
                                         compositor::wasm_runtime::WasmResult::OutOfFuel => {
-                                            write_str("[AutoDream/Nightmare] Hardened version survived fuzzing — accepted\n");
+                                            write_str("[AutoDream] VERDICT: SURVIVED (fuel exhausted, but no crash) — accepted\n");
                                             wasm_cache.insert(alloc::string::String::from(orig_key), wasm_bytes.clone());
                                         }
                                         compositor::wasm_runtime::WasmResult::Trap(ref msg) => {
-                                            write_str("[AutoDream/Nightmare] Hardened version CRASHED: ");
-                                            write_str(&msg[..msg.len().min(60)]);
-                                            write_str(" — rejected\n");
+                                            write_str("[AutoDream] VERDICT: CRASHED! Trap: ");
+                                            write_str(&msg[..msg.len().min(80)]);
+                                            write_str("\n[AutoDream] Keeping original (V2 too fragile)\n");
                                         }
-                                        _ => {
-                                            write_str("[AutoDream/Nightmare] Hardened version failed — rejected\n");
+                                        compositor::wasm_runtime::WasmResult::LoadError(ref msg) => {
+                                            write_str("[AutoDream] VERDICT: LOAD FAILED: ");
+                                            write_str(&msg[..msg.len().min(80)]);
+                                            write_str("\n");
                                         }
                                     }
                                 }
                             }
 
+                            write_str("[AutoDream] ========== DREAM COMPLETE ==========\n");
                             let done_ms = if tsc_per_us > 0 { rdtsc() / tsc_per_us / 1000 } else { 0 };
                             draug.on_dream_complete(done_ms);
                         }

@@ -475,6 +475,7 @@ impl DraugDaemon {
     pub fn is_dreaming(&self) -> bool { self.dreaming }
     pub fn dream_count(&self) -> u32 { self.dream_count }
     pub fn current_dream_mode(&self) -> DreamMode { self.dream_mode }
+    pub fn last_input_ms(&self) -> u64 { self.last_user_input_ms }
 
     // ═══════ Token Scheduler: Attention-Based LLM Priority ══════════
     //
