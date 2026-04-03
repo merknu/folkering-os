@@ -100,6 +100,7 @@ pub struct DraugDaemon {
     active: bool,
     waiting_for_llm: bool,
     analysis_count: u32,
+    last_analysis_ms: u64,
 
     /// Command history for prediction (Pillar 4)
     cmd_history: [Option<alloc::string::String>; MAX_CMD_HISTORY],
@@ -137,6 +138,7 @@ impl DraugDaemon {
             active: true,
             waiting_for_llm: false,
             analysis_count: 0,
+            last_analysis_ms: 0,
             cmd_history: [const { None }; MAX_CMD_HISTORY],
             cmd_head: 0,
             cmd_count: 0,
@@ -243,12 +245,14 @@ impl DraugDaemon {
     }
 
     /// Check if Draug should run an analysis cycle.
-    /// Only runs when user is idle (>60s since last input).
+    /// Hard limits: max 5 analyses per session, 5 minute cooldown between each.
     pub fn should_analyze(&self, now_ms: u64) -> bool {
         self.active
             && !self.waiting_for_llm
             && self.log_count >= ANALYSIS_BATCH
-            && now_ms.saturating_sub(self.last_user_input_ms) > 30_000 // 30s idle
+            && self.analysis_count < 5  // HARD LIMIT: max 5 analyses ever
+            && now_ms.saturating_sub(self.last_user_input_ms) > 30_000
+            && now_ms.saturating_sub(self.last_analysis_ms) > 300_000 // 5 min cooldown
     }
 
     /// Build an analysis prompt from recent observations.
@@ -283,12 +287,14 @@ impl DraugDaemon {
         prompt
     }
 
-    /// Start an analysis cycle (send prompt to LLM via MCP)
-    pub fn start_analysis(&mut self) -> bool {
+    /// Start an analysis cycle (send prompt to LLM via MCP).
+    /// Records timestamp for cooldown enforcement.
+    pub fn start_analysis(&mut self, now_ms: u64) -> bool {
         let prompt = self.build_analysis_prompt();
         if libfolk::mcp::client::send_chat(&prompt).is_some() {
             self.waiting_for_llm = true;
             self.analysis_count += 1;
+            self.last_analysis_ms = now_ms;
             true
         } else {
             false
@@ -477,6 +483,7 @@ impl DraugDaemon {
     pub fn current_dream_mode(&self) -> DreamMode { self.dream_mode }
     pub fn last_input_ms(&self) -> u64 { self.last_user_input_ms }
     pub fn is_waiting(&self) -> bool { self.waiting_for_llm }
+    pub fn analysis_count(&self) -> u32 { self.analysis_count }
 
     // ═══════ Token Scheduler: Attention-Based LLM Priority ══════════
     //

@@ -1526,8 +1526,11 @@ fn main() -> ! {
                 }
             }
             if draug.should_analyze(now_ms) && active_agent.is_none() {
-                if draug.start_analysis() {
-                    write_str("[Draug] Analysis started\n");
+                if draug.start_analysis(now_ms) {
+                    let mut nb = [0u8; 16];
+                    write_str("[Draug] Analysis #");
+                    write_str(format_usize(draug.analysis_count() as usize, &mut nb));
+                    write_str("/5 started\n");
                 }
             }
         }
