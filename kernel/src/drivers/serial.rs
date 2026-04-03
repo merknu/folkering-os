@@ -57,18 +57,20 @@ pub fn com3_write(data: &[u8]) {
 // ── COM2 (Gemini Proxy Channel) ─────────────────────────────────────────
 
 /// Write bytes to COM2 (Gemini proxy channel).
-/// Uses raw port I/O for reliability (uart_16550 send() can be flaky).
+/// Uses raw port I/O with interrupts disabled to prevent frame corruption.
 pub fn com2_write(data: &[u8]) {
-    for &byte in data {
-        unsafe {
-            // Wait for TX buffer empty (LSR bit 5)
-            loop {
-                let lsr: u8 = x86_64::instructions::port::Port::<u8>::new(0x2F8 + 5).read();
-                if lsr & 0x20 != 0 { break; }
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        for &byte in data {
+            unsafe {
+                // Wait for TX buffer empty (LSR bit 5)
+                loop {
+                    let lsr: u8 = x86_64::instructions::port::Port::<u8>::new(0x2F8 + 5).read();
+                    if lsr & 0x20 != 0 { break; }
+                }
+                x86_64::instructions::port::Port::<u8>::new(0x2F8).write(byte);
             }
-            x86_64::instructions::port::Port::<u8>::new(0x2F8).write(byte);
         }
-    }
+    });
 }
 
 /// Read a byte from COM2 (non-blocking). Returns None if no data.
