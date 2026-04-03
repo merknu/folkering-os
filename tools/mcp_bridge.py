@@ -150,20 +150,35 @@ class McpRequestTag:
 def encode_chat_response(text: str) -> bytes:
     return encode_varint(McpRequestTag.CHAT_RESPONSE) + encode_heapless_vec(text.encode('utf-8'))
 
+def encode_zigzag(value: int) -> bytes:
+    """Encode signed integer as Postcard zigzag varint."""
+    if value >= 0:
+        return encode_varint(value * 2)
+    else:
+        return encode_varint((-value) * 2 - 1)
+
 def encode_time_sync(year, month, day, hour, minute, second, utc_offset) -> bytes:
     payload = encode_varint(McpRequestTag.TIME_SYNC)
-    payload += struct.pack('<H', year) + struct.pack('5B', month, day, hour, minute, second)
-    payload += struct.pack('<h', utc_offset)
+    # Postcard uses varint for u16/u8, zigzag varint for i16
+    payload += encode_varint(year)       # u16
+    payload += struct.pack('B', month)   # u8 (single byte, no varint)
+    payload += struct.pack('B', day)
+    payload += struct.pack('B', hour)
+    payload += struct.pack('B', minute)
+    payload += struct.pack('B', second)
+    payload += encode_zigzag(utc_offset) # i16 (zigzag encoded)
     return payload
 
 def encode_wasm_chunk(total_chunks: int, chunk_index: int, data: bytes) -> bytes:
     payload = encode_varint(McpRequestTag.WASM_CHUNK)
-    payload += struct.pack('<HH', total_chunks, chunk_index)
+    # Postcard uses varint for u16, NOT fixed LE!
+    payload += encode_varint(total_chunks)
+    payload += encode_varint(chunk_index)
     payload += encode_heapless_vec(data)
     return payload
 
 def encode_ping(seq: int) -> bytes:
-    return encode_varint(McpRequestTag.PING) + struct.pack('<I', seq)
+    return encode_varint(McpRequestTag.PING) + encode_varint(seq)  # u32 as varint
 
 def encode_ack() -> bytes:
     return encode_varint(McpRequestTag.ACK)
