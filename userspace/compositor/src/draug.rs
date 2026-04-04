@@ -502,46 +502,56 @@ impl DraugDaemon {
     }
 
     /// Build the dream prompt based on current mode.
+    /// `app_name` is the cache key (original user prompt, e.g., "bouncing ball").
+    /// `render_summary` is a text description of what the app currently draws.
     pub fn build_dream_prompt(&self, source_code: &str, app_name: &str, render_summary: &str) -> String {
+        // The app_name IS the description — it's the original "gemini generate X" prompt
+        let context = format!(
+            "APP: '{}'\n\
+             PURPOSE: This app was created by the command 'gemini generate {}'. \
+             It should continue to fulfill this purpose after your modifications.\n",
+            app_name, app_name
+        );
+
         match self.dream_mode {
             DreamMode::Refactor => format!(
-                "You are Draug, optimizing WASM apps for Folkering OS.\n\
-                 The system is idle. Refactor this app for FEWER CPU CYCLES.\n\n\
-                 App: '{}'\n```rust\n{}\n```\n\n\
-                 Rules:\n\
-                 - Remove unnecessary calculations\n\
-                 - Use simpler math where possible\n\
-                 - Do NOT add new features\n\
-                 - Return ONLY the improved Rust code",
-                app_name, source_code
+                "You are Draug, optimizing WASM apps for Folkering OS.\n\n\
+                 {}\n\
+                 Current code:\n```rust\n{}\n```\n\n\
+                 REFACTOR RULES:\n\
+                 - ONLY reduce CPU cycles. Do NOT add features.\n\
+                 - Do NOT change the visual output — it must look identical.\n\
+                 - Pre-compute constants, use integer math, remove redundancy.\n\
+                 - Do NOT remove safety checks.\n\
+                 - Return ONLY the improved Rust code.",
+                context, source_code
             ),
             DreamMode::Creative => format!(
-                "You are Draug, the creative daemon of Folkering OS.\n\
-                 The system is idle. Improve the VISUAL QUALITY of this app.\n\n\
-                 App: '{}'\n```rust\n{}\n```\n\n\
-                 Current render output:\n{}\n\n\
-                 Rules:\n\
-                 - Add ONE meaningful visual improvement (better colors, animation, layout)\n\
-                 - Keep the core functionality the same\n\
-                 - Return ONLY the improved Rust code",
-                app_name, source_code, render_summary
+                "You are Draug, the creative daemon of Folkering OS.\n\n\
+                 {}\n\
+                 Current code:\n```rust\n{}\n```\n\n\
+                 Current visual output:\n{}\n\n\
+                 CREATIVE RULES:\n\
+                 - Add ONE meaningful visual improvement.\n\
+                 - Good: smoother animation, better colors, text labels, layout polish.\n\
+                 - Bad: changing the app's purpose, removing functionality.\n\
+                 - Use Folkering palette: bg=0x001a1a2e, blue=0x003498db, green=0x0044FF44.\n\
+                 - Keep it under 2KB compiled WASM.\n\
+                 - Return ONLY the improved Rust code.",
+                context, source_code, render_summary
             ),
             DreamMode::Nightmare => format!(
-                "You are Draug in Nightmare mode — the immune system of Folkering OS.\n\
-                 Your job is to find and FIX vulnerabilities in this WASM app.\n\n\
-                 App: '{}'\n```rust\n{}\n```\n\n\
-                 Think like a fuzzer:\n\
-                 - What happens with screen_width=0? Division by zero?\n\
-                 - What if folk_random() returns i32::MIN or i32::MAX?\n\
-                 - What if folk_poll_event returns 1000 events per frame?\n\
-                 - Are there array index overflows with extreme coordinates?\n\n\
-                 Add defensive checks:\n\
-                 - Clamp values to safe ranges\n\
-                 - Avoid division by zero\n\
-                 - Bounds-check array indices\n\
-                 - Handle edge cases gracefully\n\n\
-                 Return ONLY the hardened Rust code. No explanation.",
-                app_name, source_code
+                "You are Draug in Nightmare mode — the immune system of Folkering OS.\n\n\
+                 {}\n\
+                 Current code:\n```rust\n{}\n```\n\n\
+                 NIGHTMARE RULES:\n\
+                 - HARDEN the code. Do NOT change behavior.\n\
+                 - What if screen_width=0 or screen_height=0? Add .max(1) before division.\n\
+                 - What if folk_random() returns i32::MIN? Use .wrapping_abs() or .clamp().\n\
+                 - What if coordinates overflow? Use .clamp(0, width) for bounds.\n\
+                 - Use saturating_add/sub instead of +/- where overflow is possible.\n\
+                 - Return ONLY the hardened Rust code.",
+                context, source_code
             ),
         }
     }

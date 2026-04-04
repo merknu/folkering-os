@@ -235,8 +235,14 @@ def fix_infinite_loop(source: str) -> str:
 
 
 # The Master Prompt — strict no_std WASM code generation
+from folkering_context import get_full_wasm_context, get_dream_context
+
+_WASM_CONTEXT = get_full_wasm_context()
+
 WASM_SYSTEM_PROMPT = """You are a code generator for Folkering OS (bare-metal Rust, no_std).
 Generate a SINGLE Rust file that compiles to wasm32-unknown-unknown.
+
+""" + _WASM_CONTEXT + """
 
 STRICT RULES:
 - #![no_std] and #![no_main] are REQUIRED
@@ -432,10 +438,10 @@ def _cache_store(prompt: str, source: str, wasm_bytes: bytes):
         f.write(source)
     with open(os.path.join(_WASM_CACHE_DIR, f"{key}.wasm"), "wb") as f:
         f.write(wasm_bytes)
-    # Update metadata
     import datetime
     meta = _cache_get_meta(prompt)
     meta["version"] = meta.get("version", 0) + 1
+    meta["description"] = prompt  # Store the original prompt as app description
     if not meta.get("created"):
         meta["created"] = datetime.datetime.now().isoformat()
     meta["last_updated"] = datetime.datetime.now().isoformat()
@@ -499,8 +505,25 @@ def _llm_to_wasm(prompt: str, force: bool = False, tweak: str = "") -> tuple:
     # If --tweak, load existing source and ask LLM to modify it
     if tweak:
         _, existing_src = _cache_check(prompt)
+        # Get app description from metadata
+        meta = _cache_get_meta(prompt)
+        app_desc = meta.get("description", prompt)
+
+        # Detect dream mode from tweak text for context injection
+        if "refactor" in tweak.lower() or "fewer cpu" in tweak.lower():
+            dream_ctx = get_dream_context("refactor")
+        elif "visual" in tweak.lower() or "improvement" in tweak.lower():
+            dream_ctx = get_dream_context("creative")
+        elif "harden" in tweak.lower() or "edge case" in tweak.lower():
+            dream_ctx = get_dream_context("nightmare")
+        else:
+            dream_ctx = ""
+
         if existing_src:
-            full_prompt = f"{WASM_SYSTEM_PROMPT}\n\nHere is existing code:\n```rust\n{existing_src}\n```\n\nModify it: {tweak}"
+            full_prompt = (f"{WASM_SYSTEM_PROMPT}\n\n{dream_ctx}\n\n"
+                          f"APP DESCRIPTION: {app_desc}\n\n"
+                          f"Here is the existing code:\n```rust\n{existing_src}\n```\n\n"
+                          f"Modify it: {tweak}")
         else:
             full_prompt = f"{WASM_SYSTEM_PROMPT}\n\nGenerate: {prompt}\nAlso apply this tweak: {tweak}"
     else:
