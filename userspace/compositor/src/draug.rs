@@ -116,7 +116,12 @@ pub struct DraugDaemon {
 
     /// Strike tracker: cache_key_hash → failure count
     /// Apps with 3 strikes are "perfected" and skipped
-    strikes: [Option<(u32, u8)>; 8], // (key_hash, strike_count)
+    strikes: [Option<(u32, u8)>; 8],
+
+    /// Dream journal: tracks which app was dreamt about most recently.
+    /// Each entry is (key_hash, dream_count_when_last_dreamt).
+    /// Used to pick the LEAST recently dreamt app for fair rotation.
+    dream_journal: [Option<(u32, u32)>; 16],
 }
 
 /// Compact observation summary for the log
@@ -148,6 +153,7 @@ impl DraugDaemon {
             dream_target: None,
             dream_mode: DreamMode::Refactor,
             strikes: [const { None }; 8],
+            dream_journal: [const { None }; 16],
         }
     }
 
@@ -397,9 +403,45 @@ impl DraugDaemon {
         }
     }
 
-    /// Pick a cached WASM app and choose dream mode.
-    /// Skips "perfected" apps for Refactor mode.
-    /// Alternates between Refactor and Creative.
+    /// Get the dream journal entry for a key — returns when it was last dreamt about.
+    fn last_dreamt_about(&self, key: &str) -> u32 {
+        let h = Self::key_hash(key);
+        for entry in &self.dream_journal {
+            if let Some((k, when)) = entry {
+                if *k == h { return *when; }
+            }
+        }
+        0 // Never dreamt about → highest priority
+    }
+
+    /// Record that we dreamt about this key.
+    fn journal_record(&mut self, key: &str) {
+        let h = Self::key_hash(key);
+        // Update existing entry or find empty slot
+        for entry in &mut self.dream_journal {
+            if let Some((k, when)) = entry {
+                if *k == h { *when = self.dream_count; return; }
+            }
+        }
+        for entry in &mut self.dream_journal {
+            if entry.is_none() {
+                *entry = Some((h, self.dream_count));
+                return;
+            }
+        }
+        // Full — overwrite oldest
+        let mut oldest_idx = 0;
+        let mut oldest_when = u32::MAX;
+        for (i, entry) in self.dream_journal.iter().enumerate() {
+            if let Some((_, when)) = entry {
+                if *when < oldest_when { oldest_when = *when; oldest_idx = i; }
+            }
+        }
+        self.dream_journal[oldest_idx] = Some((h, self.dream_count));
+    }
+
+    /// Pick the LEAST recently dreamt app and choose dream mode.
+    /// Ensures fair rotation across all cached apps, not just one.
     pub fn start_dream(&mut self, cache_keys: &[&str], now_ms: u64) -> Option<(String, DreamMode)> {
         if cache_keys.is_empty() { return None; }
 
@@ -410,32 +452,53 @@ impl DraugDaemon {
             _ => DreamMode::Nightmare,
         };
 
-        // Find a suitable target
-        for i in 0..cache_keys.len() {
-            let idx = ((self.dream_count as usize) + i) % cache_keys.len();
-            let key = cache_keys[idx];
+        // Find the app that was LEAST recently dreamt about
+        let mut best_key: Option<&str> = None;
+        let mut best_when: u32 = u32::MAX;
+
+        for key in cache_keys {
+            // Skip perfected apps for Refactor mode
             if mode == DreamMode::Refactor && self.is_perfected(key) {
                 continue;
             }
+            let when = self.last_dreamt_about(key);
+            if when < best_when {
+                best_when = when;
+                best_key = Some(key);
+            }
+        }
+
+        // If all skipped for Refactor (all perfected), fall back to Creative
+        if best_key.is_none() && mode == DreamMode::Refactor {
+            for key in cache_keys {
+                let when = self.last_dreamt_about(key);
+                if when < best_when {
+                    best_when = when;
+                    best_key = Some(key);
+                }
+            }
+            if best_key.is_some() {
+                let target = String::from(best_key.unwrap());
+                self.journal_record(&target);
+                self.dream_target = Some(target.clone());
+                self.dream_mode = DreamMode::Creative;
+                self.dreaming = true;
+                self.last_dream_ms = now_ms;
+                return Some((target, DreamMode::Creative));
+            }
+        }
+
+        if let Some(key) = best_key {
             let target = String::from(key);
+            self.journal_record(&target);
             self.dream_target = Some(target.clone());
             self.dream_mode = mode;
             self.dreaming = true;
-            self.last_dream_ms = now_ms; // Prevent re-triggering before cooldown
-            return Some((target, mode));
-        }
-
-        // All apps perfected for Refactor? Try Creative instead
-        if mode == DreamMode::Refactor && !cache_keys.is_empty() {
-            let idx = (self.dream_count as usize) % cache_keys.len();
-            let target = String::from(cache_keys[idx]);
-            self.dream_target = Some(target.clone());
-            self.dream_mode = DreamMode::Creative;
-            self.dreaming = true;
             self.last_dream_ms = now_ms;
-            return Some((target, DreamMode::Creative));
+            Some((target, mode))
+        } else {
+            None
         }
-        None
     }
 
     /// Build the dream prompt based on current mode.
