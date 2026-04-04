@@ -1549,7 +1549,7 @@ fn main() -> ! {
         if draug.should_dream(dream_ms) && active_agent.is_none() && async_tool_gen.is_none()
             && !draug.should_yield_tokens(active_agent.is_some(), dream_ms) {
             let keys: alloc::vec::Vec<&str> = wasm_cache.keys().map(|k| k.as_str()).collect();
-            if let Some((target, mode)) = draug.start_dream(&keys) {
+            if let Some((target, mode)) = draug.start_dream(&keys, dream_ms) {
                 let mode_str = match mode {
                     compositor::draug::DreamMode::Refactor => "Refactor",
                     compositor::draug::DreamMode::Creative => "Creative",
@@ -1617,6 +1617,10 @@ fn main() -> ! {
                 if libfolk::mcp::client::send_wasm_gen(&tweak) {
                     async_tool_gen = Some((0, target));
                     write_str("[AutoDream] Request sent\n");
+                } else {
+                    // send failed — cancel dream to prevent retry spam
+                    write_str("[AutoDream] Send failed — cancelling dream\n");
+                    draug.on_dream_complete(dream_ms);
                 }
             }
         }

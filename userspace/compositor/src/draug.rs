@@ -400,7 +400,7 @@ impl DraugDaemon {
     /// Pick a cached WASM app and choose dream mode.
     /// Skips "perfected" apps for Refactor mode.
     /// Alternates between Refactor and Creative.
-    pub fn start_dream(&mut self, cache_keys: &[&str]) -> Option<(String, DreamMode)> {
+    pub fn start_dream(&mut self, cache_keys: &[&str], now_ms: u64) -> Option<(String, DreamMode)> {
         if cache_keys.is_empty() { return None; }
 
         // Rotate modes: 0=Refactor, 1=Creative, 2=Nightmare
@@ -414,7 +414,6 @@ impl DraugDaemon {
         for i in 0..cache_keys.len() {
             let idx = ((self.dream_count as usize) + i) % cache_keys.len();
             let key = cache_keys[idx];
-            // Skip perfected apps for Refactor mode
             if mode == DreamMode::Refactor && self.is_perfected(key) {
                 continue;
             }
@@ -422,6 +421,7 @@ impl DraugDaemon {
             self.dream_target = Some(target.clone());
             self.dream_mode = mode;
             self.dreaming = true;
+            self.last_dream_ms = now_ms; // Prevent re-triggering before cooldown
             return Some((target, mode));
         }
 
@@ -432,6 +432,7 @@ impl DraugDaemon {
             self.dream_target = Some(target.clone());
             self.dream_mode = DreamMode::Creative;
             self.dreaming = true;
+            self.last_dream_ms = now_ms;
             return Some((target, DreamMode::Creative));
         }
         None
