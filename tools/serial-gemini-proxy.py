@@ -441,7 +441,13 @@ def _cache_store(prompt: str, source: str, wasm_bytes: bytes):
     import datetime
     meta = _cache_get_meta(prompt)
     meta["version"] = meta.get("version", 0) + 1
-    meta["description"] = prompt  # Store the original prompt as app description
+    # Store clean description (strip internal command prefixes)
+    desc = prompt
+    for prefix in ["gemini generate ", "gemini gen ", "generate ", "agent generate "]:
+        if desc.lower().startswith(prefix):
+            desc = desc[len(prefix):]
+            break
+    meta["description"] = desc
     if not meta.get("created"):
         meta["created"] = datetime.datetime.now().isoformat()
     meta["last_updated"] = datetime.datetime.now().isoformat()
@@ -505,9 +511,16 @@ def _llm_to_wasm(prompt: str, force: bool = False, tweak: str = "") -> tuple:
     # If --tweak, load existing source and ask LLM to modify it
     if tweak:
         _, existing_src = _cache_check(prompt)
-        # Get app description from metadata
+        # Get app description from metadata (clean, no command prefixes)
         meta = _cache_get_meta(prompt)
         app_desc = meta.get("description", prompt)
+        # Extra safety: strip command prefixes from description
+        for pfx in ["gemini generate ", "gemini gen ", "generate ", "agent generate ", "--tweak "]:
+            if app_desc.lower().startswith(pfx):
+                app_desc = app_desc[len(pfx):]
+        # Strip tweak quotes if present
+        if app_desc.startswith('"') and '" ' in app_desc:
+            app_desc = app_desc[app_desc.index('" ') + 2:]
 
         # Detect dream mode from tweak text for context injection
         if "refactor" in tweak.lower() or "fewer cpu" in tweak.lower():
@@ -521,13 +534,26 @@ def _llm_to_wasm(prompt: str, force: bool = False, tweak: str = "") -> tuple:
 
         if existing_src:
             full_prompt = (f"{WASM_SYSTEM_PROMPT}\n\n{dream_ctx}\n\n"
-                          f"APP DESCRIPTION: {app_desc}\n\n"
-                          f"Here is the existing code:\n```rust\n{existing_src}\n```\n\n"
-                          f"Modify it: {tweak}")
+                          f"APP: \"{app_desc}\"\n"
+                          f"This is a visual WASM widget for Folkering OS. "
+                          f"It must remain a {app_desc} after your changes.\n\n"
+                          f"TECHNICAL REMINDER:\n"
+                          f"- NO crate imports (no `use`, no `extern crate`)\n"
+                          f"- ONLY the folk_* host functions listed above\n"
+                          f"- Must compile with: cargo build --target wasm32-unknown-unknown\n"
+                          f"- #![no_std] #![no_main] are REQUIRED\n\n"
+                          f"Current source code:\n```rust\n{existing_src}\n```\n\n"
+                          f"YOUR TASK: {tweak}")
         else:
             full_prompt = f"{WASM_SYSTEM_PROMPT}\n\nGenerate: {prompt}\nAlso apply this tweak: {tweak}"
     else:
-        full_prompt = f"{WASM_SYSTEM_PROMPT}\n\nGenerate: {prompt}"
+        # Clean the prompt for generation
+        clean = prompt
+        for pfx in ["gemini generate ", "gemini gen ", "generate "]:
+            if clean.lower().startswith(pfx):
+                clean = clean[len(pfx):]
+                break
+        full_prompt = f"{WASM_SYSTEM_PROMPT}\n\nGenerate a WASM app: {clean}"
 
     print(f"[WASM] Generating code via MEDIUM tier...")
     source = call_llm(full_prompt, tier="medium")
