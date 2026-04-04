@@ -1631,6 +1631,35 @@ fn main() -> ! {
             write_str("[AutoDream] User woke up — dream cancelled\n");
         }
 
+        // Morning Briefing: show pending creative changes when user returns
+        if did_work && draug.has_pending_creative() && !draug.is_dreaming() {
+            let count = draug.pending_count();
+            write_str("[Morning Briefing] Draug has ");
+            let mut nb2 = [0u8; 16];
+            write_str(format_usize(count, &mut nb2));
+            write_str(" creative change(s) waiting for approval.\n");
+
+            // Show in a terminal window
+            let brief_win = wm.create_terminal("Morning Briefing", 200, 100, 500, 250);
+            if let Some(win) = wm.get_window_mut(brief_win) {
+                win.push_line("Good morning! Draug dreamt overnight:");
+                win.push_line("");
+                for (i, p) in draug.pending_creative.iter().enumerate() {
+                    if p.accepted.is_none() {
+                        let line = alloc::format!("  {}. '{}': {}", i + 1, &p.app_name[..p.app_name.len().min(20)], &p.description[..p.description.len().min(50)]);
+                        win.push_line(&line);
+                    }
+                }
+                win.push_line("");
+                win.push_line("Type in omnibar: 'dream accept all' or 'dream reject all'");
+                win.push_line("Or: 'dream accept 1' / 'dream reject 2'");
+            }
+            need_redraw = true;
+            damage.damage_full();
+            // Only show once per batch — mark as shown
+            // (pending_creative stays until user decides)
+        }
+
         // ===== MCP: Poll for responses from Python proxy =====
         if tz_sync_pending || async_tool_gen.is_some() || active_agent.is_some() || draug.is_waiting() {
             if let Some(response) = libfolk::mcp::client::poll() {
@@ -1787,38 +1816,65 @@ fn main() -> ! {
                                         let bench_config = compositor::wasm_runtime::WasmConfig {
                                             screen_width: fb.width as u32, screen_height: fb.height as u32, uptime_ms: 0,
                                         };
-                                        write_str("[AutoDream] Benchmarking V1 (10 iterations)...\n");
-                                        let t1 = rdtsc();
-                                        for _ in 0..10 { let _ = compositor::wasm_runtime::execute_wasm(v1_wasm, bench_config.clone()); }
-                                        let v1_us = (rdtsc() - t1) / tsc_per_us / 10;
-                                        write_str("[AutoDream] Benchmarking V2 (10 iterations)...\n");
-                                        let t2 = rdtsc();
-                                        for _ in 0..10 { let _ = compositor::wasm_runtime::execute_wasm(&wasm_bytes, bench_config.clone()); }
-                                        let v2_us = (rdtsc() - t2) / tsc_per_us / 10;
 
-                                        write_str("[AutoDream] V1: ");
-                                        write_str(format_usize(v1_us as usize, &mut nb));
-                                        write_str("us | V2: ");
-                                        write_str(format_usize(v2_us as usize, &mut nb));
-                                        write_str("us | V1 size: ");
-                                        write_str(format_usize(v1_wasm.len(), &mut nb));
-                                        write_str("B | V2 size: ");
-                                        write_str(format_usize(wasm_bytes.len(), &mut nb));
-                                        write_str("B\n");
+                                        // Lobotomy check: compare draw command counts
+                                        let (_, v1_out) = compositor::wasm_runtime::execute_wasm(v1_wasm, bench_config.clone());
+                                        let v1_cmds = v1_out.draw_commands.len() + v1_out.circle_commands.len()
+                                            + v1_out.line_commands.len() + v1_out.text_commands.len();
+                                        let (_, v2_out) = compositor::wasm_runtime::execute_wasm(&wasm_bytes, bench_config.clone());
+                                        let v2_cmds = v2_out.draw_commands.len() + v2_out.circle_commands.len()
+                                            + v2_out.line_commands.len() + v2_out.text_commands.len();
 
-                                        if v2_us < v1_us {
-                                            let pct = ((v1_us - v2_us) * 100 / v1_us.max(1)) as usize;
-                                            write_str("[AutoDream] VERDICT: EVOLVED! ");
-                                            write_str(format_usize(pct, &mut nb));
-                                            write_str("% faster\n");
-                                            wasm_cache.insert(alloc::string::String::from(orig_key), wasm_bytes.clone());
-                                            draug.reset_strikes(orig_key);
-                                        } else {
-                                            write_str("[AutoDream] VERDICT: STRIKE (V2 not faster)\n");
+                                        if v1_cmds > 0 && v2_cmds == 0 {
+                                            // V2 draws NOTHING — lobotomized!
+                                            write_str("[AutoDream] VERDICT: STRIKE (Lobotomy — V2 draws 0 commands vs V1:");
+                                            write_str(format_usize(v1_cmds, &mut nb));
+                                            write_str(")\n");
                                             draug.add_strike(orig_key);
-                                            if draug.is_perfected(orig_key) {
-                                                write_str("[AutoDream] STATUS: PERFECTED — no more refactoring for this app\n");
+                                        } else if v1_cmds > 0 && (v2_cmds * 2) < v1_cmds {
+                                            // V2 draws less than half of V1 — functional degradation
+                                            write_str("[AutoDream] VERDICT: STRIKE (Degradation — V2:");
+                                            write_str(format_usize(v2_cmds, &mut nb));
+                                            write_str(" cmds vs V1:");
+                                            write_str(format_usize(v1_cmds, &mut nb));
+                                            write_str(")\n");
+                                            draug.add_strike(orig_key);
+                                        } else {
+                                            // Passed sanity check — now benchmark
+                                            write_str("[AutoDream] Sanity: V1=");
+                                            write_str(format_usize(v1_cmds, &mut nb));
+                                            write_str(" V2=");
+                                            write_str(format_usize(v2_cmds, &mut nb));
+                                            write_str(" cmds (OK)\n");
+
+                                            write_str("[AutoDream] Benchmarking (10 iterations)...\n");
+                                            let t1 = rdtsc();
+                                            for _ in 0..10 { let _ = compositor::wasm_runtime::execute_wasm(v1_wasm, bench_config.clone()); }
+                                            let v1_us = (rdtsc() - t1) / tsc_per_us / 10;
+                                            let t2 = rdtsc();
+                                            for _ in 0..10 { let _ = compositor::wasm_runtime::execute_wasm(&wasm_bytes, bench_config.clone()); }
+                                            let v2_us = (rdtsc() - t2) / tsc_per_us / 10;
+
+                                            write_str("[AutoDream] V1:");
+                                            write_str(format_usize(v1_us as usize, &mut nb));
+                                            write_str("us V2:");
+                                            write_str(format_usize(v2_us as usize, &mut nb));
+                                            write_str("us\n");
+
+                                            if v2_us < v1_us {
+                                                let pct = ((v1_us - v2_us) * 100 / v1_us.max(1)) as usize;
+                                                write_str("[AutoDream] VERDICT: EVOLVED! ");
+                                                write_str(format_usize(pct, &mut nb));
+                                                write_str("% faster\n");
+                                                wasm_cache.insert(alloc::string::String::from(orig_key), wasm_bytes.clone());
+                                                draug.reset_strikes(orig_key);
+                                            } else {
+                                                write_str("[AutoDream] VERDICT: STRIKE (V2 not faster)\n");
+                                                draug.add_strike(orig_key);
                                             }
+                                        }
+                                        if draug.is_perfected(orig_key) {
+                                            write_str("[AutoDream] STATUS: PERFECTED\n");
                                         }
                                     } else {
                                         write_str("[AutoDream] ERROR: V1 not in cache, cannot compare\n");
@@ -1829,7 +1885,6 @@ fn main() -> ! {
                                     write_str("[AutoDream] New version: ");
                                     write_str(format_usize(wasm_bytes.len(), &mut nb));
                                     write_str(" bytes\n");
-                                    // Run headless to describe what changed
                                     let preview_cfg = compositor::wasm_runtime::WasmConfig {
                                         screen_width: fb.width as u32, screen_height: fb.height as u32, uptime_ms: 0,
                                     };
@@ -1838,8 +1893,9 @@ fn main() -> ! {
                                     write_str("[AutoDream] New render: ");
                                     write_str(&summary[..summary.len().min(200)]);
                                     write_str("\n");
-                                    write_str("[AutoDream] VERDICT: ACCEPTED as candidate\n");
-                                    wasm_cache.insert(alloc::string::String::from(orig_key), wasm_bytes.clone());
+                                    // Queue for Morning Briefing — user decides
+                                    write_str("[AutoDream] VERDICT: QUEUED for user approval (Morning Briefing)\n");
+                                    draug.queue_creative(orig_key, &summary[..summary.len().min(100)], wasm_bytes.clone());
                                 }
                                 compositor::draug::DreamMode::Nightmare => {
                                     write_str("[AutoDream] ---- NIGHTMARE RESULT ----\n");
@@ -3652,6 +3708,43 @@ fn main() -> ! {
                             }
                         } else {
                             win.push_line("Usage: save <filename> <text>");
+                        }
+                    } else if cmd_str == "dream accept all" || cmd_str == "dream accept" {
+                        draug.accept_all_creative();
+                        let accepted = draug.drain_accepted();
+                        for (name, wasm) in &accepted {
+                            wasm_cache.insert(name.clone(), wasm.clone());
+                            win.push_line(&alloc::format!("[Dream] Accepted: {}", &name[..name.len().min(30)]));
+                        }
+                        if accepted.is_empty() {
+                            win.push_line("[Dream] No pending changes");
+                        }
+                    } else if cmd_str == "dream reject all" || cmd_str == "dream reject" {
+                        for i in 0..draug.pending_creative.len() {
+                            draug.reject_creative(i);
+                        }
+                        draug.drain_accepted(); // Clear rejected
+                        win.push_line("[Dream] All creative changes rejected");
+                    } else if cmd_str.starts_with("dream accept ") {
+                        if let Ok(idx) = cmd_str[13..].trim().parse::<usize>() {
+                            if idx > 0 && idx <= draug.pending_creative.len() {
+                                draug.accept_creative(idx - 1);
+                                let accepted = draug.drain_accepted();
+                                for (name, wasm) in &accepted {
+                                    wasm_cache.insert(name.clone(), wasm.clone());
+                                    win.push_line(&alloc::format!("[Dream] Accepted: {}", name));
+                                }
+                            } else {
+                                win.push_line("[Dream] Invalid index");
+                            }
+                        }
+                    } else if cmd_str.starts_with("dream reject ") {
+                        if let Ok(idx) = cmd_str[13..].trim().parse::<usize>() {
+                            if idx > 0 && idx <= draug.pending_creative.len() {
+                                draug.reject_creative(idx - 1);
+                                draug.drain_accepted();
+                                win.push_line("[Dream] Rejected");
+                            }
                         }
                     } else if cmd_str == "poweroff" || cmd_str == "shutdown" {
                         // M12: Save app states and shut down

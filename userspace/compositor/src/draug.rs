@@ -35,14 +35,17 @@ pub const MAX_LOG_ENTRIES: usize = 20;
 /// Minimum entries before analysis can trigger
 pub const ANALYSIS_BATCH: usize = 3;
 
-/// AutoDream: idle threshold before dreaming starts (15 minutes)
-pub const DREAM_IDLE_MS: u64 = 900_000;
+/// Circadian rhythm: daytime idle threshold (09:00-23:00)
+pub const DREAM_IDLE_DAY_MS: u64 = 2_700_000; // 45 minutes
+
+/// Circadian rhythm: nighttime idle threshold (23:00-06:00)
+pub const DREAM_IDLE_NIGHT_MS: u64 = 300_000; // 5 minutes
 
 /// AutoDream: cooldown between dreams (10 minutes)
 pub const DREAM_COOLDOWN_MS: u64 = 600_000;
 
 /// AutoDream: max dreams per session
-pub const DREAM_MAX_PER_SESSION: u32 = 5;
+pub const DREAM_MAX_PER_SESSION: u32 = 10;
 
 /// AutoDream: max refactoring failures before marking as "perfected"
 pub const DREAM_STRIKE_LIMIT: u8 = 3;
@@ -57,6 +60,17 @@ pub enum DreamMode {
     /// Immune system: fuzzing — inject extreme inputs to find crashes
     Nightmare,
 }
+
+/// Pending creative changes awaiting user approval ("Morning Briefing")
+pub struct PendingCreative {
+    pub app_name: alloc::string::String,
+    pub description: alloc::string::String, // what changed
+    pub wasm_bytes: alloc::vec::Vec<u8>,
+    pub accepted: Option<bool>, // None = pending, Some(true) = accepted, Some(false) = rejected
+}
+
+/// Maximum pending creative changes
+pub const MAX_PENDING_CREATIVE: usize = 8;
 
 /// System observation snapshot
 pub struct Observation {
@@ -119,9 +133,10 @@ pub struct DraugDaemon {
     strikes: [Option<(u32, u8)>; 8],
 
     /// Dream journal: tracks which app was dreamt about most recently.
-    /// Each entry is (key_hash, dream_count_when_last_dreamt).
-    /// Used to pick the LEAST recently dreamt app for fair rotation.
     dream_journal: [Option<(u32, u32)>; 16],
+
+    /// Morning Briefing: creative changes pending user approval
+    pub pending_creative: alloc::vec::Vec<PendingCreative>,
 }
 
 /// Compact observation summary for the log
@@ -154,6 +169,7 @@ impl DraugDaemon {
             dream_mode: DreamMode::Refactor,
             strikes: [const { None }; 8],
             dream_journal: [const { None }; 16],
+            pending_creative: alloc::vec::Vec::new(),
         }
     }
 
@@ -355,13 +371,30 @@ impl DraugDaemon {
     //
     // Three Strikes Rule: after 3 failed refactor attempts, app is "perfected"
 
+    /// Check if it's nighttime (23:00 - 06:00) based on RTC.
+    pub fn is_nighttime() -> bool {
+        let rtc = libfolk::sys::get_rtc();
+        rtc.hour >= 23 || rtc.hour < 6
+    }
+
+    /// Get current idle threshold based on circadian rhythm.
+    fn idle_threshold() -> u64 {
+        if Self::is_nighttime() {
+            DREAM_IDLE_NIGHT_MS // 5 min at night
+        } else {
+            DREAM_IDLE_DAY_MS // 45 min during day
+        }
+    }
+
     /// Check if the system should enter dream mode.
+    /// Uses circadian rhythm: 5 min idle at night, 45 min during day.
+    /// Nightmare mode blocked during daytime (too CPU-heavy).
     pub fn should_dream(&self, now_ms: u64) -> bool {
         self.active
             && !self.dreaming
             && !self.waiting_for_llm
             && self.dream_count < DREAM_MAX_PER_SESSION
-            && now_ms.saturating_sub(self.last_user_input_ms) > DREAM_IDLE_MS
+            && now_ms.saturating_sub(self.last_user_input_ms) > Self::idle_threshold()
             && now_ms.saturating_sub(self.last_dream_ms) > DREAM_COOLDOWN_MS
     }
 
@@ -441,16 +474,22 @@ impl DraugDaemon {
     }
 
     /// Pick the LEAST recently dreamt app and choose dream mode.
-    /// Ensures fair rotation across all cached apps, not just one.
+    /// 3-mode rotation: Refactor → Creative → Nightmare
+    /// Nightmare blocked during daytime (circadian rhythm).
     pub fn start_dream(&mut self, cache_keys: &[&str], now_ms: u64) -> Option<(String, DreamMode)> {
         if cache_keys.is_empty() { return None; }
 
         // Rotate modes: 0=Refactor, 1=Creative, 2=Nightmare
-        let mode = match self.dream_count % 3 {
+        let mut mode = match self.dream_count % 3 {
             0 => DreamMode::Refactor,
             1 => DreamMode::Creative,
             _ => DreamMode::Nightmare,
         };
+
+        // Circadian: block Nightmare during daytime (too CPU-heavy)
+        if mode == DreamMode::Nightmare && !Self::is_nighttime() {
+            mode = DreamMode::Creative;
+        }
 
         // Find the app that was LEAST recently dreamt about
         let mut best_key: Option<&str> = None;
@@ -579,6 +618,68 @@ impl DraugDaemon {
     pub fn last_input_ms(&self) -> u64 { self.last_user_input_ms }
     pub fn is_waiting(&self) -> bool { self.waiting_for_llm }
     pub fn analysis_count(&self) -> u32 { self.analysis_count }
+
+    // ═══════ Morning Briefing: User Approval of Creative Changes ════════
+
+    /// Queue a creative change for user approval (NOT auto-accepted).
+    pub fn queue_creative(&mut self, app_name: &str, description: &str, wasm: alloc::vec::Vec<u8>) {
+        if self.pending_creative.len() >= MAX_PENDING_CREATIVE {
+            self.pending_creative.remove(0); // Drop oldest
+        }
+        self.pending_creative.push(PendingCreative {
+            app_name: String::from(app_name),
+            description: String::from(description),
+            wasm_bytes: wasm,
+            accepted: None,
+        });
+    }
+
+    /// Check if there are pending creative changes to show the user.
+    pub fn has_pending_creative(&self) -> bool {
+        self.pending_creative.iter().any(|p| p.accepted.is_none())
+    }
+
+    /// Get pending creative changes for the Morning Briefing.
+    pub fn pending_count(&self) -> usize {
+        self.pending_creative.iter().filter(|p| p.accepted.is_none()).count()
+    }
+
+    /// Accept a pending creative change by index.
+    pub fn accept_creative(&mut self, idx: usize) {
+        if idx < self.pending_creative.len() {
+            self.pending_creative[idx].accepted = Some(true);
+        }
+    }
+
+    /// Reject a pending creative change by index.
+    pub fn reject_creative(&mut self, idx: usize) {
+        if idx < self.pending_creative.len() {
+            self.pending_creative[idx].accepted = Some(false);
+        }
+    }
+
+    /// Accept all pending creative changes.
+    pub fn accept_all_creative(&mut self) {
+        for p in &mut self.pending_creative {
+            if p.accepted.is_none() { p.accepted = Some(true); }
+        }
+    }
+
+    /// Get accepted creative WASMs (to apply to cache) and clear them.
+    pub fn drain_accepted(&mut self) -> alloc::vec::Vec<(String, alloc::vec::Vec<u8>)> {
+        let mut result = alloc::vec::Vec::new();
+        self.pending_creative.retain(|p| {
+            if p.accepted == Some(true) {
+                result.push((p.app_name.clone(), p.wasm_bytes.clone()));
+                false // remove from pending
+            } else if p.accepted == Some(false) {
+                false // remove rejected too
+            } else {
+                true // keep pending
+            }
+        });
+        result
+    }
 
     // ═══════ Token Scheduler: Attention-Based LLM Priority ══════════
     //
