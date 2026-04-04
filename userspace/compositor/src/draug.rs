@@ -213,8 +213,9 @@ impl DraugDaemon {
 
     /// Check if it's time for a tick. Call from main loop.
     pub fn should_tick(&self, now_ms: u64) -> bool {
-        self.active && !self.waiting_for_llm
-            && now_ms.saturating_sub(self.last_tick_ms) >= TICK_INTERVAL_MS
+        // Ticks ALWAYS run (collect telemetry only, no LLM calls)
+        // Don't gate on waiting_for_llm — that blocks tick counting during analysis
+        self.active && now_ms.saturating_sub(self.last_tick_ms) >= TICK_INTERVAL_MS
     }
 
     /// Execute a tick: collect telemetry and log it.

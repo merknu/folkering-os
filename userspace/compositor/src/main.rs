@@ -1363,7 +1363,8 @@ fn main() -> ! {
         let current_second = (libfolk::sys::get_rtc_packed() & 0x3F) as u8;
         if current_second != last_clock_second {
             last_clock_second = current_second;
-            did_work = true;
+            // NOT did_work — clock tick is passive, not user input
+            // Status bar damage is added below and gpu_flush handles it
 
             // Sample RAM usage for history graph
             let (_, _, mem_pct) = libfolk::sys::memory_stats();
@@ -2339,24 +2340,23 @@ fn main() -> ! {
 
 
         // ===== Blink caret =====
-        // Toggle caret every CARET_BLINK_MS — targeted redraw of just the caret pixel area
+        // Freeze caret when idle >10s — prevents infinite 150ms redraw loop
         {
-            let now = uptime();
-            if now.saturating_sub(last_caret_flip_ms) >= CARET_BLINK_MS {
+            let caret_ms = if tsc_per_us > 0 { rdtsc() / tsc_per_us / 1000 } else { uptime() };
+            let idle_secs = caret_ms.saturating_sub(draug.last_input_ms()) / 1000;
+            if idle_secs < 10 && caret_ms.saturating_sub(last_caret_flip_ms) >= CARET_BLINK_MS {
                 caret_visible = !caret_visible;
-                last_caret_flip_ms = now;
+                last_caret_flip_ms = caret_ms;
                 if omnibar_visible {
-                    // Targeted caret redraw: just the caret character area (~8x16 pixels)
                     let caret_x_pos = text_box_x + TEXT_PADDING + (cursor_pos.min(chars_per_line) * 8);
                     if caret_x_pos < text_box_x + text_box_w - 30 {
-                        // Clear caret area with omnibar background
                         fb.fill_rect(caret_x_pos, text_box_y + 8, 8, 20, fb.color_from_rgb24(0x1a1a2e));
                         if caret_visible {
                             fb.draw_string(caret_x_pos, text_box_y + 10, "|", folk_accent, fb.color_from_rgb24(0x1a1a2e));
                         }
                         damage.add_damage(compositor::damage::Rect::new(
                             caret_x_pos as u32, text_box_y as u32 + 8, 10, 22));
-                        did_work = true;
+                        // NOT did_work — caret blink is cosmetic, not user input
                     }
                 }
             }
@@ -5603,8 +5603,8 @@ fn main() -> ! {
                     };
                     fb.draw_cursor(cursor_x as usize, cursor_y as usize, cursor_fill, cursor_outline);
                 }
-            } else if did_work && !had_mouse_events {
-                // Non-mouse work (clock tick, etc.): present status bar damage
+            } else if !had_mouse_events {
+                // Non-mouse damage (clock tick, Draug, etc.): present shadow→FB
                 for r in damage.regions() {
                     fb.present_region(r.x, r.y, r.w, r.h);
                 }
