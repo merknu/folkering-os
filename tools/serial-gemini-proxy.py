@@ -416,7 +416,7 @@ def _cache_meta_path(prompt: str) -> str:
     return os.path.join(_WASM_CACHE_DIR, f"{_cache_key(prompt)}.meta.json")
 
 def _cache_get_meta(prompt: str) -> dict:
-    """Read cache metadata (strikes, perfected status, version history)."""
+    """Read cache metadata (lineage, strikes, version history)."""
     path = _cache_meta_path(prompt)
     if os.path.exists(path):
         try:
@@ -424,35 +424,138 @@ def _cache_get_meta(prompt: str) -> dict:
                 return json.loads(f.read())
         except Exception:
             pass
-    return {"strikes": 0, "perfected": False, "version": 1, "dreams": 0, "created": ""}
+    return {
+        "id": "",              # Unique hash of this version's source code
+        "parent_id": "",       # ID of the version this was derived from
+        "root_id": "",         # ID of the original "genesis" version (shared by all branches)
+        "branch": "main",      # Branch name: "main", "fast", "beautiful", etc.
+        "strikes": 0,
+        "perfected": False,
+        "version": 1,
+        "description": "",
+        "created": "",
+        "last_updated": "",
+        "lineage": [],         # List of ancestor IDs: [root, ..., parent, self]
+        "dream_history": [],   # What dreams have been applied: ["refactor", "creative", ...]
+    }
 
 def _cache_set_meta(prompt: str, meta: dict):
     """Write cache metadata."""
     with open(_cache_meta_path(prompt), "w") as f:
         f.write(json.dumps(meta, indent=2))
 
-def _cache_store(prompt: str, source: str, wasm_bytes: bytes):
-    """Store compiled WASM + source code + metadata in cache."""
+def _cache_store(prompt: str, source: str, wasm_bytes: bytes, parent_prompt: str = "", dream_mode: str = ""):
+    """Store compiled WASM + source code + metadata with lineage tracking."""
     key = _cache_key(prompt)
     with open(os.path.join(_WASM_CACHE_DIR, f"{key}.rs"), "w") as f:
         f.write(source)
     with open(os.path.join(_WASM_CACHE_DIR, f"{key}.wasm"), "wb") as f:
         f.write(wasm_bytes)
+
     import datetime
+    # Unique ID for this version = hash of source code
+    source_id = hashlib.sha256(source.encode()).hexdigest()[:12]
+
     meta = _cache_get_meta(prompt)
     meta["version"] = meta.get("version", 0) + 1
-    # Store clean description (strip internal command prefixes)
+    meta["id"] = source_id
+
+    # Clean description
     desc = prompt
     for prefix in ["gemini generate ", "gemini gen ", "generate ", "agent generate "]:
         if desc.lower().startswith(prefix):
             desc = desc[len(prefix):]
             break
     meta["description"] = desc
+
+    # Lineage tracking
+    if parent_prompt:
+        parent_meta = _cache_get_meta(parent_prompt)
+        meta["parent_id"] = parent_meta.get("id", "")
+        meta["root_id"] = parent_meta.get("root_id", "") or parent_meta.get("id", "")
+        # Inherit branch name from parent (unless explicitly changed)
+        if not meta.get("branch") or meta["branch"] == "main":
+            meta["branch"] = parent_meta.get("branch", "main")
+        # Build lineage chain
+        parent_lineage = parent_meta.get("lineage", [])
+        meta["lineage"] = parent_lineage + [parent_meta.get("id", "")]
+    else:
+        # Genesis: first version of this app
+        meta["root_id"] = source_id
+        meta["parent_id"] = ""
+        meta["lineage"] = []
+
+    # Dream history
+    if dream_mode:
+        history = meta.get("dream_history", [])
+        history.append({"mode": dream_mode, "time": datetime.datetime.now().isoformat(), "version": meta["version"]})
+        # Keep last 20 entries
+        meta["dream_history"] = history[-20:]
+
     if not meta.get("created"):
         meta["created"] = datetime.datetime.now().isoformat()
     meta["last_updated"] = datetime.datetime.now().isoformat()
     _cache_set_meta(prompt, meta)
-    print(f"[CACHE] Stored: {key} v{meta['version']} ({len(source)} chars, {len(wasm_bytes)} bytes)")
+
+    lineage_depth = len(meta.get("lineage", []))
+    print(f"[CACHE] Stored: {key} v{meta['version']} id={source_id} depth={lineage_depth} ({len(source)} chars, {len(wasm_bytes)} bytes)")
+
+
+# ── Lineage Query ────────────────────────────────────────────────────────
+
+def _list_all_apps() -> list:
+    """List all cached apps with their lineage metadata."""
+    apps = []
+    for f in os.listdir(_WASM_CACHE_DIR):
+        if f.endswith(".meta.json"):
+            try:
+                with open(os.path.join(_WASM_CACHE_DIR, f), "r") as fh:
+                    meta = json.loads(fh.read())
+                key = f.replace(".meta.json", "")
+                apps.append({
+                    "key": key,
+                    "id": meta.get("id", "?"),
+                    "parent_id": meta.get("parent_id", ""),
+                    "root_id": meta.get("root_id", ""),
+                    "branch": meta.get("branch", "main"),
+                    "version": meta.get("version", 1),
+                    "description": meta.get("description", key),
+                    "dreams": len(meta.get("dream_history", [])),
+                    "perfected": meta.get("perfected", False),
+                })
+            except Exception:
+                pass
+    return apps
+
+
+def _get_lineage_tree(prompt: str) -> str:
+    """Build a text representation of an app's family tree."""
+    meta = _cache_get_meta(prompt)
+    if not meta.get("id"):
+        return f"No lineage data for '{prompt}'"
+
+    root_id = meta.get("root_id", meta.get("id", ""))
+    # Find all apps with same root_id (all relatives)
+    family = []
+    for app in _list_all_apps():
+        if app["root_id"] == root_id or app["id"] == root_id:
+            family.append(app)
+
+    if not family:
+        return f"'{prompt}' has no known relatives"
+
+    # Sort by version
+    family.sort(key=lambda a: a["version"])
+
+    lines = [f"Lineage for '{meta.get('description', prompt)}' (root: {root_id[:8]}...)"]
+    lines.append("")
+    for app in family:
+        prefix = "  " if app["id"] != meta.get("id") else "→ "
+        perfected = " [PERFECTED]" if app.get("perfected") else ""
+        lines.append(f"{prefix}v{app['version']} [{app['branch']}] id={app['id'][:8]} "
+                     f"dreams={app['dreams']}{perfected} — {app['description'][:40]}")
+
+    return "\n".join(lines)
 
 
 # ── Daily Dream Budget ──────────────────────────────────────────────────
@@ -606,8 +709,16 @@ def _llm_to_wasm(prompt: str, force: bool = False, tweak: str = "") -> tuple:
         if len(wasm_binary) > MAX_WASM_SIZE:
             return None, f"WASM too large: {len(wasm_binary)} bytes"
         print(f"[WASM] Compiled: {len(wasm_binary)} bytes")
-        # Cache the source + binary for future reuse
-        _cache_store(prompt, source, wasm_binary)
+        # Detect dream mode from tweak text for lineage
+        dream_mode_tag = ""
+        parent = ""
+        if tweak:
+            parent = prompt  # The original app is the parent
+            if "refactor" in tweak.lower(): dream_mode_tag = "refactor"
+            elif "visual" in tweak.lower() or "improvement" in tweak.lower(): dream_mode_tag = "creative"
+            elif "harden" in tweak.lower(): dream_mode_tag = "nightmare"
+            else: dream_mode_tag = "tweak"
+        _cache_store(prompt, source, wasm_binary, parent_prompt=parent, dream_mode=dream_mode_tag)
         return wasm_binary, None
     except subprocess.TimeoutExpired:
         return None, "Compile timeout (60s)"

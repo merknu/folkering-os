@@ -43,6 +43,7 @@ pub const OS_TOOLS: &[Tool] = &[
     Tool { name: "list_tasks", description: "List running OS tasks with PIDs and names." },
     Tool { name: "system_info", description: "Get system uptime, memory usage, and CPU info." },
     Tool { name: "generate_wasm", description: "Generate and compile a WASM visual tool. Args: description of what to draw" },
+    Tool { name: "list_cache", description: "List all cached WASM apps with names and sizes" },
     Tool { name: "run_command", description: "Execute a shell command. Args: command string" },
 ];
 
@@ -280,8 +281,11 @@ pub fn execute_tool(name: &str, args: &str) -> String {
             )
         }
         "generate_wasm" => {
-            // Marker — compositor intercepts this and routes to WASM gen pipeline
             format!("__WASM_GEN__{}", args.trim())
+        }
+        "list_cache" => {
+            // Marker — compositor fills this from wasm_cache keys
+            format!("__LIST_CACHE__")
         }
         "run_command" => {
             // Search is the closest we have to a generic command

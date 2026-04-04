@@ -1702,7 +1702,20 @@ fn main() -> ! {
                                         // Check for WASM gen (special case — async)
                                         if tname == "generate_wasm" {
                                             deferred_tool_gen = Some((agent.window_id, alloc::string::String::from(targs.as_str())));
-                                            // Agent stays active, WASM result will be handled separately
+                                        } else if tname == "list_cache" {
+                                            // List OS-side WASM cache
+                                            let mut cache_list = alloc::string::String::from("Cached WASM apps:\n");
+                                            for (name, wasm) in &wasm_cache {
+                                                cache_list.push_str(&alloc::format!("  - {} ({} bytes)\n", name, wasm.len()));
+                                            }
+                                            if wasm_cache.is_empty() {
+                                                cache_list.push_str("  (empty)\n");
+                                            }
+                                            agent.on_tool_result(&cache_list);
+                                            if let Some(win) = wm.get_window_mut(agent.window_id) {
+                                                win.push_line(&cache_list[..cache_list.len().min(200)]);
+                                                win.push_line("[Agent] Thinking...");
+                                            }
                                         } else {
                                             // Execute tool synchronously
                                             let result = compositor::agent::execute_tool(&tname, &targs);
