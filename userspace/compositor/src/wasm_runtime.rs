@@ -368,6 +368,106 @@ fn register_host_functions(linker: &mut Linker<HostState>) {
             handle as i32
         },
     );
+
+    // Phase 5: Semantic file query — search files by concept/purpose
+    // folk_query_files(query_ptr, query_len, result_ptr, result_max_len) -> i32
+    // Writes the first matching filename to result_ptr.
+    // Returns filename length on success, 0 on not found, -1 on error.
+    let _ = linker.func_wrap("env", "folk_query_files",
+        |mut caller: Caller<HostState>, query_ptr: i32, query_len: i32, result_ptr: i32, result_max_len: i32| -> i32 {
+            if query_len <= 0 || query_len > 256 || result_max_len <= 0 { return -1; }
+
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+
+            // Read query string from WASM memory
+            let mut query_buf = alloc::vec![0u8; query_len as usize];
+            if mem.read(&caller, query_ptr as usize, &mut query_buf).is_err() { return -1; }
+            let query = match alloc::str::from_utf8(&query_buf) {
+                Ok(s) => String::from(s),
+                Err(_) => return -1,
+            };
+
+            // Call Synapse semantic query
+            match libfolk::sys::synapse::query_intent(&query) {
+                Ok(info) => {
+                    // Construct result filename from query
+                    let result_name = alloc::format!("{}.wasm", query);
+                    let result_bytes = result_name.as_bytes();
+                    let copy_len = result_bytes.len().min(result_max_len as usize);
+                    if mem.write(&mut caller, result_ptr as usize, &result_bytes[..copy_len]).is_ok() {
+                        copy_len as i32
+                    } else { -1 }
+                }
+                Err(_) => 0, // Not found
+            }
+        },
+    );
+
+    // Phase 6: VFS write + list — apps can save data and browse files
+    // folk_list_files(buf_ptr, max_len) -> i32
+    // Writes "name1\nname2\n..." to buf. Returns total bytes written.
+    let _ = linker.func_wrap("env", "folk_list_files",
+        |mut caller: Caller<HostState>, buf_ptr: i32, max_len: i32| -> i32 {
+            if max_len <= 0 { return 0; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+            // Read directory entries from ramdisk (kernel syscall)
+            let mut entries: [libfolk::sys::fs::DirEntry; 32] = unsafe { ::core::mem::zeroed() };
+            let count = libfolk::sys::fs::read_dir(&mut entries);
+            // Build newline-separated file list with size info
+            let mut result = String::new();
+            for i in 0..count {
+                let e = &entries[i];
+                let name = e.name_str();
+                result.push_str(name);
+                result.push('\t');
+                // Append size
+                let mut nbuf = [0u8; 12];
+                let mut n = e.size as usize;
+                let mut pos = nbuf.len();
+                if n == 0 { pos -= 1; nbuf[pos] = b'0'; }
+                while n > 0 && pos > 0 { pos -= 1; nbuf[pos] = b'0' + (n % 10) as u8; n /= 10; }
+                if let Ok(s) = ::core::str::from_utf8(&nbuf[pos..]) { result.push_str(s); }
+                result.push('\n');
+            }
+            let bytes = result.as_bytes();
+            let copy_len = bytes.len().min(max_len as usize);
+            if mem.write(&mut caller, buf_ptr as usize, &bytes[..copy_len]).is_ok() {
+                copy_len as i32
+            } else { -1 }
+        },
+    );
+
+    // folk_write_file(path_ptr, path_len, data_ptr, data_len) -> i32
+    // Saves data to Synapse VFS. Returns 0 on success, -1 on error.
+    let _ = linker.func_wrap("env", "folk_write_file",
+        |mut caller: Caller<HostState>, path_ptr: i32, path_len: i32, data_ptr: i32, data_len: i32| -> i32 {
+            if path_len <= 0 || path_len > 256 || data_len < 0 || data_len > 4096 { return -1; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+            let mut name_buf = alloc::vec![0u8; path_len as usize];
+            if mem.read(&caller, path_ptr as usize, &mut name_buf).is_err() { return -1; }
+            let name = match alloc::str::from_utf8(&name_buf) {
+                Ok(s) => s,
+                Err(_) => return -1,
+            };
+            let mut data_buf = alloc::vec![0u8; data_len as usize];
+            if data_len > 0 {
+                if mem.read(&caller, data_ptr as usize, &mut data_buf).is_err() { return -1; }
+            }
+            match libfolk::sys::synapse::write_file(name, &data_buf) {
+                Ok(_) => 0,
+                Err(_) => -1,
+            }
+        },
+    );
 }
 
 // ── One-Shot Execution (tools/scripts) ───────────────────────────────────
@@ -600,4 +700,120 @@ fn take_output(state: &mut HostState) -> WasmOutput {
         surface_dirty: dirty,
         asset_requests: assets,
     }
+}
+
+// ── View Adapter: Data Format Translation Engine ──────────────────────────
+
+/// Execute a View Adapter WASM module to transform data.
+///
+/// The adapter exports `transform()` which reads input via `folk_adapter_input`
+/// and writes output via `folk_adapter_output`.
+///
+/// Returns the transformed bytes, or None if the adapter fails.
+pub fn execute_adapter(adapter_wasm: &[u8], input_data: &[u8]) -> Option<Vec<u8>> {
+    let engine = Engine::default();
+
+    // Adapter host state: input/output buffers
+    struct AdapterState {
+        input: Vec<u8>,
+        output: Vec<u8>,
+        input_read: bool,
+    }
+
+    let mut store = Store::new(&engine, AdapterState {
+        input: Vec::from(input_data),
+        output: Vec::new(),
+        input_read: false,
+    });
+    store.set_fuel(500_000).unwrap_or(()); // Adapters get less fuel than apps
+
+    let module = match Module::new(&engine, adapter_wasm) {
+        Ok(m) => m,
+        Err(_) => return None,
+    };
+
+    let mut linker = <Linker<AdapterState>>::new(&engine);
+
+    // folk_adapter_input(ptr, max_len) -> i32: write input data to WASM memory
+    let _ = linker.func_wrap("env", "folk_adapter_input",
+        |mut caller: Caller<AdapterState>, ptr: i32, max_len: i32| -> i32 {
+            if caller.data().input_read { return 0; }
+            let input = &caller.data().input;
+            let copy_len = input.len().min(max_len as usize);
+            let data = input[..copy_len].to_vec();
+            if let Some(Extern::Memory(mem)) = caller.get_export("memory") {
+                if mem.write(&mut caller, ptr as usize, &data).is_ok() {
+                    caller.data_mut().input_read = true;
+                    return copy_len as i32;
+                }
+            }
+            0
+        },
+    );
+
+    // folk_adapter_output(ptr, len): read transformed data from WASM memory
+    let _ = linker.func_wrap("env", "folk_adapter_output",
+        |mut caller: Caller<AdapterState>, ptr: i32, len: i32| {
+            if len <= 0 || len > 8192 { return; }
+            let mut buf = alloc::vec![0u8; len as usize];
+            if let Some(Extern::Memory(mem)) = caller.get_export("memory") {
+                if mem.read(&caller, ptr as usize, &mut buf).is_ok() {
+                    caller.data_mut().output = buf;
+                }
+            }
+        },
+    );
+
+    // Also provide basic folk_* stubs so adapters can reuse the WASM template
+    let _ = linker.func_wrap("env", "folk_get_time", |_: Caller<AdapterState>| -> i32 { 0 });
+    let _ = linker.func_wrap("env", "folk_screen_width", |_: Caller<AdapterState>| -> i32 { 0 });
+    let _ = linker.func_wrap("env", "folk_screen_height", |_: Caller<AdapterState>| -> i32 { 0 });
+
+    let instance = match linker.instantiate(&mut store, &module) {
+        Ok(i) => match i.ensure_no_start(&mut store) {
+            Ok(i) => i,
+            Err(_) => return None,
+        },
+        Err(_) => return None,
+    };
+
+    // Call transform() or run() — adapters may export either
+    let func_name = if instance.get_func(&store, "transform").is_some() {
+        "transform"
+    } else {
+        "run"
+    };
+
+    let func = match instance.get_typed_func::<(), ()>(&store, func_name) {
+        Ok(f) => f,
+        Err(_) => return None,
+    };
+
+    if func.call(&mut store, ()).is_err() {
+        return None;
+    }
+
+    let output = ::core::mem::replace(&mut store.data_mut().output, Vec::new());
+    if output.is_empty() { None } else { Some(output) }
+}
+
+/// Build the LLM prompt for generating a View Adapter.
+pub fn adapter_generation_prompt(source_mime: &str, target_format: &str, sample_data: &str) -> String {
+    alloc::format!(
+        "Generate a Rust no_std WASM module that transforms data.\n\n\
+         Source format: {}\n\
+         Target format: {}\n\n\
+         The module must:\n\
+         - #![no_std] #![no_main]\n\
+         - Import: extern \"C\" {{ fn folk_adapter_input(ptr: *mut u8, max_len: i32) -> i32; \
+           fn folk_adapter_output(ptr: *const u8, len: i32); }}\n\
+         - Export: #[no_mangle] pub extern \"C\" fn transform()\n\
+         - Read input via folk_adapter_input into a stack buffer\n\
+         - Transform the data from {} to {}\n\
+         - Write output via folk_adapter_output\n\n\
+         Sample input data (first 200 bytes):\n{}\n\n\
+         Return ONLY the Rust code, no explanation.",
+        source_mime, target_format, source_mime, target_format,
+        &sample_data[..sample_data.len().min(200)]
+    )
 }

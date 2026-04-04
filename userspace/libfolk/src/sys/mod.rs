@@ -20,6 +20,7 @@ pub mod ping;
 pub mod random;
 pub mod time;
 pub mod inference;
+pub mod pci;
 
 // Re-export commonly used functions at the sys level
 pub use task::{exit, yield_cpu, get_pid, spawn, parallel_gemm, ask_gemini, gpu_flush, gpu_flush_batch, gpu_vsync, gpu_info, gpu_move_cursor, com3_read, com3_write, com2_write_raw, com2_async_send, com2_async_poll, com2_async_read, com2_async_poll_legacy, wait_for_irq, get_rtc, get_rtc_packed, DateTime, memory_stats, iqe_read, iqe_tsc_freq};

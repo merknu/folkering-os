@@ -46,6 +46,8 @@ pub const OS_TOOLS: &[Tool] = &[
     Tool { name: "list_cache", description: "List all cached WASM apps with names and sizes" },
     Tool { name: "revert_app", description: "Rollback a WASM app to a previous version. Args: app_name version_number" },
     Tool { name: "run_command", description: "Execute a shell command. Args: command string" },
+    Tool { name: "query_intent", description: "Search files by concept/purpose. Args: natural language query (e.g. 'calculator', 'animation')" },
+    Tool { name: "pci_devices", description: "List all PCI hardware devices with vendor/device IDs, class, BARs, and interrupt lines" },
 ];
 
 /// Build the system prompt that includes tool descriptions
@@ -297,6 +299,30 @@ pub fn execute_tool(name: &str, args: &str) -> String {
                 Ok(resp) => format!("{} results (shmem={})", resp.count, resp.shmem_handle),
                 Err(e) => format!("Error: {:?}", e),
             }
+        }
+        "query_intent" => {
+            match libfolk::sys::synapse::query_intent(args.trim()) {
+                Ok(info) => format!("Found: file_id={}, size={} bytes", info.file_id, info.size),
+                Err(_) => format!("No files match '{}'", args.trim()),
+            }
+        }
+        "pci_devices" => {
+            let mut devices: [libfolk::sys::pci::PciDeviceInfo; 32] = unsafe { core::mem::zeroed() };
+            let count = libfolk::sys::pci::enumerate(&mut devices);
+            let mut result = format!("Found {} PCI devices:\n", count);
+            for i in 0..count {
+                let d = &devices[i];
+                result.push_str(&format!(
+                    "  {:02x}:{:02x}.{} {:04x}:{:04x} class={:02x}.{:02x} irq={} {} [BAR0={}B BAR1={}B]\n",
+                    d.bus, d.device_num, d.function,
+                    d.vendor_id, d.device_id,
+                    d.class_code, d.subclass,
+                    d.interrupt_line,
+                    d.class_name(),
+                    d.bar_sizes[0], d.bar_sizes[1]
+                ));
+            }
+            result
         }
         _ => format!("Error: unknown tool '{}'", name),
     }

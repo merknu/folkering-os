@@ -574,6 +574,24 @@ def _cache_store(prompt: str, source: str, wasm_bytes: bytes, parent_prompt: str
     if not meta.get("created"):
         meta["created"] = datetime.datetime.now().isoformat()
     meta["last_updated"] = datetime.datetime.now().isoformat()
+
+    # Semantic VFS: auto-generate intent metadata
+    intent = {
+        "purpose": desc,
+        "type": "interactive_app" if any(kw in source.lower() for kw in
+            ["folk_poll_event", "mouse", "click", "key_down"]) else "visual_widget",
+        "mime": "application/wasm",
+    }
+    # Detect capabilities from source
+    caps = []
+    if "folk_poll_event" in source: caps.append("input")
+    if "folk_draw_rect" in source or "folk_fill_screen" in source: caps.append("graphics")
+    if "folk_draw_text" in source: caps.append("text")
+    if "folk_get_time" in source or "folk_get_datetime" in source: caps.append("time")
+    if "folk_random" in source: caps.append("random")
+    if caps: intent["capabilities"] = caps
+    meta["intent"] = intent
+
     _cache_set_meta(prompt, meta)
 
     # Save version snapshot for rollback (never deleted)
@@ -685,52 +703,42 @@ def _dream_budget_record():
 
 
 def _clarify_request(prompt: str) -> tuple:
-    """Ask FAST LLM to clarify an ambiguous generation request.
+    """Check if an ambiguous request needs clarification.
     Returns (should_proceed: bool, message: str).
-    If should_proceed is False, message contains a question or suggestion."""
+    If should_proceed is False, message contains a question or suggestion.
 
-    # Skip clarification for tweaks, dreams, and very specific prompts
-    if "--tweak" in prompt or len(prompt.split()) > 8:
+    PERFORMANCE: No LLM call. Uses fast heuristics only.
+    The old version called FAST tier for every request, adding 3-10s latency.
+    """
+
+    # Skip clarification for tweaks, dreams, force, and most prompts
+    if "--tweak" in prompt or "--force" in prompt or len(prompt.split()) > 5:
         return True, ""
 
-    # Check if cached variants exist
-    all_apps = _list_all_apps()
     # Clean prompt for matching
     clean = prompt.lower()
     for pfx in ["gemini generate ", "generate ", "agent generate "]:
         if clean.startswith(pfx):
             clean = clean[len(pfx):]
             break
+    clean = clean.strip()
 
-    # Find similar cached apps
-    similar = [a for a in all_apps if clean in a["description"].lower() or a["description"].lower() in clean]
-    if similar:
-        suggestions = ", ".join(f"'{a['description']}' (v{a['version']})" for a in similar[:5])
-        return False, f"EXISTING: Found similar apps: {suggestions}. Type the exact name to load, or add details to create a new variant."
+    # Reject only truly empty or single-char prompts
+    if len(clean) < 3:
+        return False, "QUESTION: What should the app do? Example: 'bouncing ball' or 'analog clock'"
 
-    # Ask FAST LLM: is this request clear enough to generate code?
-    clarify_prompt = (
-        f"A user wants to generate a visual WASM app with this description: \"{clean}\"\n\n"
-        f"Is this description clear enough to write code? Answer with ONLY one JSON:\n"
-        f"If clear: {{\"clear\": true}}\n"
-        f"If unclear or nonsensical: {{\"clear\": false, \"question\": \"your clarifying question\"}}\n"
-        f"If it could have variants: {{\"clear\": true, \"variants\": [\"simple version\", \"advanced version\"]}}\n"
-    )
-    try:
-        result = call_llm(clarify_prompt, tier="fast")
-        result = result.strip()
-        # Find JSON in response
-        if '{' in result:
-            json_str = result[result.index('{'):result.rindex('}') + 1]
-            data = json.loads(json_str)
-            if not data.get("clear", True):
-                return False, f"QUESTION: {data.get('question', 'Could you be more specific?')}"
-            if data.get("variants"):
-                variants = ", ".join(f"'{v}'" for v in data["variants"][:4])
-                return False, f"VARIANTS: Did you mean one of these? {variants}. Be more specific or just press Enter to use the first option."
-    except Exception:
-        pass  # Clarification failed — proceed anyway
+    # Check for EXACT cache match — offer to load instead of regenerating
+    all_apps = _list_all_apps()
+    exact = [a for a in all_apps if a["description"].lower() == clean]
+    if exact:
+        a = exact[0]
+        # Exact match exists — load from cache (fast path, no LLM call)
+        print(f"[CLARIFY] Exact cache hit: '{a['description']}' v{a['version']}")
+        # Don't block — let cache_check handle it in _llm_to_wasm
+        return True, ""
 
+    # Everything else: proceed directly. The LLM is better at handling
+    # ambiguity than a clarification round-trip that adds 5-10s latency.
     return True, ""
 
 
@@ -739,17 +747,17 @@ def _llm_to_wasm(prompt: str, force: bool = False, tweak: str = "") -> tuple:
     Returns (bytes, None) on success, (None, str) on failure.
     Returns (None, "CLARIFY:...") if the request needs user clarification."""
 
-    # Phase 0: Clarification (only for new generation, not tweaks/dreams)
-    if not force and not tweak:
-        should_proceed, clarify_msg = _clarify_request(prompt)
-        if not should_proceed:
-            return None, f"CLARIFY:{clarify_msg}"
-
-    # Phase 1: Check cache first (unless --force)
+    # Phase 0: Check cache first (instant — no LLM call)
     if not force and not tweak:
         cached_wasm, _ = _cache_check(prompt)
         if cached_wasm:
             return cached_wasm, None
+
+    # Phase 0.5: Clarification (heuristic only, no LLM call)
+    if not force and not tweak:
+        should_proceed, clarify_msg = _clarify_request(prompt)
+        if not should_proceed:
+            return None, f"CLARIFY:{clarify_msg}"
 
     # If --tweak, load existing source and ask LLM to modify it
     if tweak:
@@ -864,6 +872,157 @@ def _llm_to_wasm(prompt: str, force: bool = False, tweak: str = "") -> tuple:
         return None, "Compile timeout (60s)"
     except Exception as e:
         return None, f"Build error: {e}"
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _generate_driver(vendor_id: str, device_id: str, class_name: str) -> tuple:
+    """Generate a WASM device driver for a specific PCI device.
+    Uses the driver-specific ABI prompt (folk_mmio_*, folk_in*, folk_wait_irq).
+    Returns (bytes, None) on success, (None, error_str) on failure."""
+
+    # Build the driver system prompt with full ABI definition
+    driver_prompt = f"""Generate a Rust no_std WASM device driver for Folkering OS.
+
+TARGET DEVICE:
+- PCI Vendor: {vendor_id}, Device: {device_id}
+- Class: {class_name}
+
+CONSTRAINTS:
+- #![no_std] #![no_main]
+- No allocation (no Vec, String, Box)
+- No crate imports (no `use` statements for external crates)
+- Export: #[no_mangle] pub extern "C" fn driver_main()
+- All host calls must be inside unsafe {{}}
+
+AVAILABLE HOST FUNCTIONS (declare as extern "C"):
+  // Port I/O (capability-checked by kernel)
+  fn folk_inb(port: i32) -> i32;
+  fn folk_inw(port: i32) -> i32;
+  fn folk_inl(port: i32) -> i32;
+  fn folk_outb(port: i32, value: i32);
+  fn folk_outw(port: i32, value: i32);
+  fn folk_outl(port: i32, value: i32);
+
+  // MMIO (offset relative to BAR base, bounds-checked)
+  fn folk_mmio_read_u8(bar: i32, offset: i32) -> i32;
+  fn folk_mmio_read_u16(bar: i32, offset: i32) -> i32;
+  fn folk_mmio_read_u32(bar: i32, offset: i32) -> i32;
+  fn folk_mmio_write_u8(bar: i32, offset: i32, value: i32);
+  fn folk_mmio_write_u16(bar: i32, offset: i32, value: i32);
+  fn folk_mmio_write_u32(bar: i32, offset: i32, value: i32);
+
+  // Interrupt lifecycle
+  fn folk_wait_irq();   // yields until hardware interrupt fires
+  fn folk_ack_irq();    // acknowledge interrupt (unmask at APIC)
+
+  // Device identity query
+  fn folk_device_vendor_id() -> i32;
+  fn folk_device_id() -> i32;
+  fn folk_device_irq() -> i32;
+  fn folk_bar_size(bar: i32) -> i32;
+
+  // Debug output
+  fn folk_log(ptr: i32, len: i32);
+
+DRIVER PATTERN:
+  #[no_mangle]
+  pub extern "C" fn driver_main() {{
+      unsafe {{
+          let vid = folk_device_vendor_id();
+          let did = folk_device_id();
+          let bar0_size = folk_bar_size(0);
+
+          // Log startup
+          let msg = b"Driver started";
+          folk_log(msg.as_ptr() as i32, msg.len() as i32);
+
+          // Read device status register (example: offset 0x10 in BAR0)
+          let status = folk_mmio_read_u32(0, 0x10);
+
+          // Initialize device via MMIO writes
+          folk_mmio_write_u32(0, 0x10, 0x01); // enable device
+
+          // Main loop: wait for interrupts and process
+          loop {{
+              folk_wait_irq();
+              // Read interrupt status
+              let isr = folk_mmio_read_u32(0, 0x08);
+              // Process interrupt...
+              folk_ack_irq();
+          }}
+      }}
+  }}
+
+Return ONLY the complete Rust source code for the driver. No explanation."""
+
+    print(f"[DRIVER] Generating driver for {vendor_id}:{device_id} ({class_name})...")
+    source = call_llm(driver_prompt, tier="heavy")
+
+    if source.startswith("Error:"):
+        return None, source
+
+    # Extract code
+    if "<think>" in source and "</think>" in source:
+        source = source[source.index("</think>") + 8:]
+    extracted = None
+    if "```rust" in source:
+        extracted = source.split("```rust")[1].split("```")[0]
+    elif "```" in source:
+        parts = source.split("```")
+        if len(parts) >= 3: extracted = parts[1]
+    if extracted: source = extracted.strip()
+    elif "#![no_std]" in source: source = source[source.index("#![no_std]"):].strip()
+
+    # Fix common issues
+    source = fix_missing_externs(source)
+    source = fix_unsafe_calls(source)
+
+    # Ensure driver exports driver_main (not run)
+    if "fn driver_main" not in source and "fn run" in source:
+        source = source.replace("fn run()", "fn driver_main()")
+
+    print(f"[DRIVER] Source: {len(source)} chars")
+
+    # Compile
+    tmp_dir = tempfile.mkdtemp(prefix="folkdrv_")
+    try:
+        proj_dir = os.path.join(tmp_dir, "wasm_driver")
+        subprocess.run(["cargo", "new", "--lib", proj_dir], capture_output=True, timeout=10)
+        with open(os.path.join(proj_dir, "Cargo.toml"), "w") as f:
+            f.write('[package]\nname = "wasm_driver"\nversion = "0.1.0"\nedition = "2021"\n'
+                    '[lib]\ncrate-type = ["cdylib"]\n[profile.release]\n'
+                    'opt-level = "z"\nlto = true\nstrip = true\npanic = "abort"\n')
+        with open(os.path.join(proj_dir, "src", "lib.rs"), "w") as f:
+            f.write(source)
+        result = subprocess.run(
+            ["cargo", "build", "--target", "wasm32-unknown-unknown", "--release"],
+            capture_output=True, text=True, timeout=60, cwd=proj_dir)
+        if result.returncode != 0:
+            print(f"[DRIVER] Compile failed: {result.stderr[:200]}")
+            return None, f"Driver compile error: {result.stderr[:400]}"
+        wasm_path = os.path.join(proj_dir, "target", "wasm32-unknown-unknown", "release", "wasm_driver.wasm")
+        if not os.path.exists(wasm_path):
+            return None, "Driver WASM output not found"
+        with open(wasm_path, "rb") as f:
+            wasm_binary = f.read()
+        print(f"[DRIVER] Compiled: {len(wasm_binary)} bytes")
+
+        # Cache the driver source
+        cache_key = f"driver_{vendor_id}_{device_id}"
+        cache_path = os.path.join(_WASM_CACHE_DIR, f"{cache_key}.rs")
+        with open(cache_path, "w") as f:
+            f.write(source)
+        wasm_cache_path = os.path.join(_WASM_CACHE_DIR, f"{cache_key}.wasm")
+        with open(wasm_cache_path, "wb") as f:
+            f.write(wasm_binary)
+        print(f"[DRIVER] Cached: {cache_key}")
+
+        return wasm_binary, None
+    except subprocess.TimeoutExpired:
+        return None, "Driver compile timeout (60s)"
+    except Exception as e:
+        return None, f"Driver build error: {e}"
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -1013,7 +1172,7 @@ def _call_gemini(prompt: str, model: str = "", base_url: str = "") -> str:
     req = urllib.request.Request(url, data=body,
         headers={"Content-Type": "application/json"}, method="POST")
     ctx = ssl.create_default_context()
-    with urllib.request.urlopen(req, context=ctx, timeout=60) as resp:
+    with urllib.request.urlopen(req, context=ctx, timeout=30) as resp:
         result = json.loads(resp.read())
         return result["candidates"][0]["content"]["parts"][0]["text"]
 
@@ -1034,7 +1193,7 @@ def _call_openai(prompt: str, model: str = "", base_url: str = "") -> str:
         headers["Authorization"] = f"Bearer {LLM_API_KEY}"
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
     # Use SSL only for HTTPS URLs
-    kwargs = {"timeout": 120}
+    kwargs = {"timeout": 45}
     if url.startswith("https"):
         kwargs["context"] = ssl.create_default_context()
     with urllib.request.urlopen(req, **kwargs) as resp:
@@ -1056,7 +1215,7 @@ def _call_local(prompt: str, model: str = "", base_url: str = "") -> str:
     }).encode()
     req = urllib.request.Request(url, data=body,
         headers={"Content-Type": "application/json"}, method="POST")
-    with urllib.request.urlopen(req, timeout=120) as resp:
+    with urllib.request.urlopen(req, timeout=45) as resp:
         result = json.loads(resp.read())
         msg = result.get("message", {})
         content = msg.get("content", "")
@@ -1084,7 +1243,7 @@ def _call_claude(prompt: str, model: str = "") -> str:
         "anthropic-version": "2023-06-01",
     }, method="POST")
     ctx = ssl.create_default_context()
-    with urllib.request.urlopen(req, context=ctx, timeout=60) as resp:
+    with urllib.request.urlopen(req, context=ctx, timeout=30) as resp:
         result = json.loads(resp.read())
         return result["content"][0]["text"]
 
@@ -1183,14 +1342,36 @@ def handle_mcp_frame(frame_bytes: bytes, sock: socket.socket):
 
     elif msg_type == 'wasm_gen_request':
         desc = msg.get('description', '')
-        is_dream = "--tweak" in desc and ("refactor" in desc.lower() or "optimize" in desc.lower() or "visual" in desc.lower())
-        print(f"[MCP] WASM gen{'(dream)' if is_dream else ''}: {desc[:60]}...")
 
-        # Dream budget check — reject if daily quota exhausted
-        if is_dream and not _dream_budget_check():
-            error_frame = make_frame(encode_chat_response("Error: dream budget exhausted for today"))
-            sock.sendall(error_frame)
+        # ── Autonomous Driver Generation ──────────────────────────
+        # Format: __DRIVER_GEN__<vendor_id>:<device_id>:<class_name>
+        if desc.startswith("__DRIVER_GEN__"):
+            parts = desc[14:].split(":", 2)
+            if len(parts) >= 3:
+                vendor_id = parts[0]
+                device_id = parts[1]
+                class_name = parts[2]
+                print(f"[MCP] DRIVER GEN: {vendor_id}:{device_id} ({class_name})")
+                wasm_binary, error = _generate_driver(vendor_id, device_id, class_name)
+                if error:
+                    error_frame = make_frame(encode_chat_response(f"Error: {error}"))
+                    sock.sendall(error_frame)
+                else:
+                    send_wasm_chunked(wasm_binary, sock, session_id=_session.session_id)
+            else:
+                error_frame = make_frame(encode_chat_response("Error: bad driver gen format"))
+                sock.sendall(error_frame)
         else:
+        # ── Normal WASM App Generation ────────────────────────────
+
+            is_dream = "--tweak" in desc and ("refactor" in desc.lower() or "optimize" in desc.lower() or "visual" in desc.lower())
+            print(f"[MCP] WASM gen{'(dream)' if is_dream else ''}: {desc[:60]}...")
+
+            # Dream budget check — reject if daily quota exhausted
+            if is_dream and not _dream_budget_check():
+                error_frame = make_frame(encode_chat_response("Error: dream budget exhausted for today"))
+                sock.sendall(error_frame)
+            else:
             # Check if app is "perfected" (three strikes) — skip refactor dreams
             base_key = desc.rsplit(' ', 1)[-1] if ' ' in desc else desc
             meta = _cache_get_meta(base_key)
@@ -1201,8 +1382,7 @@ def handle_mcp_frame(frame_bytes: bytes, sock: socket.socket):
             else:
                 wasm_binary, error = _llm_to_wasm(desc)
                 if error and error.startswith("CLARIFY:"):
-                    # Clarification needed — send question back as ChatResponse
-                    clarify_msg = error[8:]  # Strip "CLARIFY:" prefix
+                    clarify_msg = error[8:]
                     print(f"[MCP] Clarification needed: {clarify_msg[:60]}")
                     response_frame = make_frame(encode_chat_response(clarify_msg))
                     sock.sendall(response_frame)

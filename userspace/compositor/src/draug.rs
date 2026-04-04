@@ -99,6 +99,93 @@ pub enum ObservationEvent {
 /// Maximum command history entries for prediction
 pub const MAX_CMD_HISTORY: usize = 16;
 
+// ── Friction Sensor: Frustration-Driven Evolution ──────────────────────
+
+/// Signal weights for friction tracking
+pub const FRICTION_RAGE_CLICK: u16 = 10;
+pub const FRICTION_QUICK_CLOSE: u16 = 20;
+pub const FRICTION_BACKSPACE_SPAM: u16 = 5;
+
+/// Threshold above which an app is considered "frustrating"
+pub const FRICTION_THRESHOLD: u16 = 15;
+
+/// Decay interval: reduce all scores by 1 every 60s
+pub const FRICTION_DECAY_MS: u64 = 60_000;
+
+/// Tracks per-app frustration signals to prioritize dream targets
+pub struct FrictionTracker {
+    /// (cache_key_hash, score) — up to 8 tracked apps
+    scores: [(u32, u16); 8],
+    last_decay_ms: u64,
+}
+
+impl FrictionTracker {
+    pub const fn new() -> Self {
+        Self {
+            scores: [(0, 0); 8],
+            last_decay_ms: 0,
+        }
+    }
+
+    /// Record a friction signal for an app
+    pub fn record_signal(&mut self, key_hash: u32, weight: u16) {
+        // Find existing slot
+        for (h, score) in &mut self.scores {
+            if *h == key_hash && *score > 0 {
+                *score = score.saturating_add(weight);
+                return;
+            }
+        }
+        // Find empty slot (score == 0)
+        for (h, score) in &mut self.scores {
+            if *score == 0 {
+                *h = key_hash;
+                *score = weight;
+                return;
+            }
+        }
+        // Full — overwrite lowest score
+        let mut min_idx = 0;
+        let mut min_score = u16::MAX;
+        for (i, (_, s)) in self.scores.iter().enumerate() {
+            if *s < min_score { min_score = *s; min_idx = i; }
+        }
+        self.scores[min_idx] = (key_hash, weight);
+    }
+
+    /// Returns the hash of the most frustrated app, if any exceeds threshold
+    pub fn most_frustrated(&self) -> Option<u32> {
+        let mut best: Option<(u32, u16)> = None;
+        for (h, score) in &self.scores {
+            if *score >= FRICTION_THRESHOLD {
+                if best.map_or(true, |(_, s)| *score > s) {
+                    best = Some((*h, *score));
+                }
+            }
+        }
+        best.map(|(h, _)| h)
+    }
+
+    /// Decay all scores by 1 every FRICTION_DECAY_MS
+    pub fn decay(&mut self, now_ms: u64) {
+        if now_ms.saturating_sub(self.last_decay_ms) < FRICTION_DECAY_MS {
+            return;
+        }
+        self.last_decay_ms = now_ms;
+        for (_, score) in &mut self.scores {
+            *score = score.saturating_sub(1);
+        }
+    }
+
+    /// Get friction score for an app (for logging)
+    pub fn score_for(&self, key_hash: u32) -> u16 {
+        for (h, score) in &self.scores {
+            if *h == key_hash { return *score; }
+        }
+        0
+    }
+}
+
 /// Draug daemon state
 pub struct DraugDaemon {
     /// Observation log (circular, append-only)
@@ -137,6 +224,12 @@ pub struct DraugDaemon {
 
     /// Morning Briefing: creative changes pending user approval
     pub pending_creative: alloc::vec::Vec<PendingCreative>,
+
+    /// Friction Sensor: tracks user frustration per app
+    pub friction: FrictionTracker,
+
+    /// Crash tracker: apps that hit fuel limit repeatedly (for Nightmare priority)
+    crash_hashes: [(u32, u8); 8],
 }
 
 /// Compact observation summary for the log
@@ -170,6 +263,8 @@ impl DraugDaemon {
             strikes: [const { None }; 8],
             dream_journal: [const { None }; 16],
             pending_creative: alloc::vec::Vec::new(),
+            friction: FrictionTracker::new(),
+            crash_hashes: [(0, 0); 8],
         }
     }
 
@@ -243,6 +338,9 @@ impl DraugDaemon {
     /// Execute a tick: collect telemetry and log it.
     pub fn tick(&mut self, now_ms: u64) {
         self.last_tick_ms = now_ms;
+
+        // Decay friction scores over time
+        self.friction.decay(now_ms);
 
         let (total_mb, used_mb, mem_pct) = libfolk::sys::memory_stats();
         let uptime_s = (now_ms / 1000) as u32;
@@ -476,9 +574,27 @@ impl DraugDaemon {
     /// Pick the LEAST recently dreamt app and choose dream mode.
     /// 3-mode rotation: Refactor → Creative → Nightmare
     /// Nightmare blocked during daytime (circadian rhythm).
+    /// FRICTION OVERRIDE: if any app has high frustration, pick it + Creative mode.
     pub fn start_dream(&mut self, cache_keys: &[&str], now_ms: u64) -> Option<(String, DreamMode)> {
         if cache_keys.is_empty() { return None; }
 
+        // ── Friction Override: frustrated apps get priority ──
+        if let Some(frustrated_hash) = self.friction.most_frustrated() {
+            // Find the cache key that matches this hash
+            for key in cache_keys {
+                if Self::key_hash(key) == frustrated_hash {
+                    let target = String::from(*key);
+                    self.journal_record(&target);
+                    self.dream_target = Some(target.clone());
+                    self.dream_mode = DreamMode::Creative; // Always Creative for frustrated apps
+                    self.dreaming = true;
+                    self.last_dream_ms = now_ms;
+                    return Some((target, DreamMode::Creative));
+                }
+            }
+        }
+
+        // ── Normal rotation ──
         // Rotate modes: 0=Refactor, 1=Creative, 2=Nightmare
         let mut mode = match self.dream_count % 3 {
             0 => DreamMode::Refactor,
@@ -543,6 +659,7 @@ impl DraugDaemon {
     /// Build the dream prompt based on current mode.
     /// `app_name` is the cache key (original user prompt, e.g., "bouncing ball").
     /// `render_summary` is a text description of what the app currently draws.
+    /// If the app has high friction score, adds frustration-aware guidance.
     pub fn build_dream_prompt(&self, source_code: &str, app_name: &str, render_summary: &str) -> String {
         // The app_name IS the description — it's the original "gemini generate X" prompt
         let context = format!(
@@ -551,6 +668,18 @@ impl DraugDaemon {
              It should continue to fulfill this purpose after your modifications.\n",
             app_name, app_name
         );
+
+        // Check if this app is frustrating the user
+        let frustration_suffix = {
+            let h = Self::key_hash(app_name);
+            if self.friction.score_for(h) >= FRICTION_THRESHOLD {
+                "\n\nUSER FRUSTRATION DETECTED: The user is frustrated with this app. \
+                 Focus on usability: clearer layout, better visual feedback, \
+                 more intuitive interaction, smoother animations."
+            } else {
+                ""
+            }
+        };
 
         match self.dream_mode {
             DreamMode::Refactor => format!(
@@ -576,8 +705,8 @@ impl DraugDaemon {
                  - Bad: changing the app's purpose, removing functionality.\n\
                  - Use Folkering palette: bg=0x001a1a2e, blue=0x003498db, green=0x0044FF44.\n\
                  - Keep it under 2KB compiled WASM.\n\
-                 - Return ONLY the improved Rust code.",
-                context, source_code, render_summary
+                 - Return ONLY the improved Rust code.{}",
+                context, source_code, render_summary, frustration_suffix
             ),
             DreamMode::Nightmare => format!(
                 "You are Draug in Nightmare mode — the immune system of Folkering OS.\n\n\
@@ -594,6 +723,20 @@ impl DraugDaemon {
             ),
         }
     }
+
+    /// Record a crash (fuel exhaustion) for priority Nightmare dreaming.
+    pub fn record_crash(&mut self, key: &str) {
+        let h = Self::key_hash(key);
+        for (ch, count) in &mut self.crash_hashes {
+            if *ch == h && *count > 0 { *count = count.saturating_add(1); return; }
+        }
+        for (ch, count) in &mut self.crash_hashes {
+            if *count == 0 { *ch = h; *count = 1; return; }
+        }
+    }
+
+    /// Public key hash for main.rs friction signal recording.
+    pub fn key_hash_pub(key: &str) -> u32 { Self::key_hash(key) }
 
     /// Record dream completion.
     pub fn on_dream_complete(&mut self, now_ms: u64) {

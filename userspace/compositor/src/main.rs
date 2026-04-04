@@ -833,6 +833,7 @@ fn main() -> ! {
 
     // Phase 2: Persistent interactive WASM app (game loop)
     let mut active_wasm_app: Option<compositor::wasm_runtime::PersistentWasmApp> = None;
+    let mut active_wasm_app_key: Option<alloc::string::String> = None; // cache key for friction tracking
 
     // App Persistence: cache last compiled WASM for save/run
     let mut last_wasm_bytes: Option<alloc::vec::Vec<u8>> = None;
@@ -1062,6 +1063,23 @@ fn main() -> ! {
     // Mouse click tracking (detect left-button press edge)
     let mut prev_left_button: bool = false;
 
+    // Friction Sensor: rage click detection (circular buffer of click timestamps)
+    let mut click_timestamps: [u64; 8] = [0; 8];
+    let mut click_ts_idx: usize = 0;
+    // Friction Sensor: window open time tracking (for quick-close detection)
+    let mut wasm_app_open_since_ms: u64 = 0;
+    // Live Patching: consecutive fuel exhaustion counter
+    let mut fuel_fail_count: u8 = 0;
+    // Live Patching: app currently being immune-patched
+    let mut immune_patching: Option<alloc::string::String> = None;
+    // State Migration: snapshot of WASM linear memory before dream evolution
+    let mut state_snapshot: Option<alloc::vec::Vec<u8>> = None;
+
+    // Autonomous Drivers: active WASM driver instances
+    let mut active_drivers: alloc::vec::Vec<compositor::driver_runtime::WasmDriver> = alloc::vec::Vec::new();
+    // Pending driver generation: PCI device info waiting for WASM from proxy
+    let mut pending_driver_device: Option<libfolk::sys::pci::PciDeviceInfo> = None;
+
     // ===== Window Manager (Milestone 2.1) =====
     let mut wm = WindowManager::new();
     // Track which window (if any) is being dragged
@@ -1248,6 +1266,18 @@ fn main() -> ! {
     // Pillar 4: WASM warm cache — pre-compiled modules for instant response
     let mut wasm_cache: alloc::collections::BTreeMap<alloc::string::String, alloc::vec::Vec<u8>> = alloc::collections::BTreeMap::new();
     const MAX_CACHE_ENTRIES: usize = 4;
+
+    // Semantic VFS: View Adapter cache — compiled WASM data translators
+    // Key: "source_mime|target_format", Value: compiled WASM adapter bytes
+    let mut adapter_cache: alloc::collections::BTreeMap<alloc::string::String, alloc::vec::Vec<u8>> = alloc::collections::BTreeMap::new();
+    const MAX_ADAPTER_ENTRIES: usize = 8;
+    // Pending adapter generation request (source_mime|target_format)
+    let mut pending_adapter: Option<alloc::string::String> = None;
+    // Adapter input/output buffers for executing adapters
+    static mut ADAPTER_INPUT: [u8; 4096] = [0u8; 4096];
+    static mut ADAPTER_INPUT_LEN: usize = 0;
+    static mut ADAPTER_OUTPUT: [u8; 4096] = [0u8; 4096];
+    static mut ADAPTER_OUTPUT_LEN: usize = 0;
 
     // Timing instrumentation — find the freeze
     #[inline(always)]
@@ -1536,6 +1566,14 @@ fn main() -> ! {
             }
         }
 
+        // ===== Tick WASM Drivers: poll IRQs and resume suspended drivers =====
+        if !active_drivers.is_empty() {
+            let resumed = compositor::driver_runtime::tick_drivers(&mut active_drivers);
+            if resumed > 0 {
+                did_work = true;
+            }
+        }
+
         // ===== Draug/Dream timeout — prevent permanent waiting_for_llm =====
         {
             let timeout_ms = if tsc_per_us > 0 { rdtsc() / tsc_per_us / 1000 } else { 0 };
@@ -1555,6 +1593,23 @@ fn main() -> ! {
                     compositor::draug::DreamMode::Creative => "Creative",
                     compositor::draug::DreamMode::Nightmare => "Nightmare",
                 };
+
+                // State Migration: snapshot WASM memory if active app is the dream target
+                state_snapshot = None;
+                if let Some(ref app) = active_wasm_app {
+                    if let Some(ref k) = active_wasm_app_key {
+                        if k.as_str() == target.as_str() {
+                            if let Some(mem) = app.get_memory_slice() {
+                                let snap_len = mem.len().min(1024);
+                                state_snapshot = Some(alloc::vec::Vec::from(&mem[..snap_len]));
+                                write_str("[StateMigration] Captured ");
+                                let mut nb2 = [0u8; 16];
+                                write_str(format_usize(snap_len, &mut nb2));
+                                write_str(" bytes of app state\n");
+                            }
+                        }
+                    }
+                }
 
                 // Log dream start to both serial AND COM3 telemetry
                 write_str("[AutoDream] ========================================\n");
@@ -1842,6 +1897,120 @@ fn main() -> ! {
                         };
                         last_wasm_bytes = Some(wasm_bytes.clone());
 
+                        // Live Patching: if this WASM is a response to immune_patching request
+                        if let Some(ref patch_key) = immune_patching.clone() {
+                            let config = compositor::wasm_runtime::WasmConfig {
+                                screen_width: fb.width as u32,
+                                screen_height: fb.height as u32,
+                                uptime_ms: libfolk::sys::uptime() as u32,
+                            };
+                            match compositor::wasm_runtime::PersistentWasmApp::new(&wasm_bytes, config) {
+                                Ok(app) => {
+                                    write_str("[IMMUNE] Patched '");
+                                    write_str(&patch_key[..patch_key.len().min(30)]);
+                                    write_str("' live!\n");
+                                    active_wasm_app = Some(app);
+                                    fuel_fail_count = 0;
+                                    // Update cache with fixed version
+                                    wasm_cache.insert(patch_key.clone(), wasm_bytes.clone());
+                                }
+                                Err(e) => {
+                                    write_str("[IMMUNE] Patch failed to load: ");
+                                    write_str(&e[..e.len().min(60)]);
+                                    write_str("\n");
+                                }
+                            }
+                            immune_patching = None;
+                            continue; // Skip normal processing
+                        }
+
+                        // View Adapter: if this WASM is a response to adapter generation
+                        if let Some(ref adapter_key) = pending_adapter.clone() {
+                            // Validate the adapter compiles
+                            let config = compositor::wasm_runtime::WasmConfig {
+                                screen_width: fb.width as u32,
+                                screen_height: fb.height as u32,
+                                uptime_ms: libfolk::sys::uptime() as u32,
+                            };
+                            let (result, _) = compositor::wasm_runtime::execute_wasm(&wasm_bytes, config);
+                            match result {
+                                compositor::wasm_runtime::WasmResult::Ok |
+                                compositor::wasm_runtime::WasmResult::OutOfFuel => {
+                                    // Adapter compiled and runs — cache it
+                                    if adapter_cache.len() >= MAX_ADAPTER_ENTRIES {
+                                        if let Some(oldest) = adapter_cache.keys().next().cloned() {
+                                            adapter_cache.remove(&oldest);
+                                        }
+                                    }
+                                    adapter_cache.insert(adapter_key.clone(), wasm_bytes.clone());
+                                    write_str("[ViewAdapter] Cached adapter: ");
+                                    write_str(&adapter_key[..adapter_key.len().min(40)]);
+                                    write_str("\n");
+                                }
+                                _ => {
+                                    write_str("[ViewAdapter] Adapter generation failed — discarding\n");
+                                }
+                            }
+                            pending_adapter = None;
+                            continue;
+                        }
+
+                        // Autonomous Driver: if this WASM is a driver response
+                        if let Some(pci_dev) = pending_driver_device.take() {
+                            let mut cap = compositor::driver_runtime::DriverCapability::from_pci(&pci_dev);
+                            let name = alloc::format!("drv_{:04x}_{:04x}", pci_dev.vendor_id, pci_dev.device_id);
+                            cap.set_name(&name);
+
+                            // Map MMIO BARs into our address space
+                            let mapped = compositor::driver_runtime::map_device_bars(&mut cap);
+                            write_str("[DRV] Mapped ");
+                            let mut nb4 = [0u8; 16];
+                            write_str(format_usize(mapped, &mut nb4));
+                            write_str(" MMIO BARs\n");
+
+                            // Instantiate the WASM driver
+                            match compositor::driver_runtime::WasmDriver::new(&wasm_bytes, cap) {
+                                Ok(mut driver) => {
+                                    // Bind IRQ
+                                    let _ = driver.bind_irq();
+
+                                    // Start driver execution
+                                    write_str("[DRV] Starting driver: ");
+                                    write_str(&name[..name.len().min(30)]);
+                                    write_str("\n");
+                                    match driver.start() {
+                                        compositor::driver_runtime::DriverResult::WaitingForIrq => {
+                                            write_str("[DRV] Driver yielded (waiting for IRQ)\n");
+                                            active_drivers.push(driver);
+                                        }
+                                        compositor::driver_runtime::DriverResult::Completed => {
+                                            write_str("[DRV] Driver completed immediately\n");
+                                        }
+                                        compositor::driver_runtime::DriverResult::OutOfFuel => {
+                                            write_str("[DRV] Driver preempted (fuel) — scheduling\n");
+                                            active_drivers.push(driver);
+                                        }
+                                        compositor::driver_runtime::DriverResult::Trapped(msg) => {
+                                            write_str("[DRV] Driver TRAPPED: ");
+                                            write_str(&msg[..msg.len().min(60)]);
+                                            write_str("\n");
+                                        }
+                                        compositor::driver_runtime::DriverResult::LoadError(e) => {
+                                            write_str("[DRV] Load error: ");
+                                            write_str(&e[..e.len().min(60)]);
+                                            write_str("\n");
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    write_str("[DRV] Failed to instantiate: ");
+                                    write_str(&e[..e.len().min(60)]);
+                                    write_str("\n");
+                                }
+                            }
+                            continue;
+                        }
+
                         // AutoDream: two-hemisphere evaluation
                         if draug.is_dreaming() && !tool_prompt.is_empty() {
                             let orig_key = tool_prompt.rsplit(' ').next().unwrap_or(&tool_prompt);
@@ -1969,6 +2138,28 @@ fn main() -> ! {
                             write_str("[AutoDream] ========== DREAM COMPLETE ==========\n");
                             let done_ms = if tsc_per_us > 0 { rdtsc() / tsc_per_us / 1000 } else { 0 };
                             draug.on_dream_complete(done_ms);
+
+                            // State Migration: if active app was the dream target, hot-swap with evolved version
+                            if let Some(ref snapshot) = state_snapshot {
+                                if let Some(ref k) = active_wasm_app_key {
+                                    if k.as_str() == orig_key {
+                                        if let Some(evolved_wasm) = wasm_cache.get(orig_key) {
+                                            let config = compositor::wasm_runtime::WasmConfig {
+                                                screen_width: fb.width as u32,
+                                                screen_height: fb.height as u32,
+                                                uptime_ms: libfolk::sys::uptime() as u32,
+                                            };
+                                            if let Ok(mut new_app) = compositor::wasm_runtime::PersistentWasmApp::new(evolved_wasm, config) {
+                                                new_app.write_memory(0, snapshot);
+                                                active_wasm_app = Some(new_app);
+                                                fuel_fail_count = 0;
+                                                write_str("[StateMigration] Hot-swapped running app with evolved version + restored state\n");
+                                            }
+                                        }
+                                    }
+                                }
+                                state_snapshot = None;
+                            }
                         }
                         // Normal cache storage (non-dream)
                         else if !tool_prompt.is_empty() {
@@ -1981,6 +2172,40 @@ fn main() -> ! {
                             write_str("[Cache] Stored WASM for: ");
                             write_str(&tool_prompt[..tool_prompt.len().min(40)]);
                             write_str("\n");
+
+                            // Semantic VFS: auto-tag intent metadata
+                            let clean_name = {
+                                let mut n = tool_prompt.as_str();
+                                for pfx in &["gemini generate ", "gemini gen ", "generate "] {
+                                    if n.len() > pfx.len() && n.as_bytes()[..pfx.len()].eq_ignore_ascii_case(pfx.as_bytes()) {
+                                        n = &n[pfx.len()..];
+                                        break;
+                                    }
+                                }
+                                n.trim()
+                            };
+                            // Write WASM to Synapse — returns rowid on success
+                            let wasm_filename = alloc::format!("{}.wasm", clean_name);
+                            let write_ret = libfolk::sys::synapse::write_file(&wasm_filename, &wasm_bytes);
+                            if write_ret.is_ok() {
+                                // Synapse now returns rowid directly in the reply
+                                // Use file_count as fallback rowid estimate
+                                let rowid = if let Ok(count) = libfolk::sys::synapse::file_count() {
+                                    count as u32
+                                } else { 0 };
+                                if rowid > 0 {
+                                    let intent_json = alloc::format!(
+                                        "{{\"purpose\":\"{}\",\"type\":\"wasm_app\",\"size\":{}}}",
+                                        clean_name, wasm_bytes.len()
+                                    );
+                                    let _ = libfolk::sys::synapse::write_intent(
+                                        rowid, "application/wasm", &intent_json,
+                                    );
+                                    write_str("[Synapse] Intent tagged: ");
+                                    write_str(clean_name);
+                                    write_str("\n");
+                                }
+                            }
                         }
 
                         let config = compositor::wasm_runtime::WasmConfig {
@@ -2006,6 +2231,9 @@ fn main() -> ! {
                                         win.push_line("[AI] Interactive app launched! Press ESC to exit.");
                                     }
                                     active_wasm_app = Some(app);
+                                    active_wasm_app_key = Some(tool_prompt.clone());
+                                    wasm_app_open_since_ms = libfolk::sys::uptime();
+                                    fuel_fail_count = 0;
                                 }
                                 Err(e) => {
                                     if let Some(win) = wm.get_window_mut(tool_win_id) {
@@ -2076,6 +2304,17 @@ fn main() -> ! {
                 com3_buf[com3_len] = byte;
                 com3_len += 1;
             }
+        }
+        // COM3 God Mode: if a command is pending and WASM is fullscreen,
+        // force-close the WASM app so the command can be processed by the omnibar.
+        if com3_inject.is_some() && active_wasm_app.is_some() {
+            active_wasm_app = None;
+            active_wasm_app_key = None;
+            fuel_fail_count = 0;
+            fb.clear(folk_dark);
+            need_redraw = true;
+            damage.damage_full();
+            write_str("[COM3] Closed fullscreen WASM to process command\n");
         }
 
         // Check if Alt+Tab HUD has expired — clear HUD area and trigger redraw
@@ -2155,6 +2394,27 @@ fn main() -> ! {
                     app.push_event(compositor::wasm_runtime::FolkEvent {
                         event_type: 2, x: cursor_x, y: cursor_y, data: 1,
                     });
+
+                    // Friction Sensor: rage click detection (>5 clicks in 2s)
+                    let now = libfolk::sys::uptime();
+                    click_timestamps[click_ts_idx] = now;
+                    click_ts_idx = (click_ts_idx + 1) % 8;
+                    // Count clicks in last 2 seconds
+                    let mut recent = 0u8;
+                    for ts in &click_timestamps {
+                        if *ts > 0 && now.saturating_sub(*ts) < 2000 { recent += 1; }
+                    }
+                    if recent > 5 {
+                        if let Some(ref k) = active_wasm_app_key {
+                            let h = compositor::draug::DraugDaemon::key_hash_pub(k);
+                            draug.friction.record_signal(h, compositor::draug::FRICTION_RAGE_CLICK);
+                            write_str("[Friction] rage_click for '");
+                            write_str(&k[..k.len().min(30)]);
+                            write_str("'\n");
+                        }
+                        // Reset to avoid spamming
+                        click_timestamps = [0; 8];
+                    }
                 }
             }
 
@@ -2506,6 +2766,9 @@ fn main() -> ! {
                         match compositor::wasm_runtime::PersistentWasmApp::new(&wasm_bytes, config) {
                             Ok(app) => {
                                 active_wasm_app = Some(app);
+                                active_wasm_app_key = Some(alloc::string::String::from(app_name));
+                                wasm_app_open_since_ms = libfolk::sys::uptime();
+                                fuel_fail_count = 0;
                                 last_wasm_bytes = Some(wasm_bytes);
                             }
                             Err(_) => {}
@@ -2545,7 +2808,23 @@ fn main() -> ! {
             }
             if let Some(app) = &mut active_wasm_app {
                 if key == 0x1B { // ESC
+                    // Friction Sensor: detect quick close (<3s = frustration)
+                    if wasm_app_open_since_ms > 0 {
+                        let open_duration = libfolk::sys::uptime().saturating_sub(wasm_app_open_since_ms);
+                        if open_duration < 3000 {
+                            if let Some(ref k) = active_wasm_app_key {
+                                let h = compositor::draug::DraugDaemon::key_hash_pub(k);
+                                draug.friction.record_signal(h, compositor::draug::FRICTION_QUICK_CLOSE);
+                                write_str("[Friction] quick_close for '");
+                                write_str(&k[..k.len().min(30)]);
+                                write_str("'\n");
+                            }
+                        }
+                    }
                     active_wasm_app = None;
+                    active_wasm_app_key = None;
+                    wasm_app_open_since_ms = 0;
+                    fuel_fail_count = 0;
                     // Clear WASM residue from framebuffer
                     fb.clear(folk_dark);
                     // Re-draw desktop title
@@ -3173,6 +3452,9 @@ fn main() -> ! {
                                         };
                                         if let Ok(app) = compositor::wasm_runtime::PersistentWasmApp::new(&wasm_bytes, config) {
                                             active_wasm_app = Some(app);
+                                            active_wasm_app_key = Some(alloc::string::String::from(app_name));
+                                            wasm_app_open_since_ms = libfolk::sys::uptime();
+                                            fuel_fail_count = 0;
                                             last_wasm_bytes = Some(wasm_bytes);
                                             last_wasm_interactive = true;
                                             opened_wasm = true;
@@ -3275,6 +3557,9 @@ fn main() -> ! {
                                     match compositor::wasm_runtime::PersistentWasmApp::new(&wasm_bytes, config) {
                                         Ok(app) => {
                                             active_wasm_app = Some(app);
+                                            active_wasm_app_key = Some(alloc::string::String::from(app_name));
+                                            wasm_app_open_since_ms = libfolk::sys::uptime();
+                                            fuel_fail_count = 0;
                                             last_wasm_bytes = Some(wasm_bytes);
                                             last_wasm_interactive = true;
                                             write_str("[WASM] Launched fullscreen: ");
@@ -3299,26 +3584,28 @@ fn main() -> ! {
                     }
                 }
 
-                if !is_open_cmd && !is_run_cmd {
-                // M13: Try semantic intent match BEFORE creating terminal window
-                if let Some(app_name) = try_intent_match(cmd_str) {
-                    let mut fname = [0u8; 64];
-                    let nb = app_name.as_bytes();
-                    let ext = b".fkui";
-                    if nb.len() + ext.len() < 64 {
-                        fname[..nb.len()].copy_from_slice(nb);
-                        fname[nb.len()..nb.len()+ext.len()].copy_from_slice(ext);
-                        let fname_str = unsafe {
-                            core::str::from_utf8_unchecked(&fname[..nb.len()+ext.len()])
-                        };
-                        if let Ok(resp) = libfolk::sys::synapse::read_file_shmem(fname_str) {
-                            deferred_app_handle = resp.shmem_handle;
-                            write_str("[WM] Intent match: ");
-                            write_str(app_name);
-                            write_str("\n");
+                let is_gemini_cmd = starts_with_ci(cmd_str, "gemini ");
+                if !is_open_cmd && !is_run_cmd && !is_gemini_cmd {
+                    // M13: Try semantic intent match BEFORE creating terminal window (skip for gemini commands)
+                    if let Some(app_name) = try_intent_match(cmd_str) {
+                        let mut fname = [0u8; 64];
+                        let nb = app_name.as_bytes();
+                        let ext = b".fkui";
+                        if nb.len() + ext.len() < 64 {
+                            fname[..nb.len()].copy_from_slice(nb);
+                            fname[nb.len()..nb.len()+ext.len()].copy_from_slice(ext);
+                            let fname_str = unsafe {
+                                core::str::from_utf8_unchecked(&fname[..nb.len()+ext.len()])
+                            };
+                            if let Ok(resp) = libfolk::sys::synapse::read_file_shmem(fname_str) {
+                                deferred_app_handle = resp.shmem_handle;
+                                write_str("[WM] Intent match: ");
+                                write_str(app_name);
+                                write_str("\n");
+                            }
                         }
                     }
-                }
+                } // end intent match guard
 
                 if deferred_app_handle == 0 {
                 write_str("[WM] Creating window for: ");
@@ -3806,6 +4093,80 @@ fn main() -> ! {
                                 win.push_line("[Dream] Rejected");
                             }
                         }
+                    } else if starts_with_ci(cmd_str, "generate driver") {
+                        // Autonomous Driver Generation: generate WASM driver for a PCI device
+                        let target = cmd_str.get(15..).unwrap_or("").trim();
+                        let mut pci_buf: [libfolk::sys::pci::PciDeviceInfo; 32] = unsafe { core::mem::zeroed() };
+                        let count = libfolk::sys::pci::enumerate(&mut pci_buf);
+
+                        // Find target device (by vendor:device ID or auto-select first non-bridge)
+                        let dev = if target.contains(':') {
+                            // Parse "1af4:1042" format
+                            let parts: alloc::vec::Vec<&str> = target.split(':').collect();
+                            if parts.len() == 2 {
+                                let vid = u16::from_str_radix(parts[0], 16).unwrap_or(0);
+                                let did = u16::from_str_radix(parts[1], 16).unwrap_or(0);
+                                pci_buf[..count].iter().find(|d| d.vendor_id == vid && d.device_id == did)
+                            } else { None }
+                        } else {
+                            // Auto-select: first non-bridge device that isn't VirtIO GPU (already driven)
+                            pci_buf[..count].iter().find(|d|
+                                d.class_code != 0x06 && // not a bridge
+                                !(d.vendor_id == 0x1AF4 && d.device_id == 0x1050) // not VirtIO GPU
+                            )
+                        };
+
+                        if let Some(d) = dev {
+                            let desc = alloc::format!(
+                                "__DRIVER_GEN__{:04x}:{:04x}:{}",
+                                d.vendor_id, d.device_id, d.class_name()
+                            );
+                            win.push_line(&alloc::format!(
+                                "[DRV] Generating driver for {:04x}:{:04x} ({})...",
+                                d.vendor_id, d.device_id, d.class_name()
+                            ));
+                            // Store device info for when WASM arrives
+                            pending_driver_device = Some(d.clone());
+                            // Send to proxy for LLM generation
+                            if libfolk::mcp::client::send_wasm_gen(&desc) {
+                                win.push_line("[DRV] Request sent to LLM");
+                            } else {
+                                win.push_line("[DRV] MCP send failed");
+                                pending_driver_device = None;
+                            }
+                        } else {
+                            win.push_line("[DRV] No matching PCI device found");
+                            win.push_line("[DRV] Usage: generate driver [vendor:device]");
+                            win.push_line("[DRV] Example: generate driver 1af4:1042");
+                        }
+                    } else if cmd_str == "drivers" {
+                        // List active WASM drivers
+                        win.push_line(&alloc::format!("[DRV] {} active drivers:", active_drivers.len()));
+                        for drv in active_drivers.iter() {
+                            win.push_line(&alloc::format!(
+                                "  {:04x}:{:04x} {} irq={} {}",
+                                drv.capability.vendor_id, drv.capability.device_id,
+                                drv.capability.driver_name(),
+                                drv.capability.irq_line,
+                                if drv.waiting_for_irq { "[waiting]" } else { "[running]" }
+                            ));
+                        }
+                    } else if cmd_str == "lspci" {
+                        // List PCI devices (Autonomous Driver Discovery)
+                        let mut pci_buf: [libfolk::sys::pci::PciDeviceInfo; 32] = unsafe { core::mem::zeroed() };
+                        let count = libfolk::sys::pci::enumerate(&mut pci_buf);
+                        win.push_line(&alloc::format!("[PCI] {} devices:", count));
+                        for i in 0..count {
+                            let d = &pci_buf[i];
+                            win.push_line(&alloc::format!(
+                                "  {:02x}:{:02x}.{} {:04x}:{:04x} {} irq={} BAR0={}B",
+                                d.bus, d.device_num, d.function,
+                                d.vendor_id, d.device_id,
+                                d.class_name(),
+                                d.interrupt_line,
+                                d.bar_sizes[0]
+                            ));
+                        }
                     } else if cmd_str == "poweroff" || cmd_str == "shutdown" {
                         // M12: Save app states and shut down
                         let name_hash = shell_hash_name("poweroff") as u64;
@@ -3967,6 +4328,9 @@ fn main() -> ! {
                                                                 // Hide the load window — WASM app takes over screen
                                                                 win.visible = false;
                                                                 active_wasm_app = Some(app);
+                                                                active_wasm_app_key = Some(alloc::string::String::from(path));
+                                                                wasm_app_open_since_ms = libfolk::sys::uptime();
+                                                                fuel_fail_count = 0;
                                                             }
                                                             Err(e) => { win.push_line(&alloc::format!("[OS] Error: {}", &e[..e.len().min(60)])); }
                                                         }
@@ -4066,6 +4430,9 @@ fn main() -> ! {
                                             Ok(app) => {
                                                 win.push_line("[OS] App launched! Press ESC to exit.");
                                                 active_wasm_app = Some(app);
+                                                active_wasm_app_key = Some(alloc::string::String::from(app_name));
+                                                wasm_app_open_since_ms = libfolk::sys::uptime();
+                                                fuel_fail_count = 0;
                                                 last_wasm_bytes = Some(wasm_bytes);
                                                 last_wasm_interactive = true;
                                             }
@@ -4317,7 +4684,6 @@ fn main() -> ! {
                     }
                 }
                 } // end if deferred_app_handle == 0
-                } // end if !is_open_cmd
 
                 // Clear the omnibar input after executing
                 text_len = 0;
@@ -4783,16 +5149,47 @@ fn main() -> ! {
 
                         match &result {
                             compositor::wasm_runtime::WasmResult::OutOfFuel => {
-                                app.active = false;
-                                write_str("[WASM APP] Halted: fuel exhausted\n");
+                                fuel_fail_count = fuel_fail_count.saturating_add(1);
+                                if fuel_fail_count >= 3 && immune_patching.is_none() {
+                                    // Live Patching: 3 consecutive fuel failures → request fix
+                                    app.active = false;
+                                    write_str("[IMMUNE] App fuel-limited 3x — requesting live patch\n");
+                                    if let Some(ref k) = active_wasm_app_key {
+                                        let desc = alloc::format!(
+                                            "This WASM app '{}' hits fuel limit every frame. \
+                                             It has run() called per frame with 1M instruction budget. \
+                                             Find the infinite loop or expensive computation and fix it. \
+                                             Return ONLY the fixed Rust source code.", k
+                                        );
+                                        if libfolk::mcp::client::send_wasm_gen(&desc) {
+                                            immune_patching = Some(k.clone());
+                                            write_str("[IMMUNE] Patch request sent via MCP\n");
+                                        } else {
+                                            write_str("[IMMUNE] Failed to send patch request\n");
+                                        }
+                                        // Record for Nightmare dream priority
+                                        draug.record_crash(k);
+                                    }
+                                } else if fuel_fail_count < 3 {
+                                    write_str("[WASM APP] Fuel exhausted (");
+                                    write_str(match fuel_fail_count { 1 => "1/3", 2 => "2/3", _ => "?" });
+                                    write_str(")\n");
+                                }
                             }
                             compositor::wasm_runtime::WasmResult::Trap(msg) => {
                                 app.active = false;
                                 write_str("[WASM APP] Trap: ");
                                 write_str(&msg[..msg.len().min(80)]);
                                 write_str("\n");
+                                // Record for Nightmare dream priority
+                                if let Some(ref k) = active_wasm_app_key {
+                                    draug.record_crash(k);
+                                }
                             }
-                            _ => {}
+                            _ => {
+                                // Reset fail counter on successful frame
+                                fuel_fail_count = 0;
+                            }
                         }
 
                         if let Some(color) = output.fill_screen {
@@ -4844,11 +5241,86 @@ fn main() -> ! {
                             }
                         }
 
-                        // Phase 4: Async asset loading
+                        // Phase 4: Async asset loading + View Adapter pipeline
                         if !output.asset_requests.is_empty() {
                             for req in &output.asset_requests {
                                 const VFS_ASSET_VADDR: usize = 0x50060000;
-                                match libfolk::sys::synapse::read_file_shmem(&req.filename) {
+
+                                // Semantic VFS: check for query://, adapt://, or mime:// prefixes
+                                let actual_filename = if req.filename.starts_with("query://") {
+                                    // query://calculator → semantic search by concept
+                                    let query = &req.filename[8..];
+                                    match libfolk::sys::synapse::query_intent(query) {
+                                        Ok(info) => {
+                                            // Resolved! Read the file by shmem using file_id
+                                            write_str("[Synapse] query:// '");
+                                            write_str(&query[..query.len().min(30)]);
+                                            write_str("' → file_id=");
+                                            let mut nb3 = [0u8; 16];
+                                            write_str(format_usize(info.file_id as usize, &mut nb3));
+                                            write_str("\n");
+                                            // We need the filename to read via shmem
+                                            // Use file_id to look up name via read_file_by_name won't work
+                                            // Instead, construct filename from query
+                                            alloc::format!("{}.wasm", query)
+                                        }
+                                        Err(_) => {
+                                            write_str("[Synapse] query:// '");
+                                            write_str(&query[..query.len().min(30)]);
+                                            write_str("' → not found\n");
+                                            req.filename.clone() // Fallback to literal
+                                        }
+                                    }
+                                } else if req.filename.starts_with("mime://") {
+                                    // mime://application/wasm → find first file with this MIME type
+                                    let mime = &req.filename[7..];
+                                    let mime_hash = libfolk::sys::synapse::hash_name(mime);
+                                    // Use QUERY_MIME IPC (simple hash lookup)
+                                    let request = libfolk::sys::synapse::SYN_OP_QUERY_MIME
+                                        | ((mime_hash as u64) << 32);
+                                    let ret = unsafe {
+                                        libfolk::syscall::syscall3(
+                                            libfolk::syscall::SYS_IPC_SEND,
+                                            libfolk::sys::synapse::SYNAPSE_TASK_ID as u64,
+                                            request, 0
+                                        )
+                                    };
+                                    if ret != libfolk::sys::synapse::SYN_STATUS_NOT_FOUND && ret != u64::MAX {
+                                        let file_id = (ret & 0xFFFF) as u16;
+                                        write_str("[Synapse] mime:// → file_id=");
+                                        let mut nb3 = [0u8; 16];
+                                        write_str(format_usize(file_id as usize, &mut nb3));
+                                        write_str("\n");
+                                    }
+                                    // Fallback — mime:// can't easily resolve to a filename yet
+                                    req.filename.clone()
+                                } else if req.filename.starts_with("adapt://") {
+                                    // adapt://source_mime/target_format/filename
+                                    let parts: alloc::vec::Vec<&str> = req.filename[8..].splitn(3, '/').collect();
+                                    if parts.len() == 3 {
+                                        let adapter_key = alloc::format!("{}|{}", parts[0], parts[1]);
+                                        if !adapter_cache.contains_key(&adapter_key) && pending_adapter.is_none() {
+                                            let prompt = compositor::wasm_runtime::adapter_generation_prompt(
+                                                parts[0], parts[1], ""
+                                            );
+                                            if libfolk::mcp::client::send_wasm_gen(&prompt) {
+                                                pending_adapter = Some(adapter_key);
+                                                write_str("[ViewAdapter] Generating adapter: ");
+                                                write_str(parts[0]);
+                                                write_str(" → ");
+                                                write_str(parts[1]);
+                                                write_str("\n");
+                                            }
+                                        }
+                                        alloc::string::String::from(parts[2])
+                                    } else {
+                                        req.filename.clone()
+                                    }
+                                } else {
+                                    req.filename.clone()
+                                };
+
+                                match libfolk::sys::synapse::read_file_shmem(&actual_filename) {
                                     Ok(resp) => {
                                         if shmem_map(resp.shmem_handle, VFS_ASSET_VADDR).is_ok() {
                                             let file_data = unsafe {
@@ -4857,10 +5329,26 @@ fn main() -> ! {
                                                     resp.size as usize
                                                 )
                                             };
-                                            let copy_len = (resp.size as u32).min(req.dest_len) as usize;
+
+                                            // View Adapter: if adapt:// was used, try transform
+                                            let transformed = if req.filename.starts_with("adapt://") {
+                                                let parts: alloc::vec::Vec<&str> = req.filename[8..].splitn(3, '/').collect();
+                                                if parts.len() == 3 {
+                                                    let adapter_key = alloc::format!("{}|{}", parts[0], parts[1]);
+                                                    if let Some(adapter_wasm) = adapter_cache.get(&adapter_key) {
+                                                        compositor::wasm_runtime::execute_adapter(
+                                                            adapter_wasm, &file_data[..resp.size as usize]
+                                                        )
+                                                    } else { None }
+                                                } else { None }
+                                            } else { None };
+
+                                            let final_data = transformed.as_deref()
+                                                .unwrap_or(&file_data[..resp.size as usize]);
+                                            let copy_len = final_data.len().min(req.dest_len as usize);
                                             app.write_memory(
                                                 req.dest_ptr as usize,
-                                                &file_data[..copy_len]
+                                                &final_data[..copy_len]
                                             );
                                             let _ = shmem_unmap(resp.shmem_handle, VFS_ASSET_VADDR);
                                             let _ = shmem_destroy(resp.shmem_handle);

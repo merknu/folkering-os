@@ -630,6 +630,22 @@ fn create_sqlite(output_path: String, add_entries: Vec<AddEntry>, generate_embed
         process::exit(1);
     });
 
+    // Create file_intents table for Semantic VFS (ECS component)
+    // Stores MIME type and intent JSON separately from raw file data
+    conn.execute(
+        "CREATE TABLE file_intents (
+            file_id INTEGER PRIMARY KEY,
+            mime_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+            intent_json TEXT,
+            schema_version INTEGER DEFAULT 1,
+            FOREIGN KEY (file_id) REFERENCES files(id)
+        )",
+        [],
+    ).unwrap_or_else(|e| {
+        eprintln!("Error creating file_intents table: {}", e);
+        process::exit(1);
+    });
+
     // Create index on embeddings for faster lookups
     conn.execute(
         "CREATE INDEX idx_embeddings_file_id ON embeddings(file_id)",
@@ -915,6 +931,14 @@ fn create_sqlite(output_path: String, add_entries: Vec<AddEntry>, generate_embed
     println!("      kind INTEGER NOT NULL,  -- 0=ELF, 1=Data");
     println!("      size INTEGER NOT NULL,");
     println!("      data BLOB");
+    println!("  );");
+    println!();
+    println!("  CREATE TABLE file_intents (");
+    println!("      file_id INTEGER PRIMARY KEY,");
+    println!("      mime_type TEXT NOT NULL DEFAULT 'application/octet-stream',");
+    println!("      intent_json TEXT,");
+    println!("      schema_version INTEGER DEFAULT 1,");
+    println!("      FOREIGN KEY (file_id) REFERENCES files(id)");
     println!("  );");
     println!();
     println!("  CREATE TABLE embeddings (");

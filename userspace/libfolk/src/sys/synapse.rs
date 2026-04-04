@@ -112,6 +112,28 @@ pub const SYN_OP_EMBEDDING_COUNT: u64 = 0x0022;
 /// Reply: 0 = success, SYN_STATUS_ERROR = failure
 pub const SYN_OP_WRITE_FILE: u64 = 0x0030;
 
+/// Write intent metadata for a file (Semantic VFS)
+/// Request: op | (shmem_handle << 16) | (total_size << 32)
+///   shmem contains: [file_id: u32 LE][mime_len: u16 LE][mime: bytes][json: bytes]
+/// Reply: 0 = success, SYN_STATUS_ERROR = failure
+pub const SYN_OP_WRITE_INTENT: u64 = 0x0031;
+
+/// Read intent metadata for a file (Semantic VFS)
+/// Request: op | (file_id << 16)
+/// Reply: (json_len << 32) | shmem_handle, or SYN_STATUS_NOT_FOUND
+pub const SYN_OP_READ_INTENT: u64 = 0x0032;
+
+/// Query files by MIME type
+/// Request: op | (shmem_handle << 16) | (mime_hash << 32)
+/// Reply: (count << 32) | shmem_handle
+pub const SYN_OP_QUERY_MIME: u64 = 0x0033;
+
+/// Semantic intent query — find file by purpose/concept
+/// Request: op | (query_hash << 16)
+/// Reply: (size << 32) | (file_id), or SYN_STATUS_NOT_FOUND
+/// Searches file_intents.intent_json for substring match.
+pub const SYN_OP_QUERY_INTENT: u64 = 0x0034;
+
 // ============================================================================
 // Status Codes
 // ============================================================================
@@ -551,4 +573,120 @@ pub fn embedding_count() -> SynapseResult<usize> {
     }
 
     Ok(ret as usize)
+}
+
+// ============================================================================
+// Semantic VFS — Intent Metadata Operations
+// ============================================================================
+
+/// Write intent metadata for a file.
+/// `file_id` is the rowid from a previous write_file call.
+/// `mime_type` is e.g. "application/wasm", "text/plain"
+/// `intent_json` is the semantic intent, e.g. '{"purpose":"calculator"}'
+pub fn write_intent(file_id: u32, mime_type: &str, intent_json: &str) -> SynapseResult<()> {
+    use crate::sys::{shmem_create, shmem_map, shmem_grant, shmem_unmap, shmem_destroy};
+
+    let mime_bytes = mime_type.as_bytes();
+    let json_bytes = intent_json.as_bytes();
+    // Format: [file_id: u32 LE][mime_len: u16 LE][mime bytes][json bytes]
+    let total_size = 4 + 2 + mime_bytes.len() + json_bytes.len();
+
+    let shmem_size = ((total_size + 4095) / 4096) * 4096;
+    let shmem_size = if shmem_size == 0 { 4096 } else { shmem_size };
+    let handle = shmem_create(shmem_size).map_err(|_| SynapseError::IpcFailed)?;
+    let _ = shmem_grant(handle, SYNAPSE_TASK_ID);
+
+    const INTENT_SHMEM_VADDR: usize = 0x21000000;
+    if shmem_map(handle, INTENT_SHMEM_VADDR).is_err() {
+        let _ = shmem_destroy(handle);
+        return Err(SynapseError::IpcFailed);
+    }
+
+    unsafe {
+        let ptr = INTENT_SHMEM_VADDR as *mut u8;
+        core::ptr::copy_nonoverlapping(file_id.to_le_bytes().as_ptr(), ptr, 4);
+        let mime_len = mime_bytes.len() as u16;
+        core::ptr::copy_nonoverlapping(mime_len.to_le_bytes().as_ptr(), ptr.add(4), 2);
+        core::ptr::copy_nonoverlapping(mime_bytes.as_ptr(), ptr.add(6), mime_bytes.len());
+        core::ptr::copy_nonoverlapping(json_bytes.as_ptr(), ptr.add(6 + mime_bytes.len()), json_bytes.len());
+    }
+
+    let _ = shmem_unmap(handle, INTENT_SHMEM_VADDR);
+
+    let request = SYN_OP_WRITE_INTENT
+        | ((handle as u64) << 16)
+        | ((total_size as u64) << 32);
+
+    let ret = unsafe {
+        syscall3(SYS_IPC_SEND, SYNAPSE_TASK_ID as u64, request, 0)
+    };
+
+    let _ = shmem_destroy(handle);
+
+    if ret == u64::MAX { return Err(SynapseError::ServiceUnavailable); }
+    if ret != 0 { return Err(SynapseError::IpcFailed); }
+    Ok(())
+}
+
+/// Semantic query — find a file by concept/purpose.
+/// Scans file_intents table for intent_json containing the query string.
+/// Returns the best-matching file's info (file_id, size).
+pub fn query_intent(query: &str) -> SynapseResult<FileInfo> {
+    use crate::sys::{shmem_create, shmem_map, shmem_grant, shmem_unmap, shmem_destroy};
+
+    let query_bytes = query.as_bytes();
+    let total_size = query_bytes.len();
+    if total_size == 0 { return Err(SynapseError::NotFound); }
+
+    let shmem_size = 4096;
+    let handle = shmem_create(shmem_size).map_err(|_| SynapseError::IpcFailed)?;
+    let _ = shmem_grant(handle, SYNAPSE_TASK_ID);
+
+    const QUERY_SHMEM_VADDR: usize = 0x22000000;
+    if shmem_map(handle, QUERY_SHMEM_VADDR).is_err() {
+        let _ = shmem_destroy(handle);
+        return Err(SynapseError::IpcFailed);
+    }
+
+    unsafe {
+        let ptr = QUERY_SHMEM_VADDR as *mut u8;
+        core::ptr::copy_nonoverlapping(query_bytes.as_ptr(), ptr, total_size);
+    }
+
+    let _ = shmem_unmap(handle, QUERY_SHMEM_VADDR);
+
+    let request = SYN_OP_QUERY_INTENT
+        | ((handle as u64) << 16)
+        | ((total_size as u64) << 32);
+
+    let ret = unsafe {
+        syscall3(SYS_IPC_SEND, SYNAPSE_TASK_ID as u64, request, 0)
+    };
+
+    let _ = shmem_destroy(handle);
+
+    if ret == u64::MAX { return Err(SynapseError::ServiceUnavailable); }
+    if ret == SYN_STATUS_NOT_FOUND { return Err(SynapseError::NotFound); }
+
+    let file_id = (ret & 0xFFFF) as u16;
+    let size = ((ret >> 32) & 0xFFFFFFFF) as u32;
+
+    Ok(FileInfo { file_id, size })
+}
+
+/// Read intent metadata for a file. Returns (mime_type, intent_json) via shmem.
+pub fn read_intent(file_id: u32) -> SynapseResult<ShmemFileResponse> {
+    let request = SYN_OP_READ_INTENT | ((file_id as u64) << 16);
+
+    let ret = unsafe {
+        syscall3(SYS_IPC_SEND, SYNAPSE_TASK_ID as u64, request, 0)
+    };
+
+    if ret == u64::MAX { return Err(SynapseError::ServiceUnavailable); }
+    if ret == SYN_STATUS_NOT_FOUND { return Err(SynapseError::NotFound); }
+
+    let shmem_handle = (ret & 0xFFFF) as u32;
+    let size = ((ret >> 32) & 0xFFFFFFFF) as u32;
+
+    Ok(ShmemFileResponse { shmem_handle, size })
 }

@@ -29,7 +29,8 @@ use libfolk::sys::synapse::{
     SYN_OP_FILE_INFO, SYN_OP_READ_FILE, SYN_OP_READ_FILE_BY_NAME, SYN_OP_READ_FILE_CHUNK,
     SYN_OP_READ_FILE_SHMEM, SYN_OP_SQL_QUERY,
     SYN_OP_VECTOR_SEARCH, SYN_OP_GET_EMBEDDING, SYN_OP_EMBEDDING_COUNT,
-    SYN_OP_WRITE_FILE,
+    SYN_OP_WRITE_FILE, SYN_OP_WRITE_INTENT, SYN_OP_READ_INTENT, SYN_OP_QUERY_MIME,
+    SYN_OP_QUERY_INTENT,
     SYN_STATUS_NOT_FOUND, SYN_STATUS_INVALID, SYN_STATUS_ERROR,
     SYNAPSE_VERSION, hash_name,
 };
@@ -380,6 +381,10 @@ fn handle_request(msg: AsyncIpcMessage) {
         SYN_OP_READ_FILE_SHMEM => handle_read_file_shmem(msg),
         SYN_OP_SQL_QUERY => handle_sql_query(msg),
         SYN_OP_WRITE_FILE => handle_write_file(msg),
+        SYN_OP_WRITE_INTENT => handle_write_intent(msg),
+        SYN_OP_READ_INTENT => handle_read_intent(msg),
+        SYN_OP_QUERY_MIME => handle_query_mime(msg),
+        SYN_OP_QUERY_INTENT => handle_query_intent(msg),
         SYN_OP_VECTOR_SEARCH => handle_vector_search(msg),
         SYN_OP_GET_EMBEDDING => handle_get_embedding(msg),
         SYN_OP_EMBEDDING_COUNT => handle_embedding_count(msg),
@@ -1248,13 +1253,17 @@ fn handle_write_file(msg: AsyncIpcMessage) {
     // Update DIR_CACHE_STATE for immediate visibility
     update_dir_cache(next_rowid, &name_buf[..nl], content_len);
 
+    // Semantic VFS: auto-detect MIME type and create intent record
+    let mime = auto_detect_mime(name_str, &content_buf[..content_len]);
+    let _ = sqlite_insert_intent(next_rowid, mime, "");
+
     // Flush to VirtIO disk
     if !flush_sqlite_to_disk() {
         println!("[SYNAPSE] write_file: disk flush failed (data in memory only)");
     }
 
-    println!("[SYNAPSE] Wrote '{}' ({} bytes, rowid={})", name_str, content_len, next_rowid);
-    let _ = reply(0, 0); // Success
+    println!("[SYNAPSE] Wrote '{}' ({} bytes, rowid={}, mime={})", name_str, content_len, next_rowid, mime);
+    let _ = reply(next_rowid as u64, 0); // Return rowid on success (0 = error in old protocol)
 }
 
 /// Find the maximum rowid in the files table
@@ -1273,6 +1282,78 @@ fn find_max_rowid() -> i64 {
         }
     }
     0
+}
+
+/// Look up a file's size by rowid from the files table.
+fn get_file_size(file_id: i64) -> u32 {
+    if let Some(db) = get_sqlite_db() {
+        if let Ok(scanner) = db.table_scan("files") {
+            for result in scanner {
+                if let Ok(record) = result {
+                    if record.rowid == file_id {
+                        if let Some(Value::Integer(size)) = record.get(3) {
+                            return size as u32;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    0
+}
+
+/// Look up a file's name by rowid from the files table.
+fn get_file_name(file_id: i64, buf: &mut [u8]) -> usize {
+    if let Some(db) = get_sqlite_db() {
+        if let Ok(scanner) = db.table_scan("files") {
+            for result in scanner {
+                if let Ok(record) = result {
+                    if record.rowid == file_id {
+                        if let Some(Value::Text(name)) = record.get(1) {
+                            let n = name.len().min(buf.len());
+                            buf[..n].copy_from_slice(&name.as_bytes()[..n]);
+                            return n;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    0
+}
+
+/// Auto-detect MIME type from filename extension and content magic bytes.
+fn auto_detect_mime<'a>(name: &str, content: &[u8]) -> &'a str {
+    // Check extension
+    if name.ends_with(".wasm") { return "application/wasm"; }
+    if name.ends_with(".txt")  { return "text/plain"; }
+    if name.ends_with(".json") { return "application/json"; }
+    if name.ends_with(".csv")  { return "text/csv"; }
+    if name.ends_with(".html") { return "text/html"; }
+    if name.ends_with(".rs")   { return "text/x-rust"; }
+
+    // Check content magic bytes
+    if content.len() >= 4 {
+        // WASM magic: \0asm
+        if content[0] == 0x00 && content[1] == b'a' && content[2] == b's' && content[3] == b'm' {
+            return "application/wasm";
+        }
+        // ELF magic: \x7fELF
+        if content[0] == 0x7f && content[1] == b'E' && content[2] == b'L' && content[3] == b'F' {
+            return "application/x-elf";
+        }
+        // JSON start
+        if content[0] == b'{' || content[0] == b'[' {
+            return "application/json";
+        }
+    }
+
+    // Check if content is valid UTF-8 text
+    if content.len() > 0 && core::str::from_utf8(content).is_ok() {
+        return "text/plain";
+    }
+
+    "application/octet-stream"
 }
 
 /// Pick the smallest SQLite integer type code for a value
@@ -1532,6 +1613,413 @@ fn sqlite_insert_file(rowid: i64, name: &str, content: &[u8]) -> bool {
         SQLITE_STATE.data[27] = counter_bytes[3];
 
         true
+    }
+}
+
+// ============================================================================
+// Semantic VFS — file_intents table operations
+// ============================================================================
+
+/// VADDR for intent shmem mapping
+const INTENT_SHMEM_VADDR: usize = 0x14000000;
+
+/// Insert an intent record into the file_intents B-tree
+/// Columns: file_id (INTEGER PK/rowid), mime_type (TEXT), intent_json (TEXT), schema_version (INT=1)
+fn sqlite_insert_intent(file_id: i64, mime_type: &str, intent_json: &str) -> bool {
+    unsafe {
+        if !SQLITE_STATE.valid { return false; }
+
+        let db_data = &SQLITE_STATE.data[..SQLITE_STATE.size];
+        let db = match SqliteDb::open(db_data) {
+            Ok(db) => db,
+            Err(_) => return false,
+        };
+
+        let root_page = match db.find_table_root("file_intents") {
+            Ok(p) => p,
+            Err(_) => {
+                println!("[SYNAPSE] insert_intent: file_intents table not found");
+                return false;
+            }
+        };
+
+        let page_size = db.page_size() as usize;
+
+        // Traverse B-tree to rightmost leaf
+        let mut current_page = root_page;
+        for _ in 0..10 {
+            let page_off = (current_page as usize - 1) * page_size;
+            let hdr_off = if current_page == 1 { 100 } else { 0 };
+            let page_type = SQLITE_STATE.data[page_off + hdr_off];
+            if page_type == 0x0d { break; }
+            else if page_type == 0x05 {
+                let rp_offset = page_off + hdr_off + 8;
+                let right_child = u32::from_be_bytes([
+                    SQLITE_STATE.data[rp_offset], SQLITE_STATE.data[rp_offset + 1],
+                    SQLITE_STATE.data[rp_offset + 2], SQLITE_STATE.data[rp_offset + 3],
+                ]);
+                current_page = right_child;
+            } else { return false; }
+        }
+
+        let leaf_page = current_page;
+        let page_offset = (leaf_page as usize - 1) * page_size;
+        let header_offset = if leaf_page == 1 { 100 } else { 0 };
+
+        if SQLITE_STATE.data[page_offset + header_offset] != 0x0d { return false; }
+
+        let hdr = page_offset + header_offset;
+        let cell_count = u16::from_be_bytes([
+            SQLITE_STATE.data[hdr + 3], SQLITE_STATE.data[hdr + 4],
+        ]) as usize;
+        let cell_content_start = {
+            let raw = u16::from_be_bytes([SQLITE_STATE.data[hdr + 5], SQLITE_STATE.data[hdr + 6]]);
+            if raw == 0 { page_size } else { raw as usize }
+        };
+
+        let mime_bytes = mime_type.as_bytes();
+        let json_bytes = intent_json.as_bytes();
+
+        // Type codes: file_id=NULL(0, stored as rowid), mime=TEXT, json=TEXT, version=INT(1)=type 9
+        let id_type: u64 = 0;
+        let mime_type_code = 13 + (mime_bytes.len() as u64) * 2;
+        let json_type_code = if json_bytes.is_empty() { 0 } else { 13 + (json_bytes.len() as u64) * 2 };
+        let version_type: u64 = 9; // constant 1
+
+        let mut hdr_buf = [0u8; 16];
+        let mut hdr_pos = 0usize;
+        hdr_pos += 1; // placeholder for header_size
+        hdr_pos += encode_varint(id_type, &mut hdr_buf[hdr_pos..]);
+        hdr_pos += encode_varint(mime_type_code, &mut hdr_buf[hdr_pos..]);
+        hdr_pos += encode_varint(json_type_code, &mut hdr_buf[hdr_pos..]);
+        hdr_pos += encode_varint(version_type, &mut hdr_buf[hdr_pos..]);
+
+        let header_size = hdr_pos;
+        if header_size > 127 { return false; }
+        hdr_buf[0] = header_size as u8;
+
+        // Record body = header + mime + json (id=0bytes, version=0bytes for type 9)
+        let record_body_size = header_size + mime_bytes.len() + json_bytes.len();
+
+        let mut cell_buf = [0u8; 2048];
+        let mut cell_pos = 0usize;
+        cell_pos += encode_varint(record_body_size as u64, &mut cell_buf[cell_pos..]);
+        cell_pos += encode_varint(file_id as u64, &mut cell_buf[cell_pos..]);
+
+        cell_buf[cell_pos..cell_pos + header_size].copy_from_slice(&hdr_buf[..header_size]);
+        cell_pos += header_size;
+
+        // Column values: id(NULL=0bytes), mime(TEXT), json(TEXT or NULL), version(type9=0bytes)
+        cell_buf[cell_pos..cell_pos + mime_bytes.len()].copy_from_slice(mime_bytes);
+        cell_pos += mime_bytes.len();
+        if !json_bytes.is_empty() {
+            cell_buf[cell_pos..cell_pos + json_bytes.len()].copy_from_slice(json_bytes);
+            cell_pos += json_bytes.len();
+        }
+
+        let cell_len = cell_pos;
+        let pointer_array_end = header_offset + 8 + cell_count * 2;
+        let free_space = cell_content_start - pointer_array_end;
+        if cell_len + 2 > free_space {
+            println!("[SYNAPSE] insert_intent: no space (need {}, have {})", cell_len + 2, free_space);
+            return false;
+        }
+
+        let new_cell_offset = cell_content_start - cell_len;
+        SQLITE_STATE.data[page_offset + new_cell_offset..page_offset + new_cell_offset + cell_len]
+            .copy_from_slice(&cell_buf[..cell_len]);
+
+        let ptr_offset = page_offset + header_offset + 8 + cell_count * 2;
+        let cell_ptr = (new_cell_offset as u16).to_be_bytes();
+        SQLITE_STATE.data[ptr_offset] = cell_ptr[0];
+        SQLITE_STATE.data[ptr_offset + 1] = cell_ptr[1];
+
+        let new_count = (cell_count + 1) as u16;
+        let count_bytes = new_count.to_be_bytes();
+        SQLITE_STATE.data[hdr + 3] = count_bytes[0];
+        SQLITE_STATE.data[hdr + 4] = count_bytes[1];
+
+        let start_bytes = (new_cell_offset as u16).to_be_bytes();
+        SQLITE_STATE.data[hdr + 5] = start_bytes[0];
+        SQLITE_STATE.data[hdr + 6] = start_bytes[1];
+
+        // Increment DB change counter
+        let change_counter = u32::from_be_bytes([
+            SQLITE_STATE.data[24], SQLITE_STATE.data[25],
+            SQLITE_STATE.data[26], SQLITE_STATE.data[27],
+        ]);
+        let new_counter = change_counter.wrapping_add(1);
+        let counter_bytes = new_counter.to_be_bytes();
+        SQLITE_STATE.data[24] = counter_bytes[0];
+        SQLITE_STATE.data[25] = counter_bytes[1];
+        SQLITE_STATE.data[26] = counter_bytes[2];
+        SQLITE_STATE.data[27] = counter_bytes[3];
+
+        true
+    }
+}
+
+/// Read intent for a file_id from file_intents table.
+/// Returns (mime_type, intent_json) as byte slices into a provided buffer.
+fn sqlite_read_intent(file_id: i64, out_buf: &mut [u8]) -> Option<(usize, usize)> {
+    let db = get_sqlite_db()?;
+    let scanner = db.table_scan("file_intents").ok()?;
+
+    for result in scanner {
+        if let Ok(record) = result {
+            if record.rowid == file_id {
+                let mut pos = 0usize;
+
+                // Column 1: mime_type (TEXT)
+                let mime_len = if let Some(Value::Text(s)) = record.get(1) {
+                    let b = s.as_bytes();
+                    let n = b.len().min(out_buf.len());
+                    out_buf[..n].copy_from_slice(&b[..n]);
+                    pos = n;
+                    n
+                } else { 0 };
+
+                // Column 2: intent_json (TEXT or NULL)
+                let json_len = if let Some(Value::Text(s)) = record.get(2) {
+                    let b = s.as_bytes();
+                    let n = b.len().min(out_buf.len() - pos);
+                    out_buf[pos..pos + n].copy_from_slice(&b[..n]);
+                    n
+                } else { 0 };
+
+                return Some((mime_len, json_len));
+            }
+        }
+    }
+    None
+}
+
+/// Handle WRITE_INTENT request
+/// Protocol: op | (shmem_handle << 16) | (total_size << 32)
+/// Shmem format: [file_id: u32 LE][mime_len: u16 LE][mime bytes][json bytes]
+fn handle_write_intent(msg: AsyncIpcMessage) {
+    if unsafe { BACKEND } != Backend::Sqlite {
+        let _ = reply(SYN_STATUS_ERROR, 0);
+        return;
+    }
+
+    let shmem_handle = ((msg.payload0 >> 16) & 0xFFFF) as u32;
+    let total_size = (msg.payload0 >> 32) as usize;
+
+    if shmem_handle == 0 || total_size < 7 {
+        let _ = reply(SYN_STATUS_ERROR, 0);
+        return;
+    }
+
+    if shmem_map(shmem_handle, INTENT_SHMEM_VADDR).is_err() {
+        let _ = reply(SYN_STATUS_ERROR, 0);
+        return;
+    }
+
+    let shmem_slice = unsafe {
+        core::slice::from_raw_parts(INTENT_SHMEM_VADDR as *const u8, total_size)
+    };
+
+    // Parse: [file_id: u32 LE][mime_len: u16 LE][mime][json]
+    let file_id = u32::from_le_bytes([shmem_slice[0], shmem_slice[1], shmem_slice[2], shmem_slice[3]]);
+    let mime_len = u16::from_le_bytes([shmem_slice[4], shmem_slice[5]]) as usize;
+
+    if 6 + mime_len > total_size {
+        let _ = shmem_unmap(shmem_handle, INTENT_SHMEM_VADDR);
+        let _ = reply(SYN_STATUS_ERROR, 0);
+        return;
+    }
+
+    // Copy to local buffers before unmapping
+    let mut mime_buf = [0u8; 128];
+    let ml = mime_len.min(128);
+    mime_buf[..ml].copy_from_slice(&shmem_slice[6..6 + ml]);
+
+    let json_start = 6 + mime_len;
+    let json_len = total_size - json_start;
+    let mut json_buf = [0u8; 1024];
+    let jl = json_len.min(1024);
+    if jl > 0 {
+        json_buf[..jl].copy_from_slice(&shmem_slice[json_start..json_start + jl]);
+    }
+
+    let _ = shmem_unmap(shmem_handle, INTENT_SHMEM_VADDR);
+
+    let mime_str = unsafe { core::str::from_utf8_unchecked(&mime_buf[..ml]) };
+    let json_str = unsafe { core::str::from_utf8_unchecked(&json_buf[..jl]) };
+
+    if sqlite_insert_intent(file_id as i64, mime_str, json_str) {
+        flush_sqlite_to_disk();
+        println!("[SYNAPSE] Intent stored for file_id={} mime={}", file_id, mime_str);
+        let _ = reply(0, 0);
+    } else {
+        println!("[SYNAPSE] Intent insert failed for file_id={}", file_id);
+        let _ = reply(SYN_STATUS_ERROR, 0);
+    }
+}
+
+/// Handle READ_INTENT request
+/// Request: op | (file_id << 16)
+/// Reply: (total_len << 32) | shmem_handle  (shmem contains: [mime_len: u16 LE][mime][json])
+fn handle_read_intent(msg: AsyncIpcMessage) {
+    let file_id = ((msg.payload0 >> 16) & 0xFFFF) as i64;
+
+    let mut buf = [0u8; 2048];
+    match sqlite_read_intent(file_id, &mut buf) {
+        Some((mime_len, json_len)) => {
+            let total = 2 + mime_len + json_len;
+            // Allocate shmem for response
+            let shmem_size = 4096;
+            match shmem_create(shmem_size) {
+                Ok(handle) => {
+                    let _ = shmem_grant(handle, msg.sender);
+                    if shmem_map(handle, INTENT_SHMEM_VADDR).is_ok() {
+                        unsafe {
+                            let ptr = INTENT_SHMEM_VADDR as *mut u8;
+                            let ml = (mime_len as u16).to_le_bytes();
+                            *ptr = ml[0];
+                            *ptr.add(1) = ml[1];
+                            core::ptr::copy_nonoverlapping(buf.as_ptr(), ptr.add(2), mime_len);
+                            core::ptr::copy_nonoverlapping(
+                                buf[mime_len..].as_ptr(), ptr.add(2 + mime_len), json_len
+                            );
+                        }
+                        let _ = shmem_unmap(handle, INTENT_SHMEM_VADDR);
+                        let _ = reply((total as u64) << 32 | handle as u64, 0);
+                    } else {
+                        let _ = reply(SYN_STATUS_ERROR, 0);
+                    }
+                }
+                Err(_) => { let _ = reply(SYN_STATUS_ERROR, 0); }
+            }
+        }
+        None => {
+            let _ = reply(SYN_STATUS_NOT_FOUND, 0);
+        }
+    }
+}
+
+/// Handle QUERY_MIME — scan file_intents for matching mime_type
+fn handle_query_mime(msg: AsyncIpcMessage) {
+    // For now, use the hash approach (same as read_file_by_name)
+    let mime_hash = ((msg.payload0 >> 32) & 0xFFFFFFFF) as u32;
+
+    if let Some(db) = get_sqlite_db() {
+        if let Ok(scanner) = db.table_scan("file_intents") {
+            for result in scanner {
+                if let Ok(record) = result {
+                    if let Some(Value::Text(mime)) = record.get(1) {
+                        if hash_name(mime) == mime_hash {
+                            // Found! Return the file_id and look up its size
+                            let file_id = record.rowid as u16;
+                            let size = get_file_size(file_id as i64);
+                            let _ = reply((size as u64) << 32 | file_id as u64, 0);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let _ = reply(SYN_STATUS_NOT_FOUND, 0);
+}
+
+/// Handle QUERY_INTENT — semantic file search by concept/purpose
+/// Scans file_intents.intent_json for substring match against query.
+/// Request: op | (shmem_handle << 16) | (query_len << 32)
+/// Reply: (size << 32) | file_id, or SYN_STATUS_NOT_FOUND
+fn handle_query_intent(msg: AsyncIpcMessage) {
+    let shmem_handle = ((msg.payload0 >> 16) & 0xFFFF) as u32;
+    let query_len = (msg.payload0 >> 32) as usize;
+
+    if shmem_handle == 0 || query_len == 0 || query_len > 256 {
+        let _ = reply(SYN_STATUS_NOT_FOUND, 0);
+        return;
+    }
+
+    // Map shmem to read query string
+    const QUERY_INTENT_VADDR: usize = 0x15000000;
+    if shmem_map(shmem_handle, QUERY_INTENT_VADDR).is_err() {
+        let _ = reply(SYN_STATUS_ERROR, 0);
+        return;
+    }
+
+    let query_slice = unsafe {
+        core::slice::from_raw_parts(QUERY_INTENT_VADDR as *const u8, query_len)
+    };
+    let mut query_buf = [0u8; 256];
+    let ql = query_len.min(256);
+    query_buf[..ql].copy_from_slice(&query_slice[..ql]);
+    let _ = shmem_unmap(shmem_handle, QUERY_INTENT_VADDR);
+
+    let query = match core::str::from_utf8(&query_buf[..ql]) {
+        Ok(s) => s,
+        Err(_) => {
+            let _ = reply(SYN_STATUS_ERROR, 0);
+            return;
+        }
+    };
+
+    // Lowercase query for case-insensitive matching
+    let mut query_lower = [0u8; 256];
+    for (i, b) in query.bytes().enumerate().take(256) {
+        query_lower[i] = if b >= b'A' && b <= b'Z' { b + 32 } else { b };
+    }
+    let query_lc = unsafe { core::str::from_utf8_unchecked(&query_lower[..ql]) };
+
+    // Scan file_intents for best match
+    let mut best_file_id: i64 = -1;
+    let mut best_score: usize = 0;
+
+    if let Some(db) = get_sqlite_db() {
+        if let Ok(scanner) = db.table_scan("file_intents") {
+            for result in scanner {
+                if let Ok(record) = result {
+                    let file_id = record.rowid;
+
+                    // Check intent_json (column 2) for substring match
+                    if let Some(Value::Text(json)) = record.get(2) {
+                        // Case-insensitive substring search
+                        let mut json_lower = [0u8; 1024];
+                        let jl = json.len().min(1024);
+                        for (i, b) in json.bytes().enumerate().take(jl) {
+                            json_lower[i] = if b >= b'A' && b <= b'Z' { b + 32 } else { b };
+                        }
+                        let json_lc = unsafe { core::str::from_utf8_unchecked(&json_lower[..jl]) };
+
+                        // Score: number of query words found in intent_json
+                        let mut score = 0;
+                        for word in query_lc.split_whitespace() {
+                            if json_lc.contains(word) { score += 1; }
+                        }
+
+                        if score > best_score {
+                            best_score = score;
+                            best_file_id = file_id;
+                        }
+                    }
+
+                    // Also check mime_type (column 1)
+                    if let Some(Value::Text(mime)) = record.get(1) {
+                        if mime.contains(query_lc) || query_lc.contains(mime) {
+                            if best_score == 0 {
+                                best_file_id = file_id;
+                                best_score = 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if best_file_id >= 0 {
+        let size = get_file_size(best_file_id);
+        println!("[SYNAPSE] Intent query '{}' → file_id={} (score={})", query, best_file_id, best_score);
+        let _ = reply((size as u64) << 32 | best_file_id as u64, 0);
+    } else {
+        println!("[SYNAPSE] Intent query '{}' → not found", query);
+        let _ = reply(SYN_STATUS_NOT_FOUND, 0);
     }
 }
 
