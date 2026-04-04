@@ -3748,6 +3748,27 @@ fn main() -> ! {
                         } else {
                             win.push_line("Usage: save <filename> <text>");
                         }
+                    } else if cmd_str.starts_with("revert ") {
+                        // Rollback: "revert ball to v1" or "revert ball 1"
+                        let parts: alloc::vec::Vec<&str> = cmd_str[7..].trim().split_whitespace().collect();
+                        if parts.len() >= 2 {
+                            let app_name = parts[0];
+                            let ver_str = parts[parts.len() - 1].trim_start_matches('v');
+                            if let Ok(ver) = ver_str.parse::<u32>() {
+                                // Send rollback request to proxy via MCP chat
+                                let rollback_prompt = alloc::format!("__ROLLBACK__ {} {}", app_name, ver);
+                                if libfolk::mcp::client::send_chat(&rollback_prompt).is_some() {
+                                    win.push_line(&alloc::format!("[Revert] Rolling back '{}' to v{}...", app_name, ver));
+                                } else {
+                                    win.push_line("[Revert] Failed to send rollback request");
+                                }
+                            } else {
+                                win.push_line("Usage: revert <app> <version>");
+                            }
+                        } else {
+                            win.push_line("Usage: revert <app> <version>");
+                            win.push_line("Example: revert ball 1");
+                        }
                     } else if cmd_str == "dream accept all" || cmd_str == "dream accept" {
                         draug.accept_all_creative();
                         let accepted = draug.drain_accepted();

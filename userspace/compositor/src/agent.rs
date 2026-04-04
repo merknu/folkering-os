@@ -44,6 +44,7 @@ pub const OS_TOOLS: &[Tool] = &[
     Tool { name: "system_info", description: "Get system uptime, memory usage, and CPU info." },
     Tool { name: "generate_wasm", description: "Generate and compile a WASM visual tool. Args: description of what to draw" },
     Tool { name: "list_cache", description: "List all cached WASM apps with names and sizes" },
+    Tool { name: "revert_app", description: "Rollback a WASM app to a previous version. Args: app_name version_number" },
     Tool { name: "run_command", description: "Execute a shell command. Args: command string" },
 ];
 
@@ -284,8 +285,11 @@ pub fn execute_tool(name: &str, args: &str) -> String {
             format!("__WASM_GEN__{}", args.trim())
         }
         "list_cache" => {
-            // Marker — compositor fills this from wasm_cache keys
             format!("__LIST_CACHE__")
+        }
+        "revert_app" => {
+            // Marker — compositor handles rollback via proxy
+            format!("__REVERT__{}", args.trim())
         }
         "run_command" => {
             // Search is the closest we have to a generic command

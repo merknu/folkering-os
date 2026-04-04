@@ -412,6 +412,85 @@ def _cache_check(prompt: str) -> tuple:
         return wasm, src
     return None, None
 
+
+def _cache_save_version(prompt: str, source: str, wasm_bytes: bytes):
+    """Save a numbered version snapshot (for rollback). Never deleted."""
+    key = _cache_key(prompt)
+    meta = _cache_get_meta(prompt)
+    ver = meta.get("version", 1)
+    versions_dir = os.path.join(_WASM_CACHE_DIR, "versions", key)
+    os.makedirs(versions_dir, exist_ok=True)
+    with open(os.path.join(versions_dir, f"v{ver}.rs"), "w") as f:
+        f.write(source)
+    with open(os.path.join(versions_dir, f"v{ver}.wasm"), "wb") as f:
+        f.write(wasm_bytes)
+    with open(os.path.join(versions_dir, f"v{ver}.meta.json"), "w") as f:
+        f.write(json.dumps(meta, indent=2))
+    print(f"[CACHE] Snapshot saved: {key}/v{ver}")
+
+
+def _cache_list_versions(prompt: str) -> list:
+    """List all saved versions of an app."""
+    key = _cache_key(prompt)
+    versions_dir = os.path.join(_WASM_CACHE_DIR, "versions", key)
+    if not os.path.exists(versions_dir):
+        return []
+    versions = []
+    for f in sorted(os.listdir(versions_dir)):
+        if f.endswith(".meta.json"):
+            ver_num = f.replace(".meta.json", "").replace("v", "")
+            try:
+                with open(os.path.join(versions_dir, f), "r") as fh:
+                    meta = json.loads(fh.read())
+                wasm_path = os.path.join(versions_dir, f"v{ver_num}.wasm")
+                size = os.path.getsize(wasm_path) if os.path.exists(wasm_path) else 0
+                versions.append({
+                    "version": int(ver_num),
+                    "id": meta.get("id", "?"),
+                    "size": size,
+                    "description": meta.get("description", ""),
+                    "dream_history": meta.get("dream_history", []),
+                })
+            except Exception:
+                pass
+    return versions
+
+
+def _cache_rollback(prompt: str, target_version: int) -> tuple:
+    """Rollback to a specific version. Returns (wasm_bytes, source, error)."""
+    key = _cache_key(prompt)
+    versions_dir = os.path.join(_WASM_CACHE_DIR, "versions", key)
+    src_path = os.path.join(versions_dir, f"v{target_version}.rs")
+    wasm_path = os.path.join(versions_dir, f"v{target_version}.wasm")
+    meta_path = os.path.join(versions_dir, f"v{target_version}.meta.json")
+
+    if not os.path.exists(wasm_path):
+        return None, None, f"Version {target_version} not found"
+
+    with open(wasm_path, "rb") as f:
+        wasm = f.read()
+    src = ""
+    if os.path.exists(src_path):
+        with open(src_path, "r") as f:
+            src = f.read()
+
+    # Restore as current version
+    with open(os.path.join(_WASM_CACHE_DIR, f"{key}.wasm"), "wb") as f:
+        f.write(wasm)
+    if src:
+        with open(os.path.join(_WASM_CACHE_DIR, f"{key}.rs"), "w") as f:
+            f.write(src)
+    if os.path.exists(meta_path):
+        with open(meta_path, "r") as f:
+            old_meta = json.loads(f.read())
+        import datetime
+        old_meta["last_updated"] = datetime.datetime.now().isoformat()
+        old_meta["rollback_from"] = _cache_get_meta(prompt).get("version", 0)
+        _cache_set_meta(prompt, old_meta)
+
+    print(f"[CACHE] Rolled back {key} to v{target_version} ({len(wasm)} bytes)")
+    return wasm, src, None
+
 def _cache_meta_path(prompt: str) -> str:
     return os.path.join(_WASM_CACHE_DIR, f"{_cache_key(prompt)}.meta.json")
 
@@ -496,6 +575,9 @@ def _cache_store(prompt: str, source: str, wasm_bytes: bytes, parent_prompt: str
         meta["created"] = datetime.datetime.now().isoformat()
     meta["last_updated"] = datetime.datetime.now().isoformat()
     _cache_set_meta(prompt, meta)
+
+    # Save version snapshot for rollback (never deleted)
+    _cache_save_version(prompt, source, wasm_bytes)
 
     lineage_depth = len(meta.get("lineage", []))
     print(f"[CACHE] Stored: {key} v{meta['version']} id={source_id} depth={lineage_depth} ({len(source)} chars, {len(wasm_bytes)} bytes)")
@@ -1032,8 +1114,31 @@ def handle_mcp_frame(frame_bytes: bytes, sock: socket.socket):
     print(f"[MCP] Received: {msg_type} (seq={seq})")
 
     if msg_type == 'chat_request':
-        # OS wants to talk to the LLM — route through hybrid router + context manager
         prompt = msg['prompt']
+
+        # Handle internal commands (not LLM calls)
+        if prompt.startswith("__ROLLBACK__"):
+            parts = prompt.split()
+            if len(parts) >= 3:
+                app_name = parts[1]
+                try:
+                    ver = int(parts[2])
+                    wasm, src, err = _cache_rollback(app_name, ver)
+                    if err:
+                        response_frame = make_frame(encode_chat_response(f"Rollback failed: {err}"))
+                    else:
+                        response_frame = make_frame(encode_chat_response(
+                            f"Rolled back '{app_name}' to v{ver} ({len(wasm)} bytes). Restart app to see changes."))
+                        # Also send the WASM binary so OS can update its cache
+                        send_wasm_chunked(wasm, sock, session_id=_session.session_id)
+                except Exception as e:
+                    response_frame = make_frame(encode_chat_response(f"Rollback error: {e}"))
+            else:
+                response_frame = make_frame(encode_chat_response("Usage: __ROLLBACK__ <app_name> <version>"))
+            sock.sendall(response_frame)
+            return
+
+        # Normal LLM routing
         tier = route_for_task(msg_type, prompt)
         print(f"[MCP] Chat ({tier}): {prompt[:80]}...")
 
