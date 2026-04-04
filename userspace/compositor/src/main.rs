@@ -1715,12 +1715,23 @@ fn main() -> ! {
                                 }
                                 need_redraw = true;
                             } else if draug.is_waiting() {
-                                // Route to Draug daemon
+                                // Route to Draug daemon (analysis response)
                                 if let Some(alert) = draug.on_analysis_response(resp_text) {
                                     write_str(&alert);
                                     write_str("\n");
                                 } else {
                                     write_str("[Draug] Analysis complete (no action needed)\n");
+                                }
+                            } else if draug.is_dreaming() {
+                                // Dream error response (e.g., budget exhausted, compile fail)
+                                write_str("[AutoDream] Error from proxy: ");
+                                write_str(&resp_text[..resp_text.len().min(80)]);
+                                write_str("\n");
+                                let done_ms = if tsc_per_us > 0 { rdtsc() / tsc_per_us / 1000 } else { 0 };
+                                draug.on_dream_complete(done_ms);
+                                // Clear async_tool_gen if dream was pending
+                                if async_tool_gen.is_some() {
+                                    async_tool_gen = None;
                                 }
                             } else {
                                 write_str("[MCP] ChatResponse (unrouted): ");
