@@ -602,10 +602,68 @@ def _dream_budget_record():
     print(f"[DREAM-BUDGET] Used: {budget['calls']}/{DREAM_MAX_PER_DAY} today")
 
 
+def _clarify_request(prompt: str) -> tuple:
+    """Ask FAST LLM to clarify an ambiguous generation request.
+    Returns (should_proceed: bool, message: str).
+    If should_proceed is False, message contains a question or suggestion."""
+
+    # Skip clarification for tweaks, dreams, and very specific prompts
+    if "--tweak" in prompt or len(prompt.split()) > 8:
+        return True, ""
+
+    # Check if cached variants exist
+    all_apps = _list_all_apps()
+    # Clean prompt for matching
+    clean = prompt.lower()
+    for pfx in ["gemini generate ", "generate ", "agent generate "]:
+        if clean.startswith(pfx):
+            clean = clean[len(pfx):]
+            break
+
+    # Find similar cached apps
+    similar = [a for a in all_apps if clean in a["description"].lower() or a["description"].lower() in clean]
+    if similar:
+        suggestions = ", ".join(f"'{a['description']}' (v{a['version']})" for a in similar[:5])
+        return False, f"EXISTING: Found similar apps: {suggestions}. Type the exact name to load, or add details to create a new variant."
+
+    # Ask FAST LLM: is this request clear enough to generate code?
+    clarify_prompt = (
+        f"A user wants to generate a visual WASM app with this description: \"{clean}\"\n\n"
+        f"Is this description clear enough to write code? Answer with ONLY one JSON:\n"
+        f"If clear: {{\"clear\": true}}\n"
+        f"If unclear or nonsensical: {{\"clear\": false, \"question\": \"your clarifying question\"}}\n"
+        f"If it could have variants: {{\"clear\": true, \"variants\": [\"simple version\", \"advanced version\"]}}\n"
+    )
+    try:
+        result = call_llm(clarify_prompt, tier="fast")
+        result = result.strip()
+        # Find JSON in response
+        if '{' in result:
+            json_str = result[result.index('{'):result.rindex('}') + 1]
+            data = json.loads(json_str)
+            if not data.get("clear", True):
+                return False, f"QUESTION: {data.get('question', 'Could you be more specific?')}"
+            if data.get("variants"):
+                variants = ", ".join(f"'{v}'" for v in data["variants"][:4])
+                return False, f"VARIANTS: Did you mean one of these? {variants}. Be more specific or just press Enter to use the first option."
+    except Exception:
+        pass  # Clarification failed — proceed anyway
+
+    return True, ""
+
+
 def _llm_to_wasm(prompt: str, force: bool = False, tweak: str = "") -> tuple:
-    """Shared WASM pipeline: cache check → LLM → extract → fix → compile → cache store.
-    Returns (bytes, None) on success, (None, str) on failure."""
-    # Check cache first (unless --force)
+    """Shared WASM pipeline: clarify → cache check → LLM → extract → fix → compile → cache store.
+    Returns (bytes, None) on success, (None, str) on failure.
+    Returns (None, "CLARIFY:...") if the request needs user clarification."""
+
+    # Phase 0: Clarification (only for new generation, not tweaks/dreams)
+    if not force and not tweak:
+        should_proceed, clarify_msg = _clarify_request(prompt)
+        if not should_proceed:
+            return None, f"CLARIFY:{clarify_msg}"
+
+    # Phase 1: Check cache first (unless --force)
     if not force and not tweak:
         cached_wasm, _ = _cache_check(prompt)
         if cached_wasm:
@@ -1037,7 +1095,13 @@ def handle_mcp_frame(frame_bytes: bytes, sock: socket.socket):
                 print(f"[CACHE] Skipped perfected app: {base_key}")
             else:
                 wasm_binary, error = _llm_to_wasm(desc)
-                if error:
+                if error and error.startswith("CLARIFY:"):
+                    # Clarification needed — send question back as ChatResponse
+                    clarify_msg = error[8:]  # Strip "CLARIFY:" prefix
+                    print(f"[MCP] Clarification needed: {clarify_msg[:60]}")
+                    response_frame = make_frame(encode_chat_response(clarify_msg))
+                    sock.sendall(response_frame)
+                elif error:
                     error_frame = make_frame(encode_chat_response(f"Error: {error}"))
                     sock.sendall(error_frame)
                 else:

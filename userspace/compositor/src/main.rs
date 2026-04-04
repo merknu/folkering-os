@@ -1775,6 +1775,32 @@ fn main() -> ! {
                                 if async_tool_gen.is_some() {
                                     async_tool_gen = None;
                                 }
+                            } else if async_tool_gen.is_some() {
+                                // Response during WASM gen — likely clarification or error
+                                let (tool_win_id, _) = async_tool_gen.take().unwrap_or((0, alloc::string::String::new()));
+                                write_str("[MCP] WASM gen response: ");
+                                write_str(&resp_text[..resp_text.len().min(80)]);
+                                write_str("\n");
+
+                                // Check for clarification types
+                                let is_question = resp_text.starts_with("QUESTION:") || resp_text.starts_with("VARIANTS:") || resp_text.starts_with("EXISTING:");
+                                if let Some(win) = wm.get_window_mut(tool_win_id) {
+                                    if is_question {
+                                        win.push_line("[AI] Need more info:");
+                                    } else if resp_text.starts_with("Error:") {
+                                        win.push_line("[AI] Generation failed:");
+                                    }
+                                    for line in resp_text.split('\n') {
+                                        if !line.is_empty() {
+                                            win.push_line(&line[..line.len().min(100)]);
+                                        }
+                                    }
+                                    if is_question {
+                                        win.push_line("");
+                                        win.push_line("Refine your request and try again.");
+                                    }
+                                }
+                                need_redraw = true;
                             } else {
                                 write_str("[MCP] ChatResponse (unrouted): ");
                                 write_str(&resp_text[..resp_text.len().min(60)]);
