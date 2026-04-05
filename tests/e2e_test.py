@@ -155,10 +155,8 @@ class COM3Injector:
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.settimeout(5)
-        # SO_LINGER=0: on close(), send RST immediately (no CLOSE_WAIT/FIN_WAIT)
-        import struct as _struct
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
-                             _struct.pack("ii", 1, 0))
+        # Use normal close (FIN not RST) — QEMU nowait dies permanently after RST
+        # Trade-off: CLOSE_WAIT lingers for ~60s, but COM3 stays alive for QEMU lifetime
         try:
             self.sock.connect((self.host, self.port))
             print(f"  Connected to COM3 ({self.host}:{self.port}) [linger=RST]")

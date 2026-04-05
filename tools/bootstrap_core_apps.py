@@ -86,7 +86,7 @@ def connect_com3():
     """Connect to COM3 with SO_LINGER=0."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(5)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    # Normal close (FIN) — QEMU COM3 dies permanently after RST (SO_LINGER=0)
     sock.connect((COM3_HOST, COM3_PORT))
     return sock
 

@@ -2429,6 +2429,7 @@ fn main() -> ! {
         }
 
         // ===== GOD MODE PIPE (COM3) — Poll for injected commands =====
+        // Read ALL pending bytes (no break — process entire buffer per frame)
         while let Some(byte) = libfolk::sys::com3_read() {
             if byte == b'\n' && com3_len > 0 {
                 // Complete command received — inject into omnibar dispatcher
@@ -2440,7 +2441,7 @@ fn main() -> ! {
                 }
                 com3_len = 0;
                 did_work = true;
-                break;
+                // Don't break — keep reading to drain buffer
             } else if byte != b'\n' && byte != b'\r' && com3_len < com3_buf.len() {
                 com3_buf[com3_len] = byte;
                 com3_len += 1;
