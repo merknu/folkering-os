@@ -1092,6 +1092,10 @@ fn main() -> ! {
     let mut streaming_upstream: Option<compositor::wasm_runtime::PersistentWasmApp> = None;
     let mut streaming_downstream: Option<compositor::wasm_runtime::PersistentWasmApp> = None;
 
+    // Spatial Pipelining: node connections + drag state
+    let mut node_connections: alloc::vec::Vec<compositor::spatial::NodeConnection> = alloc::vec::Vec::new();
+    let mut connection_drag: Option<compositor::spatial::ConnectionDrag> = None;
+
     // ===== Window Manager (Milestone 2.1) =====
     let mut wm = WindowManager::new();
     // Track which window (if any) is being dragged
@@ -2615,6 +2619,32 @@ fn main() -> ! {
             // Release drag
             if left_released {
                 dragging_window_id = None;
+                // Cancel connection drag if not on InputPort
+                if connection_drag.is_some() {
+                    // Check if we're over an InputPort
+                    if let Some((win_id, HitZone::InputPort)) = wm.hit_test(new_x, new_y) {
+                        if let Some(drag) = connection_drag.take() {
+                            if drag.source_win_id != win_id {
+                                node_connections.push(compositor::spatial::NodeConnection {
+                                    source_win_id: drag.source_win_id,
+                                    dest_win_id: win_id,
+                                });
+                                write_str("[Spatial] Connected!\n");
+                            }
+                        }
+                    } else {
+                        connection_drag = None;
+                        write_str("[Spatial] Drag cancelled\n");
+                    }
+                    need_redraw = true;
+                }
+            }
+
+            // Update connection drag position
+            if let Some(ref mut drag) = connection_drag {
+                drag.current_x = new_x;
+                drag.current_y = new_y;
+                need_redraw = true;
             }
 
             if left_pressed {
@@ -2645,6 +2675,31 @@ fn main() -> ! {
                             handled = true;
                             // IQE: window drag start
                             libfolk::sys::com3_write(b"IQE,WIN_DRAG,0\n");
+                        }
+                        HitZone::OutputPort => {
+                            // Start dragging a connection cable from this output port
+                            connection_drag = Some(compositor::spatial::ConnectionDrag {
+                                source_win_id: win_id,
+                                current_x: cx,
+                                current_y: cy,
+                            });
+                            write_str("[Spatial] Dragging from output port\n");
+                            handled = true;
+                            need_redraw = true;
+                        }
+                        HitZone::InputPort => {
+                            // If we're dragging a connection, complete it here
+                            if let Some(drag) = connection_drag.take() {
+                                if drag.source_win_id != win_id {
+                                    node_connections.push(compositor::spatial::NodeConnection {
+                                        source_win_id: drag.source_win_id,
+                                        dest_win_id: win_id,
+                                    });
+                                    write_str("[Spatial] Connected!\n");
+                                }
+                            }
+                            handled = true;
+                            need_redraw = true;
                         }
                         HitZone::Content => {
                             wm.focus(win_id);
@@ -5933,6 +5988,51 @@ fn main() -> ! {
             // Only show windows in desktop mode (not when WASM app is fullscreen)
             if !wasm_fullscreen && wm.has_visible() {
                 wm.composite(&mut fb);
+
+                // ===== Spatial Pipelining: render ports + connections =====
+                // Draw I/O port circles on windows that have ports enabled
+                for win in &wm.windows {
+                    if !win.visible { continue; }
+                    let mid_y = win.y + win.total_h() as i32 / 2;
+                    if win.output_port {
+                        let px = win.x + win.total_w() as i32;
+                        let raw = if compositor::spatial::is_source(&node_connections, win.id) {
+                            compositor::spatial::PORT_COLOR_CONNECTED
+                        } else { compositor::spatial::PORT_COLOR_IDLE };
+                        let c = fb.color_from_rgb24(raw);
+                        compositor::graphics::draw_circle(&mut fb, px, mid_y,
+                            compositor::spatial::PORT_RADIUS, c);
+                    }
+                    if win.input_port {
+                        let px = win.x;
+                        let raw = if compositor::spatial::is_dest(&node_connections, win.id) {
+                            compositor::spatial::PORT_COLOR_CONNECTED
+                        } else { compositor::spatial::PORT_COLOR_IDLE };
+                        let c = fb.color_from_rgb24(raw);
+                        compositor::graphics::draw_circle(&mut fb, px, mid_y,
+                            compositor::spatial::PORT_RADIUS, c);
+                    }
+                }
+                // Draw connection lines between connected windows
+                for conn in &node_connections {
+                    let (sx, sy) = if let Some(w) = wm.get_window(conn.source_win_id) {
+                        (w.x + w.total_w() as i32, w.y + w.total_h() as i32 / 2)
+                    } else { continue };
+                    let (dx, dy) = if let Some(w) = wm.get_window(conn.dest_win_id) {
+                        (w.x, w.y + w.total_h() as i32 / 2)
+                    } else { continue };
+                    let c = fb.color_from_rgb24(compositor::spatial::CONNECTION_COLOR);
+                    compositor::graphics::draw_line(&mut fb, sx, sy, dx, dy, c);
+                }
+                // Draw active drag cable
+                if let Some(ref drag) = connection_drag {
+                    if let Some(w) = wm.get_window(drag.source_win_id) {
+                        let sx = w.x + w.total_w() as i32;
+                        let sy = w.y + w.total_h() as i32 / 2;
+                        let c = fb.color_from_rgb24(compositor::spatial::PORT_COLOR_DRAG);
+                        compositor::graphics::draw_line(&mut fb, sx, sy, drag.current_x, drag.current_y, c);
+                    }
+                }
             }
 
             // ===== Alt+Tab HUD overlay =====
