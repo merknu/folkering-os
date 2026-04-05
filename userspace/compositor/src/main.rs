@@ -1080,6 +1080,10 @@ fn main() -> ! {
     // Pending driver generation: PCI device info waiting for WASM from proxy
     let mut pending_driver_device: Option<libfolk::sys::pci::PciDeviceInfo> = None;
 
+    // FolkShell: JIT synthesis state
+    let mut pending_shell_jit: Option<alloc::string::String> = None;
+    let mut shell_jit_pipeline: Option<(alloc::vec::Vec<compositor::folkshell::Command>, usize, alloc::string::String)> = None;
+
     // ===== Window Manager (Milestone 2.1) =====
     let mut wm = WindowManager::new();
     // Track which window (if any) is being dragged
@@ -1588,6 +1592,7 @@ fn main() -> ! {
             && !draug.should_yield_tokens(active_agent.is_some(), dream_ms) {
             let keys: alloc::vec::Vec<&str> = wasm_cache.keys().map(|k| k.as_str()).collect();
             if let Some((target, mode)) = draug.start_dream(&keys, dream_ms) {
+                // Dream target found — proceed with generation
                 let mode_str = match mode {
                     compositor::draug::DreamMode::Refactor => "Refactor",
                     compositor::draug::DreamMode::Creative => "Creative",
@@ -1677,6 +1682,9 @@ fn main() -> ! {
                     write_str("[AutoDream] Send failed — cancelling dream\n");
                     draug.on_dream_complete(dream_ms);
                 }
+            } else {
+                // Digital Homeostasis: all apps stable, no dreams needed
+                write_str("[AutoDream] All systems stable. Sleeping.\n");
             }
         }
 
@@ -1716,7 +1724,7 @@ fn main() -> ! {
         }
 
         // ===== MCP: Poll for responses from Python proxy =====
-        if tz_sync_pending || async_tool_gen.is_some() || active_agent.is_some() || draug.is_waiting() {
+        if tz_sync_pending || async_tool_gen.is_some() || active_agent.is_some() || draug.is_waiting() || pending_shell_jit.is_some() {
             if let Some(response) = libfolk::mcp::client::poll() {
                 did_work = true;
                 match response {
@@ -2011,15 +2019,80 @@ fn main() -> ! {
                             continue;
                         }
 
+                        // FolkShell JIT: if shell is waiting for a synthesized command
+                        if let Some(ref jit_name) = pending_shell_jit.clone() {
+                            wasm_cache.insert(jit_name.clone(), wasm_bytes.clone());
+                            write_str("[FolkShell] JIT command ready: ");
+                            write_str(&jit_name[..jit_name.len().min(30)]);
+                            write_str("\n");
+
+                            // Resume pipeline from where it stopped
+                            if let Some((pipeline, stage, pipe_input)) = shell_jit_pipeline.take() {
+                                let result = compositor::folkshell::execute_pipeline(
+                                    &pipeline, stage, pipe_input, &wasm_cache
+                                );
+                                match result {
+                                    compositor::folkshell::ShellState::Done(output) => {
+                                        // Display output in the most recent window
+                                        write_str("[FolkShell] Pipeline output:\n");
+                                        write_str(&output[..output.len().min(200)]);
+                                        write_str("\n");
+                                    }
+                                    compositor::folkshell::ShellState::WaitingForJIT {
+                                        command_name, pipeline: p, stage: s, pipe_input: pi
+                                    } => {
+                                        // Another command missing — chain JIT
+                                        write_str("[FolkShell] Chaining JIT: ");
+                                        write_str(&command_name[..command_name.len().min(30)]);
+                                        write_str("\n");
+                                        let prompt = compositor::folkshell::jit_prompt(&command_name, &pi);
+                                        if libfolk::mcp::client::send_wasm_gen(&prompt) {
+                                            pending_shell_jit = Some(command_name);
+                                            shell_jit_pipeline = Some((p, s, pi));
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            if !matches!(pending_shell_jit.as_deref(), Some(_)) || shell_jit_pipeline.is_none() {
+                                pending_shell_jit = None;
+                            }
+                            continue;
+                        }
+
                         // AutoDream: two-hemisphere evaluation
                         if draug.is_dreaming() && !tool_prompt.is_empty() {
-                            let orig_key = tool_prompt.rsplit(' ').next().unwrap_or(&tool_prompt);
+                            // Use dream target as cache key (copy to avoid borrow conflict)
+                            let orig_key_owned = draug.dream_target()
+                                .map(alloc::string::String::from)
+                                .unwrap_or_else(|| alloc::string::String::from(
+                                    tool_prompt.rsplit(' ').next().unwrap_or(&tool_prompt)
+                                ));
+                            let orig_key = orig_key_owned.as_str();
                             let dream_mode = draug.current_dream_mode();
                             let mut nb = [0u8; 16];
 
                             match dream_mode {
                                 compositor::draug::DreamMode::Refactor => {
                                     write_str("[AutoDream] ---- REFACTOR RESULT ----\n");
+                                    // Amnesia fix: if V1 not in RAM cache, try loading from Synapse VFS
+                                    if !wasm_cache.contains_key(orig_key) {
+                                        let vfs_name = alloc::format!("{}.wasm", orig_key);
+                                        const VFS_DREAM_VADDR: usize = 0x50070000;
+                                        if let Ok(resp) = libfolk::sys::synapse::read_file_shmem(&vfs_name) {
+                                            if shmem_map(resp.shmem_handle, VFS_DREAM_VADDR).is_ok() {
+                                                let data = unsafe {
+                                                    core::slice::from_raw_parts(VFS_DREAM_VADDR as *const u8, resp.size as usize)
+                                                };
+                                                wasm_cache.insert(alloc::string::String::from(orig_key), alloc::vec::Vec::from(data));
+                                                let _ = shmem_unmap(resp.shmem_handle, VFS_DREAM_VADDR);
+                                                let _ = shmem_destroy(resp.shmem_handle);
+                                                write_str("[AutoDream] Recovered V1 from Synapse VFS\n");
+                                            } else {
+                                                let _ = shmem_destroy(resp.shmem_handle);
+                                            }
+                                        }
+                                    }
                                     if let Some(v1_wasm) = wasm_cache.get(orig_key) {
                                         let bench_config = compositor::wasm_runtime::WasmConfig {
                                             screen_width: fb.width as u32, screen_height: fb.height as u32, uptime_ms: 0,
@@ -3420,6 +3493,56 @@ fn main() -> ! {
         if execute_command && text_len > 0 {
             if let Ok(cmd_str) = core::str::from_utf8(&text_buffer[..text_len]) {
 
+                // ═══════ FolkShell Pre-Processor ═══════
+                // Try FolkShell first — handles pipes (|>) and JIT command synthesis.
+                // Falls through to legacy dispatch for builtins and unrecognized input.
+                let mut folkshell_handled = false;
+                if cmd_str.contains("|>") {
+                    // Pipe syntax → FolkShell handles this
+                    let result = compositor::folkshell::eval(cmd_str, &wasm_cache);
+                    match result {
+                        compositor::folkshell::ShellState::Done(ref output) => {
+                            // Create a window for the output
+                            let win_count = wm.windows.len() as i32;
+                            let wx = 80 + win_count * 24;
+                            let wy = 60 + win_count * 24;
+                            let win_id = wm.create_terminal(cmd_str, wx, wy, 480, 200);
+                            if let Some(win) = wm.get_window_mut(win_id) {
+                                for line in output.lines() {
+                                    win.push_line(line);
+                                }
+                            }
+                            folkshell_handled = true;
+                            need_redraw = true;
+                        }
+                        compositor::folkshell::ShellState::WaitingForJIT {
+                            command_name, pipeline, stage, pipe_input
+                        } => {
+                            let win_count = wm.windows.len() as i32;
+                            let wx = 80 + win_count * 24;
+                            let wy = 60 + win_count * 24;
+                            let win_id = wm.create_terminal(cmd_str, wx, wy, 480, 200);
+                            if let Some(win) = wm.get_window_mut(win_id) {
+                                win.push_line(&alloc::format!(
+                                    "[FolkShell] Synthesizing '{}'...", command_name
+                                ));
+                            }
+                            let prompt = compositor::folkshell::jit_prompt(&command_name, &pipe_input);
+                            if libfolk::mcp::client::send_wasm_gen(&prompt) {
+                                pending_shell_jit = Some(command_name);
+                                shell_jit_pipeline = Some((pipeline, stage, pipe_input));
+                                write_str("[FolkShell] JIT request sent\n");
+                            }
+                            folkshell_handled = true;
+                            need_redraw = true;
+                        }
+                        _ => {} // Passthrough or error → legacy dispatch
+                    }
+                }
+
+                if !folkshell_handled {
+                // ═══════ Legacy Omnibar Dispatch ═══════
+
                 // Special case: `open <app>` — try WASM fullscreen first, then FKUI window
                 let is_open_cmd = cmd_str.starts_with("open ");
                 if is_open_cmd {
@@ -4684,6 +4807,7 @@ fn main() -> ! {
                     }
                 }
                 } // end if deferred_app_handle == 0
+                } // end if !folkshell_handled
 
                 // Clear the omnibar input after executing
                 text_len = 0;

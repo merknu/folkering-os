@@ -61,6 +61,7 @@ pub mod vector_font;
 pub mod graphics;
 pub mod wasm_runtime;
 pub mod driver_runtime;
+pub mod folkshell;
 pub mod window_manager;
 pub mod agent;
 pub mod draug;

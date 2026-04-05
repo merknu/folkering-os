@@ -571,22 +571,47 @@ impl DraugDaemon {
         self.dream_journal[oldest_idx] = Some((h, self.dream_count));
     }
 
-    /// Pick the LEAST recently dreamt app and choose dream mode.
-    /// 3-mode rotation: Refactor → Creative → Nightmare
-    /// Nightmare blocked during daytime (circadian rhythm).
-    /// FRICTION OVERRIDE: if any app has high frustration, pick it + Creative mode.
+    /// Check if an app needs a dream (has friction, crashes, or is new).
+    fn app_needs_dream(&self, key: &str) -> bool {
+        let h = Self::key_hash(key);
+        // 1. Friction score > 0 → needs Creative
+        if self.friction.score_for(h) > 0 { return true; }
+        // 2. Crash record → needs Nightmare
+        for (ch, count) in &self.crash_hashes {
+            if *ch == h && *count > 0 { return true; }
+        }
+        // 3. Never dreamt about → needs baseline Refactor
+        if self.last_dreamt_about(key) == 0 { return true; }
+        // 4. Not perfected for Refactor → still room to optimize
+        if !self.is_perfected(key) { return true; }
+        false
+    }
+
+    /// Pick a dream target using Digital Homeostasis.
+    ///
+    /// Instead of always forcing a dream, the engine checks if any app
+    /// actually NEEDS improvement. If all apps are stable (perfected,
+    /// zero friction, no crashes), it returns None and conserves budget.
+    ///
+    /// Priority: Friction → Crashes → New apps → Unperfected → Sleep
     pub fn start_dream(&mut self, cache_keys: &[&str], now_ms: u64) -> Option<(String, DreamMode)> {
         if cache_keys.is_empty() { return None; }
 
-        // ── Friction Override: frustrated apps get priority ──
+        // ── Digital Homeostasis: check if ANY app needs a dream ──
+        let any_needs_dream = cache_keys.iter().any(|k| self.app_needs_dream(k));
+        if !any_needs_dream {
+            // All systems stable — conserve budget
+            return None;
+        }
+
+        // ── Priority 1: Friction Override ──
         if let Some(frustrated_hash) = self.friction.most_frustrated() {
-            // Find the cache key that matches this hash
             for key in cache_keys {
                 if Self::key_hash(key) == frustrated_hash {
                     let target = String::from(*key);
                     self.journal_record(&target);
                     self.dream_target = Some(target.clone());
-                    self.dream_mode = DreamMode::Creative; // Always Creative for frustrated apps
+                    self.dream_mode = DreamMode::Creative;
                     self.dreaming = true;
                     self.last_dream_ms = now_ms;
                     return Some((target, DreamMode::Creative));
@@ -594,52 +619,56 @@ impl DraugDaemon {
             }
         }
 
-        // ── Normal rotation ──
-        // Rotate modes: 0=Refactor, 1=Creative, 2=Nightmare
+        // ── Priority 2: Crashed apps → Nightmare ──
+        for key in cache_keys {
+            let h = Self::key_hash(key);
+            for (ch, count) in &self.crash_hashes {
+                if *ch == h && *count > 0 {
+                    let target = String::from(*key);
+                    self.journal_record(&target);
+                    self.dream_target = Some(target.clone());
+                    self.dream_mode = DreamMode::Nightmare;
+                    self.dreaming = true;
+                    self.last_dream_ms = now_ms;
+                    return Some((target, DreamMode::Nightmare));
+                }
+            }
+        }
+
+        // ── Priority 3: New apps (never dreamt) → Refactor baseline ──
+        for key in cache_keys {
+            if self.last_dreamt_about(key) == 0 && !self.is_perfected(key) {
+                let target = String::from(*key);
+                self.journal_record(&target);
+                self.dream_target = Some(target.clone());
+                self.dream_mode = DreamMode::Refactor;
+                self.dreaming = true;
+                self.last_dream_ms = now_ms;
+                return Some((target, DreamMode::Refactor));
+            }
+        }
+
+        // ── Priority 4: Normal rotation for unperfected apps ──
         let mut mode = match self.dream_count % 3 {
             0 => DreamMode::Refactor,
             1 => DreamMode::Creative,
             _ => DreamMode::Nightmare,
         };
 
-        // Circadian: block Nightmare during daytime (too CPU-heavy)
         if mode == DreamMode::Nightmare && !Self::is_nighttime() {
             mode = DreamMode::Creative;
         }
 
-        // Find the app that was LEAST recently dreamt about
         let mut best_key: Option<&str> = None;
         let mut best_when: u32 = u32::MAX;
 
         for key in cache_keys {
-            // Skip perfected apps for Refactor mode
-            if mode == DreamMode::Refactor && self.is_perfected(key) {
-                continue;
-            }
+            if !self.app_needs_dream(key) { continue; }
+            if mode == DreamMode::Refactor && self.is_perfected(key) { continue; }
             let when = self.last_dreamt_about(key);
             if when < best_when {
                 best_when = when;
                 best_key = Some(key);
-            }
-        }
-
-        // If all skipped for Refactor (all perfected), fall back to Creative
-        if best_key.is_none() && mode == DreamMode::Refactor {
-            for key in cache_keys {
-                let when = self.last_dreamt_about(key);
-                if when < best_when {
-                    best_when = when;
-                    best_key = Some(key);
-                }
-            }
-            if best_key.is_some() {
-                let target = String::from(best_key.unwrap());
-                self.journal_record(&target);
-                self.dream_target = Some(target.clone());
-                self.dream_mode = DreamMode::Creative;
-                self.dreaming = true;
-                self.last_dream_ms = now_ms;
-                return Some((target, DreamMode::Creative));
             }
         }
 
@@ -652,7 +681,7 @@ impl DraugDaemon {
             self.last_dream_ms = now_ms;
             Some((target, mode))
         } else {
-            None
+            None // All filtered out — homeostasis achieved
         }
     }
 

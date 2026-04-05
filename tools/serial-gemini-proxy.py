@@ -1372,27 +1372,27 @@ def handle_mcp_frame(frame_bytes: bytes, sock: socket.socket):
                 error_frame = make_frame(encode_chat_response("Error: dream budget exhausted for today"))
                 sock.sendall(error_frame)
             else:
-            # Check if app is "perfected" (three strikes) — skip refactor dreams
-            base_key = desc.rsplit(' ', 1)[-1] if ' ' in desc else desc
-            meta = _cache_get_meta(base_key)
-            if is_dream and meta.get("perfected") and "refactor" in desc.lower():
-                error_frame = make_frame(encode_chat_response("Error: app perfected — skipping refactor"))
-                sock.sendall(error_frame)
-                print(f"[CACHE] Skipped perfected app: {base_key}")
-            else:
-                wasm_binary, error = _llm_to_wasm(desc)
-                if error and error.startswith("CLARIFY:"):
-                    clarify_msg = error[8:]
-                    print(f"[MCP] Clarification needed: {clarify_msg[:60]}")
-                    response_frame = make_frame(encode_chat_response(clarify_msg))
-                    sock.sendall(response_frame)
-                elif error:
-                    error_frame = make_frame(encode_chat_response(f"Error: {error}"))
+                # Check if app is "perfected" (three strikes) — skip refactor dreams
+                base_key = desc.rsplit(' ', 1)[-1] if ' ' in desc else desc
+                meta = _cache_get_meta(base_key)
+                if is_dream and meta.get("perfected") and "refactor" in desc.lower():
+                    error_frame = make_frame(encode_chat_response("Error: app perfected — skipping refactor"))
                     sock.sendall(error_frame)
+                    print(f"[CACHE] Skipped perfected app: {base_key}")
                 else:
-                    if is_dream:
-                        _dream_budget_record()
-                    send_wasm_chunked(wasm_binary, sock, session_id=_session.session_id)
+                    wasm_binary, error = _llm_to_wasm(desc)
+                    if error and error.startswith("CLARIFY:"):
+                        clarify_msg = error[8:]
+                        print(f"[MCP] Clarification needed: {clarify_msg[:60]}")
+                        response_frame = make_frame(encode_chat_response(clarify_msg))
+                        sock.sendall(response_frame)
+                    elif error:
+                        error_frame = make_frame(encode_chat_response(f"Error: {error}"))
+                        sock.sendall(error_frame)
+                    else:
+                        if is_dream:
+                            _dream_budget_record()
+                        send_wasm_chunked(wasm_binary, sock, session_id=_session.session_id)
 
     elif msg_type == 'pong':
         print(f"[MCP] Pong seq={msg.get('seq', 0)}")
