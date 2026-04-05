@@ -1248,6 +1248,22 @@ def _call_claude(prompt: str, model: str = "") -> str:
         return result["content"][0]["text"]
 
 
+def sign_wasm(wasm_bytes: bytes, prompt: str) -> bytes:
+    """Sign WASM binary with cryptographic intention signature.
+    Prepends a 37-byte header: FOLK\\x00 (5 bytes) + SHA256 signature (32 bytes).
+    The OS strips and verifies this header before execution."""
+    import hashlib, time
+    wasm_hash = hashlib.sha256(wasm_bytes).digest()
+    timestamp = int(time.time()).to_bytes(8, 'little')
+    prompt_bytes = prompt.encode('utf-8')[:4096]
+    sig_input = prompt_bytes + wasm_hash + timestamp
+    signature = hashlib.sha256(sig_input).digest()
+    # Header: magic(5) + signature(32) = 37 bytes
+    header = b'FOLK\x00' + signature
+    print(f"[CRYPTO] Signed: {hashlib.sha256(wasm_bytes).hexdigest()[:16]}... sig={signature.hex()[:16]}...")
+    return header + wasm_bytes
+
+
 def handle_mcp_frame(frame_bytes: bytes, sock: socket.socket):
     """Process a complete MCP frame (COBS-encoded, CRC-verified, Postcard-serialized)."""
     from mcp_bridge import (parse_frame, decode_mcp_response, make_frame, send_reliable,
@@ -1289,7 +1305,8 @@ def handle_mcp_frame(frame_bytes: bytes, sock: socket.socket):
                         response_frame = make_frame(encode_chat_response(
                             f"Rolled back '{app_name}' to v{ver} ({len(wasm)} bytes). Restart app to see changes."))
                         # Also send the WASM binary so OS can update its cache
-                        send_wasm_chunked(wasm, sock, session_id=_session.session_id)
+                        signed = sign_wasm(wasm, f"rollback:{app_name}:v{ver}")
+                        send_wasm_chunked(signed, sock, session_id=_session.session_id)
                 except Exception as e:
                     response_frame = make_frame(encode_chat_response(f"Rollback error: {e}"))
             else:
@@ -1357,7 +1374,8 @@ def handle_mcp_frame(frame_bytes: bytes, sock: socket.socket):
                     error_frame = make_frame(encode_chat_response(f"Error: {error}"))
                     sock.sendall(error_frame)
                 else:
-                    send_wasm_chunked(wasm_binary, sock, session_id=_session.session_id)
+                    signed = sign_wasm(wasm_binary, desc)
+                    send_wasm_chunked(signed, sock, session_id=_session.session_id)
             else:
                 error_frame = make_frame(encode_chat_response("Error: bad driver gen format"))
                 sock.sendall(error_frame)
@@ -1392,7 +1410,8 @@ def handle_mcp_frame(frame_bytes: bytes, sock: socket.socket):
                     else:
                         if is_dream:
                             _dream_budget_record()
-                        send_wasm_chunked(wasm_binary, sock, session_id=_session.session_id)
+                        signed = sign_wasm(wasm_binary, desc)
+                        send_wasm_chunked(signed, sock, session_id=_session.session_id)
 
     elif msg_type == 'pong':
         print(f"[MCP] Pong seq={msg.get('seq', 0)}")
