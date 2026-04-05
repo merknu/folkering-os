@@ -367,12 +367,25 @@ fn execute_builtin(cmd: &Command, pipe_input: &str) -> String {
         }
         "help" => {
             String::from(
-                "FolkShell commands:\n\
+                "FolkShell — AI-Native Semantic Object Shell\n\
+                 \n\
+                 Built-in commands:\n\
                  ls, ps, uptime, lspci, drivers, help\n\
-                 gemini generate <desc>  — generate WASM app\n\
+                 \n\
+                 AI commands:\n\
+                 gemini generate <desc>   — generate WASM app\n\
                  generate driver [vid:did] — generate hardware driver\n\
-                 <cmd1> |> <cmd2>  — pipe output between commands\n\
-                 Unknown commands are auto-generated via LLM JIT\n"
+                 \n\
+                 Pipe syntax:\n\
+                 <cmd1> |> <cmd2>   — pipe output between commands\n\
+                 Unknown commands are auto-generated via LLM JIT\n\
+                 \n\
+                 WASM API (for generated apps):\n\
+                 folk_http_get(url, buf)      — HTTP GET via host\n\
+                 folk_intent_fetch(query, buf) — semantic data fetch\n\
+                 folk_list_files(buf, len)    — list VFS files\n\
+                 folk_write_file(path, data)  — save to VFS\n\
+                 folk_query_files(query, buf) — semantic file search\n"
             )
         }
         _ => {

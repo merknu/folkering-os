@@ -1543,6 +1543,49 @@ def handle_serial(sock: socket.socket):
                         sock.sendall(RESP_START + f"Load error: {e}".encode() + RESP_END + b"\n")
                     continue
 
+                # ── Intent-IP: HTTP GET via host network ──
+                if prompt.startswith("__HTTP_GET__"):
+                    url = prompt[12:].strip()
+                    print(f"[INTENT-IP] HTTP GET: {url[:80]}")
+                    try:
+                        import urllib.request, ssl
+                        ctx = ssl.create_default_context()
+                        req = urllib.request.Request(url, headers={"User-Agent": "FolkeringOS/1.0"})
+                        with urllib.request.urlopen(req, context=ctx, timeout=15) as resp:
+                            body = resp.read(4096).decode("utf-8", errors="replace")
+                        print(f"[INTENT-IP] Got {len(body)} chars")
+                        sock.sendall(RESP_START + body.encode("utf-8", errors="replace")[:4096] + RESP_END + b"\n")
+                    except Exception as e:
+                        err = f"HTTP error: {e}"
+                        print(f"[INTENT-IP] {err}")
+                        sock.sendall(RESP_START + err.encode()[:256] + RESP_END + b"\n")
+                    continue
+
+                # ── Intent-IP: Semantic fetch via LLM ──
+                if prompt.startswith("__INTENT_FETCH__"):
+                    query = prompt[16:].strip()
+                    print(f"[INTENT-IP] Semantic fetch: {query[:80]}")
+                    # Ask LLM to translate intent to structured data
+                    intent_prompt = (
+                        f"The user wants: \"{query}\"\n\n"
+                        f"You are an API translation layer. Return ONLY a structured JSON response "
+                        f"with the requested data. If you need to call an API, describe what the "
+                        f"response would be. Keep it under 500 chars. No explanation, just data."
+                    )
+                    try:
+                        result = call_llm(intent_prompt, tier="fast")
+                        # Strip markdown code fences if present
+                        if "```json" in result:
+                            result = result.split("```json")[1].split("```")[0].strip()
+                        elif "```" in result:
+                            result = result.split("```")[1].split("```")[0].strip()
+                        print(f"[INTENT-IP] Result: {len(result)} chars")
+                        sock.sendall(RESP_START + result.encode("utf-8", errors="replace")[:4096] + RESP_END + b"\n")
+                    except Exception as e:
+                        err = f"Intent error: {e}"
+                        sock.sendall(RESP_START + err.encode()[:256] + RESP_END + b"\n")
+                    continue
+
                 # Check for [GENERATE_TOOL] prefix → WASM pipeline
                 if prompt.startswith(TOOL_GENERATE_PREFIX):
                     tool_prompt = prompt[len(TOOL_GENERATE_PREFIX):].strip()

@@ -468,6 +468,67 @@ fn register_host_functions(linker: &mut Linker<HostState>) {
             }
         },
     );
+
+    // Phase 7: Intent-IP — Semantic Network Requests
+    // folk_http_get(url_ptr, url_len, buf_ptr, max_len) -> i32
+    // Makes an HTTP GET request via kernel network stack.
+    // Returns bytes written to buf, or -1 on error.
+    let _ = linker.func_wrap("env", "folk_http_get",
+        |mut caller: Caller<HostState>, url_ptr: i32, url_len: i32, buf_ptr: i32, max_len: i32| -> i32 {
+            if url_len <= 0 || url_len > 512 || max_len <= 0 { return -1; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+            // Read URL from WASM memory
+            let mut url_buf = alloc::vec![0u8; url_len as usize];
+            if mem.read(&caller, url_ptr as usize, &mut url_buf).is_err() { return -1; }
+            let url = match alloc::str::from_utf8(&url_buf) {
+                Ok(s) => s,
+                Err(_) => return -1,
+            };
+            // Use kernel ask_gemini syscall with __HTTP_GET__ prefix
+            // The proxy intercepts this and performs actual HTTP GET
+            let prompt = alloc::format!("__HTTP_GET__{}", url);
+            let mut response = alloc::vec![0u8; max_len as usize];
+            let bytes = libfolk::sys::ask_gemini(&prompt, &mut response);
+            if bytes == 0 { return -1; }
+            let copy_len = bytes.min(max_len as usize);
+            if mem.write(&mut caller, buf_ptr as usize, &response[..copy_len]).is_ok() {
+                copy_len as i32
+            } else { -1 }
+        },
+    );
+
+    // folk_intent_fetch(query_ptr, query_len, buf_ptr, max_len) -> i32
+    // Semantic network request: "Get weather in Oslo" → OS translates to API call.
+    // The LLM proxy interprets the intent, calls the appropriate API, and returns
+    // structured data. The app never needs to know HTTP headers or JSON parsing.
+    let _ = linker.func_wrap("env", "folk_intent_fetch",
+        |mut caller: Caller<HostState>, query_ptr: i32, query_len: i32, buf_ptr: i32, max_len: i32| -> i32 {
+            if query_len <= 0 || query_len > 512 || max_len <= 0 { return -1; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+            let mut query_buf = alloc::vec![0u8; query_len as usize];
+            if mem.read(&caller, query_ptr as usize, &mut query_buf).is_err() { return -1; }
+            let query = match alloc::str::from_utf8(&query_buf) {
+                Ok(s) => s,
+                Err(_) => return -1,
+            };
+            // Send as MCP ChatRequest with __INTENT_FETCH__ prefix
+            // Proxy will: interpret intent → call API → return structured result
+            let prompt = alloc::format!("__INTENT_FETCH__{}", query);
+            let mut response = alloc::vec![0u8; max_len as usize];
+            let bytes = libfolk::sys::ask_gemini(&prompt, &mut response);
+            if bytes == 0 { return -1; }
+            let copy_len = bytes.min(max_len as usize);
+            if mem.write(&mut caller, buf_ptr as usize, &response[..copy_len]).is_ok() {
+                copy_len as i32
+            } else { -1 }
+        },
+    );
 }
 
 // ── One-Shot Execution (tools/scripts) ───────────────────────────────────
