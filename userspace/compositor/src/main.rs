@@ -1095,6 +1095,8 @@ fn main() -> ! {
     // Spatial Pipelining: node connections + drag state
     let mut node_connections: alloc::vec::Vec<compositor::spatial::NodeConnection> = alloc::vec::Vec::new();
     let mut connection_drag: Option<compositor::spatial::ConnectionDrag> = None;
+    // Spatial Pipelining: per-window WASM app instances (keyed by window ID)
+    let mut window_apps: alloc::collections::BTreeMap<u32, compositor::wasm_runtime::PersistentWasmApp> = alloc::collections::BTreeMap::new();
 
     // ===== Window Manager (Milestone 2.1) =====
     let mut wm = WindowManager::new();
@@ -2629,7 +2631,23 @@ fn main() -> ! {
                                     source_win_id: drag.source_win_id,
                                     dest_win_id: win_id,
                                 });
-                                write_str("[Spatial] Connected!\n");
+                                // Instantiate WASM apps for both windows if not already running
+                                let config = compositor::wasm_runtime::WasmConfig {
+                                    screen_width: 400, screen_height: 300,
+                                    uptime_ms: libfolk::sys::uptime() as u32,
+                                };
+                                for &wid in &[drag.source_win_id, win_id] {
+                                    if !window_apps.contains_key(&wid) {
+                                        if let Some(w) = wm.get_window(wid) {
+                                            if let Some(ref wasm) = w.node_wasm {
+                                                if let Ok(app) = compositor::wasm_runtime::PersistentWasmApp::new(wasm, config.clone()) {
+                                                    window_apps.insert(wid, app);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                write_str("[Spatial] Connected + apps instantiated!\n");
                             }
                         }
                     } else {
@@ -2688,14 +2706,29 @@ fn main() -> ! {
                             need_redraw = true;
                         }
                         HitZone::InputPort => {
-                            // If we're dragging a connection, complete it here
                             if let Some(drag) = connection_drag.take() {
                                 if drag.source_win_id != win_id {
                                     node_connections.push(compositor::spatial::NodeConnection {
                                         source_win_id: drag.source_win_id,
                                         dest_win_id: win_id,
                                     });
-                                    write_str("[Spatial] Connected!\n");
+                                    // Instantiate apps for connected windows
+                                    let cfg = compositor::wasm_runtime::WasmConfig {
+                                        screen_width: 400, screen_height: 300,
+                                        uptime_ms: libfolk::sys::uptime() as u32,
+                                    };
+                                    for &wid in &[drag.source_win_id, win_id] {
+                                        if !window_apps.contains_key(&wid) {
+                                            if let Some(w) = wm.get_window(wid) {
+                                                if let Some(ref wasm) = w.node_wasm {
+                                                    if let Ok(app) = compositor::wasm_runtime::PersistentWasmApp::new(wasm, cfg.clone()) {
+                                                        window_apps.insert(wid, app);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    write_str("[Spatial] Connected + apps instantiated!\n");
                                 }
                             }
                             handled = true;
@@ -5988,6 +6021,85 @@ fn main() -> ! {
             // Only show windows in desktop mode (not when WASM app is fullscreen)
             if !wasm_fullscreen && wm.has_visible() {
                 wm.composite(&mut fb);
+
+                // ===== Spatial Pipelining: In-Window Tick-Tock =====
+                // For each connection: run upstream app, pipe stream data, run downstream app
+                // Both render INSIDE their respective windows (not fullscreen)
+                for conn_idx in 0..node_connections.len() {
+                    let src_id = node_connections[conn_idx].source_win_id;
+                    let dst_id = node_connections[conn_idx].dest_win_id;
+                    let config = compositor::wasm_runtime::WasmConfig {
+                        screen_width: 400, screen_height: 300,
+                        uptime_ms: libfolk::sys::uptime() as u32,
+                    };
+
+                    // TICK: run upstream app → collect stream_data
+                    let stream_data = if let Some(up_app) = window_apps.get_mut(&src_id) {
+                        let (_, output) = up_app.run_frame(config.clone());
+                        // Render upstream output inside its window
+                        if let Some(w) = wm.get_window(src_id) {
+                            let cx = w.x as usize + 2 + 6; // BORDER_W + padding
+                            let cy = w.y as usize + 2 + 26 + 4; // BORDER + TITLE + pad
+                            if let Some(color) = output.fill_screen {
+                                fb.fill_rect(cx, cy, w.width as usize - 12, w.height as usize - 8,
+                                    fb.color_from_rgb24(color));
+                            }
+                            for cmd in &output.draw_commands {
+                                let rx = cx + cmd.x as usize;
+                                let ry = cy + cmd.y as usize;
+                                fb.fill_rect(rx, ry, cmd.w as usize, cmd.h as usize,
+                                    fb.color_from_rgb24(cmd.color));
+                            }
+                            for tc in &output.text_commands {
+                                let tx = cx + tc.x as usize;
+                                let ty = cy + tc.y as usize;
+                                fb.draw_string(tx, ty, &tc.text,
+                                    fb.color_from_rgb24(tc.color), fb.color_from_rgb24(0));
+                            }
+                        }
+                        output.stream_data
+                    } else { alloc::vec::Vec::new() };
+
+                    // TOCK: inject stream data into downstream + run
+                    if let Some(down_app) = window_apps.get_mut(&dst_id) {
+                        down_app.inject_stream_data(&stream_data);
+                        let (_, output) = down_app.run_frame(config);
+                        // Render downstream output inside its window
+                        if let Some(w) = wm.get_window(dst_id) {
+                            let cx = w.x as usize + 2 + 6;
+                            let cy = w.y as usize + 2 + 26 + 4;
+                            if let Some(color) = output.fill_screen {
+                                fb.fill_rect(cx, cy, w.width as usize - 12, w.height as usize - 8,
+                                    fb.color_from_rgb24(color));
+                            }
+                            for cmd in &output.draw_commands {
+                                let rx = cx + cmd.x as usize;
+                                let ry = cy + cmd.y as usize;
+                                fb.fill_rect(rx, ry, cmd.w as usize, cmd.h as usize,
+                                    fb.color_from_rgb24(cmd.color));
+                            }
+                            for tc in &output.text_commands {
+                                let tx = cx + tc.x as usize;
+                                let ty = cy + tc.y as usize;
+                                fb.draw_string(tx, ty, &tc.text,
+                                    fb.color_from_rgb24(tc.color), fb.color_from_rgb24(0));
+                            }
+                            for cc in &output.circle_commands {
+                                let c = fb.color_from_rgb24(cc.color);
+                                compositor::graphics::draw_circle(&mut fb,
+                                    cx as i32 + cc.cx, cy as i32 + cc.cy, cc.r, c);
+                            }
+                            for lc in &output.line_commands {
+                                let c = fb.color_from_rgb24(lc.color);
+                                compositor::graphics::draw_line(&mut fb,
+                                    cx as i32 + lc.x1, cy as i32 + lc.y1,
+                                    cx as i32 + lc.x2, cy as i32 + lc.y2, c);
+                            }
+                        }
+                    }
+
+                    did_work = true;
+                }
 
                 // ===== Spatial Pipelining: render ports + connections =====
                 // Draw I/O port circles on windows that have ports enabled

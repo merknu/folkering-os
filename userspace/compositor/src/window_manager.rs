@@ -173,6 +173,8 @@ pub struct Window {
     pub output_port: bool,
     /// This window has an input port (left edge) for receiving stream data
     pub input_port: bool,
+    /// WASM bytes for this node (compositor instantiates PersistentWasmApp from these)
+    pub node_wasm: Option<alloc::vec::Vec<u8>>,
 }
 
 impl Window {
@@ -294,6 +296,7 @@ impl WindowManager {
             typing: false,
             output_port: false,
             input_port: false,
+            node_wasm: None,
         };
         self.windows.push(win);
         self.focused_id = Some(id);
