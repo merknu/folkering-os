@@ -995,11 +995,15 @@ fn main() -> ! {
 
     // Text buffer for typed input - use local stack variables
     // (Previous static mut caused undefined behavior)
+    // State struct types defined in compositor::state (see state.rs).
+    // Variables below will be migrated into these structs incrementally.
+    // For now, structs serve as the architectural blueprint.
+
     let mut text_buffer: [u8; 256] = [0; 256];
     let mut text_len: usize = 0;
-    let mut cursor_pos: usize = 0;  // Cursor position within text (0..=text_len)
+    let mut cursor_pos: usize = 0;
     let mut show_results: bool = false;
-    let mut omnibar_visible: bool = true;  // Start VISIBLE by default
+    let mut omnibar_visible: bool = true;
 
     // Alt+Tab HUD state
     let mut hud_title: [u8; 32] = [0; 32];

@@ -62,6 +62,7 @@ pub mod graphics;
 pub mod wasm_runtime;
 pub mod driver_runtime;
 pub mod folkshell;
+pub mod state;
 pub mod window_manager;
 pub mod agent;
 pub mod draug;
