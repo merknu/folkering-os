@@ -177,6 +177,23 @@ pub fn ack_irq(irq_line: u8) -> Result<(), ()> {
     if ret == u64::MAX { Err(()) } else { Ok(()) }
 }
 
+/// Allocate a contiguous DMA buffer.
+/// Returns the physical address of the buffer, or Err if allocation failed.
+/// The buffer is mapped at `vaddr` in the caller's address space with UC attributes.
+pub fn dma_alloc(size: usize, vaddr: usize) -> Result<u64, ()> {
+    let ret = unsafe { syscall2(0xAA, size as u64, vaddr as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(ret) }
+}
+
+/// Query IOMMU availability.
+/// Returns (available, base_address).
+pub fn iommu_status() -> (bool, u64) {
+    let ret = unsafe { syscall1(0xAB, 0) };
+    let available = (ret & 1) != 0;
+    let base = ret & 0xFFFFFFFF_00000000;
+    (available, base)
+}
+
 /// Check if a bound IRQ has fired (non-blocking).
 /// Returns true if an interrupt is pending, false if not.
 pub fn check_irq(irq_line: u8) -> Result<bool, ()> {

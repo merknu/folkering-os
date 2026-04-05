@@ -500,6 +500,38 @@ fn register_host_functions(linker: &mut Linker<HostState>) {
         },
     );
 
+    // Phase 8: On-Device SLM — Local AI inference for WASM apps
+    // folk_slm_generate(prompt_ptr, prompt_len, buf_ptr, max_len) -> i32
+    // Routes to local Ollama (FAST tier) for instant AI responses.
+    // This is the "spinal cord" — fast local inference for UI decisions,
+    // JIT synthesis, and simple reasoning. Cloud models (Gemini) are the
+    // "cerebral cortex" — only used for complex tasks like AutoDream.
+    let _ = linker.func_wrap("env", "folk_slm_generate",
+        |mut caller: Caller<HostState>, prompt_ptr: i32, prompt_len: i32, buf_ptr: i32, max_len: i32| -> i32 {
+            if prompt_len <= 0 || prompt_len > 2048 || max_len <= 0 { return -1; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+            let mut prompt_buf = alloc::vec![0u8; prompt_len as usize];
+            if mem.read(&caller, prompt_ptr as usize, &mut prompt_buf).is_err() { return -1; }
+            let prompt = match alloc::str::from_utf8(&prompt_buf) {
+                Ok(s) => s,
+                Err(_) => return -1,
+            };
+            // Route to local Ollama via __SLM_GENERATE__ prefix
+            // Proxy routes this to FAST tier (local, free, instant)
+            let full_prompt = alloc::format!("__SLM_GENERATE__{}", prompt);
+            let mut response = alloc::vec![0u8; max_len as usize];
+            let bytes = libfolk::sys::ask_gemini(&full_prompt, &mut response);
+            if bytes == 0 { return -1; }
+            let copy_len = bytes.min(max_len as usize);
+            if mem.write(&mut caller, buf_ptr as usize, &response[..copy_len]).is_ok() {
+                copy_len as i32
+            } else { -1 }
+        },
+    );
+
     // folk_intent_fetch(query_ptr, query_len, buf_ptr, max_len) -> i32
     // Semantic network request: "Get weather in Oslo" → OS translates to API call.
     // The LLM proxy interprets the intent, calls the appropriate API, and returns

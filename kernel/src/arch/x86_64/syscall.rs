@@ -1113,6 +1113,9 @@ extern "C" fn syscall_handler(
         0xA7 => syscall_bind_irq(arg1, arg2),  // Bind IRQ vector to task
         0xA8 => syscall_ack_irq(arg1),          // Acknowledge IRQ (unmask)
         0xA9 => syscall_check_irq(arg1),         // Check if IRQ fired (non-blocking)
+        // Phase 10: DMA + IOMMU
+        0xAA => syscall_dma_alloc(arg1, arg2),   // Allocate DMA buffer (size, vaddr)
+        0xAB => syscall_iommu_status(),            // Query IOMMU availability
         _ => {
             crate::drivers::serial::write_str("[HANDLER] Invalid syscall!\n");
             u64::MAX // Return error
@@ -3117,4 +3120,84 @@ fn syscall_port_outl(port: u64, value: u64) -> u64 {
         p.write(value as u32);
     }
     0
+}
+
+// ===== Phase 10: DMA Buffer Allocation + IOMMU Status =====
+
+/// Syscall 0xAA: Allocate a contiguous physical DMA buffer.
+/// arg1 = size (bytes, rounded up to page boundary)
+/// arg2 = virtual address to map at in caller's address space
+/// Returns: physical address of buffer, or u64::MAX on error.
+///
+/// The physical memory is allocated contiguously (required for DMA).
+/// When IOMMU is available, it would also set up IOMMU page tables.
+fn syscall_dma_alloc(size: u64, vaddr: u64) -> u64 {
+    let num_pages = ((size as usize) + 4095) / 4096;
+    if num_pages == 0 || num_pages > 256 { // Max 1MB DMA buffer
+        return u64::MAX;
+    }
+    if vaddr < 0x200000 || vaddr >= 0xFFFF_8000_0000_0000 {
+        return u64::MAX;
+    }
+
+    // Allocate contiguous physical pages
+    // Use the physical allocator to get a contiguous block
+    let phys_addr = match crate::memory::physical::alloc_contiguous(num_pages) {
+        Some(addr) => addr,
+        None => {
+            crate::serial_strln!("[DMA] Failed to allocate contiguous memory");
+            return u64::MAX;
+        }
+    };
+
+    // Map into caller's address space with Uncacheable attributes (for DMA)
+    use crate::memory::paging;
+    use crate::task::task::{get_current_task, get_task};
+    use x86_64::structures::paging::PageTableFlags as Ptf;
+    let task_id = get_current_task();
+    let pml4_phys = match get_task(task_id) {
+        Some(task) => task.lock().page_table_phys,
+        None => return u64::MAX,
+    };
+
+    let ptf = Ptf::PRESENT | Ptf::WRITABLE | Ptf::NO_EXECUTE
+        | Ptf::WRITE_THROUGH | Ptf::NO_CACHE;
+
+    for i in 0..num_pages {
+        let virt = vaddr as usize + i * 4096;
+        let phys = phys_addr + i * 4096;
+        if paging::map_page_in_table(pml4_phys, virt, phys, ptf).is_err() {
+            crate::serial_strln!("[DMA] Page mapping failed");
+            return u64::MAX;
+        }
+    }
+
+    // TODO: When IOMMU is initialized, create IOMMU page table entries here
+    // to restrict which PCI device can access this physical memory.
+    let iommu = super::acpi::iommu_available();
+
+    crate::serial_str!("[DMA] Allocated ");
+    crate::drivers::serial::write_dec(num_pages as u32);
+    crate::serial_str!(" pages at phys=");
+    crate::drivers::serial::write_hex(phys_addr as u64);
+    crate::serial_str!(" vaddr=");
+    crate::drivers::serial::write_hex(vaddr);
+    if iommu {
+        crate::serial_str!(" (IOMMU available)");
+    }
+    crate::drivers::serial::write_newline();
+
+    phys_addr as u64
+}
+
+/// Syscall 0xAB: Query IOMMU status.
+/// Returns: (iommu_base << 32) | available_flag
+fn syscall_iommu_status() -> u64 {
+    let available = super::acpi::iommu_available();
+    let base = super::acpi::iommu_base();
+    if available {
+        (base & 0xFFFFFFFF_00000000) | 1
+    } else {
+        0
+    }
 }

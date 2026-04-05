@@ -1550,6 +1550,23 @@ def handle_serial(sock: socket.socket):
                         sock.sendall(RESP_START + f"Load error: {e}".encode() + RESP_END + b"\n")
                     continue
 
+                # ── On-Device SLM: Local AI inference via Ollama ──
+                if prompt.startswith("__SLM_GENERATE__"):
+                    slm_prompt = prompt[16:].strip()
+                    print(f"[SLM] Local inference: {slm_prompt[:60]}...")
+                    try:
+                        # Force FAST tier (local Ollama, free, instant)
+                        result = call_llm(slm_prompt, tier="fast")
+                        # Strip thinking tags if present
+                        if "<think>" in result and "</think>" in result:
+                            result = result[result.index("</think>") + 8:].strip()
+                        print(f"[SLM] Response: {len(result)} chars")
+                        sock.sendall(RESP_START + result.encode("utf-8", errors="replace")[:4096] + RESP_END + b"\n")
+                    except Exception as e:
+                        err = f"SLM error: {e}"
+                        sock.sendall(RESP_START + err.encode()[:256] + RESP_END + b"\n")
+                    continue
+
                 # ── Intent-IP: HTTP GET via host network ──
                 if prompt.startswith("__HTTP_GET__"):
                     url = prompt[12:].strip()

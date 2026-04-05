@@ -357,6 +357,42 @@ fn register_driver_functions(linker: &mut Linker<DriverState>) {
             iosize as i32
         },
     );
+
+    // ── 7.3: DMA Memory Allocation ───────────────────────────────────
+
+    // folk_dma_alloc(size) -> i64
+    // Allocates contiguous physical memory for DMA.
+    // Returns packed value: (wasm_offset << 32) | physical_address
+    // or -1 on error.
+    let _ = linker.func_wrap("env", "folk_dma_alloc",
+        |_caller: Caller<DriverState>, size: i32| -> i64 {
+            if size <= 0 || size > 1048576 { return -1; } // Max 1MB
+            // DMA buffers mapped at 0x50000000+ (driver DMA region)
+            let vaddr = 0x5000_0000usize;
+            match libfolk::sys::pci::dma_alloc(size as usize, vaddr) {
+                Ok(phys) => {
+                    // Return packed: high 32 = wasm offset (0 for now), low 32 = phys
+                    (phys & 0xFFFFFFFF) as i64
+                }
+                Err(_) => -1,
+            }
+        },
+    );
+
+    // folk_dma_free(wasm_ptr) — placeholder for now
+    let _ = linker.func_wrap("env", "folk_dma_free",
+        |_caller: Caller<DriverState>, _ptr: i32| {
+            // TODO: track allocations and free physical pages
+        },
+    );
+
+    // folk_iommu_status() -> i32: 1 if IOMMU available, 0 if not
+    let _ = linker.func_wrap("env", "folk_iommu_status",
+        |_caller: Caller<DriverState>| -> i32 {
+            let (available, _) = libfolk::sys::pci::iommu_status();
+            if available { 1 } else { 0 }
+        },
+    );
 }
 
 // ── MMIO BAR Mapping ────────────────────────────────────────────────────
