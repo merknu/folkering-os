@@ -3534,8 +3534,8 @@ fn main() -> ! {
                 // Try FolkShell first — handles pipes (|>) and JIT command synthesis.
                 // Falls through to legacy dispatch for builtins and unrecognized input.
                 let mut folkshell_handled = false;
-                if cmd_str.contains("|>") {
-                    // Pipe syntax → FolkShell handles this
+                if cmd_str.contains("|>") || cmd_str.contains("~>") {
+                    // Pipe syntax (deterministic |> or fuzzy ~>) → FolkShell handles this
                     let result = compositor::folkshell::eval(cmd_str, &wasm_cache);
                     match result {
                         compositor::folkshell::ShellState::Done(ref output) => {

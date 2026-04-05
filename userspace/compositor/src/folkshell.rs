@@ -34,6 +34,32 @@ pub struct Command {
     pub args: Vec<String>,
 }
 
+/// Confidence level for semantic matching
+#[derive(Clone, Debug, Copy)]
+pub enum Confidence {
+    Default,   // τ = 0.70
+    High,      // τ = 0.90
+    Low,       // τ = 0.50
+}
+
+impl Confidence {
+    pub fn threshold(&self) -> u32 {
+        match self {
+            Confidence::Default => 70,
+            Confidence::High => 90,
+            Confidence::Low => 50,
+        }
+    }
+}
+
+/// A pipeline segment — either a command or a semantic query
+#[derive(Clone, Debug)]
+pub enum PipeSegment {
+    Cmd(Command),
+    /// Semantic match: ~> "query string" [Confidence: High]
+    Semantic { query: String, confidence: Confidence },
+}
+
 /// Abstract Syntax Tree node
 #[derive(Clone, Debug)]
 pub enum AstNode {
@@ -41,6 +67,8 @@ pub enum AstNode {
     Cmd(Command),
     /// Deterministic pipe: left |> right
     Pipe { left: Box<AstNode>, right: Box<AstNode> },
+    /// Fuzzy semantic pipe: left ~> "query"
+    FuzzyPipe { left: Box<AstNode>, query: String, confidence: Confidence },
 }
 
 // ── Shell State Machine ─────────────────────────────────────────────────
@@ -68,43 +96,105 @@ pub enum ShellState {
 
 // ── Parser ──────────────────────────────────────────────────────────────
 
+/// Operator type between pipeline segments
+#[derive(Clone, Debug, Copy, PartialEq)]
+enum PipeOp {
+    /// |> deterministic pipe
+    Deterministic,
+    /// ~> fuzzy semantic pipe
+    Fuzzy,
+}
+
+/// A raw pipeline segment: (text, operator_to_next)
+struct RawSegment<'a> {
+    text: &'a str,
+    op: PipeOp,
+}
+
 /// Parse a shell input string into an AST.
-/// Splits on `|>` for pipes, then splits each segment on whitespace.
-/// Handles double-quoted arguments: `cmd "multi word arg"`.
+/// Supports `|>` (deterministic) and `~>` (fuzzy semantic) pipes.
+/// Handles double-quoted arguments and [Confidence: High/Low] annotations.
 pub fn parse(input: &str) -> Result<AstNode, String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Err(String::from("empty input"));
     }
 
-    // Split on |> pipe operator
-    let segments: Vec<&str> = split_pipe(trimmed);
+    // Split on |> and ~> operators
+    let segments = split_pipeline(trimmed);
 
     if segments.is_empty() {
         return Err(String::from("empty pipeline"));
     }
 
-    // Parse each segment into a Command
-    let mut commands = Vec::new();
-    for seg in &segments {
-        let cmd = parse_command(seg.trim())?;
-        commands.push(cmd);
-    }
+    // Build AST from segments
+    let first = parse_segment(&segments[0])?;
+    let mut ast = first;
 
-    // Build AST: left-to-right pipe chain
-    let mut ast = AstNode::Cmd(commands.remove(0));
-    for cmd in commands {
-        ast = AstNode::Pipe {
-            left: Box::new(ast),
-            right: Box::new(AstNode::Cmd(cmd)),
-        };
+    for i in 1..segments.len() {
+        let prev_op = segments[i - 1].op;
+        let seg = &segments[i];
+
+        match prev_op {
+            PipeOp::Deterministic => {
+                let right = parse_segment(seg)?;
+                ast = AstNode::Pipe {
+                    left: Box::new(ast),
+                    right: Box::new(right),
+                };
+            }
+            PipeOp::Fuzzy => {
+                // Fuzzy pipe: right side is a semantic query string
+                let text = seg.text.trim();
+                let (query, confidence) = parse_semantic_query(text);
+                ast = AstNode::FuzzyPipe {
+                    left: Box::new(ast),
+                    query: String::from(query),
+                    confidence,
+                };
+            }
+        }
     }
 
     Ok(ast)
 }
 
-/// Split input on `|>` delimiter, respecting quoted strings.
-fn split_pipe(input: &str) -> Vec<&str> {
+/// Parse a segment into an AstNode (always a Command for now)
+fn parse_segment(seg: &RawSegment) -> Result<AstNode, String> {
+    let cmd = parse_command(seg.text.trim())?;
+    Ok(AstNode::Cmd(cmd))
+}
+
+/// Parse a semantic query with optional confidence annotation.
+/// Input: `"software subscriptions" [Confidence: High]`
+/// Returns: ("software subscriptions", Confidence::High)
+fn parse_semantic_query(text: &str) -> (&str, Confidence) {
+    let trimmed = text.trim();
+
+    // Check for [Confidence: X] suffix
+    if let Some(bracket_start) = trimmed.rfind('[') {
+        let annotation = &trimmed[bracket_start..];
+        let query = trimmed[..bracket_start].trim();
+        // Strip quotes from query
+        let query = query.trim_matches('"');
+
+        let confidence = if annotation.contains("High") || annotation.contains("high") {
+            Confidence::High
+        } else if annotation.contains("Low") || annotation.contains("low") {
+            Confidence::Low
+        } else {
+            Confidence::Default
+        };
+        return (query, confidence);
+    }
+
+    // No annotation — strip quotes and use default confidence
+    let query = trimmed.trim_matches('"');
+    (query, Confidence::Default)
+}
+
+/// Split input on `|>` and `~>` delimiters, respecting quoted strings.
+fn split_pipeline(input: &str) -> Vec<RawSegment> {
     let mut segments = Vec::new();
     let mut start = 0;
     let bytes = input.as_bytes();
@@ -114,17 +204,34 @@ fn split_pipe(input: &str) -> Vec<&str> {
     while i < bytes.len() {
         if bytes[i] == b'"' {
             in_quotes = !in_quotes;
-        } else if !in_quotes && i + 1 < bytes.len() && bytes[i] == b'|' && bytes[i + 1] == b'>' {
-            segments.push(&input[start..i]);
-            i += 2; // skip |>
-            start = i;
-            continue;
+        } else if !in_quotes && i + 1 < bytes.len() {
+            if bytes[i] == b'|' && bytes[i + 1] == b'>' {
+                segments.push(RawSegment {
+                    text: &input[start..i],
+                    op: PipeOp::Deterministic,
+                });
+                i += 2;
+                start = i;
+                continue;
+            }
+            if bytes[i] == b'~' && bytes[i + 1] == b'>' {
+                segments.push(RawSegment {
+                    text: &input[start..i],
+                    op: PipeOp::Fuzzy,
+                });
+                i += 2;
+                start = i;
+                continue;
+            }
         }
         i += 1;
     }
-    // Last segment
+    // Last segment (op doesn't matter for last)
     if start < input.len() {
-        segments.push(&input[start..]);
+        segments.push(RawSegment {
+            text: &input[start..],
+            op: PipeOp::Deterministic,
+        });
     }
     segments
 }
@@ -167,14 +274,29 @@ fn parse_command(segment: &str) -> Result<Command, String> {
     Ok(Command { name, args: tokens })
 }
 
-/// Flatten an AST into a linear pipeline of commands (left to right).
-pub fn flatten_pipeline(ast: &AstNode) -> Vec<Command> {
+/// A flattened pipeline step (command or semantic filter)
+#[derive(Clone, Debug)]
+pub enum PipelineStep {
+    Cmd(Command),
+    Semantic { query: String, confidence: Confidence },
+}
+
+/// Flatten an AST into a linear pipeline of steps (left to right).
+pub fn flatten_pipeline(ast: &AstNode) -> Vec<PipelineStep> {
     match ast {
-        AstNode::Cmd(cmd) => alloc::vec![cmd.clone()],
+        AstNode::Cmd(cmd) => alloc::vec![PipelineStep::Cmd(cmd.clone())],
         AstNode::Pipe { left, right } => {
-            let mut cmds = flatten_pipeline(left);
-            cmds.extend(flatten_pipeline(right));
-            cmds
+            let mut steps = flatten_pipeline(left);
+            steps.extend(flatten_pipeline(right));
+            steps
+        }
+        AstNode::FuzzyPipe { left, query, confidence } => {
+            let mut steps = flatten_pipeline(left);
+            steps.push(PipelineStep::Semantic {
+                query: query.clone(),
+                confidence: *confidence,
+            });
+            steps
         }
     }
 }
@@ -222,72 +344,156 @@ pub fn eval(
     let pipeline = flatten_pipeline(&ast);
 
     // Single command that's a builtin → passthrough to legacy
-    if pipeline.len() == 1 && is_builtin_or_legacy(&pipeline[0].name) {
-        return ShellState::Passthrough;
-    }
-
-    // If ANY command in the pipeline is a builtin, passthrough entire thing
-    // (legacy dispatch handles gemini, open, run, etc.)
-    if pipeline.iter().any(|cmd| is_builtin_or_legacy(&cmd.name)) && pipeline.len() == 1 {
-        return ShellState::Passthrough;
+    if pipeline.len() == 1 {
+        if let PipelineStep::Cmd(ref cmd) = pipeline[0] {
+            if is_builtin_or_legacy(&cmd.name) {
+                return ShellState::Passthrough;
+            }
+        }
     }
 
     // Execute pipeline stage by stage
-    execute_pipeline(&pipeline, 0, String::new(), wasm_cache)
+    execute_pipeline_steps(&pipeline, 0, String::new(), wasm_cache)
 }
 
 /// Execute pipeline from a given stage with accumulated pipe input.
-pub fn execute_pipeline(
-    pipeline: &[Command],
+pub fn execute_pipeline_steps(
+    pipeline: &[PipelineStep],
     from_stage: usize,
     mut pipe_input: String,
     wasm_cache: &BTreeMap<String, Vec<u8>>,
 ) -> ShellState {
     for stage in from_stage..pipeline.len() {
-        let cmd = &pipeline[stage];
+        match &pipeline[stage] {
+            PipelineStep::Cmd(cmd) => {
+                // 1. Check builtins
+                if is_builtin_or_legacy(&cmd.name) {
+                    pipe_input = execute_builtin(cmd, &pipe_input);
+                    continue;
+                }
 
-        // 1. Check builtins (inline execution)
-        if is_builtin_or_legacy(&cmd.name) {
-            // For piped builtins, execute inline
-            pipe_input = execute_builtin(cmd, &pipe_input);
-            continue;
-        }
+                // 2. Check wasm_cache (RAM)
+                if let Some(wasm_bytes) = wasm_cache.get(&cmd.name) {
+                    pipe_input = execute_wasm_command(wasm_bytes, cmd, &pipe_input);
+                    continue;
+                }
 
-        // 2. Check wasm_cache (RAM)
-        if let Some(wasm_bytes) = wasm_cache.get(&cmd.name) {
-            pipe_input = execute_wasm_command(wasm_bytes, cmd, &pipe_input);
-            continue;
-        }
+                // 3. Check Synapse VFS
+                let vfs_name = format!("{}.wasm", cmd.name);
+                const VFS_SHELL_VADDR: usize = 0x50090000;
+                if let Ok(resp) = libfolk::sys::synapse::read_file_shmem(&vfs_name) {
+                    if libfolk::sys::shmem_map(resp.shmem_handle, VFS_SHELL_VADDR).is_ok() {
+                        let data = unsafe {
+                            ::core::slice::from_raw_parts(VFS_SHELL_VADDR as *const u8, resp.size as usize)
+                        };
+                        let wasm_bytes = Vec::from(data);
+                        let _ = libfolk::sys::shmem_unmap(resp.shmem_handle, VFS_SHELL_VADDR);
+                        let _ = libfolk::sys::shmem_destroy(resp.shmem_handle);
+                        pipe_input = execute_wasm_command(&wasm_bytes, cmd, &pipe_input);
+                        continue;
+                    } else {
+                        let _ = libfolk::sys::shmem_destroy(resp.shmem_handle);
+                    }
+                }
 
-        // 3. Check Synapse VFS
-        let vfs_name = format!("{}.wasm", cmd.name);
-        const VFS_SHELL_VADDR: usize = 0x50090000;
-        if let Ok(resp) = libfolk::sys::synapse::read_file_shmem(&vfs_name) {
-            if libfolk::sys::shmem_map(resp.shmem_handle, VFS_SHELL_VADDR).is_ok() {
-                let data = unsafe {
-                    core::slice::from_raw_parts(VFS_SHELL_VADDR as *const u8, resp.size as usize)
+                // 4. Not found → JIT synthesis needed
+                // Convert pipeline steps back to Commands for JIT state
+                let cmd_pipeline: Vec<Command> = pipeline.iter().filter_map(|s| {
+                    if let PipelineStep::Cmd(c) = s { Some(c.clone()) } else { None }
+                }).collect();
+                return ShellState::WaitingForJIT {
+                    command_name: cmd.name.clone(),
+                    pipeline: cmd_pipeline,
+                    stage,
+                    pipe_input,
                 };
-                let wasm_bytes = Vec::from(data);
-                let _ = libfolk::sys::shmem_unmap(resp.shmem_handle, VFS_SHELL_VADDR);
-                let _ = libfolk::sys::shmem_destroy(resp.shmem_handle);
-                pipe_input = execute_wasm_command(&wasm_bytes, cmd, &pipe_input);
-                continue;
-            } else {
-                let _ = libfolk::sys::shmem_destroy(resp.shmem_handle);
+            }
+
+            PipelineStep::Semantic { query, confidence } => {
+                // ── Fuzzy Semantic Matching (~>) ──────────────────
+                // Use Synapse VFS intent query to find files matching the semantic query.
+                // The pipe_input from the previous stage is filtered/routed based on
+                // cosine similarity to the query.
+                pipe_input = execute_semantic_match(query, *confidence, &pipe_input);
             }
         }
-
-        // 4. Not found → JIT synthesis needed
-        return ShellState::WaitingForJIT {
-            command_name: cmd.name.clone(),
-            pipeline: pipeline.to_vec(),
-            stage,
-            pipe_input,
-        };
     }
 
     // All stages completed
     ShellState::Done(pipe_input)
+}
+
+/// Execute a semantic match: query Synapse VFS for entities matching the query.
+/// Returns text describing matching files/intents.
+fn execute_semantic_match(query: &str, confidence: Confidence, pipe_input: &str) -> String {
+    let threshold = confidence.threshold();
+
+    // Use Synapse intent query to find matching files
+    match libfolk::sys::synapse::query_intent(query) {
+        Ok(info) => {
+            let mut result = format!(
+                "[~> Match] '{}' → file_id={} size={}B (threshold={}%)\n",
+                query, info.file_id, info.size, threshold
+            );
+            // Append the pipe_input as context
+            if !pipe_input.is_empty() {
+                result.push_str("Input data:\n");
+                // Only include lines that conceptually match the query
+                // (simple keyword filter for Phase 1 — full cosine similarity in Phase 2)
+                let query_lower = query.to_ascii_lowercase();
+                let query_words: Vec<&str> = query_lower.split_whitespace().collect();
+                let mut matched_lines = 0;
+                for line in pipe_input.lines() {
+                    let line_lower = line.to_ascii_lowercase();
+                    let score = query_words.iter()
+                        .filter(|w| line_lower.contains(**w))
+                        .count();
+                    // Simple relevance: if any query word matches, include the line
+                    if score > 0 || query_words.is_empty() {
+                        result.push_str("  ");
+                        result.push_str(line);
+                        result.push('\n');
+                        matched_lines += 1;
+                    }
+                }
+                if matched_lines == 0 {
+                    result.push_str("  (no matching lines — full vector search needs embeddings)\n");
+                }
+            }
+            result
+        }
+        Err(_) => {
+            // No VFS match — fall back to keyword filtering on pipe_input
+            let mut result = format!("[~> Filter] '{}' (keyword match, threshold={}%)\n", query, threshold);
+            let query_lower = query.to_ascii_lowercase();
+            let query_words: Vec<&str> = query_lower.split_whitespace().collect();
+            for line in pipe_input.lines() {
+                let line_lower = line.to_ascii_lowercase();
+                let hits = query_words.iter()
+                    .filter(|w| line_lower.contains(**w))
+                    .count();
+                if hits > 0 {
+                    result.push_str("  ");
+                    result.push_str(line);
+                    result.push('\n');
+                }
+            }
+            result
+        }
+    }
+}
+
+// Legacy compat wrapper for JIT resume (uses Command-only pipeline)
+pub fn execute_pipeline(
+    pipeline: &[Command],
+    from_stage: usize,
+    pipe_input: String,
+    wasm_cache: &BTreeMap<String, Vec<u8>>,
+) -> ShellState {
+    let steps: Vec<PipelineStep> = pipeline.iter()
+        .map(|c| PipelineStep::Cmd(c.clone()))
+        .collect();
+    execute_pipeline_steps(&steps, from_stage, pipe_input, wasm_cache)
 }
 
 /// Execute a WASM command (one-shot) and return its text output.
