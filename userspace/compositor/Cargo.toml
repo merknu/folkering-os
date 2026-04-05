@@ -21,5 +21,7 @@ libfolk = { path = "../libfolk", features = ["mcp"] }
 libaccesskit-folk = { path = "../libaccesskit-folk" }
 
 # WebAssembly interpreter for JIT tool execution (no_std, fuel metering)
+# wasmi 2.0.0-beta.2 available — needs API migration (instantiate_and_start, func_wrap<Params,Args>)
+# TODO: Upgrade in dedicated session for memory64 + On-Device SLM support
 wasmi = { version = "0.38", default-features = false }
 
