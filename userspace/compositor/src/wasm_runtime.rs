@@ -510,10 +510,9 @@ fn register_host_functions(linker: &mut Linker<HostState>) {
 
     // Phase 8: On-Device SLM — Local AI inference for WASM apps
     // folk_slm_generate(prompt_ptr, prompt_len, buf_ptr, max_len) -> i32
-    // Routes to local Ollama (FAST tier) for instant AI responses.
-    // This is the "spinal cord" — fast local inference for UI decisions,
-    // JIT synthesis, and simple reasoning. Cloud models (Gemini) are the
-    // "cerebral cortex" — only used for complex tasks like AutoDream.
+    // Tries LOCAL brain first (zero latency, zero network).
+    // Falls back to Ollama proxy for complex queries.
+    // "Spinal cord" = local, "Cerebral cortex" = cloud.
     let _ = linker.func_wrap("env", "folk_slm_generate",
         |mut caller: Caller<HostState>, prompt_ptr: i32, prompt_len: i32, buf_ptr: i32, max_len: i32| -> i32 {
             if prompt_len <= 0 || prompt_len > 2048 || max_len <= 0 { return -1; }
@@ -524,11 +523,20 @@ fn register_host_functions(linker: &mut Linker<HostState>) {
             let mut prompt_buf = alloc::vec![0u8; prompt_len as usize];
             if mem.read(&caller, prompt_ptr as usize, &mut prompt_buf).is_err() { return -1; }
             let prompt = match alloc::str::from_utf8(&prompt_buf) {
-                Ok(s) => s,
+                Ok(s) => String::from(s),
                 Err(_) => return -1,
             };
-            // Route to local Ollama via __SLM_GENERATE__ prefix
-            // Proxy routes this to FAST tier (local, free, instant)
+
+            // Try LOCAL brain first (zero latency, zero network)
+            if let Some(local_response) = crate::slm_runtime::brain().generate(&prompt) {
+                let bytes = local_response.as_bytes();
+                let copy_len = bytes.len().min(max_len as usize);
+                if mem.write(&mut caller, buf_ptr as usize, &bytes[..copy_len]).is_ok() {
+                    return copy_len as i32;
+                }
+            }
+
+            // Fallback: route to proxy (Ollama FAST tier)
             let full_prompt = alloc::format!("__SLM_GENERATE__{}", prompt);
             let mut response = alloc::vec![0u8; max_len as usize];
             let bytes = libfolk::sys::ask_gemini(&full_prompt, &mut response);

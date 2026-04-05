@@ -64,6 +64,7 @@ pub mod driver_runtime;
 pub mod folkshell;
 pub mod spatial;
 pub mod state;
+pub mod slm_runtime;
 pub mod window_manager;
 pub mod agent;
 pub mod draug;
