@@ -2082,7 +2082,6 @@ fn main() -> ! {
                                     compositor::folkshell::ShellState::WaitingForJIT {
                                         command_name, pipeline: p, stage: s, pipe_input: pi
                                     } => {
-                                        // Another command missing — chain JIT
                                         write_str("[FolkShell] Chaining JIT: ");
                                         write_str(&command_name[..command_name.len().min(30)]);
                                         write_str("\n");
@@ -2090,6 +2089,24 @@ fn main() -> ! {
                                         if libfolk::mcp::client::send_wasm_gen(&prompt) {
                                             pending_shell_jit = Some(command_name);
                                             shell_jit_pipeline = Some((p, s, pi));
+                                        }
+                                    }
+                                    compositor::folkshell::ShellState::Widget { wasm_bytes: w, title: t } => {
+                                        // JIT produced a visual widget — launch it
+                                        write_str("[FolkShell] JIT widget: ");
+                                        write_str(&t[..t.len().min(30)]);
+                                        write_str("\n");
+                                        let config = compositor::wasm_runtime::WasmConfig {
+                                            screen_width: fb.width as u32,
+                                            screen_height: fb.height as u32,
+                                            uptime_ms: libfolk::sys::uptime() as u32,
+                                        };
+                                        if let Ok(app) = compositor::wasm_runtime::PersistentWasmApp::new(&w, config) {
+                                            active_wasm_app = Some(app);
+                                            active_wasm_app_key = Some(t);
+                                            wasm_app_open_since_ms = libfolk::sys::uptime();
+                                            fuel_fail_count = 0;
+                                            damage.damage_full();
                                         }
                                     }
                                     _ => {}
@@ -3576,6 +3593,40 @@ fn main() -> ! {
                             }
                             folkshell_handled = true;
                             need_redraw = true;
+                        }
+                        compositor::folkshell::ShellState::Widget { wasm_bytes, title } => {
+                            // ═══════ Holographic Output ═══════
+                            // Launch the WASM as a live interactive widget in a floating window
+                            write_str("[FolkShell] Holographic widget: ");
+                            write_str(&title[..title.len().min(30)]);
+                            write_str("\n");
+                            let config = compositor::wasm_runtime::WasmConfig {
+                                screen_width: fb.width as u32,
+                                screen_height: fb.height as u32,
+                                uptime_ms: libfolk::sys::uptime() as u32,
+                            };
+                            match compositor::wasm_runtime::PersistentWasmApp::new(&wasm_bytes, config) {
+                                Ok(app) => {
+                                    active_wasm_app = Some(app);
+                                    active_wasm_app_key = Some(title.clone());
+                                    wasm_app_open_since_ms = libfolk::sys::uptime();
+                                    fuel_fail_count = 0;
+                                    write_str("[FolkShell] Widget launched fullscreen!\n");
+                                }
+                                Err(e) => {
+                                    // Fallback: show as text in terminal window
+                                    let win_count = wm.windows.len() as i32;
+                                    let wx = 80 + win_count * 24;
+                                    let wy = 60 + win_count * 24;
+                                    let win_id = wm.create_terminal(cmd_str, wx, wy, 480, 200);
+                                    if let Some(win) = wm.get_window_mut(win_id) {
+                                        win.push_line(&alloc::format!("[Widget] Load error: {}", &e[..e.len().min(60)]));
+                                    }
+                                }
+                            }
+                            folkshell_handled = true;
+                            need_redraw = true;
+                            damage.damage_full();
                         }
                         _ => {} // Passthrough or error → legacy dispatch
                     }

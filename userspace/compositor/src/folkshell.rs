@@ -88,8 +88,16 @@ pub enum ShellState {
         /// Accumulated output from previous stages
         pipe_input: String,
     },
-    /// Execution completed with output
+    /// Execution completed with text output
     Done(String),
+    /// Execution completed with a visual WASM widget (Holographic Output).
+    /// The compositor should launch this as a PersistentWasmApp in a floating window.
+    Widget {
+        /// Compiled WASM bytes for the visual widget
+        wasm_bytes: Vec<u8>,
+        /// Title for the widget window
+        title: String,
+    },
     /// Shell could not handle this input (fall through to legacy dispatch)
     Passthrough,
 }
@@ -374,8 +382,12 @@ pub fn execute_pipeline_steps(
 
                 // 2. Check wasm_cache (RAM)
                 if let Some(wasm_bytes) = wasm_cache.get(&cmd.name) {
-                    pipe_input = execute_wasm_command(wasm_bytes, cmd, &pipe_input);
-                    continue;
+                    match execute_wasm_command(wasm_bytes, cmd, &pipe_input) {
+                        WasmCommandResult::Text(t) => { pipe_input = t; continue; }
+                        WasmCommandResult::Visual(w, title) => {
+                            return ShellState::Widget { wasm_bytes: w, title };
+                        }
+                    }
                 }
 
                 // 3. Check Synapse VFS
@@ -389,8 +401,12 @@ pub fn execute_pipeline_steps(
                         let wasm_bytes = Vec::from(data);
                         let _ = libfolk::sys::shmem_unmap(resp.shmem_handle, VFS_SHELL_VADDR);
                         let _ = libfolk::sys::shmem_destroy(resp.shmem_handle);
-                        pipe_input = execute_wasm_command(&wasm_bytes, cmd, &pipe_input);
-                        continue;
+                        match execute_wasm_command(&wasm_bytes, cmd, &pipe_input) {
+                            WasmCommandResult::Text(t) => { pipe_input = t; continue; }
+                            WasmCommandResult::Visual(w, title) => {
+                                return ShellState::Widget { wasm_bytes: w, title };
+                            }
+                        }
                     } else {
                         let _ = libfolk::sys::shmem_destroy(resp.shmem_handle);
                     }
@@ -497,7 +513,13 @@ pub fn execute_pipeline(
 }
 
 /// Execute a WASM command (one-shot) and return its text output.
-fn execute_wasm_command(wasm_bytes: &[u8], cmd: &Command, _pipe_input: &str) -> String {
+/// Result of executing a WASM command — either text or a visual widget
+enum WasmCommandResult {
+    Text(String),
+    Visual(Vec<u8>, String), // (wasm_bytes, title)
+}
+
+fn execute_wasm_command(wasm_bytes: &[u8], cmd: &Command, _pipe_input: &str) -> WasmCommandResult {
     let config = crate::wasm_runtime::WasmConfig {
         screen_width: 1280,
         screen_height: 800,
@@ -506,28 +528,63 @@ fn execute_wasm_command(wasm_bytes: &[u8], cmd: &Command, _pipe_input: &str) -> 
     let (result, output) = crate::wasm_runtime::execute_wasm(wasm_bytes, config);
     match result {
         crate::wasm_runtime::WasmResult::Ok => {
-            // Collect text output from draw commands
+            // Count visual draw commands
+            let draw_count = output.draw_commands.len()
+                + output.circle_commands.len()
+                + output.line_commands.len();
+            let has_text = !output.text_commands.is_empty();
+            let has_fill = output.fill_screen.is_some();
+
+            // Holographic Output: if the command produces significant visuals
+            // (more than just text), return it as a live widget
+            if (draw_count >= 3 || has_fill) && is_visual_command(&cmd.name) {
+                return WasmCommandResult::Visual(
+                    Vec::from(wasm_bytes),
+                    cmd.name.clone(),
+                );
+            }
+
+            // Text output path
             let mut text = String::new();
             for tc in &output.text_commands {
                 text.push_str(&tc.text);
                 text.push('\n');
             }
-            if text.is_empty() {
-                format!("[{}] OK ({} draw cmds)", cmd.name, output.draw_commands.len())
+            if text.is_empty() && draw_count > 0 {
+                // Has draws but no text — describe them
+                WasmCommandResult::Text(
+                    format!("[{}] Visual: {} rects, {} circles, {} lines",
+                        cmd.name, output.draw_commands.len(),
+                        output.circle_commands.len(), output.line_commands.len())
+                )
+            } else if text.is_empty() {
+                WasmCommandResult::Text(format!("[{}] OK", cmd.name))
             } else {
-                text
+                WasmCommandResult::Text(text)
             }
         }
         crate::wasm_runtime::WasmResult::OutOfFuel => {
-            format!("[{}] Halted: fuel exhausted", cmd.name)
+            WasmCommandResult::Text(format!("[{}] Halted: fuel exhausted", cmd.name))
         }
         crate::wasm_runtime::WasmResult::Trap(msg) => {
-            format!("[{}] Trap: {}", cmd.name, &msg[..msg.len().min(60)])
+            WasmCommandResult::Text(format!("[{}] Trap: {}", cmd.name, &msg[..msg.len().min(60)]))
         }
         crate::wasm_runtime::WasmResult::LoadError(msg) => {
-            format!("[{}] Load error: {}", cmd.name, &msg[..msg.len().min(60)])
+            WasmCommandResult::Text(format!("[{}] Load error: {}", cmd.name, &msg[..msg.len().min(60)]))
         }
     }
+}
+
+/// Check if a command name suggests visual/graphical output.
+/// These commands get the visual JIT prompt and return WidgetHandles.
+fn is_visual_command(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("dashboard") || lower.contains("chart") || lower.contains("graph")
+        || lower.contains("widget") || lower.contains("visual") || lower.contains("monitor")
+        || lower.contains("render") || lower.contains("display") || lower.contains("gauge")
+        || lower.contains("meter") || lower.contains("heatmap") || lower.contains("plot")
+        || lower.starts_with("show-") || lower.starts_with("draw-")
+        || lower.starts_with("format-")
 }
 
 /// Execute a builtin command and return text output.
@@ -605,19 +662,53 @@ fn execute_builtin(cmd: &Command, pipe_input: &str) -> String {
 
 /// Build the LLM prompt for JIT synthesis of a missing command.
 pub fn jit_prompt(command_name: &str, pipe_context: &str) -> String {
-    format!(
-        "Generate a Rust no_std WASM tool called '{}' for Folkering OS.\n\n\
-         This tool is part of a shell pipeline. It receives text input and \
-         produces text output via folk_draw_text.\n\n\
-         Pipeline context (data flowing in): {}\n\n\
-         CONSTRAINTS:\n\
-         - #![no_std] #![no_main]\n\
-         - Export: #[no_mangle] pub extern \"C\" fn run()\n\
-         - Use folk_draw_text(x, y, ptr, len, color) to output results\n\
-         - Use folk_screen_width()/folk_screen_height() for layout\n\
-         - NO allocation, NO imports, NO loops\n\
-         - Return ONLY the Rust code.",
-        command_name,
-        if pipe_context.is_empty() { "(none — first command)" } else { pipe_context }
-    )
+    if is_visual_command(command_name) {
+        // Holographic Output: generate a visual WASM widget
+        format!(
+            "Generate a Rust no_std WASM visual widget called '{}' for Folkering OS.\n\n\
+             This is a GRAPHICAL dashboard/widget, NOT a text tool.\n\
+             It must draw a beautiful, colorful visualization using the Folkering color palette.\n\n\
+             Pipeline context (data to visualize): {}\n\n\
+             AVAILABLE DRAWING FUNCTIONS (extern \"C\"):\n\
+             fn folk_fill_screen(color: i32);          // fill background\n\
+             fn folk_draw_rect(x: i32, y: i32, w: i32, h: i32, color: i32); // filled rectangle\n\
+             fn folk_draw_text(x: i32, y: i32, ptr: i32, len: i32, color: i32); // text\n\
+             fn folk_draw_line(x1: i32, y1: i32, x2: i32, y2: i32, color: i32); // line\n\
+             fn folk_draw_circle(cx: i32, cy: i32, r: i32, color: i32); // circle\n\
+             fn folk_screen_width() -> i32;\n\
+             fn folk_screen_height() -> i32;\n\
+             fn folk_get_time() -> i32;  // uptime ms\n\n\
+             COLOR PALETTE (0x00RRGGBB):\n\
+             Background: 0x001a1a2e, Surface: 0x00252540, Blue: 0x003498db,\n\
+             Purple: 0x009b59b6, Green: 0x0044FF44, Orange: 0x00FFAA00,\n\
+             Red: 0x00FF4444, White: 0x00FFFFFF\n\n\
+             CONSTRAINTS:\n\
+             - #![no_std] #![no_main]\n\
+             - Export: #[no_mangle] pub extern \"C\" fn run()\n\
+             - Use folk_fill_screen for background, then draw rects/text/circles\n\
+             - Create a visually rich dashboard with bars, labels, and data\n\
+             - All extern calls in unsafe {{}}\n\
+             - NO allocation, NO imports\n\
+             - Return ONLY the Rust code.",
+            command_name,
+            if pipe_context.is_empty() { "(system overview data)" } else { pipe_context }
+        )
+    } else {
+        // Text output tool
+        format!(
+            "Generate a Rust no_std WASM tool called '{}' for Folkering OS.\n\n\
+             This tool is part of a shell pipeline. It receives text input and \
+             produces text output via folk_draw_text.\n\n\
+             Pipeline context (data flowing in): {}\n\n\
+             CONSTRAINTS:\n\
+             - #![no_std] #![no_main]\n\
+             - Export: #[no_mangle] pub extern \"C\" fn run()\n\
+             - Use folk_draw_text(x, y, ptr, len, color) to output results\n\
+             - Use folk_screen_width()/folk_screen_height() for layout\n\
+             - NO allocation, NO imports, NO loops\n\
+             - Return ONLY the Rust code.",
+            command_name,
+            if pipe_context.is_empty() { "(none — first command)" } else { pipe_context }
+        )
+    }
 }
