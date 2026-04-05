@@ -24,10 +24,17 @@ import os
 import base64
 import shutil
 
-# Add tools/ directory to path for mcp_bridge import
+# Add tools/ directory to path for module imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from context_manager import ContextManager
 from mcp_bridge import _retx_queue  # Retransmission queue (global, used in handle_serial timeout check)
+# Modular proxy components (extracted from this monolith)
+from proxy.llm_router import call_llm as _call_llm_modular, route_for_task as _route_modular, dispatch as _dispatch_modular
+from proxy.cache_manager import (cache_check as _cache_check_mod, cache_store as _cache_store_mod,
+    cache_get_meta as _cache_get_meta_mod, cache_rollback as _cache_rollback_mod,
+    list_all_apps as _list_all_apps_mod, dream_budget_check as _dream_budget_check_mod,
+    dream_budget_record as _dream_budget_record_mod, set_dream_max, cache_key as _cache_key_mod)
+from proxy.crypto import sign_wasm as _sign_wasm_mod
 _context_mgr = ContextManager(max_tokens=4096)  # Match LLM context window
 
 # ── Configuration (from .env or environment variables) ────────────────────
