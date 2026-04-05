@@ -484,10 +484,8 @@ impl WasmDriver {
         let mut linker = <Linker<DriverState>>::new(&engine);
         register_driver_functions(&mut linker);
 
-        let instance = linker.instantiate(&mut store, &module)
-            .map_err(|e| format!("Instantiate: {:?}", e))?
-            .ensure_no_start(&mut store)
-            .map_err(|e| format!("Start trap: {:?}", e))?;
+        let instance = linker.instantiate_and_start(&mut store, &module)
+            .map_err(|e| format!("Instantiate: {:?}", e))?;
 
         Ok(Self {
             store, instance,

@@ -634,11 +634,8 @@ pub fn execute_wasm(
     let mut linker = Linker::<HostState>::new(&engine);
     register_host_functions(&mut linker);
 
-    let instance = match linker.instantiate(&mut store, &module) {
-        Ok(inst) => match inst.ensure_no_start(&mut store) {
-            Ok(i) => i,
-            Err(e) => return (WasmResult::Trap(alloc::format!("Start trap: {:?}", e)), empty_output()),
-        },
+    let instance = match linker.instantiate_and_start(&mut store, &module) {
+        Ok(i) => i,
         Err(e) => return (WasmResult::LoadError(alloc::format!("Instantiation: {:?}", e)), empty_output()),
     };
 
@@ -690,18 +687,16 @@ impl PersistentWasmApp {
         let mut linker = Linker::<HostState>::new(&engine);
         register_host_functions(&mut linker);
 
-        let instance = linker.instantiate(&mut store, &module)
-            .map_err(|e| alloc::format!("Instantiation: {:?}", e))?
-            .ensure_no_start(&mut store)
-            .map_err(|e| alloc::format!("Start trap: {:?}", e))?;
+        let instance = linker.instantiate_and_start(&mut store, &module)
+            .map_err(|e| alloc::format!("Instantiation: {:?}", e))?;
 
         // Try to grow WASM memory for surface buffer support.
         // If allocation fails (heap too small), surface just won't be available
         // and folk_get_surface() will return 0 (apps use DrawCmd fallback).
         if let Some(Extern::Memory(mem)) = instance.get_export(&store, "memory") {
-            let current_pages = mem.size(&store);
+            let current_pages = mem.size(&store) as u32;
             if current_pages < MIN_SURFACE_PAGES {
-                match mem.grow(&mut store, MIN_SURFACE_PAGES - current_pages) {
+                match mem.grow(&mut store, (MIN_SURFACE_PAGES - current_pages) as u64) {
                     Ok(_) => {} // Surface buffer available
                     Err(_) => {} // Growth failed — surface won't work, but app runs fine with DrawCmd
                 }
@@ -930,11 +925,8 @@ pub fn execute_adapter(adapter_wasm: &[u8], input_data: &[u8]) -> Option<Vec<u8>
     let _ = linker.func_wrap("env", "folk_screen_width", |_: Caller<AdapterState>| -> i32 { 0 });
     let _ = linker.func_wrap("env", "folk_screen_height", |_: Caller<AdapterState>| -> i32 { 0 });
 
-    let instance = match linker.instantiate(&mut store, &module) {
-        Ok(i) => match i.ensure_no_start(&mut store) {
-            Ok(i) => i,
-            Err(_) => return None,
-        },
+    let instance = match linker.instantiate_and_start(&mut store, &module) {
+        Ok(i) => i,
         Err(_) => return None,
     };
 
