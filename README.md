@@ -149,7 +149,7 @@ bash tools/start-folkering-q35.sh
 
 ## License
 
-MIT
+AGPL-3.0
 
 ## Author
 
