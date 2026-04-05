@@ -94,6 +94,10 @@ The OS:
 | Neural Desktop | Calculator | Paint |
 |:-:|:-:|:-:|
 | ![Desktop](screenshots/neural-desktop.png) | ![Calculator](screenshots/calculator.png) | ![Paint](screenshots/paint-app.png) |
+| About Dialog | Zero-Copy Gradient | Bouncing Ball |
+| ![About](screenshots/about-app.png) | ![Gradient](screenshots/gradient-surface.png) | ![Bouncing](screenshots/bouncing-ball.png) |
+
+*Row 1: Neural Desktop with system tray, interactive Calculator, Mini Paint with 8-color palette. Row 2: About Dialog with animated starfield, zero-copy rainbow gradient (786K pixels from WASM memory), bouncing ball screensaver.*
 
 ## Tech Stack
 
@@ -149,7 +153,15 @@ bash tools/start-folkering-q35.sh
 
 ## License
 
-AGPL-3.0
+Folkering OS is **dual-licensed**:
+
+- **AGPL-3.0** ([LICENSE](LICENSE)) — Free for open-source use. If you modify Folkering OS and distribute it (including as a network service), you must release your source code under the same license.
+
+- **Commercial License** — For proprietary, closed-source, or embedded use without AGPL obligations. Contact **ikkjekvifull@gmail.com** for enterprise licensing.
+
+All contributors must sign a [Contributor License Agreement](CONTRIBUTING.md) (CLA) before pull requests are merged. This enables dual licensing while contributors retain their copyright.
+
+**"Folkering OS"** is a trademark of Knut Ingmar Merødningen. Forks may not use the Folkering OS name or branding without permission.
 
 ## Author
 
