@@ -1088,6 +1088,10 @@ fn main() -> ! {
     let mut pending_shell_jit: Option<alloc::string::String> = None;
     let mut shell_jit_pipeline: Option<(alloc::vec::Vec<compositor::folkshell::Command>, usize, alloc::string::String)> = None;
 
+    // Semantic Streams: Tick-Tock co-scheduled WASM instances
+    let mut streaming_upstream: Option<compositor::wasm_runtime::PersistentWasmApp> = None;
+    let mut streaming_downstream: Option<compositor::wasm_runtime::PersistentWasmApp> = None;
+
     // ===== Window Manager (Milestone 2.1) =====
     let mut wm = WindowManager::new();
     // Track which window (if any) is being dragged
@@ -2956,6 +2960,9 @@ fn main() -> ! {
                     active_wasm_app_key = None;
                     wasm_app_open_since_ms = 0;
                     fuel_fail_count = 0;
+                    // Also close streaming pipeline
+                    streaming_upstream = None;
+                    streaming_downstream = None;
                     // Clear WASM residue from framebuffer
                     fb.clear(folk_dark);
                     // Re-draw desktop title
@@ -3622,6 +3629,37 @@ fn main() -> ! {
                                     if let Some(win) = wm.get_window_mut(win_id) {
                                         win.push_line(&alloc::format!("[Widget] Load error: {}", &e[..e.len().min(60)]));
                                     }
+                                }
+                            }
+                            folkshell_handled = true;
+                            need_redraw = true;
+                            damage.damage_full();
+                        }
+                        compositor::folkshell::ShellState::Streaming(sp) => {
+                            // ═══════ Semantic Streams: Tick-Tock ═══════
+                            write_str("[FolkShell] Streaming pipeline: ");
+                            write_str(&sp.upstream_title[..sp.upstream_title.len().min(20)]);
+                            write_str(" → ");
+                            write_str(&sp.downstream_title[..sp.downstream_title.len().min(20)]);
+                            write_str("\n");
+                            let config = compositor::wasm_runtime::WasmConfig {
+                                screen_width: fb.width as u32,
+                                screen_height: fb.height as u32,
+                                uptime_ms: libfolk::sys::uptime() as u32,
+                            };
+                            match (
+                                compositor::wasm_runtime::PersistentWasmApp::new(&sp.upstream_wasm, config.clone()),
+                                compositor::wasm_runtime::PersistentWasmApp::new(&sp.downstream_wasm, config),
+                            ) {
+                                (Ok(up), Ok(down)) => {
+                                    streaming_upstream = Some(up);
+                                    streaming_downstream = Some(down);
+                                    // Hide regular WASM app
+                                    active_wasm_app = None;
+                                    write_str("[FolkShell] Tick-Tock streaming started!\n");
+                                }
+                                _ => {
+                                    write_str("[FolkShell] Failed to instantiate streaming apps\n");
                                 }
                             }
                             folkshell_handled = true;
@@ -5346,8 +5384,54 @@ fn main() -> ! {
 
         // Only redraw once after processing all keys
         if need_redraw {
+            // ===== SEMANTIC STREAMS: Tick-Tock Co-Scheduling =====
+            let is_streaming = streaming_upstream.is_some() && streaming_downstream.is_some();
+            if is_streaming {
+                let config = compositor::wasm_runtime::WasmConfig {
+                    screen_width: fb.width as u32,
+                    screen_height: fb.height as u32,
+                    uptime_ms: libfolk::sys::uptime() as u32,
+                };
+
+                // TICK: Run upstream — it produces stream data
+                let stream_data = if let Some(up) = &mut streaming_upstream {
+                    let (_, up_output) = up.run_frame(config.clone());
+                    up_output.stream_data
+                } else { alloc::vec::Vec::new() };
+
+                // Inject stream data into downstream's read buffer
+                if let Some(down) = &mut streaming_downstream {
+                    down.inject_stream_data(&stream_data);
+
+                    // TOCK: Run downstream — it reads data and draws
+                    let (result, output) = down.run_frame(config);
+
+                    // Render downstream's visual output to framebuffer
+                    if let Some(color) = output.fill_screen {
+                        fb.clear(fb.color_from_rgb24(color));
+                    }
+                    for cmd in &output.draw_commands {
+                        fb.fill_rect(cmd.x as usize, cmd.y as usize, cmd.w as usize, cmd.h as usize, fb.color_from_rgb24(cmd.color));
+                    }
+                    for cmd in &output.text_commands {
+                        fb.draw_string(cmd.x as usize, cmd.y as usize, &cmd.text, fb.color_from_rgb24(cmd.color), fb.color_from_rgb24(0));
+                    }
+                    for cmd in &output.circle_commands {
+                        let c = fb.color_from_rgb24(cmd.color);
+                        compositor::graphics::draw_circle(&mut fb, cmd.cx, cmd.cy, cmd.r, c);
+                    }
+                    for cmd in &output.line_commands {
+                        let c = fb.color_from_rgb24(cmd.color);
+                        compositor::graphics::draw_line(&mut fb, cmd.x1, cmd.y1, cmd.x2, cmd.y2, c);
+                    }
+                }
+
+                damage.damage_full();
+                did_work = true;
+            }
+
             // Skip desktop UI when WASM app owns the screen
-            let wasm_fullscreen = active_wasm_app.as_ref().map_or(false, |a| a.active);
+            let wasm_fullscreen = active_wasm_app.as_ref().map_or(false, |a| a.active) || is_streaming;
 
             // ===== WASM FULLSCREEN MODE =====
             // When a WASM app is active, it owns the entire framebuffer.

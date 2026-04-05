@@ -98,8 +98,27 @@ pub enum ShellState {
         /// Title for the widget window
         title: String,
     },
+    /// Semantic Stream: two WASM instances running in Tick-Tock co-scheduling.
+    /// Upstream produces data via folk_stream_write, downstream reads via folk_stream_read.
+    Streaming(StreamingPipeline),
     /// Shell could not handle this input (fall through to legacy dispatch)
     Passthrough,
+}
+
+/// A streaming pipeline: upstream data source + downstream visual widget.
+#[derive(Clone, Debug)]
+pub struct StreamingPipeline {
+    pub upstream_wasm: Vec<u8>,
+    pub downstream_wasm: Vec<u8>,
+    pub upstream_title: String,
+    pub downstream_title: String,
+}
+
+/// Check if a command name suggests a streaming/live data source.
+pub fn is_streaming_command(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("live") || lower.contains("stream") || lower.contains("realtime")
+        || lower.starts_with("get-live") || lower.starts_with("watch-")
 }
 
 // ── Parser ──────────────────────────────────────────────────────────────
@@ -711,4 +730,61 @@ pub fn jit_prompt(command_name: &str, pipe_context: &str) -> String {
             if pipe_context.is_empty() { "(none — first command)" } else { pipe_context }
         )
     }
+}
+
+/// JIT prompt for a streaming upstream data source.
+pub fn jit_prompt_upstream(command_name: &str) -> String {
+    format!(
+        "Generate a Rust no_std WASM STREAMING DATA SOURCE called '{}' for Folkering OS.\n\n\
+         This is called EVERY FRAME via run(). On each call, produce fresh data.\n\n\
+         AVAILABLE FUNCTIONS (extern \"C\"):\n\
+         fn folk_stream_write(ptr: i32, len: i32); // push data downstream\n\
+         fn folk_get_time() -> i32;  // uptime in ms (changes each frame)\n\
+         fn folk_random() -> i32;    // random number\n\n\
+         PATTERN:\n\
+         #[no_mangle] pub extern \"C\" fn run() {{\n\
+             unsafe {{\n\
+                 let t = folk_get_time();\n\
+                 let data = ...;  // generate fresh data based on time\n\
+                 folk_stream_write(data.as_ptr() as i32, data.len() as i32);\n\
+             }}\n\
+         }}\n\n\
+         IMPORTANT: Do NOT draw anything. Only produce data via folk_stream_write.\n\
+         Data format: simple text lines like \"cpu=45 mem=72 uptime=1234\".\n\
+         CONSTRAINTS: #![no_std] #![no_main], no allocation, all in unsafe.\n\
+         Return ONLY the Rust code.",
+        command_name
+    )
+}
+
+/// JIT prompt for a streaming downstream visualizer.
+pub fn jit_prompt_downstream(command_name: &str) -> String {
+    format!(
+        "Generate a Rust no_std WASM LIVE DASHBOARD called '{}' for Folkering OS.\n\n\
+         This is called EVERY FRAME. On each call, read fresh data and draw.\n\n\
+         AVAILABLE FUNCTIONS (extern \"C\"):\n\
+         fn folk_stream_read(ptr: i32, max_len: i32) -> i32; // read upstream data\n\
+         fn folk_fill_screen(color: i32);\n\
+         fn folk_draw_rect(x: i32, y: i32, w: i32, h: i32, color: i32);\n\
+         fn folk_draw_text(x: i32, y: i32, ptr: i32, len: i32, color: i32);\n\
+         fn folk_draw_circle(cx: i32, cy: i32, r: i32, color: i32);\n\
+         fn folk_screen_width() -> i32;\n\
+         fn folk_screen_height() -> i32;\n\
+         fn folk_get_time() -> i32;\n\n\
+         PATTERN:\n\
+         #[no_mangle] pub extern \"C\" fn run() {{\n\
+             unsafe {{\n\
+                 let mut buf = [0u8; 256];\n\
+                 let n = folk_stream_read(buf.as_mut_ptr() as i32, 256);\n\
+                 // Parse data from buf[..n], draw bars/text/circles\n\
+                 folk_fill_screen(0x001a1a2e);\n\
+                 // ... draw live visualization ...\n\
+             }}\n\
+         }}\n\n\
+         COLOR PALETTE: bg=0x001a1a2e, blue=0x003498db, green=0x0044FF44,\n\
+         red=0x00FF4444, white=0x00FFFFFF, purple=0x009b59b6\n\n\
+         CONSTRAINTS: #![no_std] #![no_main], no allocation.\n\
+         Return ONLY the Rust code.",
+        command_name
+    )
 }

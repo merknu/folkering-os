@@ -98,6 +98,10 @@ pub struct WasmOutput {
     pub fill_screen: Option<u32>,
     pub surface_dirty: bool,
     pub asset_requests: Vec<PendingAssetRequest>,
+    /// Semantic Streams: data pushed by upstream via folk_stream_write()
+    pub stream_data: Vec<u8>,
+    /// Semantic Streams: upstream signals completion
+    pub stream_complete: bool,
 }
 
 /// Generate a text description of what a WASM app renders.
@@ -147,6 +151,10 @@ struct HostState {
     pending_asset_requests: Vec<PendingAssetRequest>,
     next_asset_handle: u32,
     config: WasmConfig,
+    // Semantic Streams
+    stream_write_buf: Vec<u8>,  // upstream writes here via folk_stream_write
+    stream_read_buf: Vec<u8>,   // downstream reads from here (set by compositor)
+    stream_complete: bool,
 }
 
 // ── Host Function Registration ───────────────────────────────────────────
@@ -561,6 +569,46 @@ fn register_host_functions(linker: &mut Linker<HostState>) {
             } else { -1 }
         },
     );
+
+    // Phase 9: Semantic Streams — Tick-Tock Co-Scheduling
+    // folk_stream_write(ptr, len) — upstream pushes data to stream buffer
+    let _ = linker.func_wrap("env", "folk_stream_write",
+        |mut caller: Caller<HostState>, ptr: i32, len: i32| {
+            if len <= 0 || len > 4096 { return; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return,
+            };
+            let mut buf = alloc::vec![0u8; len as usize];
+            if mem.read(&caller, ptr as usize, &mut buf).is_ok() {
+                caller.data_mut().stream_write_buf.extend_from_slice(&buf);
+            }
+        },
+    );
+
+    // folk_stream_read(ptr, max_len) -> i32 — downstream pulls data from stream
+    let _ = linker.func_wrap("env", "folk_stream_read",
+        |mut caller: Caller<HostState>, ptr: i32, max_len: i32| -> i32 {
+            if max_len <= 0 { return 0; }
+            let data = caller.data().stream_read_buf.clone();
+            if data.is_empty() { return 0; }
+            let copy_len = data.len().min(max_len as usize);
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+            if mem.write(&mut caller, ptr as usize, &data[..copy_len]).is_ok() {
+                copy_len as i32
+            } else { -1 }
+        },
+    );
+
+    // folk_stream_done() — signal that streaming is complete
+    let _ = linker.func_wrap("env", "folk_stream_done",
+        |mut caller: Caller<HostState>| {
+            caller.data_mut().stream_complete = true;
+        },
+    );
 }
 
 // ── One-Shot Execution (tools/scripts) ───────────────────────────────────
@@ -748,6 +796,9 @@ fn new_host_state(config: WasmConfig) -> HostState {
         pending_asset_requests: Vec::new(),
         next_asset_handle: 1,
         config,
+        stream_write_buf: Vec::new(),
+        stream_read_buf: Vec::new(),
+        stream_complete: false,
     }
 }
 
@@ -760,6 +811,8 @@ fn empty_output() -> WasmOutput {
         fill_screen: None,
         surface_dirty: false,
         asset_requests: Vec::new(),
+        stream_data: Vec::new(),
+        stream_complete: false,
     }
 }
 
@@ -772,6 +825,8 @@ fn state_to_output(state: HostState) -> WasmOutput {
         fill_screen: state.fill_screen,
         surface_dirty: state.surface_dirty,
         asset_requests: state.pending_asset_requests,
+        stream_data: state.stream_write_buf,
+        stream_complete: state.stream_complete,
     }
 }
 
@@ -782,8 +837,11 @@ fn take_output(state: &mut HostState) -> WasmOutput {
     let lines = ::core::mem::replace(&mut state.line_commands, Vec::new());
     let circles = ::core::mem::replace(&mut state.circle_commands, Vec::new());
     let assets = ::core::mem::replace(&mut state.pending_asset_requests, Vec::new());
+    let stream = ::core::mem::replace(&mut state.stream_write_buf, Vec::new());
     let dirty = state.surface_dirty;
+    let stream_done = state.stream_complete;
     state.surface_dirty = false;
+    state.stream_complete = false;
     WasmOutput {
         draw_commands: draws,
         text_commands: texts,
@@ -792,6 +850,16 @@ fn take_output(state: &mut HostState) -> WasmOutput {
         fill_screen: state.fill_screen.take(),
         surface_dirty: dirty,
         asset_requests: assets,
+        stream_data: stream,
+        stream_complete: stream_done,
+    }
+}
+
+/// Inject stream data into a PersistentWasmApp's read buffer (for Tick-Tock).
+/// Called by compositor between upstream.run_frame() and downstream.run_frame().
+impl PersistentWasmApp {
+    pub fn inject_stream_data(&mut self, data: &[u8]) {
+        self.store.data_mut().stream_read_buf = Vec::from(data);
     }
 }
 
