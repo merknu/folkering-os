@@ -76,6 +76,9 @@ struct DirCacheState {
     entries: [DirEntry; MAX_ENTRIES],
 }
 
+/// Maximum SQLite pages (MAX_DB_SIZE / 4096)
+const MAX_PAGES: usize = MAX_DB_SIZE / 4096;
+
 /// SQLite backend state
 #[repr(C, align(4096))]
 struct SqliteState {
@@ -85,6 +88,35 @@ struct SqliteState {
     size: usize,
     /// Whether the database is valid
     valid: bool,
+    /// Dirty page bitmap — one bit per 4KB SQLite page (512 pages = 64 bytes)
+    dirty: [u8; MAX_PAGES / 8],
+}
+
+/// Mark a SQLite page as dirty (needs flush to disk)
+unsafe fn mark_page_dirty(page_num: usize) {
+    if page_num < MAX_PAGES {
+        SQLITE_STATE.dirty[page_num / 8] |= 1 << (page_num % 8);
+    }
+}
+
+/// Mark a range of bytes as dirty (auto-computes page numbers)
+unsafe fn mark_range_dirty(offset: usize, len: usize) {
+    let start_page = offset / 4096;
+    let end_page = (offset + len + 4095) / 4096;
+    for p in start_page..end_page.min(MAX_PAGES) {
+        SQLITE_STATE.dirty[p / 8] |= 1 << (p % 8);
+    }
+}
+
+/// Check if a page is dirty
+unsafe fn is_page_dirty(page_num: usize) -> bool {
+    if page_num >= MAX_PAGES { return false; }
+    (SQLITE_STATE.dirty[page_num / 8] & (1 << (page_num % 8))) != 0
+}
+
+/// Clear all dirty flags
+unsafe fn clear_dirty() {
+    for b in SQLITE_STATE.dirty.iter_mut() { *b = 0; }
 }
 
 static mut DIR_CACHE_STATE: DirCacheState = DirCacheState {
@@ -103,6 +135,7 @@ static mut SQLITE_STATE: SqliteState = SqliteState {
     data: [0u8; MAX_DB_SIZE],
     size: 0,
     valid: false,
+    dirty: [0u8; MAX_PAGES / 8],
 };
 
 static mut BACKEND: Backend = Backend::Fpk;
@@ -1136,6 +1169,9 @@ fn overwrite_blob_inplace(name: &str, new_data: &[u8]) -> bool {
                             ]);
                             let new_cc = cc.wrapping_add(1).to_be_bytes();
                             SQLITE_STATE.data[24..28].copy_from_slice(&new_cc);
+                            // Mark dirty pages covering the blob + header
+                            mark_range_dirty(offset, old_blob.len());
+                            mark_page_dirty(0); // page 1: change counter
                             return true;
                         }
                     }
@@ -1697,7 +1733,26 @@ fn sqlite_insert_file(rowid: i64, name: &str, content: &[u8]) -> bool {
             // Expand SQLITE_STATE.size to include new page
             SQLITE_STATE.size = (new_page_num) * page_size;
 
-            println!("[SYNAPSE] New leaf page {} allocated ({} bytes)", new_page_num, page_size);
+            // Mark dirty: new leaf page + parent interior page + DB header (page 1)
+            mark_page_dirty(new_page_num - 1); // new leaf (0-indexed)
+            mark_page_dirty(0); // page 1 (header: page_count, change_counter)
+            // Parent interior pages were modified in the loop above
+            let mut pp = root_page;
+            for _ in 0..10 {
+                mark_page_dirty(pp as usize - 1);
+                let pp_off = (pp as usize - 1) * page_size;
+                let pp_hdr = if pp == 1 { 100 } else { 0 };
+                if SQLITE_STATE.data[pp_off + pp_hdr] != 0x05 { break; }
+                let rp = u32::from_be_bytes([
+                    SQLITE_STATE.data[pp_off + pp_hdr + 8],
+                    SQLITE_STATE.data[pp_off + pp_hdr + 9],
+                    SQLITE_STATE.data[pp_off + pp_hdr + 10],
+                    SQLITE_STATE.data[pp_off + pp_hdr + 11],
+                ]);
+                pp = rp;
+            }
+
+            println!("[SYNAPSE] New leaf page {} allocated", new_page_num);
             return true;
         }
 
@@ -1734,6 +1789,10 @@ fn sqlite_insert_file(rowid: i64, name: &str, content: &[u8]) -> bool {
         SQLITE_STATE.data[25] = counter_bytes[1];
         SQLITE_STATE.data[26] = counter_bytes[2];
         SQLITE_STATE.data[27] = counter_bytes[3];
+
+        // Mark dirty: this leaf page + page 1 (header)
+        mark_page_dirty(leaf_page as usize - 1);
+        mark_page_dirty(0); // page 1: change counter
 
         true
     }
@@ -2211,27 +2270,35 @@ fn flush_sqlite_to_disk() -> bool {
     unsafe {
         let db_size = SQLITE_STATE.size;
         let total_sectors = (db_size + block::SECTOR_SIZE - 1) / block::SECTOR_SIZE;
+        let total_pages = (db_size + 4095) / 4096;
         let mut written = 0usize;
         let mut errors = 0usize;
 
-        // Write ALL sectors — VirtIO write has retry+verify workaround
-        for i in 0..total_sectors {
-            let offset = i * block::SECTOR_SIZE;
-            let sec = db_sector + i as u64;
-            let sector_data: &[u8; 512] = SQLITE_STATE.data[offset..offset + 512]
-                .try_into().unwrap();
-            if block::write_sector(sec, sector_data).is_ok() {
-                written += 1;
-            } else {
-                errors += 1;
-                // Don't abort — continue writing remaining sectors.
-                // Individual sector errors are already retried by block_write.
+        // Dirty-page flush: only write pages that were modified since last flush.
+        // Each SQLite page = 4096 bytes = 8 sectors.
+        for page in 0..total_pages {
+            if !is_page_dirty(page) {
+                continue; // Skip clean pages
+            }
+            let page_offset = page * 4096;
+            let sectors_in_page = if page_offset + 4096 <= db_size { 8 } else {
+                (db_size - page_offset + 511) / 512
+            };
+            for s in 0..sectors_in_page {
+                let byte_offset = page_offset + s * 512;
+                let sec = db_sector + (byte_offset / 512) as u64;
+                let sector_data: &[u8; 512] = SQLITE_STATE.data[byte_offset..byte_offset + 512]
+                    .try_into().unwrap();
+                if block::write_sector(sec, sector_data).is_ok() {
+                    written += 1;
+                } else {
+                    errors += 1;
+                }
             }
         }
 
-        if errors > 0 {
-            println!("[SYNAPSE] flush: {}/{} sectors failed", errors, total_sectors);
-        }
+        // Clear dirty flags after flush
+        clear_dirty();
 
         // Update FOLKDISK header with new DB size
         let new_db_sectors = total_sectors as u64;
@@ -2242,10 +2309,13 @@ fn flush_sqlite_to_disk() -> bool {
         if new_db_sectors != old_db_sectors {
             header_buf[56..64].copy_from_slice(&new_db_sectors.to_le_bytes());
             let _ = block::write_sector(0, &header_buf);
-            println!("[SYNAPSE] DB size: {} -> {} sectors", old_db_sectors, new_db_sectors);
+            println!("[SYNAPSE] DB grown: {} -> {} sectors", old_db_sectors, new_db_sectors);
         }
 
-        println!("[SYNAPSE] flush: {}/{} sectors written", written, total_sectors);
+        if written > 0 || errors > 0 {
+            println!("[SYNAPSE] flush: {} sectors written, {} errors ({} dirty pages)",
+                written, errors, written / 8 + if errors > 0 { 1 } else { 0 });
+        }
     }
 
     true
