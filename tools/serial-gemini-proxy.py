@@ -838,180 +838,54 @@ def _clarify_request(prompt: str) -> tuple:
 
 
 def _llm_to_wasm(prompt: str, force: bool = False, tweak: str = "") -> tuple:
-    """Shared WASM pipeline: clarify → cache check → LLM → extract → fix → compile → cache store.
-    Returns (bytes, None) on success, (None, str) on failure.
-    Returns (None, "CLARIFY:...") if the request needs user clarification."""
+    """Agentic WASM pipeline: LLM plans and executes using tools.
 
-    # Phase 0: Check cache first (instant — no LLM call)
+    The LLM has access to three tools:
+      - read_libfolk_docs(query): Search the Folk API for host function signatures
+      - write_file(filename, code): Write source code to the project
+      - cargo_compile(): Compile and return errors or WASM binary
+
+    The LLM iterates autonomously (up to 8 steps) until compilation succeeds.
+    Returns (bytes, None) on success, (None, str) on failure.
+    """
+
+    # Phase 0: Check cache
     if not force and not tweak:
         cached_wasm, _ = _cache_check(prompt)
         if cached_wasm:
             return cached_wasm, None
-
-    # Phase 0.5: Clarification (heuristic only, no LLM call)
     if not force and not tweak:
         should_proceed, clarify_msg = _clarify_request(prompt)
         if not should_proceed:
             return None, f"CLARIFY:{clarify_msg}"
 
-    # If --tweak, load existing source and ask LLM to modify it
+    # ── Build the task description ──
     if tweak:
         _, existing_src = _cache_check(prompt)
-        # Get app description from metadata (clean, no command prefixes)
         meta = _cache_get_meta(prompt)
         app_desc = meta.get("description", prompt)
-        # Extra safety: strip command prefixes from description
         for pfx in ["gemini generate ", "gemini gen ", "generate ", "agent generate ", "--tweak "]:
             if app_desc.lower().startswith(pfx):
                 app_desc = app_desc[len(pfx):]
-        # Strip tweak quotes if present
-        if app_desc.startswith('"') and '" ' in app_desc:
-            app_desc = app_desc[app_desc.index('" ') + 2:]
-
-        # Detect dream mode from tweak text for context injection
-        if "refactor" in tweak.lower() or "fewer cpu" in tweak.lower():
-            dream_ctx = get_dream_context("refactor")
-        elif "visual" in tweak.lower() or "improvement" in tweak.lower():
-            dream_ctx = get_dream_context("creative")
-        elif "harden" in tweak.lower() or "edge case" in tweak.lower():
-            dream_ctx = get_dream_context("nightmare")
-        else:
-            dream_ctx = ""
-
         if existing_src:
-            full_prompt = (f"{WASM_SYSTEM_PROMPT}\n\n{dream_ctx}\n\n"
-                          f"APP: \"{app_desc}\"\n"
-                          f"This is a visual WASM widget for Folkering OS. "
-                          f"It must remain a {app_desc} after your changes.\n\n"
-                          f"TECHNICAL REMINDER:\n"
-                          f"- NO crate imports (no `use`, no `extern crate`)\n"
-                          f"- ONLY the folk_* host functions listed above\n"
-                          f"- Must compile with: cargo build --target wasm32-unknown-unknown\n"
-                          f"- #![no_std] #![no_main] are REQUIRED\n\n"
-                          f"Current source code:\n```rust\n{existing_src}\n```\n\n"
-                          f"YOUR TASK: {tweak}")
+            task = (f"Modify an existing Folkering OS WASM app.\n"
+                    f"App: \"{app_desc}\"\n"
+                    f"Current source:\n```rust\n{existing_src}\n```\n"
+                    f"Change requested: {tweak}")
         else:
-            full_prompt = f"{WASM_SYSTEM_PROMPT}\n\nGenerate: {prompt}\nAlso apply this tweak: {tweak}"
+            task = f"Generate a WASM app: {prompt}\nAlso apply: {tweak}"
     else:
-        # Clean the prompt for generation
         clean = prompt
         for pfx in ["gemini generate ", "gemini gen ", "generate "]:
             if clean.lower().startswith(pfx):
                 clean = clean[len(pfx):]
                 break
-        full_prompt = f"{WASM_SYSTEM_PROMPT}\n\nGenerate a WASM app: {clean}"
+        task = f"Generate a WASM app: {clean}"
 
-    print(f"[WASM] Generating code via MEDIUM tier...")
-    source = call_llm(full_prompt, tier="medium")
+    # ── Run agentic ReAct loop ──
+    wasm_binary, source, error = _react_wasm_agent(task)
 
-    if source.startswith("Error:"):
-        return None, source
-
-    # Extract code from LLM response
-    if "<think>" in source and "</think>" in source:
-        source = source[source.index("</think>") + 8:]
-    extracted = None
-    if "<TOOL_CODE>" in source and "</TOOL_CODE>" in source:
-        extracted = source.split("<TOOL_CODE>")[1].split("</TOOL_CODE>")[0]
-    elif "```rust" in source:
-        extracted = source.split("```rust")[1].split("```")[0]
-    elif "```" in source:
-        parts = source.split("```")
-        if len(parts) >= 3: extracted = parts[1]
-    if extracted: source = extracted.strip()
-    elif "#![no_std]" in source: source = source[source.index("#![no_std]"):].strip()
-    else: source = source.strip()
-
-    # Fix common LLM mistakes
-    source = fix_missing_externs(source)
-    source = fix_unsafe_calls(source)
-    source = fix_infinite_loop(source)
-    print(f"[WASM] Source: {len(source)} chars")
-
-    # ── Self-correcting compile loop (up to 3 attempts) ──
-    # If compilation fails, feed the error back to the LLM and let it fix its own mistakes.
-    MAX_FIX_ATTEMPTS = 3
-    tmp_dir = tempfile.mkdtemp(prefix="folkwasm_")
-    try:
-        proj_dir = os.path.join(tmp_dir, "wasm_tool")
-        subprocess.run(["cargo", "new", "--lib", proj_dir], capture_output=True, timeout=10)
-        with open(os.path.join(proj_dir, "Cargo.toml"), "w") as f:
-            f.write('[package]\nname = "wasm_tool"\nversion = "0.1.0"\nedition = "2021"\n'
-                    '[lib]\ncrate-type = ["cdylib"]\n[profile.release]\n'
-                    'opt-level = "z"\nlto = true\nstrip = true\npanic = "abort"\n')
-
-        for attempt in range(1, MAX_FIX_ATTEMPTS + 1):
-            with open(os.path.join(proj_dir, "src", "lib.rs"), "w") as f:
-                f.write(source)
-            result = subprocess.run(
-                ["cargo", "build", "--target", "wasm32-unknown-unknown", "--release"],
-                capture_output=True, text=True, timeout=60, cwd=proj_dir)
-
-            if result.returncode == 0:
-                break  # Compilation succeeded!
-
-            # ── Compilation failed — ask LLM to fix ──
-            if attempt < MAX_FIX_ATTEMPTS:
-                err_output = result.stderr[-800:]  # Last 800 chars of errors
-                # Count actual errors (not warnings)
-                error_count = err_output.count("error[E")
-                print(f"[WASM] Compile attempt {attempt}/{MAX_FIX_ATTEMPTS} FAILED ({error_count} errors). Asking LLM to fix...")
-
-                fix_prompt = (
-                    f"The following Rust code failed to compile for wasm32-unknown-unknown.\n\n"
-                    f"COMPILER ERRORS:\n```\n{err_output}\n```\n\n"
-                    f"SOURCE CODE:\n```rust\n{source}\n```\n\n"
-                    f"Fix ALL the compiler errors. Keep the same functionality.\n"
-                    f"Rules: #![no_std] #![no_main], no allocation, no std, extern \"C\" fn run().\n"
-                    f"Available folk_* functions:\n"
-                    + "\n".join(f"  {v}" for v in FOLK_EXTERNS.values())
-                    + "\n\nReturn ONLY the complete fixed source code in <TOOL_CODE>...</TOOL_CODE> tags."
-                )
-
-                fix_response = call_llm(fix_prompt, tier="medium")
-                if fix_response.startswith("Error:"):
-                    print(f"[WASM] LLM fix request failed: {fix_response[:100]}")
-                    return None, f"Compile error (attempt {attempt}): {result.stderr[:400]}"
-
-                # Extract fixed code
-                if "<think>" in fix_response and "</think>" in fix_response:
-                    fix_response = fix_response[fix_response.index("</think>") + 8:]
-                fixed = None
-                if "<TOOL_CODE>" in fix_response and "</TOOL_CODE>" in fix_response:
-                    fixed = fix_response.split("<TOOL_CODE>")[1].split("</TOOL_CODE>")[0].strip()
-                elif "```rust" in fix_response:
-                    fixed = fix_response.split("```rust")[1].split("```")[0].strip()
-                elif "```" in fix_response:
-                    parts = fix_response.split("```")
-                    if len(parts) >= 3:
-                        fixed = parts[1].strip()
-
-                if fixed and "#![no_std]" in fixed:
-                    source = fixed
-                    source = fix_missing_externs(source)
-                    source = fix_unsafe_calls(source)
-                    source = fix_infinite_loop(source)
-                    print(f"[WASM] LLM provided fix ({len(source)} chars), retrying compile...")
-                else:
-                    print(f"[WASM] LLM fix response didn't contain valid code")
-                    return None, f"Compile error: {result.stderr[:400]}"
-            else:
-                print(f"[WASM] All {MAX_FIX_ATTEMPTS} compile attempts failed")
-                return None, f"Compile error after {MAX_FIX_ATTEMPTS} attempts: {result.stderr[:400]}"
-
-        # Compilation succeeded
-        wasm_path = os.path.join(proj_dir, "target", "wasm32-unknown-unknown", "release", "wasm_tool.wasm")
-        if not os.path.exists(wasm_path):
-            return None, "WASM output not found"
-        with open(wasm_path, "rb") as f:
-            wasm_binary = f.read()
-        if len(wasm_binary) > MAX_WASM_SIZE:
-            return None, f"WASM too large: {len(wasm_binary)} bytes"
-        if attempt > 1:
-            print(f"[WASM] Compiled after {attempt} attempts: {len(wasm_binary)} bytes")
-        else:
-            print(f"[WASM] Compiled: {len(wasm_binary)} bytes")
-        # Detect dream mode from tweak text for lineage
+    if wasm_binary:
         dream_mode_tag = ""
         parent = ""
         if tweak:
@@ -1020,14 +894,284 @@ def _llm_to_wasm(prompt: str, force: bool = False, tweak: str = "") -> tuple:
             elif "visual" in tweak.lower() or "improvement" in tweak.lower(): dream_mode_tag = "creative"
             elif "harden" in tweak.lower(): dream_mode_tag = "nightmare"
             else: dream_mode_tag = "tweak"
-        _cache_store(prompt, source, wasm_binary, parent_prompt=parent, dream_mode=dream_mode_tag)
+        _cache_store(prompt, source or "", wasm_binary, parent_prompt=parent, dream_mode=dream_mode_tag)
         return wasm_binary, None
-    except subprocess.TimeoutExpired:
-        return None, "Compile timeout (60s)"
+    return None, error or "Agent failed to produce WASM"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Agentic ReAct WASM Generator
+# ═══════════════════════════════════════════════════════════════════════════
+
+_AGENT_SYSTEM = """You are the Folkering OS Toolsmith — an AI agent that builds WASM apps.
+
+You have three tools. Call them by writing EXACTLY this format (one per message):
+
+<tool>read_libfolk_docs(query)</tool>
+  Search the Folk host API. Returns matching function signatures and docs.
+  Example: <tool>read_libfolk_docs(drawing)</tool>
+
+<tool>write_file(lib.rs, CODE_HERE)</tool>
+  Write Rust source to lib.rs. The code must be a complete #![no_std] WASM module.
+  Everything after "lib.rs, " until </tool> is the file content.
+
+<tool>cargo_compile()</tool>
+  Compile the project. Returns "OK: N bytes" or compiler errors.
+
+WORKFLOW:
+1. Think about what the app needs (drawing? input? network? time?)
+2. Use read_libfolk_docs to find the right APIs
+3. Write the code with write_file
+4. Compile with cargo_compile
+5. If errors: read the error, fix the code, write_file again, recompile
+6. When compilation succeeds, you're done
+
+RULES:
+- #![no_std] #![no_main] required
+- Export: #[no_mangle] pub extern "C" fn run()
+- #[panic_handler] required
+- ALL folk_* calls must be in unsafe { }
+- NO std, NO allocation (Vec/String/Box), NO extern crate
+- run() is called every frame — use static mut for state
+- Colors: 0x00RRGGBB format
+
+You MUST call at least one tool per response. Do NOT just write code in your response — use write_file.
+"""
+
+_REACT_MAX_STEPS = 8
+
+
+def _react_wasm_agent(task: str) -> tuple:
+    """Run a ReAct agent loop. Returns (wasm_bytes, source, error)."""
+
+    tmp_dir = tempfile.mkdtemp(prefix="folkwasm_")
+    proj_dir = os.path.join(tmp_dir, "wasm_tool")
+    subprocess.run(["cargo", "new", "--lib", proj_dir], capture_output=True, timeout=10)
+    with open(os.path.join(proj_dir, "Cargo.toml"), "w") as f:
+        f.write('[package]\nname = "wasm_tool"\nversion = "0.1.0"\nedition = "2021"\n'
+                '[lib]\ncrate-type = ["cdylib"]\n[profile.release]\n'
+                'opt-level = "z"\nlto = true\nstrip = true\npanic = "abort"\n')
+
+    # Conversation history for multi-turn
+    history = [
+        {"role": "system", "content": _AGENT_SYSTEM},
+        {"role": "user", "content": task},
+    ]
+
+    wasm_result = None
+    last_source = None
+
+    try:
+        for step in range(1, _REACT_MAX_STEPS + 1):
+            print(f"[AGENT] Step {step}/{_REACT_MAX_STEPS}")
+
+            # Call LLM with full history
+            response = _call_llm_chat(history, tier="medium")
+            if not response or response.startswith("Error:"):
+                print(f"[AGENT] LLM error: {(response or 'empty')[:100]}")
+                break
+
+            history.append({"role": "assistant", "content": response})
+
+            # Strip <think>...</think>
+            clean = response
+            if "<think>" in clean and "</think>" in clean:
+                clean = clean[clean.index("</think>") + 8:]
+
+            # Parse tool call
+            tool_match = re.search(r'<tool>(.*?)</tool>', clean, re.DOTALL)
+            if not tool_match:
+                # No tool call — check if LLM wrote code directly (common mistake)
+                if "```rust" in clean and "#![no_std]" in clean:
+                    print(f"[AGENT] LLM wrote code without write_file — auto-extracting")
+                    code = clean.split("```rust")[1].split("```")[0].strip()
+                    observation = _tool_write_file(proj_dir, f"lib.rs, {code}")
+                    history.append({"role": "user", "content": f"<observation>{observation}</observation>\nNow call <tool>cargo_compile()</tool> to compile it."})
+                    continue
+                print(f"[AGENT] No tool call found, prompting to use tools")
+                history.append({"role": "user", "content": "You must call a tool. Use <tool>read_libfolk_docs(drawing)</tool> to start, or <tool>write_file(lib.rs, YOUR_CODE)</tool> to write code."})
+                continue
+
+            tool_call = tool_match.group(1).strip()
+
+            # Dispatch tool
+            if tool_call.startswith("read_libfolk_docs("):
+                query = tool_call[18:].rstrip(")")
+                observation = _tool_read_docs(query)
+            elif tool_call.startswith("write_file("):
+                args = tool_call[11:].rstrip(")")
+                observation = _tool_write_file(proj_dir, args)
+                # Extract source for cache
+                comma = args.find(", ")
+                if comma >= 0:
+                    last_source = args[comma + 2:]
+            elif tool_call.startswith("cargo_compile("):
+                observation, wasm_result = _tool_cargo_compile(proj_dir)
+                if wasm_result:
+                    print(f"[AGENT] Compilation succeeded in step {step}: {len(wasm_result)} bytes")
+                    return wasm_result, last_source, None
+            else:
+                observation = f"Unknown tool: {tool_call[:50]}. Available: read_libfolk_docs, write_file, cargo_compile"
+
+            print(f"[AGENT] Tool result: {observation[:120]}")
+            history.append({"role": "user", "content": f"<observation>{observation}</observation>"})
+
+        # Max steps reached
+        print(f"[AGENT] Max steps ({_REACT_MAX_STEPS}) reached without successful compile")
+        return None, last_source, f"Agent exhausted {_REACT_MAX_STEPS} steps without compiling"
+
     except Exception as e:
-        return None, f"Build error: {e}"
+        print(f"[AGENT] Exception: {e}")
+        return None, last_source, f"Agent error: {e}"
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _call_llm_chat(messages: list, tier: str = "fast") -> str:
+    """Call LLM with multi-turn message history."""
+    # For local Ollama, use native /api/chat with messages
+    raw_url = FAST_URL
+    base = raw_url.rstrip("/v1").rstrip("/")
+    url = f"{base}/api/chat"
+
+    # Select model based on tier
+    model = FAST_MODEL
+    if tier == "medium":
+        model = MEDIUM_MODEL if MEDIUM_PROVIDER == "local" else FAST_MODEL
+    elif tier == "heavy":
+        model = HEAVY_MODEL if HEAVY_PROVIDER == "local" else FAST_MODEL
+
+    body = json.dumps({
+        "model": model,
+        "messages": messages,
+        "stream": False,
+    }).encode()
+
+    try:
+        req = urllib.request.Request(url, data=body,
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            result = json.loads(resp.read())
+            msg = result.get("message", {})
+            content = msg.get("content", "")
+            thinking = msg.get("thinking", "")
+            if thinking:
+                return f"<think>\n{thinking}\n</think>\n{content}"
+            return content
+    except Exception as e:
+        # Fallback: flatten to single prompt and use call_llm
+        flat = "\n\n".join(f"[{m['role']}]: {m['content']}" for m in messages)
+        return call_llm(flat, tier=tier)
+
+
+# ── Agent Tools ──────────────────────────────────────────────────────────
+
+def _tool_read_docs(query: str) -> str:
+    """Search Folk API docs. Returns matching function signatures."""
+    query_lower = query.lower().strip().strip('"').strip("'")
+    matches = []
+
+    # Category keywords for broader searches
+    categories = {
+        "draw": ["folk_draw_rect", "folk_draw_line", "folk_draw_circle", "folk_draw_text", "folk_fill_screen"],
+        "input": ["folk_poll_event"],
+        "time": ["folk_get_time", "folk_get_datetime"],
+        "screen": ["folk_screen_width", "folk_screen_height"],
+        "file": ["folk_request_file", "folk_list_files", "folk_write_file", "folk_query_files"],
+        "net": ["folk_http_get", "folk_net_has_ip", "folk_intent_fetch"],
+        "surface": ["folk_get_surface", "folk_surface_pitch", "folk_surface_present"],
+        "random": ["folk_random"],
+        "ai": ["folk_slm_generate"],
+        "stream": ["folk_stream_write", "folk_stream_read", "folk_stream_done"],
+        "metric": ["folk_os_metric", "folk_fw_drops"],
+    }
+
+    # Match by category
+    for cat, funcs in categories.items():
+        if cat in query_lower:
+            for name in funcs:
+                if name in FOLK_EXTERNS:
+                    matches.append(FOLK_EXTERNS[name])
+
+    # Match by function name substring
+    for name, sig in FOLK_EXTERNS.items():
+        if query_lower in name.lower() or query_lower in sig.lower():
+            if sig not in matches:
+                matches.append(sig)
+
+    # If no matches, return all
+    if not matches:
+        matches = list(FOLK_EXTERNS.values())
+        return "No exact match. Here are ALL available functions:\n" + "\n".join(f"  {s}" for s in matches)
+
+    return "Matching Folk API functions:\n" + "\n".join(f"  {s}" for s in matches)
+
+
+def _tool_write_file(proj_dir: str, args: str) -> str:
+    """Write source code to the project."""
+    comma = args.find(", ")
+    if comma < 0:
+        return "Error: format is write_file(filename, CODE). Example: write_file(lib.rs, #![no_std]...)"
+
+    filename = args[:comma].strip()
+    code = args[comma + 2:]
+
+    # Extract from code blocks if LLM wrapped it
+    if "```rust" in code:
+        code = code.split("```rust")[1].split("```")[0]
+    elif "```" in code:
+        parts = code.split("```")
+        if len(parts) >= 3:
+            code = parts[1]
+
+    code = code.strip()
+
+    # Apply automatic fixes
+    code = fix_missing_externs(code)
+    code = fix_unsafe_calls(code)
+    code = fix_infinite_loop(code)
+
+    # Write to src/lib.rs (only file we support)
+    target = os.path.join(proj_dir, "src", "lib.rs")
+    with open(target, "w") as f:
+        f.write(code)
+
+    lines = code.count("\n") + 1
+    return f"OK: wrote {len(code)} chars ({lines} lines) to src/lib.rs"
+
+
+def _tool_cargo_compile(proj_dir: str) -> tuple:
+    """Compile the project. Returns (observation_str, wasm_bytes_or_None)."""
+    try:
+        result = subprocess.run(
+            ["cargo", "build", "--target", "wasm32-unknown-unknown", "--release"],
+            capture_output=True, text=True, timeout=60, cwd=proj_dir)
+    except subprocess.TimeoutExpired:
+        return "Error: compilation timed out after 60s", None
+
+    if result.returncode != 0:
+        # Extract just the errors, skip warnings
+        stderr = result.stderr
+        # Find first "error[E" and take from there
+        first_err = stderr.find("error[E")
+        if first_err >= 0:
+            errors = stderr[first_err:]
+        else:
+            errors = stderr[-800:]
+        error_count = errors.count("error[E")
+        return f"COMPILE FAILED ({error_count} errors):\n{errors[-600:]}", None
+
+    wasm_path = os.path.join(proj_dir, "target", "wasm32-unknown-unknown", "release", "wasm_tool.wasm")
+    if not os.path.exists(wasm_path):
+        return "Error: WASM output file not found", None
+
+    with open(wasm_path, "rb") as f:
+        wasm_binary = f.read()
+
+    if len(wasm_binary) > MAX_WASM_SIZE:
+        return f"Error: WASM too large ({len(wasm_binary)} bytes, max {MAX_WASM_SIZE})", None
+
+    return f"OK: {len(wasm_binary)} bytes compiled successfully!", wasm_binary
 
 
 def _generate_driver(vendor_id: str, device_id: str, class_name: str) -> tuple:
