@@ -50,7 +50,37 @@ pub const DREAM_MAX_PER_SESSION: u32 = 10;
 /// AutoDream: max refactoring failures before marking as "perfected"
 pub const DREAM_STRIKE_LIMIT: u8 = 3;
 
-/// Dream modes — three hemispheres
+/// Compress source code for LLM prompts: strip comments, blank lines, trailing spaces.
+/// Saves 30-50% of tokens without losing meaning.
+fn compress_source(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    for line in src.lines() {
+        let trimmed = line.trim();
+        // Skip blank lines
+        if trimmed.is_empty() { continue; }
+        // Skip full-line comments (but keep doc comments)
+        if trimmed.starts_with("//") && !trimmed.starts_with("///") { continue; }
+        // Strip inline comments (simple heuristic: // after code)
+        let code = if let Some(pos) = trimmed.find("//") {
+            // Don't strip if inside a string literal (check for odd quotes before //)
+            let before = &trimmed[..pos];
+            let quote_count = before.chars().filter(|&c| c == '"').count();
+            if quote_count % 2 == 0 {
+                before.trim_end()
+            } else {
+                trimmed // Inside string, keep as-is
+            }
+        } else {
+            trimmed
+        };
+        if code.is_empty() { continue; }
+        out.push_str(code);
+        out.push('\n');
+    }
+    out
+}
+
+/// Dream modes — five hemispheres (3 app + 2 driver)
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum DreamMode {
     /// Left brain: CPU cycle reduction — headless benchmark V1 vs V2
@@ -59,6 +89,10 @@ pub enum DreamMode {
     Creative,
     /// Immune system: fuzzing — inject extreme inputs to find crashes
     Nightmare,
+    /// Driver optimization: reduce fuel, preserve IRQ loop structure
+    DriverRefactor,
+    /// Driver hardening: handle edge cases (SFI violations, IRQ storms)
+    DriverNightmare,
 }
 
 /// Pending creative changes awaiting user approval ("Morning Briefing")
@@ -690,6 +724,10 @@ impl DraugDaemon {
     /// `render_summary` is a text description of what the app currently draws.
     /// If the app has high friction score, adds frustration-aware guidance.
     pub fn build_dream_prompt(&self, source_code: &str, app_name: &str, render_summary: &str) -> String {
+        // Context compression: strip comments and blank lines to save LLM tokens
+        let compressed = compress_source(source_code);
+        let source_code = &compressed;
+
         // The app_name IS the description — it's the original "gemini generate X" prompt
         let context = format!(
             "APP: '{}'\n\
@@ -750,6 +788,36 @@ impl DraugDaemon {
                  - Return ONLY the hardened Rust code.",
                 context, source_code
             ),
+            DreamMode::DriverRefactor => format!(
+                "You are Draug, optimizing a WASM device driver for Folkering OS.\n\n\
+                 DRIVER: {}\n\
+                 Current code:\n```rust\n{}\n```\n\n\
+                 DRIVER REFACTOR RULES:\n\
+                 - ONLY reduce fuel consumption. Do NOT change functionality.\n\
+                 - The IRQ wait loop structure (folk_wait_irq/folk_ack_irq) MUST be preserved.\n\
+                 - Device initialization sequence MUST be identical.\n\
+                 - Pre-compute register offsets as constants.\n\
+                 - Combine redundant MMIO reads.\n\
+                 - Use bitwise ops instead of branches where possible.\n\
+                 - #![no_std] #![no_main] #![allow(unused)] — no allocation.\n\
+                 - Return ONLY the improved Rust code.",
+                app_name, source_code
+            ),
+            DreamMode::DriverNightmare => format!(
+                "You are Draug in Driver Nightmare mode — hardening a WASM device driver.\n\n\
+                 DRIVER: {}\n\
+                 Current code:\n```rust\n{}\n```\n\n\
+                 DRIVER NIGHTMARE RULES:\n\
+                 - HARDEN the driver. Do NOT change its purpose.\n\
+                 - What if folk_mmio_read_u32 returns -1 (SFI violation)? Check for it.\n\
+                 - What if IRQs fire faster than the handler can process? Add overflow guards.\n\
+                 - What if folk_dma_alloc returns -1? Handle allocation failure.\n\
+                 - Use saturating_add for all counters.\n\
+                 - Add folk_log debug output for unexpected register values.\n\
+                 - #![no_std] #![no_main] #![allow(unused)] — no allocation.\n\
+                 - Return ONLY the hardened Rust code.",
+                app_name, source_code
+            ),
         }
     }
 
@@ -762,6 +830,31 @@ impl DraugDaemon {
         for (ch, count) in &mut self.crash_hashes {
             if *count == 0 { *ch = h; *count = 1; return; }
         }
+    }
+
+    /// Pick a driver to dream about based on stability metrics.
+    /// Returns (vendor_id, device_id, mode) or None if all drivers are stable.
+    pub fn pick_driver_dream(
+        &self,
+        drivers: &[(u16, u16, u16, u16, u32)] // (vid, did, version, stability, fault_count)
+    ) -> Option<(u16, u16, DreamMode)> {
+        let mut worst: Option<(u16, u16, u16)> = None; // (vid, did, stability)
+        for &(vid, did, _ver, stability, faults) in drivers {
+            // Dream about drivers with faults or low stability
+            if faults > 0 || stability < 500 {
+                if worst.map_or(true, |(_, _, s)| stability < s) {
+                    worst = Some((vid, did, stability));
+                }
+            }
+        }
+        worst.map(|(vid, did, stability)| {
+            let mode = if stability < 200 {
+                DreamMode::DriverNightmare
+            } else {
+                DreamMode::DriverRefactor
+            };
+            (vid, did, mode)
+        })
     }
 
     /// Public key hash for main.rs friction signal recording.
@@ -788,6 +881,42 @@ impl DraugDaemon {
     pub fn dream_count(&self) -> u32 { self.dream_count }
     pub fn current_dream_mode(&self) -> DreamMode { self.dream_mode }
     pub fn last_input_ms(&self) -> u64 { self.last_user_input_ms }
+
+    // ── Synapse GC: Garbage Collection of old WASM versions ─────────
+
+    /// Identify cache keys that should be garbage collected.
+    /// Returns keys that are "perfected" (3 strikes) AND older than the threshold.
+    /// The compositor removes these from wasm_cache to free RAM.
+    pub fn gc_candidates<'a>(&self, cache_keys: &[&'a str]) -> alloc::vec::Vec<&'a str> {
+        let mut candidates = alloc::vec::Vec::new();
+        for &key in cache_keys {
+            // Only GC apps that are perfected (fully optimized, no more dreams)
+            if self.is_perfected(key) {
+                // Check if we've dreamt about this more than 5 times (well-tested)
+                let h = Self::key_hash(key);
+                let dreams = self.dream_journal.iter()
+                    .filter_map(|e| *e)
+                    .filter(|(k, _)| *k == h)
+                    .map(|(_, count)| count)
+                    .next()
+                    .unwrap_or(0);
+                if dreams >= 5 {
+                    candidates.push(key);
+                }
+            }
+        }
+        candidates
+    }
+
+    /// Count total strikes across all tracked apps
+    pub fn total_strikes(&self) -> u32 {
+        self.strikes.iter().filter_map(|s| *s).map(|(_, c)| c as u32).sum()
+    }
+
+    /// Count perfected apps
+    pub fn perfected_count(&self, cache_keys: &[&str]) -> usize {
+        cache_keys.iter().filter(|k| self.is_perfected(k)).count()
+    }
     pub fn is_waiting(&self) -> bool { self.waiting_for_llm }
     pub fn analysis_count(&self) -> u32 { self.analysis_count }
 

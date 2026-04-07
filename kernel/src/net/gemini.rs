@@ -35,30 +35,66 @@ fn libfolk_yield() {
     for _ in 0..5000 { core::hint::spin_loop(); }
 }
 
-/// Host proxy IP: 10.0.2.2 = QEMU SLIRP host gateway (direct, no guestfwd)
-const PROXY_IP: [u8; 4] = [10, 0, 2, 2];
+/// Host proxy IP: Proxmox host on LAN (bridge networking, not SLIRP)
+const PROXY_IP: [u8; 4] = [192, 168, 68, 150];
 const PROXY_PORT: u16 = 8080;
 
 pub fn ask_gemini(prompt: &str) -> Result<Vec<u8>, &'static str> {
-    crate::serial_str!("[GEMINI] Sending via COM2 serial (");
-    crate::drivers::serial::write_dec(prompt.len() as u32);
-    crate::serial_str!(" bytes)...\n");
-
-    // Build JSON request: {"prompt":"..."}
+    // Build the request payload (same format for both TCP and COM2)
     let mut body = Vec::with_capacity(prompt.len() + 64);
     body.extend_from_slice(b"@@GEMINI_REQ@@{\"prompt\":\"");
     json_escape_into(prompt, &mut body);
     body.extend_from_slice(b"\"}@@END@@\n");
 
-    // Send via COM2 serial port (bypasses TCP/SLIRP entirely)
+    // ── Try TCP first (100x faster than COM2 serial) ──
+    if super::has_ip() {
+        crate::serial_str!("[GEMINI] Trying TCP (");
+        crate::drivers::serial::write_dec(body.len() as u32);
+        crate::serial_str!(" bytes to ");
+        for i in 0..4 {
+            crate::drivers::serial::write_dec(PROXY_IP[i] as u32);
+            if i < 3 { crate::serial_str!("."); }
+        }
+        crate::serial_str!(":");
+        crate::drivers::serial::write_dec(PROXY_PORT as u32);
+        crate::serial_str!(")...\n");
+
+        match http_post_raw(PROXY_IP, PROXY_PORT, &body) {
+            Ok(response) => {
+                // Strip @@GEMINI_RESP@@ prefix if present
+                let text_start = if let Some(pos) = find_pattern(&response, b"@@GEMINI_RESP@@") {
+                    pos + b"@@GEMINI_RESP@@".len()
+                } else { 0 };
+                // Strip @@END@@ suffix
+                let text_end = if let Some(pos) = find_pattern(&response[text_start..], b"@@END@@") {
+                    text_start + pos
+                } else { response.len() };
+
+                let text = response[text_start..text_end].to_vec();
+                crate::serial_str!("[GEMINI] TCP got ");
+                crate::drivers::serial::write_dec(text.len() as u32);
+                crate::serial_str!(" bytes\n");
+                return Ok(text);
+            }
+            Err(e) => {
+                crate::serial_str!("[GEMINI] TCP failed: ");
+                crate::serial_str!(e);
+                crate::serial_str!(", falling back to COM2\n");
+            }
+        }
+    }
+
+    // ── Fallback: COM2 serial ──
+    crate::serial_str!("[GEMINI] Sending via COM2 serial (");
+    crate::drivers::serial::write_dec(prompt.len() as u32);
+    crate::serial_str!(" bytes)...\n");
+
     crate::drivers::serial::com2_write(&body);
 
     crate::serial_str!("[GEMINI] COM2 sent ");
     crate::drivers::serial::write_dec(body.len() as u32);
     crate::serial_str!(" bytes, waiting for response...\n");
 
-    // Read response from COM2: @@GEMINI_RESP@@{text}@@END@@
-    // 128KB heap-allocated buffer for WASM base64 payloads (NEVER stack-allocate)
     let mut resp_buf = vec![0u8; 131072];
     let resp_len = crate::drivers::serial::com2_read_until(
         b"@@END@@", &mut resp_buf, 45_000
@@ -68,13 +104,10 @@ pub fn ask_gemini(prompt: &str) -> Result<Vec<u8>, &'static str> {
         return Err("COM2 response timeout");
     }
 
-    // Strip @@GEMINI_RESP@@ prefix if present
     let response = &resp_buf[..resp_len];
     let text_start = if let Some(pos) = find_pattern(response, b"@@GEMINI_RESP@@") {
         pos + b"@@GEMINI_RESP@@".len()
-    } else {
-        0
-    };
+    } else { 0 };
 
     let text = response[text_start..].to_vec();
 
@@ -82,8 +115,6 @@ pub fn ask_gemini(prompt: &str) -> Result<Vec<u8>, &'static str> {
     crate::drivers::serial::write_dec(text.len() as u32);
     crate::serial_str!(" bytes\n");
 
-    // Parse HTTP status (not needed for serial — response is raw text)
-    // Return directly
     Ok(text)
 }
 
@@ -205,6 +236,13 @@ fn http_post_raw(ip: [u8; 4], port: u16, request: &[u8]) -> Result<Vec<u8>, &'st
                             crate::serial_str!(")\n");
                             response.extend_from_slice(&buf[..n]);
                             if response.len() > 65536 { break; }
+                            // Check for @@END@@ delimiter — don't wait for connection close
+                            if response.windows(7).any(|w| w == b"@@END@@") {
+                                crate::serial_str!("[GEMINI] Got @@END@@ marker, done (");
+                                crate::drivers::serial::write_dec(response.len() as u32);
+                                crate::serial_str!(" bytes)\n");
+                                break;
+                            }
                         }
                         _ => {}
                     }

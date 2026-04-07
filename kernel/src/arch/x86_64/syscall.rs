@@ -961,7 +961,7 @@ extern "C" fn syscall_handler(
         0x52 => syscall_get_time(),
         0x53 => syscall_get_random(arg1, arg2),
         // Milestone 30-32: HTTPS, GitHub & Clone
-        0x54 => syscall_https_test(),
+        0x54 => syscall_https_test(arg1),
         0x55 => syscall_github_fetch(arg1, arg2, arg3, arg4),
         0x56 => syscall_github_clone(arg1, arg2, arg3, arg4),
         // SMP: Parallel GEMM
@@ -1066,6 +1066,9 @@ extern "C" fn syscall_handler(
         // This is the correct idle primitive under WHPX: causes VM-exit so hypervisor
         // can inject pending interrupts (mouse, keyboard, timer).
         0x99 => {
+            // Poll network stack before halting (replaces timer-ISR polling
+            // which caused #GP from misaligned SSE in smoltcp)
+            crate::net::poll();
             unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)); }
             0
         },
@@ -1116,6 +1119,14 @@ extern "C" fn syscall_handler(
         // Phase 10: DMA + IOMMU
         0xAA => syscall_dma_alloc(arg1, arg2),   // Allocate DMA buffer (size, vaddr)
         0xAB => syscall_iommu_status(),            // Query IOMMU availability
+        // Phase 11: WASM Network Driver Bridge
+        0xAC => syscall_net_register(arg1, arg2),    // Register WASM net driver (mac_hi, mac_lo)
+        0xAD => syscall_net_submit_rx(arg1, arg2),   // Submit received packet (vaddr, len)
+        0xAE => syscall_net_poll_tx(arg1, arg2),     // Poll for TX packet (vaddr, max_len)
+        0xAF => syscall_dma_sync_read(arg1, arg2),  // Read physical memory via HHDM
+        0xB0 => syscall_net_dma_rx(arg1, arg2),     // Kernel-assisted RX: read DMA + deliver to smoltcp
+        0xB1 => syscall_dma_sync_write(arg1, arg2), // Write to physical memory via HHDM
+        0xB2 => syscall_net_metrics(arg1, arg2),    // OS metrics for AI introspection
         _ => {
             crate::drivers::serial::write_str("[HANDLER] Invalid syscall!\n");
             u64::MAX // Return error
@@ -1743,23 +1754,20 @@ fn syscall_block_write(sector: u64, buf_ptr: u64, count: u64) -> u64 {
     use crate::drivers::virtio_blk;
 
     if !virtio_blk::is_initialized() {
-        return u64::MAX; // No block device
+        return u64::MAX;
     }
 
     if buf_ptr == 0 || count == 0 || count > 128 {
-        return u64::MAX; // EINVAL
+        return u64::MAX;
     }
 
     let buf_len = (count as usize) * virtio_blk::SECTOR_SIZE;
 
-    // Validate userspace pointer
     if buf_ptr >= 0x0000_8000_0000_0000 {
-        return u64::MAX; // EFAULT
+        return u64::MAX;
     }
 
     let current_task = crate::task::task::get_current_task();
-
-    // Write journal entry before actual write (crash recovery)
     let _ = virtio_blk::write_journal_entry(current_task, 1, sector, count);
 
     let buf = unsafe {
@@ -1941,13 +1949,31 @@ fn syscall_github_clone(user_ptr: u64, user_len: u64, repo_ptr: u64, repo_len: u
     ((size as u64) << 32) | (handle as u64)
 }
 
-/// Test HTTPS connection to a hardcoded Google IP
-fn syscall_https_test() -> u64 {
-    // Google IP (hardcoded to bypass DNS)
-    let ip = [142, 250, 74, 142];
-    match crate::net::tls::https_get(ip, "www.google.com", "/") {
-        Ok(()) => 0,
-        Err(_) => u64::MAX,
+/// HTTPS test — TLS handshake only (DNS done by caller).
+/// Uses the already-resolved IP from the DNS lookup syscall.
+fn syscall_https_test(ip_packed: u64) -> u64 {
+    // Use DNS-resolved IP if provided, otherwise fallback
+    let ip = if ip_packed != 0 {
+        [
+            (ip_packed >> 24) as u8,
+            (ip_packed >> 16) as u8,
+            (ip_packed >> 8) as u8,
+            ip_packed as u8,
+        ]
+    } else {
+        [93, 184, 215, 14] // example.com fallback
+    };
+    crate::serial_str!("[TLS] HTTPS GET to example.com...");
+    match crate::net::tls::https_get(ip, "example.com", "/") {
+        Ok(()) => {
+            crate::serial_strln!("[TLS] HTTPS SUCCESS!");
+            0
+        }
+        Err(e) => {
+            crate::serial_str!("[TLS] HTTPS failed: ");
+            crate::serial_strln!(e);
+            u64::MAX
+        }
     }
 }
 
@@ -2710,14 +2736,14 @@ fn syscall_map_physical(phys_addr: u64, virt_addr: u64, size: u64, flags: u64, _
         return u64::MAX;
     }
 
-    // Check capability
-    if !capability::has_framebuffer_access(task_id, phys_addr, size) {
-        crate::serial_str!("[MAP_PHYSICAL] Error: No framebuffer capability for task ");
+    // Check capability — allow framebuffer AND PCI MMIO BAR regions
+    // PCI MMIO BARs are typically above 0xF0000000 (MMIO hole)
+    let is_pci_mmio = phys_addr >= 0xF000_0000 && size <= 1024 * 1024; // Max 1MB BAR
+    if !is_pci_mmio && !capability::has_framebuffer_access(task_id, phys_addr, size) {
+        crate::serial_str!("[MAP_PHYSICAL] Error: No capability for task ");
         crate::drivers::serial::write_dec(task_id);
         crate::serial_str!(" phys=");
         crate::drivers::serial::write_hex(phys_addr);
-        crate::serial_str!(" size=");
-        crate::drivers::serial::write_hex(size);
         crate::drivers::serial::write_newline();
         return u64::MAX;
     }
@@ -3160,7 +3186,7 @@ fn syscall_dma_alloc(size: u64, vaddr: u64) -> u64 {
         None => return u64::MAX,
     };
 
-    let ptf = Ptf::PRESENT | Ptf::WRITABLE | Ptf::NO_EXECUTE
+    let ptf = Ptf::PRESENT | Ptf::WRITABLE | Ptf::USER_ACCESSIBLE | Ptf::NO_EXECUTE
         | Ptf::WRITE_THROUGH | Ptf::NO_CACHE;
 
     for i in 0..num_pages {
@@ -3199,5 +3225,276 @@ fn syscall_iommu_status() -> u64 {
         (base & 0xFFFFFFFF_00000000) | 1
     } else {
         0
+    }
+}
+
+// ── Phase 11: WASM Network Driver Bridge ──────────────────────────────────
+
+/// Syscall 0xAC: Register a WASM network driver.
+/// arg1 = MAC bytes 0-3 (little-endian), arg2 = MAC bytes 4-5 (little-endian)
+/// Initializes the smoltcp stack with this MAC address.
+fn syscall_net_register(mac_lo: u64, mac_hi: u64) -> u64 {
+    let mac = [
+        (mac_lo & 0xFF) as u8,
+        ((mac_lo >> 8) & 0xFF) as u8,
+        ((mac_lo >> 16) & 0xFF) as u8,
+        ((mac_lo >> 24) & 0xFF) as u8,
+        (mac_hi & 0xFF) as u8,
+        ((mac_hi >> 8) & 0xFF) as u8,
+    ];
+    crate::net::init_wasm_net(mac);
+    0
+}
+
+/// Syscall 0xAD: Submit a received Ethernet frame to the kernel network stack.
+/// arg1 = virtual address of frame data (in caller's address space)
+/// arg2 = length in bytes
+/// Returns: 0 on success, u64::MAX on error
+fn syscall_net_submit_rx(vaddr: u64, length: u64) -> u64 {
+    let len = length as usize;
+    if len == 0 || len > 1514 || vaddr < 0x200000 {
+        return u64::MAX;
+    }
+    let data = unsafe {
+        core::slice::from_raw_parts(vaddr as *const u8, len)
+    };
+    if crate::net::wasm_net_submit_rx(data) {
+        0
+    } else {
+        u64::MAX
+    }
+}
+
+/// Syscall 0xAE: Poll for a packet to transmit.
+/// arg1 = virtual address of buffer (caller provides)
+/// arg2 = max buffer length
+/// Returns: packet length if available, 0 if no packet, u64::MAX on error
+fn syscall_net_poll_tx(vaddr: u64, max_len: u64) -> u64 {
+    let max = max_len as usize;
+    if max == 0 || max > 2048 || vaddr < 0x200000 {
+        return u64::MAX;
+    }
+    let buf = unsafe {
+        core::slice::from_raw_parts_mut(vaddr as *mut u8, max)
+    };
+    match crate::net::wasm_net_poll_tx(buf) {
+        Some(len) => {
+            static TX_POP_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+            let c = TX_POP_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if c < 5 {
+                crate::serial_str!("[NET-POP] ");
+                crate::drivers::serial::write_dec(len as u32);
+                crate::serial_strln!("B popped from TX ring");
+            }
+            len as u64
+        }
+        None => 0,
+    }
+}
+
+/// Syscall 0xAF: Read physical memory via HHDM (DMA coherency fallback).
+/// Used when userspace NO_CACHE mapping doesn't reflect DMA writeback (WHPX bug).
+/// arg1 = physical address to read from
+/// arg2 = destination virtual address in caller's space + (len << 32)
+/// Returns: number of bytes read, or u64::MAX on error.
+/// Syscall 0xAF: Read from physical memory via HHDM.
+/// Mode 1 (len > 0): Copy len bytes from phys to dest (bulk copy)
+/// Mode 2 (len == 0): Read u64 from phys_addr, return directly (no buffer needed)
+fn syscall_dma_sync_read(phys_addr: u64, dest_and_len: u64) -> u64 {
+    if phys_addr == 0 { return u64::MAX; }
+
+    let hhdm = crate::HHDM_OFFSET.load(core::sync::atomic::Ordering::Relaxed);
+    let src_virt = hhdm + phys_addr as usize;
+
+    let len = ((dest_and_len >> 32) & 0xFFFF) as usize;
+
+    if len == 0 {
+        // Mode 2: read u64 directly — flush cache line first to see DMA writes
+        unsafe {
+            // CLFLUSH invalidates the cache line containing this address
+            core::arch::asm!("clflush [{}]", in(reg) src_virt, options(nostack));
+            // Memory fence to ensure the flush completes
+            core::arch::asm!("mfence", options(nostack));
+        }
+        let val = unsafe { core::ptr::read_volatile(src_virt as *const u64) };
+        return val;
+    }
+
+    // Mode 1: bulk copy
+    let dest_vaddr = (dest_and_len & 0xFFFFFFFF) as usize;
+    if len > 4096 || dest_vaddr < 0x200000 {
+        return u64::MAX;
+    }
+
+    let src = src_virt as *const u8;
+    let dst = dest_vaddr as *mut u8;
+    unsafe {
+        // Flush cache lines for the source range to see DMA writes
+        let mut addr = src_virt;
+        while addr < src_virt + len {
+            core::arch::asm!("clflush [{}]", in(reg) addr, options(nostack));
+            addr += 64; // cache line size
+        }
+        core::arch::asm!("mfence", options(nostack));
+
+        for i in 0..len {
+            let byte = core::ptr::read_volatile(src.add(i));
+            core::ptr::write_volatile(dst.add(i), byte);
+        }
+    }
+
+    len as u64
+}
+
+/// Syscall 0xB0: Kernel-assisted DMA RX — read packet from physical DMA buffers
+/// and deliver directly to smoltcp. Bypasses ALL userspace cache coherency issues.
+///
+/// arg1 = ring_phys | (desc_idx << 48) — physical address of descriptor ring + index
+/// arg2 = buf_phys | (buf_size << 48) — physical address of packet buffer pool + per-buffer size
+///
+/// The kernel reads the E1000 RX descriptor via HHDM, extracts packet length,
+/// reads the packet data from the buffer, and submits it to smoltcp.
+/// Returns: packet length on success, 0 if no packet, u64::MAX on error.
+fn syscall_net_dma_rx(ring_and_idx: u64, buf_and_size: u64) -> u64 {
+    let ring_phys = ring_and_idx & 0x0000_FFFF_FFFF_FFFF;
+    let desc_idx = ((ring_and_idx >> 48) & 0xFFFF) as usize;
+    let buf_phys = buf_and_size & 0x0000_FFFF_FFFF_FFFF;
+    let buf_size = ((buf_and_size >> 48) & 0xFFFF) as usize;
+
+    if ring_phys == 0 || buf_phys == 0 || buf_size == 0 || desc_idx > 7 {
+        return u64::MAX;
+    }
+
+    let hhdm = crate::HHDM_OFFSET.load(core::sync::atomic::Ordering::Relaxed);
+
+    // Read the descriptor (16 bytes) from physical memory via HHDM
+    let desc_phys = ring_phys + (desc_idx as u64 * 16);
+    let desc_virt = hhdm + desc_phys as usize;
+
+    // Flush cache line to see DMA writes
+    unsafe {
+        core::arch::asm!("clflush [{}]", in(reg) desc_virt, options(nostack));
+        core::arch::asm!("mfence", options(nostack));
+    }
+
+    // Read length (bytes 8-9 of descriptor) and status (byte 12)
+    let len_status = unsafe { core::ptr::read_volatile((desc_virt + 8) as *const u64) };
+    let pkt_len = (len_status & 0xFFFF) as usize;
+
+    if pkt_len == 0 || pkt_len > 2048 {
+        return 0; // No packet or invalid length
+    }
+
+    // Read packet data from the buffer pool
+    let pkt_phys = buf_phys + (desc_idx as u64 * buf_size as u64);
+    let pkt_virt = hhdm + pkt_phys as usize;
+
+    // Flush cache lines for the packet data
+    unsafe {
+        let mut addr = pkt_virt;
+        let end = pkt_virt + pkt_len;
+        while addr < end {
+            core::arch::asm!("clflush [{}]", in(reg) addr, options(nostack));
+            addr += 64;
+        }
+        core::arch::asm!("mfence", options(nostack));
+    }
+
+    // Read packet data into a temporary buffer
+    let mut pkt_buf = [0u8; 2048];
+    unsafe {
+        let src = pkt_virt as *const u8;
+        for i in 0..pkt_len {
+            pkt_buf[i] = core::ptr::read_volatile(src.add(i));
+        }
+    }
+
+    // Submit to smoltcp via the WASM_NET ring
+    if crate::net::wasm_net_submit_rx(&pkt_buf[..pkt_len]) {
+        pkt_len as u64
+    } else {
+        0 // Ring full
+    }
+}
+
+/// Syscall 0xB1: Write to physical memory via HHDM (DMA coherency for writes).
+/// arg1 = physical address, arg2 = source vaddr | (len << 32)
+fn syscall_dma_sync_write(phys_addr: u64, src_and_len: u64) -> u64 {
+    let src_vaddr = (src_and_len & 0xFFFFFFFF) as usize;
+    let len = ((src_and_len >> 32) & 0xFFFF) as usize;
+
+    if len == 0 || len > 4096 || phys_addr == 0 || src_vaddr < 0x200000 {
+        return u64::MAX;
+    }
+
+    let hhdm = crate::HHDM_OFFSET.load(core::sync::atomic::Ordering::Relaxed);
+    let dst_virt = hhdm + phys_addr as usize;
+    let src = src_vaddr as *const u8;
+    let dst = dst_virt as *mut u8;
+
+    unsafe {
+        for i in 0..len {
+            let byte = core::ptr::read_volatile(src.add(i));
+            core::ptr::write_volatile(dst.add(i), byte);
+        }
+        // Flush written cache lines so DMA device sees them
+        let mut addr = dst_virt;
+        while addr < dst_virt + len {
+            core::arch::asm!("clflush [{}]", in(reg) addr, options(nostack));
+            addr += 64;
+        }
+        core::arch::asm!("mfence", options(nostack));
+    }
+
+    len as u64
+}
+
+/// Syscall 0xB2: OS metrics for AI introspection.
+/// The kernel's own AI (Draug, WASM apps) can query live system state.
+///
+/// arg1 = metric_id:
+///   0 = network summary (packed: has_ip(1) | ip_bytes(32))
+///   1 = firewall stats (packed: allows(32) | drops(32))
+///   2 = uptime_ms
+///   3 = suspicious packet count
+///
+/// Returns: packed u64 with the requested metric.
+fn syscall_net_metrics(metric_id: u64, _reserved: u64) -> u64 {
+    match metric_id {
+        0 => {
+            // Network: has_ip(1) | ip_a(8) | ip_b(8) | ip_c(8) | ip_d(8)
+            let has_ip = if crate::net::has_ip() { 1u64 } else { 0u64 };
+            let guard = crate::net::NET_STATE.lock();
+            if let Some(ref state) = *guard {
+                let addrs = state.iface.ip_addrs();
+                if let Some(cidr) = addrs.first() {
+                    if let smoltcp::wire::IpAddress::Ipv4(v4) = cidr.address() {
+                        let o = v4.octets();
+                        drop(guard);
+                        return has_ip
+                            | ((o[0] as u64) << 8)
+                            | ((o[1] as u64) << 16)
+                            | ((o[2] as u64) << 24)
+                            | ((o[3] as u64) << 32);
+                    }
+                }
+            }
+            drop(guard);
+            has_ip
+        }
+        1 => {
+            // Firewall: allows(32) | drops(32)
+            let allows = crate::net::firewall::ALLOWS.load(core::sync::atomic::Ordering::Relaxed) as u64;
+            let drops = crate::net::firewall::DROPS.load(core::sync::atomic::Ordering::Relaxed) as u64;
+            allows | (drops << 32)
+        }
+        2 => crate::timer::uptime_ms(),
+        3 => crate::net::firewall::SUSPICIOUS.count.load(core::sync::atomic::Ordering::Relaxed) as u64,
+        4 => {
+            // Anomaly detection stats: blocked_ips(16) | total_syn_attempts(16)
+            let (blocked, attempts) = crate::net::firewall::anomaly_stats();
+            (blocked as u64) | ((attempts as u64) << 16)
+        }
+        _ => u64::MAX,
     }
 }

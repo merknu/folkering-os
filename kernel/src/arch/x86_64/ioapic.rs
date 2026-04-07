@@ -239,14 +239,18 @@ pub fn enable_irq_level(irq: u8, vector: u8) {
     }
 }
 
-/// Disable an IRQ on the IOAPIC
+/// Disable (mask) an IRQ on the IOAPIC.
+/// Preserves trigger mode — only sets the mask bit.
 pub fn disable_irq(irq: u8) {
     if !IOAPIC_INIT.load(Ordering::Relaxed) {
         return;
     }
 
     unsafe {
-        set_irq_route(irq, 0, 0, false);
+        // Read current entry, set mask bit (bit 16), write back
+        let reg_low = IOREDTBL_BASE + (irq as u32) * 2;
+        let current = read_ioapic(reg_low);
+        write_ioapic(reg_low, current | (1 << 16)); // Set mask bit
     }
 }
 

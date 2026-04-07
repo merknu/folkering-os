@@ -33,7 +33,9 @@ use alloc::format;
 use wasmi::*;
 
 /// Fuel budget per driver execution slice (less than apps — drivers should be efficient)
-const DRIVER_FUEL: u64 = 500_000;
+/// Driver fuel: unlimited. Drivers yield cooperatively via folk_wait_irq().
+/// Fuel metering is NOT used for drivers (they have DMA/MMIO which is expensive in wasmi).
+const DRIVER_FUEL: u64 = 0; // 0 = skip set_fuel entirely
 
 /// Maximum MMIO BARs tracked per device
 const MAX_BARS: usize = 6;
@@ -41,6 +43,170 @@ const MAX_BARS: usize = 6;
 // ── DriverCapability: The SFI Boundary ──────────────────────────────────
 
 /// Hardware capability tree for a single PCI device.
+// ── Driver Version Control ──────────────────────────────────────────────
+
+/// How a driver was created
+#[derive(Clone, Copy, PartialEq)]
+pub enum DriverSource {
+    Jit,        // LLM-generated on demand
+    AutoDream,  // improved by Draug daemon
+    Bootstrap,  // handwritten baseline
+}
+
+/// Stability metadata for a stored driver version
+#[derive(Clone)]
+pub struct DriverMeta {
+    pub vendor_id: u16,
+    pub device_id: u16,
+    pub version: u16,
+    pub stability_score: u16,   // 0-1000, higher = more stable
+    pub irq_count: u32,         // total IRQs processed
+    pub uptime_ticks: u32,      // compositor frames alive without fault
+    pub fault_count: u16,       // total faults/traps
+    pub source: DriverSource,
+}
+
+impl DriverMeta {
+    pub fn new(vendor_id: u16, device_id: u16, version: u16, source: DriverSource) -> Self {
+        Self { vendor_id, device_id, version, stability_score: 0,
+               irq_count: 0, uptime_ticks: 0, fault_count: 0, source }
+    }
+
+    /// Recalculate stability: (uptime * 10) / (faults + 1), capped at 1000
+    pub fn recalc_stability(&mut self) {
+        let score = (self.uptime_ticks as u64 * 10) / (self.fault_count as u64 + 1);
+        self.stability_score = score.min(1000) as u16;
+    }
+
+    /// Format VFS filename: "driver_8086_100e_v1.wasm"
+    pub fn vfs_filename(&self) -> alloc::string::String {
+        alloc::format!("driver_{:04x}_{:04x}_v{}.wasm",
+            self.vendor_id, self.device_id, self.version)
+    }
+}
+
+/// Format a driver VFS filename from vendor/device/version
+pub fn driver_vfs_filename(vendor_id: u16, device_id: u16, version: u16) -> alloc::string::String {
+    alloc::format!("driver_{:04x}_{:04x}_v{}.wasm", vendor_id, device_id, version)
+}
+
+/// Find the latest version number for a device in Synapse VFS.
+/// Probes v1, v2, ... until not found. Returns 0 if no versions exist.
+pub fn find_latest_version(vendor_id: u16, device_id: u16) -> u16 {
+    let mut latest: u16 = 0;
+    for v in 1..=32u16 {
+        let fname = driver_vfs_filename(vendor_id, device_id, v);
+        match libfolk::sys::synapse::read_file_by_name(fname.as_str()) {
+            Ok(_) => latest = v,
+            Err(_) => break,
+        }
+    }
+    latest
+}
+
+/// Store a driver WASM binary in Synapse VFS with intent metadata.
+pub fn store_driver_vfs(vendor_id: u16, device_id: u16, version: u16,
+                        wasm_bytes: &[u8], source: DriverSource) -> bool {
+    let fname = driver_vfs_filename(vendor_id, device_id, version);
+    match libfolk::sys::synapse::write_file(fname.as_str(), wasm_bytes) {
+        Ok(()) => libfolk::println!("[DRV-VFS] write_file OK: {}", fname),
+        Err(e) => libfolk::println!("[DRV-VFS] write_file FAILED: {} (err={:?})", fname, e),
+    }
+    // Tag with driver intent metadata
+    let source_str = match source {
+        DriverSource::Jit => "jit",
+        DriverSource::AutoDream => "autodream",
+        DriverSource::Bootstrap => "bootstrap",
+    };
+    let intent_json = alloc::format!(
+        r#"{{"type":"driver","vendor":"{:04x}","device":"{:04x}","version":{},"source":"{}"}}"#,
+        vendor_id, device_id, version, source_str
+    );
+    // Best-effort intent write (file_id may not match exactly, use 0)
+    let _ = libfolk::sys::synapse::write_intent(0, "application/wasm-driver", &intent_json);
+    true
+}
+
+/// Load a driver WASM binary from Synapse VFS.
+pub fn load_driver_vfs(vendor_id: u16, device_id: u16, version: u16) -> Option<alloc::vec::Vec<u8>> {
+    let fname = driver_vfs_filename(vendor_id, device_id, version);
+    match libfolk::sys::synapse::read_file_shmem(fname.as_str()) {
+        Ok(resp) => {
+            const DRV_VFS_VADDR: usize = 0x5008_0000;
+            if libfolk::sys::shmem_map(resp.shmem_handle, DRV_VFS_VADDR).is_ok() {
+                let data = unsafe {
+                    core::slice::from_raw_parts(DRV_VFS_VADDR as *const u8, resp.size as usize)
+                };
+                let result = alloc::vec::Vec::from(data);
+                let _ = libfolk::sys::shmem_unmap(resp.shmem_handle, DRV_VFS_VADDR);
+                let _ = libfolk::sys::shmem_destroy(resp.shmem_handle);
+                Some(result)
+            } else {
+                let _ = libfolk::sys::shmem_destroy(resp.shmem_handle);
+                None
+            }
+        }
+        Err(_) => None,
+    }
+}
+
+// ── Bootstrap Drivers ───────────────────────────────────────────────────
+
+/// Compiled E1000 bootstrap driver v1 (1026 bytes — basic reset/IRQ loop)
+const E1000_V1_WASM: &[u8] = include_bytes!("../../../drivers/e1000_bootstrap_v1.wasm");
+/// Compiled E1000 v2 driver — DMA RX/TX with ARP announce
+const E1000_V2_WASM: &[u8] = include_bytes!("../../../drivers/e1000_v2.wasm");
+/// Compiled VirtIO-Net v1 driver — virtqueue-based, cloud-native
+const VIRTIO_NET_V1_WASM: &[u8] = include_bytes!("../../../drivers/virtio_net_v1.wasm");
+
+/// Bootstrap drivers: (vendor, device, versions)
+const BOOTSTRAP_DRIVERS: &[(u16, u16, &[(&[u8], DriverSource)])] = &[
+    (0x8086, 0x100E, &[
+        (E1000_V1_WASM, DriverSource::Bootstrap),
+        (E1000_V2_WASM, DriverSource::Bootstrap),
+    ]),
+    (0x1AF4, 0x1000, &[ // VirtIO-Net (legacy/transitional)
+        (VIRTIO_NET_V1_WASM, DriverSource::Bootstrap),
+    ]),
+];
+
+/// Get a built-in driver for a specific PCI device (fallback when VFS fails).
+/// Returns the latest compiled WASM for the device, or None.
+pub fn get_builtin_driver(vendor_id: u16, device_id: u16) -> Option<&'static [u8]> {
+    for &(vid, did, versions) in BOOTSTRAP_DRIVERS {
+        if vid == vendor_id && did == device_id {
+            // Return the LAST (latest) version
+            return versions.last().map(|&(wasm, _)| wasm);
+        }
+    }
+    None
+}
+
+/// Seed Synapse VFS with bootstrap drivers for detected hardware.
+/// Called once at compositor startup. Seeds ALL versions that don't exist yet.
+pub fn seed_bootstrap_drivers(pci_devices: &[libfolk::sys::pci::PciDeviceInfo], count: usize) {
+    for &(vid, did, versions) in BOOTSTRAP_DRIVERS {
+        let present = pci_devices[..count].iter().any(|d| d.vendor_id == vid && d.device_id == did);
+        if !present { continue; }
+
+        let existing = find_latest_version(vid, did);
+        if existing >= versions.len() as u16 {
+            libfolk::println!("[DRV-BOOT] {:04x}:{:04x} has v{} (up to date)", vid, did, existing);
+            continue;
+        }
+
+        // Seed missing versions
+        for (i, &(wasm, source)) in versions.iter().enumerate() {
+            let v = (i + 1) as u16;
+            if v <= existing { continue; } // Already in VFS
+            store_driver_vfs(vid, did, v, wasm, source);
+            libfolk::println!("[DRV-BOOT] Seeded {:04x}:{:04x} v{} ({} bytes)", vid, did, v, wasm.len());
+        }
+    }
+}
+
+// ── Driver Capability (SFI Boundary) ────────────────────────────────────
+
 /// Stored in wasmi::Store — invisible and immutable to WASM bytecode.
 /// Every host function validates access against these bounds.
 #[derive(Clone)]
@@ -153,10 +319,32 @@ impl DriverCapability {
 
 // ── Driver State (wraps DriverCapability + runtime flags) ───────────────
 
+/// Max DMA allocations per driver (rings + buffers)
+const MAX_DMA_SLOTS: usize = 8;
+/// Virtual address base for DMA slots: 0x6000_0000 + slot * 0x0001_0000 (64KB each)
+/// Must not conflict with shmem (0x3000_0000), WASM linear memory, or framebuffer.
+const DMA_VADDR_BASE: usize = 0x6000_0000;
+const DMA_SLOT_SIZE: usize = 0x0001_0000; // 64KB per slot
+
+/// A DMA buffer allocation tracked by the host
+#[derive(Clone, Copy)]
+struct DmaSlot {
+    phys: u64,    // physical address (for MMIO register setup)
+    vaddr: usize, // mapped virtual address (for host read/write)
+    size: usize,  // allocated size in bytes
+    active: bool,
+}
+
+impl DmaSlot {
+    const EMPTY: Self = Self { phys: 0, vaddr: 0, size: 0, active: false };
+}
+
 struct DriverState {
     cap: DriverCapability,
     irq_pending: bool,
     log_buf: [u8; 128],
+    /// DMA buffer pool: each slot mapped at a fixed vaddr range
+    dma_slots: [DmaSlot; MAX_DMA_SLOTS],
 }
 
 // ── Host Function Registration ──────────────────────────────────────────
@@ -347,6 +535,16 @@ fn register_driver_functions(linker: &mut Linker<DriverState>) {
         },
     );
 
+    // folk_device_io_base(bar) -> i32: returns the I/O port base for a BAR
+    let _ = linker.func_wrap("env", "folk_device_io_base",
+        |caller: Caller<DriverState>, bar: i32| -> i32 {
+            let idx = bar as usize;
+            if idx >= MAX_BARS { return 0; }
+            let (port, _) = caller.data().cap.io_bars[idx];
+            port as i32
+        },
+    );
+
     let _ = linker.func_wrap("env", "folk_bar_size",
         |caller: Caller<DriverState>, bar: i32| -> i32 {
             let idx = bar as usize;
@@ -358,31 +556,204 @@ fn register_driver_functions(linker: &mut Linker<DriverState>) {
         },
     );
 
-    // ── 7.3: DMA Memory Allocation ───────────────────────────────────
+    // ── 7.3: DMA Memory Allocation (Slot-Based) ──────────────────────
 
-    // folk_dma_alloc(size) -> i64
-    // Allocates contiguous physical memory for DMA.
-    // Returns packed value: (wasm_offset << 32) | physical_address
-    // or -1 on error.
+    // folk_dma_alloc(size) -> i32
+    // Allocates contiguous physical DMA memory.
+    // Returns slot ID (0..7) or -1 on error.
+    // Max 64KB per slot, 8 slots per driver.
     let _ = linker.func_wrap("env", "folk_dma_alloc",
-        |_caller: Caller<DriverState>, size: i32| -> i64 {
-            if size <= 0 || size > 1048576 { return -1; } // Max 1MB
-            // DMA buffers mapped at 0x50000000+ (driver DMA region)
-            let vaddr = 0x5000_0000usize;
+        |mut caller: Caller<DriverState>, size: i32| -> i32 {
+            if size <= 0 || size as usize > DMA_SLOT_SIZE { return -1; }
+
+            // Find free slot
+            let slot_idx = {
+                let state = caller.data();
+                state.dma_slots.iter().position(|s| !s.active)
+            };
+            let slot_idx = match slot_idx {
+                Some(i) => i,
+                None => return -1, // All slots used
+            };
+
+            let vaddr = DMA_VADDR_BASE + slot_idx * DMA_SLOT_SIZE;
             match libfolk::sys::pci::dma_alloc(size as usize, vaddr) {
                 Ok(phys) => {
-                    // Return packed: high 32 = wasm offset (0 for now), low 32 = phys
-                    (phys & 0xFFFFFFFF) as i64
+                    let state = caller.data_mut();
+                    state.dma_slots[slot_idx] = DmaSlot {
+                        phys, vaddr, size: size as usize, active: true,
+                    };
+                    libfolk::println!("[DMA] Slot {} alloc: {}B phys=0x{:08x} vaddr=0x{:08x}",
+                        slot_idx, size, phys, vaddr);
+                    slot_idx as i32
                 }
                 Err(_) => -1,
             }
         },
     );
 
-    // folk_dma_free(wasm_ptr) — placeholder for now
+    // folk_dma_phys(slot) -> i64
+    // Returns physical address of a DMA slot (for MMIO register setup).
+    let _ = linker.func_wrap("env", "folk_dma_phys",
+        |caller: Caller<DriverState>, slot: i32| -> i64 {
+            let idx = slot as usize;
+            let state = caller.data();
+            if idx < MAX_DMA_SLOTS && state.dma_slots[idx].active {
+                state.dma_slots[idx].phys as i64
+            } else {
+                -1
+            }
+        },
+    );
+
+    // folk_dma_write_u32(slot, offset, value)
+    // Write a u32 to DMA buffer (e.g., descriptor ring entry fields).
+    let _ = linker.func_wrap("env", "folk_dma_write_u32",
+        |caller: Caller<DriverState>, slot: i32, offset: i32, value: i32| {
+            let idx = slot as usize;
+            let off = offset as usize;
+            let state = caller.data();
+            if idx < MAX_DMA_SLOTS && state.dma_slots[idx].active && off + 4 <= state.dma_slots[idx].size {
+                let ptr = (state.dma_slots[idx].vaddr + off) as *mut u32;
+                unsafe { core::ptr::write_volatile(ptr, value as u32); }
+            }
+        },
+    );
+
+    // folk_dma_write_u64(slot, offset, value)
+    // Write a u64 to DMA buffer (e.g., 64-bit buffer address in descriptor).
+    let _ = linker.func_wrap("env", "folk_dma_write_u64",
+        |caller: Caller<DriverState>, slot: i32, offset: i32, value: i64| {
+            let idx = slot as usize;
+            let off = offset as usize;
+            let state = caller.data();
+            if idx < MAX_DMA_SLOTS && state.dma_slots[idx].active && off + 8 <= state.dma_slots[idx].size {
+                let ptr = (state.dma_slots[idx].vaddr + off) as *mut u64;
+                unsafe { core::ptr::write_volatile(ptr, value as u64); }
+            }
+        },
+    );
+
+    // folk_dma_read_u32(slot, offset) -> i32
+    // Read a u32 from DMA buffer (e.g., check descriptor status).
+    let _ = linker.func_wrap("env", "folk_dma_read_u32",
+        |caller: Caller<DriverState>, slot: i32, offset: i32| -> i32 {
+            let idx = slot as usize;
+            let off = offset as usize;
+            let state = caller.data();
+            if idx < MAX_DMA_SLOTS && state.dma_slots[idx].active && off + 4 <= state.dma_slots[idx].size {
+                let ptr = (state.dma_slots[idx].vaddr + off) as *const u32;
+                unsafe { core::ptr::read_volatile(ptr) as i32 }
+            } else {
+                -1
+            }
+        },
+    );
+
+    // folk_dma_read_u64(slot, offset) -> i64
+    let _ = linker.func_wrap("env", "folk_dma_read_u64",
+        |caller: Caller<DriverState>, slot: i32, offset: i32| -> i64 {
+            let idx = slot as usize;
+            let off = offset as usize;
+            let state = caller.data();
+            if idx < MAX_DMA_SLOTS && state.dma_slots[idx].active && off + 8 <= state.dma_slots[idx].size {
+                let ptr = (state.dma_slots[idx].vaddr + off) as *const u64;
+                unsafe { core::ptr::read_volatile(ptr) as i64 }
+            } else {
+                -1
+            }
+        },
+    );
+
+    // folk_dma_free(slot) — release a DMA slot
     let _ = linker.func_wrap("env", "folk_dma_free",
-        |_caller: Caller<DriverState>, _ptr: i32| {
-            // TODO: track allocations and free physical pages
+        |mut caller: Caller<DriverState>, slot: i32| {
+            let idx = slot as usize;
+            if idx < MAX_DMA_SLOTS {
+                caller.data_mut().dma_slots[idx].active = false;
+            }
+        },
+    );
+
+    // folk_dma_sync_read(slot, offset, len) -> i32
+    // Bulk-copy from physical DMA memory via kernel HHDM to the DMA buffer.
+    let _ = linker.func_wrap("env", "folk_dma_sync_read",
+        |caller: Caller<DriverState>, slot: i32, offset: i32, len: i32| -> i32 {
+            let idx = slot as usize;
+            let off = offset as usize;
+            let sz = len as usize;
+            let state = caller.data();
+            if idx >= MAX_DMA_SLOTS || !state.dma_slots[idx].active
+                || off + sz > state.dma_slots[idx].size {
+                return -1;
+            }
+            let phys = state.dma_slots[idx].phys + off as u64;
+            let dest = unsafe {
+                core::slice::from_raw_parts_mut(
+                    (state.dma_slots[idx].vaddr + off) as *mut u8, sz)
+            };
+            match libfolk::sys::pci::dma_sync_read(phys, dest) {
+                Ok(_) => 0,
+                Err(_) => -1,
+            }
+        },
+    );
+
+    // folk_dma_sync_read_u32(slot, offset) -> i32
+    // Read a u32 directly from physical memory via kernel HHDM.
+    // Returns the value WITHOUT touching the DMA buffer cache. Zero-overhead on real HW.
+    let _ = linker.func_wrap("env", "folk_dma_sync_read_u32",
+        |caller: Caller<DriverState>, slot: i32, offset: i32| -> i32 {
+            let idx = slot as usize;
+            let off = offset as usize;
+            let state = caller.data();
+            if idx >= MAX_DMA_SLOTS || !state.dma_slots[idx].active || off + 4 > state.dma_slots[idx].size {
+                return -1;
+            }
+            let phys = state.dma_slots[idx].phys + off as u64;
+            let val = libfolk::sys::pci::dma_sync_read_u64(phys);
+            (val & 0xFFFFFFFF) as i32
+        },
+    );
+
+    // folk_dma_sync_write(slot, offset, len) -> i32
+    // Write DMA buffer content to physical memory via kernel HHDM.
+    // Ensures DMA devices see the written data on WHPX/buggy hardware.
+    let _ = linker.func_wrap("env", "folk_dma_sync_write",
+        |caller: Caller<DriverState>, slot: i32, offset: i32, len: i32| -> i32 {
+            let idx = slot as usize;
+            let off = offset as usize;
+            let sz = len as usize;
+            let state = caller.data();
+            if idx >= MAX_DMA_SLOTS || !state.dma_slots[idx].active || off + sz > state.dma_slots[idx].size {
+                return -1;
+            }
+            let phys = state.dma_slots[idx].phys + off as u64;
+            let src = unsafe {
+                core::slice::from_raw_parts((state.dma_slots[idx].vaddr + off) as *const u8, sz)
+            };
+            match libfolk::sys::pci::dma_sync_write(phys, src) {
+                Ok(_) => 0,
+                Err(_) => -1,
+            }
+        },
+    );
+
+    // folk_net_dma_rx(ring_slot, buf_slot, desc_idx, buf_size) -> i32
+    // Kernel-assisted RX: reads DMA descriptor + packet from physical memory
+    // and delivers directly to smoltcp. Returns packet length or 0.
+    let _ = linker.func_wrap("env", "folk_net_dma_rx",
+        |caller: Caller<DriverState>, ring_slot: i32, buf_slot: i32, desc_idx: i32, buf_size: i32| -> i32 {
+            let ri = ring_slot as usize;
+            let bi = buf_slot as usize;
+            let state = caller.data();
+            if ri >= MAX_DMA_SLOTS || !state.dma_slots[ri].active
+                || bi >= MAX_DMA_SLOTS || !state.dma_slots[bi].active {
+                return 0;
+            }
+            let ring_phys = state.dma_slots[ri].phys;
+            let buf_phys = state.dma_slots[bi].phys;
+            libfolk::sys::pci::net_dma_rx(ring_phys, desc_idx as u16, buf_phys, buf_size as u16) as i32
         },
     );
 
@@ -391,6 +762,60 @@ fn register_driver_functions(linker: &mut Linker<DriverState>) {
         |_caller: Caller<DriverState>| -> i32 {
             let (available, _) = libfolk::sys::pci::iommu_status();
             if available { 1 } else { 0 }
+        },
+    );
+
+    // ── 7.4: Network Stack Bridge ────────���───────────────────────────
+
+    // folk_net_register(mac0, mac1, mac2, mac3, mac4, mac5)
+    // Register this driver as the OS network interface. Starts smoltcp + DHCP.
+    let _ = linker.func_wrap("env", "folk_net_register",
+        |caller: Caller<DriverState>, m0: i32, m1: i32, m2: i32, m3: i32, m4: i32, m5: i32| {
+            let mac = [m0 as u8, m1 as u8, m2 as u8, m3 as u8, m4 as u8, m5 as u8];
+            let _ = libfolk::sys::pci::net_register(&mac);
+            libfolk::println!("[NET-DRV] Registered MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        },
+    );
+
+    // folk_net_submit_rx(dma_slot, offset, length)
+    // Deliver a received Ethernet frame to the kernel network stack.
+    let _ = linker.func_wrap("env", "folk_net_submit_rx",
+        |caller: Caller<DriverState>, slot: i32, offset: i32, length: i32| -> i32 {
+            let idx = slot as usize;
+            let off = offset as usize;
+            let len = length as usize;
+            let state = caller.data();
+            if idx >= MAX_DMA_SLOTS || !state.dma_slots[idx].active || off + len > state.dma_slots[idx].size {
+                return -1;
+            }
+            // Read packet data from DMA buffer
+            let src = (state.dma_slots[idx].vaddr + off) as *const u8;
+            let data = unsafe { core::slice::from_raw_parts(src, len) };
+            // Submit to kernel via syscall
+            match libfolk::sys::pci::net_submit_rx(data) {
+                Ok(()) => 0,
+                Err(()) => -1,
+            }
+        },
+    );
+
+    // folk_net_poll_tx(dma_slot, offset, max_len) -> i32
+    // Check if the kernel has a packet to transmit. If so, copies it to the DMA buffer.
+    // Returns packet length (> 0) or 0 if no packet.
+    let _ = linker.func_wrap("env", "folk_net_poll_tx",
+        |caller: Caller<DriverState>, slot: i32, offset: i32, max_len: i32| -> i32 {
+            let idx = slot as usize;
+            let off = offset as usize;
+            let max = max_len as usize;
+            let state = caller.data();
+            if idx >= MAX_DMA_SLOTS || !state.dma_slots[idx].active || off + max > state.dma_slots[idx].size {
+                return 0;
+            }
+            // Poll kernel for outgoing packet via syscall
+            let dst = (state.dma_slots[idx].vaddr + off) as *mut u8;
+            let buf = unsafe { core::slice::from_raw_parts_mut(dst, max) };
+            libfolk::sys::pci::net_poll_tx(buf) as i32
         },
     );
 }
@@ -404,8 +829,9 @@ pub fn map_device_bars(cap: &mut DriverCapability) -> usize {
     use libfolk::sys::map_physical::{map_physical, MapFlags};
 
     let mut mapped = 0;
-    // Virtual addresses for BAR mapping (well above userspace heap)
-    let base_vaddr: usize = 0x4000_0000;
+    // Virtual addresses for BAR mapping — use high userspace region
+    // 0x40000000 may conflict with WASM memory. Use 0x70000000 instead.
+    let base_vaddr: usize = 0x7000_0000;
 
     for i in 0..MAX_BARS {
         let (phys, size) = cap.mmio_bars[i];
@@ -465,6 +891,8 @@ pub struct WasmDriver {
     pub bound_irq: Option<u8>,
     /// True if driver is suspended waiting for IRQ
     pub waiting_for_irq: bool,
+    /// Version control metadata (stability tracking)
+    pub meta: DriverMeta,
 }
 
 impl WasmDriver {
@@ -475,8 +903,9 @@ impl WasmDriver {
             cap: cap.clone(),
             irq_pending: false,
             log_buf: [0; 128],
+            dma_slots: [DmaSlot::EMPTY; MAX_DMA_SLOTS],
         });
-        store.set_fuel(DRIVER_FUEL).unwrap_or(());
+        store.set_fuel(10_000_000).unwrap_or(());
 
         let module = Module::new(&engine, wasm_bytes)
             .map_err(|e| format!("Module load: {:?}", e))?;
@@ -487,11 +916,13 @@ impl WasmDriver {
         let instance = linker.instantiate_and_start(&mut store, &module)
             .map_err(|e| format!("Instantiate: {:?}", e))?;
 
+        let meta = DriverMeta::new(cap.vendor_id, cap.device_id, 0, DriverSource::Jit);
         Ok(Self {
             store, instance,
             capability: cap,
             bound_irq: None,
             waiting_for_irq: false,
+            meta,
         })
     }
 
@@ -515,7 +946,7 @@ impl WasmDriver {
 
     /// Start driver execution. Returns immediately if driver yields.
     pub fn start(&mut self) -> DriverResult {
-        self.store.set_fuel(DRIVER_FUEL).unwrap_or(());
+        self.store.set_fuel(10_000_000).unwrap_or(());
 
         let func = match self.instance.get_typed_func::<(), ()>(&self.store, "driver_main") {
             Ok(f) => f,
@@ -574,7 +1005,7 @@ impl WasmDriver {
         self.waiting_for_irq = false;
 
         // Refuel for next execution slice
-        self.store.set_fuel(DRIVER_FUEL).unwrap_or(());
+        self.store.set_fuel(10_000_000).unwrap_or(());
 
         // Re-execute driver_main
         self.start()
@@ -582,7 +1013,7 @@ impl WasmDriver {
 
     /// Resume after fuel exhaustion (preemption). Just refuel and restart.
     pub fn resume_after_fuel(&mut self) -> DriverResult {
-        self.store.set_fuel(DRIVER_FUEL).unwrap_or(());
+        self.store.set_fuel(10_000_000).unwrap_or(());
         self.start()
     }
 }
@@ -594,18 +1025,38 @@ pub fn tick_drivers(drivers: &mut Vec<WasmDriver>) -> usize {
     let mut resumed = 0;
     let mut to_remove = Vec::new();
 
+    // Debug: log driver count and state periodically
+    static TICK_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let tc = TICK_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if tc < 3 {
+        libfolk::println!("[tick_drivers] {} drivers, tick #{}", drivers.len(), tc);
+        for (i, d) in drivers.iter().enumerate() {
+            libfolk::println!("[tick_drivers]   [{}] waiting={} uptime={}", i, d.waiting_for_irq, d.meta.uptime_ticks);
+        }
+    }
+
     for (i, driver) in drivers.iter_mut().enumerate() {
+        // Track uptime for all active drivers
+        driver.meta.uptime_ticks = driver.meta.uptime_ticks.saturating_add(1);
+
         if driver.waiting_for_irq {
-            // Poll for hardware interrupt
-            if driver.poll_irq() {
-                libfolk::println!("[DRV:{}] IRQ fired — resuming",
-                    driver.capability.driver_name());
+            // Wake driver periodically for TX polling (every 5 ticks ≈ every frame)
+            // The kernel smoltcp generates packets on a timer that the driver must transmit.
+            let tx_poll_due = (driver.meta.uptime_ticks % 5) == 0;
+
+            // Poll for hardware interrupt OR periodic TX poll
+            if driver.poll_irq() || tx_poll_due {
+                driver.meta.irq_count = driver.meta.irq_count.saturating_add(1);
+                libfolk::println!("[DRV:{}] IRQ #{} — resuming",
+                    driver.capability.driver_name(), driver.meta.irq_count);
                 match driver.resume_after_irq() {
                     DriverResult::WaitingForIrq => {
                         // Driver processed IRQ and is waiting for next one — good
                     }
                     DriverResult::Completed => {
-                        libfolk::println!("[DRV:{}] Completed", driver.capability.driver_name());
+                        driver.meta.recalc_stability();
+                        libfolk::println!("[DRV:{}] Completed (stability={})",
+                            driver.capability.driver_name(), driver.meta.stability_score);
                         to_remove.push(i);
                     }
                     DriverResult::OutOfFuel => {
@@ -613,7 +1064,11 @@ pub fn tick_drivers(drivers: &mut Vec<WasmDriver>) -> usize {
                         let _ = driver.resume_after_fuel();
                     }
                     DriverResult::Trapped(msg) => {
-                        libfolk::println!("[DRV:{}] TRAP: {}", driver.capability.driver_name(),
+                        driver.meta.fault_count = driver.meta.fault_count.saturating_add(1);
+                        driver.meta.recalc_stability();
+                        libfolk::println!("[DRV:{}] TRAP (faults={}, stability={}): {}",
+                            driver.capability.driver_name(),
+                            driver.meta.fault_count, driver.meta.stability_score,
                             &msg[..msg.len().min(60)]);
                         to_remove.push(i);
                     }
@@ -639,47 +1094,10 @@ pub fn tick_drivers(drivers: &mut Vec<WasmDriver>) -> usize {
 /// Generate the system prompt for LLM driver synthesis.
 /// Includes the complete folk_* ABI definition and constraints.
 pub fn driver_generation_prompt(vendor_id: u16, device_id: u16, class_name: &str) -> String {
+    // The actual prompt is in the proxy (tools/serial-gemini-proxy.py).
+    // This function just provides the device context for the __DRIVER_GEN__ marker.
     format!(
-        "Generate a Rust no_std WASM device driver for Folkering OS.\n\n\
-         TARGET DEVICE:\n\
-         - PCI Vendor: 0x{:04X}, Device: 0x{:04X}\n\
-         - Class: {}\n\n\
-         CONSTRAINTS:\n\
-         - #![no_std] #![no_main]\n\
-         - No allocation (no Vec, String, Box)\n\
-         - No crate imports\n\
-         - Export: #[no_mangle] pub extern \"C\" fn driver_main()\n\n\
-         AVAILABLE HOST FUNCTIONS (extern \"C\"):\n\
-         // Port I/O\n\
-         fn folk_inb(port: i32) -> i32;\n\
-         fn folk_inw(port: i32) -> i32;\n\
-         fn folk_inl(port: i32) -> i32;\n\
-         fn folk_outb(port: i32, value: i32);\n\
-         fn folk_outw(port: i32, value: i32);\n\
-         fn folk_outl(port: i32, value: i32);\n\n\
-         // MMIO (offset relative to BAR base)\n\
-         fn folk_mmio_read_u8(bar: i32, offset: i32) -> i32;\n\
-         fn folk_mmio_read_u16(bar: i32, offset: i32) -> i32;\n\
-         fn folk_mmio_read_u32(bar: i32, offset: i32) -> i32;\n\
-         fn folk_mmio_write_u8(bar: i32, offset: i32, value: i32);\n\
-         fn folk_mmio_write_u16(bar: i32, offset: i32, value: i32);\n\
-         fn folk_mmio_write_u32(bar: i32, offset: i32, value: i32);\n\n\
-         // Interrupt lifecycle\n\
-         fn folk_wait_irq();  // yields until hardware interrupt\n\
-         fn folk_ack_irq();   // acknowledge interrupt (unmask)\n\n\
-         // Device identity\n\
-         fn folk_device_vendor_id() -> i32;\n\
-         fn folk_device_id() -> i32;\n\
-         fn folk_device_irq() -> i32;\n\
-         fn folk_bar_size(bar: i32) -> i32;\n\n\
-         // Debug\n\
-         fn folk_log(ptr: i32, len: i32);\n\n\
-         DRIVER PATTERN:\n\
-         1. Read device identity via folk_device_vendor_id()\n\
-         2. Read BAR sizes via folk_bar_size(0..5)\n\
-         3. Initialize device via MMIO/port writes\n\
-         4. Enter loop: folk_wait_irq() → process data → folk_ack_irq()\n\n\
-         Return ONLY the Rust code.",
+        "__DRIVER_GEN__{:04x}:{:04x}:{}",
         vendor_id, device_id, class_name
     )
 }

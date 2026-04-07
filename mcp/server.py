@@ -119,6 +119,32 @@ def _guess_elf_for_address(addr_int: int) -> str:
 
 TOOLS = [
     {
+        "name": "os_metrics",
+        "description": (
+            "Get live Folkering OS metrics from the running Proxmox VM. "
+            "Returns network status (DHCP IP, gateway, DNS, ping RTT), "
+            "firewall stats (packets allowed/dropped, suspicious queue), "
+            "WASM app stats (cached apps, AutoDream dreams, compilations), "
+            "and system health (uptime, RAM, serial log size). "
+            "Use this to monitor the OS state during development and debugging."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "category": {
+                    "type": "string",
+                    "description": "Which metrics to fetch: 'all', 'network', 'firewall', 'apps', 'system'",
+                    "default": "all"
+                },
+                "serial_tail": {
+                    "type": "integer",
+                    "description": "Number of recent serial log lines to include (0 = none)",
+                    "default": 20
+                }
+            }
+        }
+    },
+    {
         "name": "kernel_symbol_lookup",
         "description": (
             "Resolve a hex address (or list of addresses) to function name, "
@@ -572,6 +598,78 @@ TOOLS = [
 ]
 
 # ── Tool implementations ───────────────────────────────────────────────────────
+
+PROXMOX_HOST = "192.168.68.150"
+SERIAL_LOG_REMOTE = "/tmp/folkering-serial.log"
+
+def _ssh_cmd(cmd: str, timeout: int = 10) -> str:
+    """Run a command on Proxmox via SSH."""
+    try:
+        result = subprocess.run(
+            ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5",
+             f"root@{PROXMOX_HOST}", cmd],
+            capture_output=True, text=True, timeout=timeout
+        )
+        return result.stdout.strip()
+    except Exception as e:
+        return f"SSH error: {e}"
+
+
+def os_metrics(category: str = "all", serial_tail: int = 20) -> str:
+    """Get live Folkering OS metrics from Proxmox VM."""
+    sections = []
+
+    if category in ("all", "network"):
+        net = _ssh_cmd(f"""
+grep 'DHCP.*got\\|DHCP.*gateway\\|DHCP.*DNS\\|Ping.*reply\\|DNS.*->' {SERIAL_LOG_REMOTE} | tail -10
+echo '---NET_STATS---'
+echo -n 'DHCP_leases:'; grep -c 'DHCP.*got' {SERIAL_LOG_REMOTE}
+echo -n 'DNS_lookups:'; grep -c 'DNS.*->' {SERIAL_LOG_REMOTE}
+echo -n 'Ping_replies:'; grep -c 'Ping.*reply' {SERIAL_LOG_REMOTE}
+""")
+        sections.append(f"## Network\n{net}")
+
+    if category in ("all", "firewall"):
+        fw = _ssh_cmd(f"""
+echo -n 'FW_drops:'; grep -c 'FW.*DROP' {SERIAL_LOG_REMOTE}
+echo -n 'FW_suspicious:'; grep -c 'SUSPICIOUS' {SERIAL_LOG_REMOTE} 2>/dev/null || echo 0
+grep 'FW.*DROP' {SERIAL_LOG_REMOTE} | tail -5
+""")
+        sections.append(f"## Firewall\n{fw}")
+
+    if category in ("all", "apps"):
+        apps = _ssh_cmd(f"""
+echo '--- Cached WASM Apps ---'
+grep 'Cache.*Stored' {SERIAL_LOG_REMOTE}
+echo ''
+echo -n 'Total_cached:'; grep -c 'Cache.*Stored' {SERIAL_LOG_REMOTE}
+echo -n 'Total_compiled:'; grep -c 'Compiled:' /tmp/proxy.log 2>/dev/null || echo 0
+echo -n 'AutoDream_dreams:'; grep -c 'DREAM.*COMPLETE' {SERIAL_LOG_REMOTE}
+echo ''
+echo '--- Recent AutoDream ---'
+grep 'AutoDream.*DREAM\\|AutoDream.*VERDICT' {SERIAL_LOG_REMOTE} | tail -5
+""")
+        sections.append(f"## WASM Apps & AutoDream\n{apps}")
+
+    if category in ("all", "system"):
+        sys_info = _ssh_cmd(f"""
+echo -n 'Serial_lines:'; wc -l < {SERIAL_LOG_REMOTE}
+echo -n 'Serial_size:'; du -h {SERIAL_LOG_REMOTE} | cut -f1
+echo -n 'VM_status:'; qm status 900 2>/dev/null | head -1
+echo -n 'Proxy_alive:'; pgrep -c -f serial-gemini || echo 0
+echo -n 'TCP_proxy:'; ss -tlnp 2>/dev/null | grep -c 8080
+echo ''
+echo '--- Uptime ---'
+grep 'HB.*kernel_ticks' {SERIAL_LOG_REMOTE} | tail -1
+""")
+        sections.append(f"## System\n{sys_info}")
+
+    if serial_tail > 0:
+        tail_out = _ssh_cmd(f"tail -{serial_tail} {SERIAL_LOG_REMOTE}")
+        sections.append(f"## Recent Serial ({serial_tail} lines)\n```\n{tail_out}\n```")
+
+    return "\n\n".join(sections)
+
 
 def kernel_symbol_lookup(addresses: list[str], elf_path: str | None = None) -> str:
     results = []
@@ -2053,7 +2151,12 @@ def handle(req: dict) -> dict:
         args   = req["params"].get("arguments", {})
 
         try:
-            if name == "kernel_symbol_lookup":
+            if name == "os_metrics":
+                result = os_metrics(
+                    category=args.get("category", "all"),
+                    serial_tail=args.get("serial_tail", 20)
+                )
+            elif name == "kernel_symbol_lookup":
                 result = kernel_symbol_lookup(
                     addresses=args["addresses"],
                     elf_path=args.get("elf_path")

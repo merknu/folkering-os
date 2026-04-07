@@ -433,12 +433,26 @@ pub fn block_read(sector: u64, buf: &mut [u8; SECTOR_SIZE]) -> Result<(), BlockE
     do_io(VIRTIO_BLK_T_IN, sector, buf)
 }
 
-/// Write a single sector (512 bytes) to the device
+/// Write a single sector (512 bytes) to the device.
+/// Includes retry + read-verify workaround for KVM VirtIO status=0xFF bug.
 pub fn block_write(sector: u64, buf: &[u8; SECTOR_SIZE]) -> Result<(), BlockError> {
-    // We need a mutable copy for the DMA buffer
-    let mut tmp = [0u8; SECTOR_SIZE];
-    tmp.copy_from_slice(buf);
-    do_io(VIRTIO_BLK_T_OUT, sector, &mut tmp)
+    for attempt in 0..3 {
+        let mut tmp = [0u8; SECTOR_SIZE];
+        tmp.copy_from_slice(buf);
+        if do_io(VIRTIO_BLK_T_OUT, sector, &mut tmp).is_ok() {
+            return Ok(());
+        }
+        // Write returned error (status=0xFF) — verify by reading back
+        let mut verify = [0u8; SECTOR_SIZE];
+        if do_io(VIRTIO_BLK_T_IN, sector, &mut verify).is_ok() {
+            if verify[..32] == buf[..32] && verify[480..] == buf[480..] {
+                return Ok(()); // Write succeeded despite status error
+            }
+        }
+        // Both failed — brief pause and retry
+        for _ in 0..50_000 { core::hint::spin_loop(); }
+    }
+    Err(BlockError::IoError)
 }
 
 /// Perform a single-sector I/O operation
@@ -477,8 +491,9 @@ fn do_io(req_type: u32, sector: u64, data: &mut [u8; SECTOR_SIZE]) -> Result<(),
         }
     }
 
-    // Set status to 0xFF (will be overwritten by device)
-    unsafe { *(status_virt as *mut u8) = 0xFF; }
+    // Set status to 0xFF (will be overwritten by device on completion)
+    unsafe { core::ptr::write_volatile(status_virt as *mut u8, 0xFF); }
+    fence(Ordering::SeqCst);
 
     // Allocate 3 descriptors for the chain: header → data → status
     let d0 = blk.queue.alloc_desc().ok_or(BlockError::IoError)?;
@@ -533,25 +548,24 @@ fn do_io(req_type: u32, sector: u64, data: &mut [u8; SECTOR_SIZE]) -> Result<(),
     let io_base = blk.io_base;
     drop(dev); // Release lock BEFORE sleep loop (IRQ handler needs it)
 
-    // Hybrid wait: hlt (sleep until ANY interrupt) + ISR poll after each wakeup.
-    // - TCG: VirtIO interrupt wakes hlt → IO_COMPLETE true → instant break
-    // - WHPX: Timer wakes hlt every ~10ms → ISR poll catches completion
-    // Pure ISR polling in tight loop causes VM-exit storm under WHPX.
-    unsafe { core::arch::asm!("sti"); }
+    // Enable interrupts and busy-poll for completion.
+    // STI is required: KVM's VirtIO only updates ISR register after
+    // the APIC delivers the interrupt, which requires IF=1.
+    unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
 
-    let mut timeout = 100_000u32; // ~1000s at 10ms/tick
-    while !IO_COMPLETE.load(Ordering::Acquire) {
-        unsafe { core::arch::asm!("hlt"); }
-        // After ANY interrupt wakes us, check both paths:
-        if IO_COMPLETE.load(Ordering::Acquire) { break; }
+    let mut timeout = 500_000u32; // ~500ms max wait per I/O
+    loop {
+        if IO_COMPLETE.load(Ordering::Acquire) {
+            break;
+        }
         let isr = read_io8(io_base, VIRTIO_PCI_ISR_STATUS);
         if isr != 0 {
             IO_COMPLETE.store(true, Ordering::Release);
             break;
         }
+        core::hint::spin_loop();
         timeout -= 1;
         if timeout == 0 {
-            crate::serial_strln!("[VIRTIO_BLK] I/O timeout!");
             return Err(BlockError::Timeout);
         }
     }
@@ -560,19 +574,35 @@ fn do_io(req_type: u32, sector: u64, data: &mut [u8; SECTOR_SIZE]) -> Result<(),
     let mut dev = BLOCK_DEVICE.lock();
     let blk = dev.as_mut().ok_or(BlockError::NotInitialized)?;
 
-    // Pop from used ring
+    // Pop from used ring and free descriptors
     if let Some((_head, _len)) = blk.queue.pop_used() {
-        // Free the descriptor chain
+        blk.queue.free_chain(d0);
+    } else {
+        // Used ring empty — descriptors leak! Force-free to prevent exhaustion
         blk.queue.free_chain(d0);
     }
 
-    // Check status
-    let status = unsafe { *(status_virt as *const u8) };
+    // Check status — volatile read (device writes to DMA memory, CPU may cache stale value)
+    fence(Ordering::SeqCst);
+    let status = unsafe { core::ptr::read_volatile(status_virt as *const u8) };
     if status != VIRTIO_BLK_S_OK {
-        crate::serial_str!("[VIRTIO_BLK] I/O error, status=");
-        crate::drivers::serial::write_dec(status as u32);
-        crate::drivers::serial::write_newline();
-        return Err(BlockError::IoError);
+        // Retry once — interrupt might have arrived before device finished writing status
+        for _ in 0..1000 { core::hint::spin_loop(); }
+        fence(Ordering::SeqCst);
+        let status2 = unsafe { core::ptr::read_volatile(status_virt as *const u8) };
+        if status2 != VIRTIO_BLK_S_OK {
+            // Suppress status=255 logging — handled by block_write retry+verify
+            static IO_ERR_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+            let c = IO_ERR_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if c < 3 {
+                crate::serial_str!("[VIRTIO_BLK] I/O error, status=");
+                crate::drivers::serial::write_dec(status2 as u32);
+                crate::drivers::serial::write_newline();
+            } else if c == 3 {
+                crate::serial_strln!("[VIRTIO_BLK] (further I/O errors suppressed)");
+            }
+            return Err(BlockError::IoError);
+        }
     }
 
     // For reads: copy data from DMA buffer

@@ -1227,10 +1227,15 @@ fn handle_write_file(msg: AsyncIpcMessage) {
         return;
     }
 
-    // Copy content to a local buffer (we need it after unmapping shmem)
-    let mut content_buf = [0u8; 4096];
-    let content_len = content.len().min(content_buf.len());
+    // Copy content to local buffer (shmem will be unmapped before insert)
+    // 16KB supports most WASM apps — larger files need overflow pages (future)
+    const MAX_CONTENT: usize = 16384;
+    let mut content_buf = [0u8; MAX_CONTENT];
+    let content_len = content.len().min(MAX_CONTENT);
     content_buf[..content_len].copy_from_slice(&content[..content_len]);
+    if content.len() > MAX_CONTENT {
+        println!("[SYNAPSE] WARNING: file truncated from {} to {} bytes", content.len(), MAX_CONTENT);
+    }
 
     // Copy name to local buffer
     let mut name_buf = [0u8; 32];
@@ -1434,18 +1439,27 @@ fn sqlite_insert_file(rowid: i64, name: &str, content: &[u8]) -> bool {
         let page_size = db.page_size() as usize;
 
         // Traverse B-tree to find the rightmost leaf page
-        // Interior pages (type 0x05) have a right-pointer; follow it to get the last leaf
         let mut current_page = root_page;
+        let page_count = u32::from_be_bytes([
+            SQLITE_STATE.data[28], SQLITE_STATE.data[29],
+            SQLITE_STATE.data[30], SQLITE_STATE.data[31],
+        ]) as usize;
         for _ in 0..10 {
-            // Safety depth limit
+            if current_page == 0 || (current_page as usize) > page_count {
+                println!("[SYNAPSE] insert: page {} out of range (max {})", current_page, page_count);
+                return false;
+            }
             let page_off = (current_page as usize - 1) * page_size;
             let hdr_off = if current_page == 1 { 100 } else { 0 };
+            if page_off + hdr_off >= SQLITE_STATE.size {
+                println!("[SYNAPSE] insert: page {} beyond db_size", current_page);
+                return false;
+            }
             let page_type = SQLITE_STATE.data[page_off + hdr_off];
 
             if page_type == 0x0d {
                 break; // Found leaf page
             } else if page_type == 0x05 {
-                // Interior page: right-pointer is at header offset + 8 (BE u32)
                 let rp_offset = page_off + hdr_off + 8;
                 let right_child = u32::from_be_bytes([
                     SQLITE_STATE.data[rp_offset],
@@ -1455,7 +1469,7 @@ fn sqlite_insert_file(rowid: i64, name: &str, content: &[u8]) -> bool {
                 ]);
                 current_page = right_child;
             } else {
-                println!("[SYNAPSE] insert: unexpected page type 0x{:02x}", page_type);
+                println!("[SYNAPSE] insert: unexpected page type 0x{:02x} at page {}", page_type, current_page);
                 return false;
             }
         }
@@ -1536,7 +1550,13 @@ fn sqlite_insert_file(rowid: i64, name: &str, content: &[u8]) -> bool {
         let record_body_size = header_size + name_bytes.len() + size_int_size + content.len();
 
         // Build the full cell: [payload_size: varint][rowid: varint][record body]
-        let mut cell_buf = [0u8; 8192];
+        // 16KB + 64 bytes for varints and header
+        const MAX_CELL: usize = 16448;
+        if record_body_size + 20 > MAX_CELL {
+            println!("[SYNAPSE] insert: cell too large ({} bytes)", record_body_size);
+            return false;
+        }
+        let mut cell_buf = [0u8; MAX_CELL];
         let mut cell_pos = 0usize;
 
         cell_pos += encode_varint(record_body_size as u64, &mut cell_buf[cell_pos..]);
@@ -1584,9 +1604,9 @@ fn sqlite_insert_file(rowid: i64, name: &str, content: &[u8]) -> bool {
             let new_page_num = page_count + 1;
             let new_page_offset = page_count * page_size; // 0-indexed
 
-            // Check we have room in the buffer
-            if new_page_offset + page_size > SQLITE_STATE.size {
-                println!("[SYNAPSE] insert: DB buffer too small for new page");
+            // Check we have room in the 2MB buffer (not the loaded DB size)
+            if new_page_offset + page_size > MAX_DB_SIZE {
+                println!("[SYNAPSE] insert: DB buffer full ({} pages max)", MAX_DB_SIZE / page_size);
                 return false;
             }
 
@@ -2191,25 +2211,41 @@ fn flush_sqlite_to_disk() -> bool {
     unsafe {
         let db_size = SQLITE_STATE.size;
         let total_sectors = (db_size + block::SECTOR_SIZE - 1) / block::SECTOR_SIZE;
-        let chunk_size = 64usize;
-        let mut sectors_remaining = total_sectors;
-        let mut current_sector = db_sector;
-        let mut buf_offset = 0usize;
+        let mut written = 0usize;
+        let mut errors = 0usize;
 
-        while sectors_remaining > 0 {
-            let this_chunk = sectors_remaining.min(chunk_size);
-            let chunk_bytes = this_chunk * block::SECTOR_SIZE;
-            let buf = &SQLITE_STATE.data[buf_offset..buf_offset + chunk_bytes];
-
-            if block::block_write(current_sector, buf, this_chunk).is_err() {
-                println!("[SYNAPSE] flush: write failed at sector {}", current_sector);
-                return false;
+        // Write ALL sectors — VirtIO write has retry+verify workaround
+        for i in 0..total_sectors {
+            let offset = i * block::SECTOR_SIZE;
+            let sec = db_sector + i as u64;
+            let sector_data: &[u8; 512] = SQLITE_STATE.data[offset..offset + 512]
+                .try_into().unwrap();
+            if block::write_sector(sec, sector_data).is_ok() {
+                written += 1;
+            } else {
+                errors += 1;
+                // Don't abort — continue writing remaining sectors.
+                // Individual sector errors are already retried by block_write.
             }
-
-            current_sector += this_chunk as u64;
-            buf_offset += chunk_bytes;
-            sectors_remaining -= this_chunk;
         }
+
+        if errors > 0 {
+            println!("[SYNAPSE] flush: {}/{} sectors failed", errors, total_sectors);
+        }
+
+        // Update FOLKDISK header with new DB size
+        let new_db_sectors = total_sectors as u64;
+        let old_db_sectors = u64::from_le_bytes([
+            header_buf[56], header_buf[57], header_buf[58], header_buf[59],
+            header_buf[60], header_buf[61], header_buf[62], header_buf[63],
+        ]);
+        if new_db_sectors != old_db_sectors {
+            header_buf[56..64].copy_from_slice(&new_db_sectors.to_le_bytes());
+            let _ = block::write_sector(0, &header_buf);
+            println!("[SYNAPSE] DB size: {} -> {} sectors", old_db_sectors, new_db_sectors);
+        }
+
+        println!("[SYNAPSE] flush: {}/{} sectors written", written, total_sectors);
     }
 
     true

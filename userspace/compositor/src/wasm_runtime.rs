@@ -31,7 +31,12 @@ use alloc::vec::Vec;
 use wasmi::*;
 
 /// Maximum fuel (instructions) per WASM execution tick
+/// Default fuel for WASM apps (1M instructions per frame)
 const FUEL_LIMIT: u64 = 1_000_000;
+/// Boosted fuel for the foreground/active app (5x more CPU time)
+pub const FUEL_FOREGROUND: u64 = 5_000_000;
+/// Reduced fuel for background windows (save CPU for foreground)
+pub const FUEL_BACKGROUND: u64 = 200_000;
 
 /// Maximum pending events per frame (prevent unbounded growth)
 const MAX_EVENTS: usize = 64;
@@ -242,6 +247,31 @@ fn register_host_functions(linker: &mut Linker<HostState>) {
     let _ = linker.func_wrap("env", "folk_random",
         |_caller: Caller<HostState>| -> i32 {
             libfolk::sys::random::random_u32() as i32
+        },
+    );
+
+    // OS Metrics: AI-generated apps can query live system state
+    // folk_os_metric(id) -> i32: 0=network, 1=firewall, 2=uptime, 3=suspicious
+    // Returns lower 32 bits of the metric (enough for most use cases)
+    let _ = linker.func_wrap("env", "folk_os_metric",
+        |_caller: Caller<HostState>, metric_id: i32| -> i32 {
+            (libfolk::sys::pci::os_metric(metric_id as u32) & 0xFFFFFFFF) as i32
+        },
+    );
+
+    // Convenience: folk_net_has_ip() -> i32 (1 if online, 0 if not)
+    let _ = linker.func_wrap("env", "folk_net_has_ip",
+        |_caller: Caller<HostState>| -> i32 {
+            let (has_ip, _, _, _, _) = libfolk::sys::pci::net_status();
+            if has_ip { 1 } else { 0 }
+        },
+    );
+
+    // Convenience: folk_fw_drops() -> i32 (firewall drop count)
+    let _ = linker.func_wrap("env", "folk_fw_drops",
+        |_caller: Caller<HostState>| -> i32 {
+            let (_, drops) = libfolk::sys::pci::firewall_stats();
+            drops as i32
         },
     );
 
@@ -483,6 +513,7 @@ fn register_host_functions(linker: &mut Linker<HostState>) {
     // Returns bytes written to buf, or -1 on error.
     let _ = linker.func_wrap("env", "folk_http_get",
         |mut caller: Caller<HostState>, url_ptr: i32, url_len: i32, buf_ptr: i32, max_len: i32| -> i32 {
+            // folk_http_get: WASM app fetches data from internet via TCP proxy
             if url_len <= 0 || url_len > 512 || max_len <= 0 { return -1; }
             let mem = match caller.get_export("memory") {
                 Some(Extern::Memory(m)) => m,
@@ -679,6 +710,8 @@ pub struct PersistentWasmApp {
     instance: Instance,
     run_fn: TypedFunc<(), ()>,
     pub active: bool,
+    /// Dynamic fuel budget: foreground apps get more CPU time
+    pub fuel_budget: u64,
 }
 
 impl PersistentWasmApp {
@@ -714,7 +747,7 @@ impl PersistentWasmApp {
         let run_fn = instance.get_typed_func::<(), ()>(&store, "run")
             .map_err(|_| String::from("No 'run' exported"))?;
 
-        Ok(Self { store, instance, run_fn, active: true })
+        Ok(Self { store, instance, run_fn, active: true, fuel_budget: FUEL_LIMIT })
     }
 
     /// Push an input event into the app's queue (max 64 per frame).
@@ -740,8 +773,8 @@ impl PersistentWasmApp {
             state.config = config;
         }
 
-        // Reset fuel for this frame
-        self.store.set_fuel(FUEL_LIMIT).unwrap_or(());
+        // Reset fuel — use dynamic budget if set, otherwise default
+        self.store.set_fuel(self.fuel_budget).unwrap_or(());
 
         // Execute run()
         match self.run_fn.call(&mut self.store, ()) {

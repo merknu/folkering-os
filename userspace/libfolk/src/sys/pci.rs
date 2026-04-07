@@ -194,6 +194,98 @@ pub fn iommu_status() -> (bool, u64) {
     (available, base)
 }
 
+// ── WASM Network Driver Bridge (Phase 11) ──────────────────────────────
+
+/// Register a WASM network driver with the kernel.
+/// Initializes the smoltcp stack with the provided MAC address.
+pub fn net_register(mac: &[u8; 6]) -> Result<(), ()> {
+    let mac_lo = (mac[0] as u64) | ((mac[1] as u64) << 8)
+        | ((mac[2] as u64) << 16) | ((mac[3] as u64) << 24);
+    let mac_hi = (mac[4] as u64) | ((mac[5] as u64) << 8);
+    let ret = unsafe { syscall2(0xAC, mac_lo, mac_hi) };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+/// Submit a received Ethernet frame to the kernel network stack.
+/// `data` must be a valid slice in the caller's address space.
+pub fn net_submit_rx(data: &[u8]) -> Result<(), ()> {
+    let ret = unsafe { syscall2(0xAD, data.as_ptr() as u64, data.len() as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+/// Poll for a packet to transmit from the kernel network stack.
+/// Returns the number of bytes written to `buf`, or 0 if no packet available.
+pub fn net_poll_tx(buf: &mut [u8]) -> usize {
+    let ret = unsafe { syscall2(0xAE, buf.as_mut_ptr() as u64, buf.len() as u64) };
+    if ret == u64::MAX { 0 } else { ret as usize }
+}
+
+/// Read physical memory via kernel HHDM (DMA coherency fallback).
+/// Copies `len` bytes from `phys_addr` to `dest` buffer.
+pub fn dma_sync_read(phys_addr: u64, dest: &mut [u8]) -> Result<usize, ()> {
+    let len = dest.len().min(4096);
+    let packed = (dest.as_mut_ptr() as u64) | ((len as u64) << 32);
+    let ret = unsafe { syscall2(0xAF, phys_addr, packed) };
+    if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }
+}
+
+/// Read a u64 directly from physical memory via kernel HHDM.
+pub fn dma_sync_read_u64(phys_addr: u64) -> u64 {
+    unsafe { syscall2(0xAF, phys_addr, 0) }
+}
+
+/// Write to physical memory via kernel HHDM (DMA coherency for writes).
+pub fn dma_sync_write(phys_addr: u64, src: &[u8]) -> Result<usize, ()> {
+    let len = src.len().min(4096);
+    let packed = (src.as_ptr() as u64) | ((len as u64) << 32);
+    let ret = unsafe { syscall2(0xB1, phys_addr, packed) };
+    if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }
+}
+
+// ── OS Metrics for AI Introspection (Phase 11) ─────────────────────────
+
+/// Query OS metrics from the kernel. Used by Draug, WASM apps, and AI agents.
+/// metric_id: 0=network, 1=firewall, 2=uptime, 3=suspicious_count
+pub fn os_metric(metric_id: u32) -> u64 {
+    unsafe { syscall2(0xB2, metric_id as u64, 0) }
+}
+
+/// Get network status: (has_ip, ip_a, ip_b, ip_c, ip_d)
+pub fn net_status() -> (bool, u8, u8, u8, u8) {
+    let v = os_metric(0);
+    let has_ip = (v & 1) != 0;
+    let a = ((v >> 8) & 0xFF) as u8;
+    let b = ((v >> 16) & 0xFF) as u8;
+    let c = ((v >> 24) & 0xFF) as u8;
+    let d = ((v >> 32) & 0xFF) as u8;
+    (has_ip, a, b, c, d)
+}
+
+/// Get firewall stats: (allows, drops)
+pub fn firewall_stats() -> (u32, u32) {
+    let v = os_metric(1);
+    ((v & 0xFFFFFFFF) as u32, ((v >> 32) & 0xFFFFFFFF) as u32)
+}
+
+/// Get uptime in milliseconds
+pub fn uptime_ms() -> u64 {
+    os_metric(2)
+}
+
+/// Get suspicious packet count
+pub fn suspicious_count() -> u32 {
+    os_metric(3) as u32
+}
+
+/// Kernel-assisted DMA RX: reads descriptor + packet from physical memory and
+/// delivers directly to smoltcp. Bypasses ALL cache coherency issues.
+pub fn net_dma_rx(ring_phys: u64, desc_idx: u16, buf_phys: u64, buf_size: u16) -> usize {
+    let arg1 = ring_phys | ((desc_idx as u64) << 48);
+    let arg2 = buf_phys | ((buf_size as u64) << 48);
+    let ret = unsafe { syscall2(0xB0, arg1, arg2) };
+    if ret == u64::MAX { 0 } else { ret as usize }
+}
+
 /// Check if a bound IRQ has fired (non-blocking).
 /// Returns true if an interrupt is pending, false if not.
 pub fn check_irq(irq_line: u8) -> Result<bool, ()> {

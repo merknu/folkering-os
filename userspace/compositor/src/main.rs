@@ -822,7 +822,7 @@ fn main() -> ! {
     // God Mode Pipe (COM3) — direct command injection buffer
     let mut com3_buf = [0u8; 512];
     let mut com3_len = 0usize;
-    let mut com3_inject: Option<alloc::string::String> = None;
+    let mut com3_queue: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
 
     // WASM JIT Toolsmithing — async generation (non-blocking)
     // Phase 1: "gemini generate X" → send [GENERATE_TOOL] via async COM2
@@ -1151,6 +1151,10 @@ fn main() -> ! {
         // Close boot test window — it served its diagnostic purpose
         wm.close_window(test_id);
     }
+
+    // Bootstrap driver seeding is deferred to first `generate driver` command
+    // (Synapse needs time to load SQLite from VirtIO disk at boot).
+    let mut drivers_seeded = false;
 
     // ===== M12: Restore saved app states from previous session =====
     const RESTORE_FKUI_VADDR: usize = COMPOSITOR_SHMEM_VADDR + 0x1000;
@@ -1611,6 +1615,8 @@ fn main() -> ! {
                     compositor::draug::DreamMode::Refactor => "Refactor",
                     compositor::draug::DreamMode::Creative => "Creative",
                     compositor::draug::DreamMode::Nightmare => "Nightmare",
+                    compositor::draug::DreamMode::DriverRefactor => "DriverRefactor",
+                    compositor::draug::DreamMode::DriverNightmare => "DriverNightmare",
                 };
 
                 // State Migration: snapshot WASM memory if active app is the dream target
@@ -1685,6 +1691,12 @@ fn main() -> ! {
                             alloc::string::String::from("(no cached binary)")
                         };
                         alloc::format!("--tweak \"add one visual improvement. Current output: {}\" {}", render_desc, target)
+                    }
+                    compositor::draug::DreamMode::DriverRefactor => {
+                        alloc::format!("--tweak \"optimize driver for fewer CPU cycles, preserve IRQ loop\" {}", target)
+                    }
+                    compositor::draug::DreamMode::DriverNightmare => {
+                        alloc::format!("--tweak \"harden driver against SFI violations, IRQ storms, DMA failures\" {}", target)
                     }
                 };
 
@@ -2016,6 +2028,16 @@ fn main() -> ! {
 
                         // Autonomous Driver: if this WASM is a driver response
                         if let Some(pci_dev) = pending_driver_device.take() {
+                            // ── Persist to Synapse VFS before loading ──
+                            let next_v = compositor::driver_runtime::find_latest_version(
+                                pci_dev.vendor_id, pci_dev.device_id) + 1;
+                            if compositor::driver_runtime::store_driver_vfs(
+                                pci_dev.vendor_id, pci_dev.device_id, next_v,
+                                &wasm_bytes, compositor::driver_runtime::DriverSource::Jit
+                            ) {
+                                write_str(&alloc::format!("[DRV] Persisted to VFS as v{}\n", next_v));
+                            }
+
                             let mut cap = compositor::driver_runtime::DriverCapability::from_pci(&pci_dev);
                             let name = alloc::format!("drv_{:04x}_{:04x}", pci_dev.vendor_id, pci_dev.device_id);
                             cap.set_name(&name);
@@ -2030,6 +2052,8 @@ fn main() -> ! {
                             // Instantiate the WASM driver
                             match compositor::driver_runtime::WasmDriver::new(&wasm_bytes, cap) {
                                 Ok(mut driver) => {
+                                    driver.meta.version = next_v;
+                                    driver.meta.source = compositor::driver_runtime::DriverSource::Jit;
                                     // Bind IRQ
                                     let _ = driver.bind_irq();
 
@@ -2211,12 +2235,33 @@ fn main() -> ! {
                                             write_str("us\n");
 
                                             if v2_us < v1_us {
+                                                // ── Edge-case fuzz test before accepting ──
+                                                // Run V2 with extreme inputs to catch crashes
+                                                let fuzz_configs = [
+                                                    compositor::wasm_runtime::WasmConfig { screen_width: 0, screen_height: 0, uptime_ms: 0 },
+                                                    compositor::wasm_runtime::WasmConfig { screen_width: 1, screen_height: 1, uptime_ms: u32::MAX },
+                                                    compositor::wasm_runtime::WasmConfig { screen_width: 9999, screen_height: 9999, uptime_ms: 0 },
+                                                ];
+                                                let mut fuzz_pass = true;
+                                                for fc in &fuzz_configs {
+                                                    let (fr, _) = compositor::wasm_runtime::execute_wasm(&wasm_bytes, fc.clone());
+                                                    if let compositor::wasm_runtime::WasmResult::Trap(_) = fr {
+                                                        write_str("[AutoDream] FUZZ FAIL: V2 crashes on edge input\n");
+                                                        fuzz_pass = false;
+                                                        break;
+                                                    }
+                                                }
+                                                if !fuzz_pass {
+                                                    write_str("[AutoDream] VERDICT: STRIKE (failed edge-case fuzz)\n");
+                                                    draug.add_strike(orig_key);
+                                                } else {
                                                 let pct = ((v1_us - v2_us) * 100 / v1_us.max(1)) as usize;
                                                 write_str("[AutoDream] VERDICT: EVOLVED! ");
                                                 write_str(format_usize(pct, &mut nb));
-                                                write_str("% faster\n");
+                                                write_str("% faster (fuzz: OK)\n");
                                                 wasm_cache.insert(alloc::string::String::from(orig_key), wasm_bytes.clone());
                                                 draug.reset_strikes(orig_key);
+                                                } // end fuzz_pass
                                             } else {
                                                 write_str("[AutoDream] VERDICT: STRIKE (V2 not faster)\n");
                                                 draug.add_strike(orig_key);
@@ -2273,6 +2318,15 @@ fn main() -> ! {
                                             write_str("\n");
                                         }
                                     }
+                                }
+                                compositor::draug::DreamMode::DriverRefactor |
+                                compositor::draug::DreamMode::DriverNightmare => {
+                                    write_str("[AutoDream] ---- DRIVER DREAM RESULT ----\n");
+                                    // For driver dreams, store as next version in VFS
+                                    // Parse vendor:device from orig_key (format: "drv_8086_100e")
+                                    // For now, just cache the improved WASM
+                                    write_str("[AutoDream] Driver dream result received\n");
+                                    wasm_cache.insert(alloc::string::String::from(orig_key), wasm_bytes.clone());
                                 }
                             }
 
@@ -2437,7 +2491,7 @@ fn main() -> ! {
                     write_str("[COM3] Inject: ");
                     write_str(cmd);
                     write_str("\n");
-                    com3_inject = Some(alloc::string::String::from(cmd));
+                    com3_queue.push(alloc::string::String::from(cmd));
                 }
                 com3_len = 0;
                 did_work = true;
@@ -2449,7 +2503,7 @@ fn main() -> ! {
         }
         // COM3 God Mode: if a command is pending and WASM is fullscreen,
         // force-close the WASM app so the command can be processed by the omnibar.
-        if com3_inject.is_some() && active_wasm_app.is_some() {
+        if !com3_queue.is_empty() && active_wasm_app.is_some() {
             active_wasm_app = None;
             active_wasm_app_key = None;
             fuel_fail_count = 0;
@@ -3635,7 +3689,8 @@ fn main() -> ! {
         let mut deferred_app_handle: u32 = 0;
 
         // COM3 God Mode: inject command directly (bypasses keyboard)
-        if let Some(injected) = com3_inject.take() {
+        // Dequeue ONE command per frame (prevents batch-drop where only last command survived)
+        if let Some(injected) = if !com3_queue.is_empty() { Some(com3_queue.remove(0)) } else { None } {
             let bytes = injected.as_bytes();
             let copy_len = bytes.len().min(text_buffer.len());
             text_buffer[..copy_len].copy_from_slice(&bytes[..copy_len]);
@@ -4229,9 +4284,11 @@ fn main() -> ! {
                         let time_str = format_uptime(ms, &mut buf);
                         win.push_line(time_str);
                     } else if cmd_str == "help" {
-                        win.push_line("Commands: ls, cat, ps, uptime");
+                        win.push_line("Commands: ls, cat, ps, uptime, mem");
+                        win.push_line("lspci, drivers, generate driver [v:d]");
+                        win.push_line("drivers versions v:d, drivers rollback v:d vN");
                         win.push_line("find <q>, calc <e>, open <a>");
-                        win.push_line("Windows: drag title, click X");
+                        win.push_line("gemini generate <desc>, ls |> cmd, ~>");
                     } else if cmd_str.starts_with("find ") || cmd_str.starts_with("search ") {
                         let query = if cmd_str.starts_with("find ") {
                             cmd_str[5..].trim()
@@ -4438,8 +4495,12 @@ fn main() -> ! {
                     } else if starts_with_ci(cmd_str, "generate driver") {
                         // Autonomous Driver Generation: generate WASM driver for a PCI device
                         let target = cmd_str.get(15..).unwrap_or("").trim();
+                        write_str("[DRV] target='");
+                        write_str(target);
+                        write_str("'\n");
                         let mut pci_buf: [libfolk::sys::pci::PciDeviceInfo; 32] = unsafe { core::mem::zeroed() };
                         let count = libfolk::sys::pci::enumerate(&mut pci_buf);
+                        write_str(&alloc::format!("[DRV] PCI: {} devices\n", count));
 
                         // Find target device (by vendor:device ID or auto-select first non-bridge)
                         let dev = if target.contains(':') {
@@ -4448,6 +4509,7 @@ fn main() -> ! {
                             if parts.len() == 2 {
                                 let vid = u16::from_str_radix(parts[0], 16).unwrap_or(0);
                                 let did = u16::from_str_radix(parts[1], 16).unwrap_or(0);
+                                write_str(&alloc::format!("[DRV] Looking for {:04x}:{:04x}\n", vid, did));
                                 pci_buf[..count].iter().find(|d| d.vendor_id == vid && d.device_id == did)
                             } else { None }
                         } else {
@@ -4459,39 +4521,246 @@ fn main() -> ! {
                         };
 
                         if let Some(d) = dev {
-                            let desc = alloc::format!(
-                                "__DRIVER_GEN__{:04x}:{:04x}:{}",
-                                d.vendor_id, d.device_id, d.class_name()
-                            );
-                            win.push_line(&alloc::format!(
-                                "[DRV] Generating driver for {:04x}:{:04x} ({})...",
-                                d.vendor_id, d.device_id, d.class_name()
-                            ));
-                            // Store device info for when WASM arrives
-                            pending_driver_device = Some(d.clone());
-                            // Send to proxy for LLM generation
-                            if libfolk::mcp::client::send_wasm_gen(&desc) {
-                                win.push_line("[DRV] Request sent to LLM");
+                            write_str(&alloc::format!("[DRV] Found {:04x}:{:04x} ({})\n",
+                                d.vendor_id, d.device_id, d.class_name()));
+
+                            // ── Just-in-time bootstrap seeding ──
+                            if !drivers_seeded {
+                                write_str("[DRV] First driver request — seeding bootstrap drivers\n");
+                                compositor::driver_runtime::seed_bootstrap_drivers(&pci_buf, count);
+                                drivers_seeded = true;
+                            }
+
+                            // ── Driver Version Control: check VFS, then built-in, then LLM ──
+                            let latest_v = compositor::driver_runtime::find_latest_version(
+                                d.vendor_id, d.device_id);
+
+                            if latest_v > 0 {
+                                // Cached driver exists — load from Synapse VFS
+                                write_str(&alloc::format!("[DRV] Found v{} in Synapse VFS\n", latest_v));
+                                win.push_line(&alloc::format!(
+                                    "[DRV] Loading {:04x}:{:04x} v{} from VFS...",
+                                    d.vendor_id, d.device_id, latest_v));
+
+                                if let Some(wasm_bytes) = compositor::driver_runtime::load_driver_vfs(
+                                    d.vendor_id, d.device_id, latest_v
+                                ) {
+                                    write_str(&alloc::format!("[DRV] Loaded {} bytes from VFS\n",
+                                        wasm_bytes.len()));
+                                    // Instantiate driver
+                                    let mut cap = compositor::driver_runtime::DriverCapability::from_pci(d);
+                                    let drv_name = alloc::format!("drv_{:04x}_{:04x}",
+                                        d.vendor_id, d.device_id);
+                                    cap.set_name(&drv_name);
+                                    compositor::driver_runtime::map_device_bars(&mut cap);
+                                    match compositor::driver_runtime::WasmDriver::new(&wasm_bytes, cap) {
+                                        Ok(mut driver) => {
+                                            driver.meta.version = latest_v;
+                                            driver.meta.source = compositor::driver_runtime::DriverSource::Bootstrap;
+                                            let _ = driver.bind_irq();
+                                            match driver.start() {
+                                                compositor::driver_runtime::DriverResult::WaitingForIrq => {
+                                                    write_str("[DRV] Driver started (IRQ wait)\n");
+                                                    win.push_line("[DRV] Driver running (from VFS)");
+                                                    active_drivers.push(driver);
+                                                }
+                                                compositor::driver_runtime::DriverResult::Completed => {
+                                                    write_str("[DRV] Driver completed immediately\n");
+                                                    win.push_line("[DRV] Driver completed");
+                                                }
+                                                other => {
+                                                    write_str("[DRV] Driver start failed\n");
+                                                    win.push_line("[DRV] Driver start failed");
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            write_str("[DRV] WASM load error\n");
+                                            win.push_line(&alloc::format!("[DRV] Load error: {}", &e[..e.len().min(50)]));
+                                        }
+                                    }
+                                } else {
+                                    write_str("[DRV] VFS read failed, falling back to LLM\n");
+                                    // Fall through to LLM generation
+                                    let desc = alloc::format!(
+                                        "__DRIVER_GEN__{:04x}:{:04x}:{}",
+                                        d.vendor_id, d.device_id, d.class_name());
+                                    pending_driver_device = Some(d.clone());
+                                    let _ = libfolk::mcp::client::send_wasm_gen(&desc);
+                                }
+                            } else if let Some(builtin) = compositor::driver_runtime::get_builtin_driver(
+                                d.vendor_id, d.device_id
+                            ) {
+                                // Built-in bootstrap driver available
+                                write_str(&alloc::format!("[DRV] Loading built-in driver ({} bytes)\n",
+                                    builtin.len()));
+                                win.push_line("[DRV] Loading built-in driver...");
+                                let mut cap = compositor::driver_runtime::DriverCapability::from_pci(d);
+                                let drv_name = alloc::format!("drv_{:04x}_{:04x}",
+                                    d.vendor_id, d.device_id);
+                                cap.set_name(&drv_name);
+                                // MAP MMIO BARs — without this, all MMIO writes go to address 0!
+                                let mapped = compositor::driver_runtime::map_device_bars(&mut cap);
+                                write_str(&alloc::format!("[DRV] Mapped {} MMIO BARs\n", mapped));
+                                match compositor::driver_runtime::WasmDriver::new(builtin, cap) {
+                                    Ok(mut driver) => {
+                                        driver.meta.version = 2;
+                                        driver.meta.source = compositor::driver_runtime::DriverSource::Bootstrap;
+                                        let _ = driver.bind_irq();
+                                        let start_result = driver.start();
+                                        write_str("[DRV] start returned\n");
+                                        match start_result {
+                                            compositor::driver_runtime::DriverResult::WaitingForIrq => {
+                                                write_str("[DRV] Built-in driver running (IRQ wait)\n");
+                                                win.push_line("[DRV] Driver running (built-in v2)");
+                                                active_drivers.push(driver);
+                                            }
+                                            compositor::driver_runtime::DriverResult::Completed => {
+                                                write_str("[DRV] Built-in driver completed\n");
+                                                win.push_line("[DRV] Driver completed");
+                                            }
+                                            compositor::driver_runtime::DriverResult::OutOfFuel => {
+                                                write_str("[DRV] Built-in driver OUT OF FUEL - scheduling\n");
+                                                active_drivers.push(driver);
+                                            }
+                                            compositor::driver_runtime::DriverResult::Trapped(ref msg) => {
+                                                write_str("[DRV] Built-in TRAP: ");
+                                                write_str(&msg[..msg.len().min(100)]);
+                                                write_str("\n");
+                                            }
+                                            other => {
+                                                write_str("[DRV] Built-in driver start failed\n");
+                                                win.push_line("[DRV] Driver start failed");
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        write_str("[DRV] Built-in load error\n");
+                                        win.push_line(&alloc::format!("[DRV] Error: {}", &e[..e.len().min(40)]));
+                                    }
+                                }
                             } else {
-                                win.push_line("[DRV] MCP send failed");
-                                pending_driver_device = None;
+                                // No cached driver — generate via LLM
+                                write_str("[DRV] No cached driver, requesting LLM generation\n");
+                                win.push_line(&alloc::format!(
+                                    "[DRV] Generating driver for {:04x}:{:04x} ({})...",
+                                    d.vendor_id, d.device_id, d.class_name()));
+                                pending_driver_device = Some(d.clone());
+                                let desc = alloc::format!(
+                                    "__DRIVER_GEN__{:04x}:{:04x}:{}",
+                                    d.vendor_id, d.device_id, d.class_name());
+                                if libfolk::mcp::client::send_wasm_gen(&desc) {
+                                    write_str("[DRV] MCP WasmGenRequest sent\n");
+                                    win.push_line("[DRV] Request sent to LLM");
+                                } else {
+                                    write_str("[DRV] MCP send FAILED\n");
+                                    win.push_line("[DRV] MCP send failed");
+                                    pending_driver_device = None;
+                                }
                             }
                         } else {
+                            write_str("[DRV] No matching device found\n");
                             win.push_line("[DRV] No matching PCI device found");
                             win.push_line("[DRV] Usage: generate driver [vendor:device]");
                             win.push_line("[DRV] Example: generate driver 1af4:1042");
                         }
                     } else if cmd_str == "drivers" {
-                        // List active WASM drivers
+                        // List active WASM drivers with version/stability info
                         win.push_line(&alloc::format!("[DRV] {} active drivers:", active_drivers.len()));
                         for drv in active_drivers.iter() {
+                            let src = match drv.meta.source {
+                                compositor::driver_runtime::DriverSource::Jit => "jit",
+                                compositor::driver_runtime::DriverSource::AutoDream => "dream",
+                                compositor::driver_runtime::DriverSource::Bootstrap => "boot",
+                            };
                             win.push_line(&alloc::format!(
-                                "  {:04x}:{:04x} {} irq={} {}",
+                                "  {:04x}:{:04x} v{} [{}] irq={}({}) stab={} {}",
                                 drv.capability.vendor_id, drv.capability.device_id,
-                                drv.capability.driver_name(),
-                                drv.capability.irq_line,
-                                if drv.waiting_for_irq { "[waiting]" } else { "[running]" }
+                                drv.meta.version, src,
+                                drv.capability.irq_line, drv.meta.irq_count,
+                                drv.meta.stability_score,
+                                if drv.waiting_for_irq { "waiting" } else { "running" }
                             ));
+                        }
+                    } else if starts_with_ci(cmd_str, "drivers versions") {
+                        // List all stored versions for a device
+                        let args = cmd_str.get(17..).unwrap_or("").trim();
+                        if args.contains(':') {
+                            let parts: alloc::vec::Vec<&str> = args.split(':').collect();
+                            if parts.len() == 2 {
+                                let vid = u16::from_str_radix(parts[0], 16).unwrap_or(0);
+                                let did = u16::from_str_radix(parts[1], 16).unwrap_or(0);
+                                let latest = compositor::driver_runtime::find_latest_version(vid, did);
+                                if latest > 0 {
+                                    win.push_line(&alloc::format!(
+                                        "[DRV] {:04x}:{:04x} — {} versions in VFS:", vid, did, latest));
+                                    for v in 1..=latest {
+                                        let fname = compositor::driver_runtime::driver_vfs_filename(vid, did, v);
+                                        let status = if active_drivers.iter().any(|d|
+                                            d.capability.vendor_id == vid &&
+                                            d.capability.device_id == did &&
+                                            d.meta.version == v
+                                        ) { " [ACTIVE]" } else { "" };
+                                        win.push_line(&alloc::format!("  v{}: {}{}", v, fname, status));
+                                    }
+                                } else {
+                                    win.push_line(&alloc::format!("[DRV] No drivers for {:04x}:{:04x}", vid, did));
+                                }
+                            }
+                        } else {
+                            win.push_line("[DRV] Usage: drivers versions 8086:100e");
+                        }
+                    } else if starts_with_ci(cmd_str, "drivers rollback") {
+                        // Rollback to a specific version: drivers rollback 8086:100e v1
+                        let args = cmd_str.get(17..).unwrap_or("").trim();
+                        let parts: alloc::vec::Vec<&str> = args.split_whitespace().collect();
+                        if parts.len() >= 2 && parts[0].contains(':') {
+                            let dev_parts: alloc::vec::Vec<&str> = parts[0].split(':').collect();
+                            let ver_str = parts[1].trim_start_matches('v');
+                            if dev_parts.len() == 2 {
+                                let vid = u16::from_str_radix(dev_parts[0], 16).unwrap_or(0);
+                                let did = u16::from_str_radix(dev_parts[1], 16).unwrap_or(0);
+                                let target_v = ver_str.parse::<u16>().unwrap_or(0);
+
+                                if target_v == 0 {
+                                    win.push_line("[DRV] Invalid version");
+                                } else if let Some(wasm_bytes) = compositor::driver_runtime::load_driver_vfs(vid, did, target_v) {
+                                    // Stop current driver for this device
+                                    active_drivers.retain(|d|
+                                        !(d.capability.vendor_id == vid && d.capability.device_id == did));
+
+                                    // Load rolled-back version
+                                    let mut pci_buf: [libfolk::sys::pci::PciDeviceInfo; 32] = unsafe { core::mem::zeroed() };
+                                    let count = libfolk::sys::pci::enumerate(&mut pci_buf);
+                                    if let Some(dev) = pci_buf[..count].iter().find(|d| d.vendor_id == vid && d.device_id == did) {
+                                        let mut cap = compositor::driver_runtime::DriverCapability::from_pci(dev);
+                                        let drv_name = alloc::format!("drv_{:04x}_{:04x}", vid, did);
+                                        cap.set_name(&drv_name);
+                                        compositor::driver_runtime::map_device_bars(&mut cap);
+                                        match compositor::driver_runtime::WasmDriver::new(&wasm_bytes, cap) {
+                                            Ok(mut driver) => {
+                                                driver.meta.version = target_v;
+                                                let _ = driver.bind_irq();
+                                                match driver.start() {
+                                                    compositor::driver_runtime::DriverResult::WaitingForIrq => {
+                                                        write_str(&alloc::format!("[DRV] Rolled back to v{}\n", target_v));
+                                                        win.push_line(&alloc::format!("[DRV] Rolled back to v{} — running", target_v));
+                                                        active_drivers.push(driver);
+                                                    }
+                                                    _ => { win.push_line("[DRV] Rollback driver failed to start"); }
+                                                }
+                                            }
+                                            Err(e) => { win.push_line(&alloc::format!("[DRV] Load error: {}", &e[..e.len().min(40)])); }
+                                        }
+                                    } else {
+                                        win.push_line("[DRV] PCI device not found");
+                                    }
+                                } else {
+                                    win.push_line(&alloc::format!("[DRV] v{} not found in VFS", target_v));
+                                }
+                            }
+                        } else {
+                            win.push_line("[DRV] Usage: drivers rollback 8086:100e v1");
                         }
                     } else if cmd_str == "lspci" {
                         // List PCI devices (Autonomous Driver Discovery)
@@ -4508,6 +4777,73 @@ fn main() -> ! {
                                 d.interrupt_line,
                                 d.bar_sizes[0]
                             ));
+                        }
+                    } else if cmd_str == "https" || starts_with_ci(cmd_str, "https ") {
+                        // HTTPS/TLS test — NON-BLOCKING via DNS first, then async TLS
+                        let target = if cmd_str.len() > 6 { cmd_str.get(6..).unwrap_or("example.com").trim() }
+                                     else { "example.com" };
+                        write_str("[HTTPS] Step 1: DNS lookup for ");
+                        write_str(target);
+                        write_str("...\n");
+                        win.push_line(&alloc::format!("[HTTPS] Looking up {}...", target));
+
+                        // DNS is also blocking, but it's much faster (~1-2s typically)
+                        // For a true async solution we'd need a state machine, but
+                        // dns lookup usually completes within the 10s timeout
+                        match libfolk::sys::dns::lookup(target) {
+                            Some(ip) => {
+                                let msg = alloc::format!("[HTTPS] {} -> {}.{}.{}.{}", target, ip.0, ip.1, ip.2, ip.3);
+                                write_str(&msg);
+                                write_str("\n");
+                                win.push_line(&msg);
+                                win.push_line("[HTTPS] Starting TLS 1.3 handshake...");
+
+                                // Now attempt HTTPS — pass DNS-resolved IP to kernel
+                                write_str("[HTTPS] TLS connecting...\n");
+                                let ip_packed = ((ip.0 as u64) << 24)
+                                    | ((ip.1 as u64) << 16)
+                                    | ((ip.2 as u64) << 8)
+                                    | (ip.3 as u64);
+                                let result = unsafe {
+                                    libfolk::syscall::syscall1(libfolk::syscall::SYS_HTTPS_TEST, ip_packed)
+                                };
+                                if result == 0 {
+                                    write_str("[HTTPS] TLS 1.3 SUCCESS!\n");
+                                    win.push_line("[HTTPS] SUCCESS: TLS 1.3 verified!");
+                                } else {
+                                    write_str("[HTTPS] TLS failed (timeout or connection error)\n");
+                                    win.push_line("[HTTPS] TLS failed — SLIRP NAT may not support long TCP");
+                                }
+                            }
+                            None => {
+                                write_str("[HTTPS] DNS lookup failed\n");
+                                win.push_line("[HTTPS] DNS failed — no internet or DNS timeout");
+                            }
+                        }
+                    } else if starts_with_ci(cmd_str, "dns ") {
+                        // DNS lookup via kernel smoltcp
+                        let hostname = cmd_str.get(4..).unwrap_or("").trim();
+                        if hostname.is_empty() {
+                            win.push_line("[DNS] Usage: dns example.com");
+                        } else {
+                            write_str("[DNS] Looking up: ");
+                            write_str(hostname);
+                            write_str("\n");
+                            win.push_line(&alloc::format!("[DNS] Looking up {}...", hostname));
+                            // SYS_NET_LOOKUP syscall (blocking)
+                            match libfolk::sys::dns::lookup(hostname) {
+                                Some(ip) => {
+                                    let msg = alloc::format!("[DNS] {} -> {}.{}.{}.{}",
+                                        hostname, ip.0, ip.1, ip.2, ip.3);
+                                    write_str(&msg);
+                                    write_str("\n");
+                                    win.push_line(&msg);
+                                }
+                                None => {
+                                    write_str("[DNS] Lookup failed\n");
+                                    win.push_line("[DNS] Lookup failed");
+                                }
+                            }
                         }
                     } else if cmd_str == "poweroff" || cmd_str == "shutdown" {
                         // M12: Save app states and shut down
@@ -4686,6 +5022,9 @@ fn main() -> ! {
                                                         for cmd in &output.text_commands { fb.draw_string(cmd.x as usize, cmd.y as usize, &cmd.text, fb.color_from_rgb24(cmd.color), fb.color_from_rgb24(0)); }
                                                         damage.damage_full();
                                                     }
+                                                } else {
+                                                    write_str("[LOAD] base64 decode FAILED\n");
+                                                    win.push_line("[OS] base64 decode failed");
                                                 }
                                             }
                                             _ => {
@@ -5529,6 +5868,8 @@ fn main() -> ! {
             if wasm_fullscreen {
                 if let Some(app) = &mut active_wasm_app {
                     if app.active {
+                        // Dynamic fuel: fullscreen app gets maximum CPU time
+                        app.fuel_budget = compositor::wasm_runtime::FUEL_FOREGROUND;
                         let config = compositor::wasm_runtime::WasmConfig {
                             screen_width: fb.width as u32,
                             screen_height: fb.height as u32,

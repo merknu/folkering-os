@@ -895,15 +895,19 @@ TARGET DEVICE:
 - PCI Vendor: {vendor_id}, Device: {device_id}
 - Class: {class_name}
 
-CONSTRAINTS:
+HARD CONSTRAINTS (violating these = compile failure):
 - #![no_std] #![no_main]
-- No allocation (no Vec, String, Box)
-- No crate imports (no `use` statements for external crates)
+- #![allow(unused)] at top
+- No allocation (no Vec, String, Box, format!, alloc)
+- No crate imports (no `use` for external crates, no std)
 - Export: #[no_mangle] pub extern "C" fn driver_main()
-- All host calls must be inside unsafe {{}}
+- ALL host function calls must be inside unsafe {{ }}
+- Use `static mut` for any state that persists between IRQ cycles
+- Declare ALL used host functions with: extern "C" {{ fn name(args) -> ret; }}
+- Every constant must have a complete value (e.g., `const X: i32 = 0x1234;`)
 
 AVAILABLE HOST FUNCTIONS (declare as extern "C"):
-  // Port I/O (capability-checked by kernel)
+  // Port I/O (capability-checked by kernel against PCI BARs)
   fn folk_inb(port: i32) -> i32;
   fn folk_inw(port: i32) -> i32;
   fn folk_inl(port: i32) -> i32;
@@ -911,7 +915,7 @@ AVAILABLE HOST FUNCTIONS (declare as extern "C"):
   fn folk_outw(port: i32, value: i32);
   fn folk_outl(port: i32, value: i32);
 
-  // MMIO (offset relative to BAR base, bounds-checked)
+  // MMIO (bar=BAR index 0-5, offset=byte offset in BAR)
   fn folk_mmio_read_u8(bar: i32, offset: i32) -> i32;
   fn folk_mmio_read_u16(bar: i32, offset: i32) -> i32;
   fn folk_mmio_read_u32(bar: i32, offset: i32) -> i32;
@@ -919,8 +923,12 @@ AVAILABLE HOST FUNCTIONS (declare as extern "C"):
   fn folk_mmio_write_u16(bar: i32, offset: i32, value: i32);
   fn folk_mmio_write_u32(bar: i32, offset: i32, value: i32);
 
+  // DMA allocation (returns physical address, max 1MB)
+  fn folk_dma_alloc(size: i32) -> i64;
+  fn folk_dma_free(phys_addr: i32);
+
   // Interrupt lifecycle
-  fn folk_wait_irq();   // yields until hardware interrupt fires
+  fn folk_wait_irq();   // yields CPU until hardware interrupt fires
   fn folk_ack_irq();    // acknowledge interrupt (unmask at APIC)
 
   // Device identity query
@@ -929,39 +937,52 @@ AVAILABLE HOST FUNCTIONS (declare as extern "C"):
   fn folk_device_irq() -> i32;
   fn folk_bar_size(bar: i32) -> i32;
 
-  // Debug output
+  // Debug logging (ptr = WASM memory address, len = byte count)
   fn folk_log(ptr: i32, len: i32);
 
-DRIVER PATTERN:
-  #[no_mangle]
-  pub extern "C" fn driver_main() {{
-      unsafe {{
-          let vid = folk_device_vendor_id();
-          let did = folk_device_id();
-          let bar0_size = folk_bar_size(0);
+COMPLETE WORKING EXAMPLE (minimal skeleton):
+```rust
+#![no_std]
+#![no_main]
+#![allow(unused)]
 
-          // Log startup
-          let msg = b"Driver started";
-          folk_log(msg.as_ptr() as i32, msg.len() as i32);
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo) -> ! {{ loop {{}} }}
 
-          // Read device status register (example: offset 0x10 in BAR0)
-          let status = folk_mmio_read_u32(0, 0x10);
+extern "C" {{
+    fn folk_device_vendor_id() -> i32;
+    fn folk_device_id() -> i32;
+    fn folk_bar_size(bar: i32) -> i32;
+    fn folk_mmio_read_u32(bar: i32, offset: i32) -> i32;
+    fn folk_mmio_write_u32(bar: i32, offset: i32, value: i32);
+    fn folk_wait_irq();
+    fn folk_ack_irq();
+    fn folk_log(ptr: i32, len: i32);
+}}
 
-          // Initialize device via MMIO writes
-          folk_mmio_write_u32(0, 0x10, 0x01); // enable device
+static mut IRQ_COUNT: u32 = 0;
 
-          // Main loop: wait for interrupts and process
-          loop {{
-              folk_wait_irq();
-              // Read interrupt status
-              let isr = folk_mmio_read_u32(0, 0x08);
-              // Process interrupt...
-              folk_ack_irq();
-          }}
-      }}
-  }}
+#[no_mangle]
+pub extern "C" fn driver_main() {{
+    unsafe {{
+        let msg = b"Driver started";
+        folk_log(msg.as_ptr() as i32, msg.len() as i32);
+        let _vid = folk_device_vendor_id();
+        // Initialize device via BAR0 MMIO
+        folk_mmio_write_u32(0, 0x00, 0x01);
+        // Main IRQ loop
+        loop {{
+            folk_wait_irq();
+            let isr = folk_mmio_read_u32(0, 0x00C0);
+            IRQ_COUNT += 1;
+            folk_ack_irq();
+        }}
+    }}
+}}
+```
 
-Return ONLY the complete Rust source code for the driver. No explanation."""
+IMPORTANT: Your code MUST compile with `cargo build --target wasm32-unknown-unknown`.
+Return ONLY the Rust source code. No markdown, no explanation, no backticks around the code."""
 
     print(f"[DRIVER] Generating driver for {vendor_id}:{device_id} ({class_name})...")
     source = call_llm(driver_prompt, tier="heavy")
@@ -1006,8 +1027,74 @@ Return ONLY the complete Rust source code for the driver. No explanation."""
             ["cargo", "build", "--target", "wasm32-unknown-unknown", "--release"],
             capture_output=True, text=True, timeout=60, cwd=proj_dir)
         if result.returncode != 0:
-            print(f"[DRIVER] Compile failed: {result.stderr[:200]}")
-            return None, f"Driver compile error: {result.stderr[:400]}"
+            print(f"[DRIVER] Compile failed: {result.stderr[:500]}")
+            # Save source even on failure for debugging
+            fail_key = f"driver_{vendor_id}_{device_id}"
+            fail_path = os.path.join(_WASM_CACHE_DIR, f"{fail_key}_FAILED.rs")
+            with open(fail_path, "w") as ff:
+                ff.write(source)
+            err_path = os.path.join(_WASM_CACHE_DIR, f"{fail_key}_FAILED.err")
+            with open(err_path, "w") as ff:
+                ff.write(result.stderr)
+            print(f"[DRIVER] Saved failed source: {fail_path}")
+
+            # AUTO-FIX: retry with compile error feedback (one attempt)
+            fix_prompt = f"""The following Rust WASM driver code failed to compile.
+Fix ALL compilation errors and return the corrected code.
+
+ORIGINAL CODE:
+```rust
+{source}
+```
+
+COMPILER ERRORS:
+{result.stderr[:2000]}
+
+CONSTRAINTS (same as before):
+- #![no_std] #![no_main]
+- No allocation (no Vec, String, Box)
+- No crate imports
+- Export: #[no_mangle] pub extern "C" fn driver_main()
+- All host calls must be inside unsafe {{}}
+
+Return ONLY the corrected Rust code."""
+
+            print(f"[DRIVER] Attempting auto-fix...")
+            fix_source = call_llm(fix_prompt, tier="heavy")
+            if fix_source and not fix_source.startswith("Error:"):
+                # Extract code from response
+                if "```rust" in fix_source:
+                    fix_source = fix_source.split("```rust")[1].split("```")[0].strip()
+                elif "```" in fix_source:
+                    parts = fix_source.split("```")
+                    if len(parts) >= 3: fix_source = parts[1].strip()
+                fix_source = fix_missing_externs(fix_source)
+                fix_source = fix_unsafe_calls(fix_source)
+                if "fn driver_main" not in fix_source and "fn run" in fix_source:
+                    fix_source = fix_source.replace("fn run()", "fn driver_main()")
+                with open(os.path.join(proj_dir, "src", "lib.rs"), "w") as ff:
+                    ff.write(fix_source)
+                retry = subprocess.run(
+                    ["cargo", "build", "--target", "wasm32-unknown-unknown", "--release"],
+                    capture_output=True, text=True, timeout=60, cwd=proj_dir)
+                if retry.returncode == 0:
+                    wasm_path2 = os.path.join(proj_dir, "target", "wasm32-unknown-unknown", "release", "wasm_driver.wasm")
+                    if os.path.exists(wasm_path2):
+                        with open(wasm_path2, "rb") as ff:
+                            wasm_binary = ff.read()
+                        print(f"[DRIVER] Auto-fix SUCCESS: {len(wasm_binary)} bytes")
+                        source = fix_source  # Use fixed source for caching
+                        # Fall through to cache + return below
+                    else:
+                        return None, "Driver WASM not found after fix"
+                else:
+                    print(f"[DRIVER] Auto-fix compile also failed: {retry.stderr[:200]}")
+                    fix2_path = os.path.join(_WASM_CACHE_DIR, f"{fail_key}_FIX_FAILED.rs")
+                    with open(fix2_path, "w") as ff:
+                        ff.write(fix_source)
+                    return None, f"Driver compile error (even after auto-fix): {retry.stderr[:300]}"
+            else:
+                return None, f"Driver compile error: {result.stderr[:400]}"
         wasm_path = os.path.join(proj_dir, "target", "wasm32-unknown-unknown", "release", "wasm_driver.wasm")
         if not os.path.exists(wasm_path):
             return None, "Driver WASM output not found"
@@ -1636,7 +1723,119 @@ def handle_serial(sock: socket.socket):
             break
 
 
+def handle_tcp_client(conn, addr):
+    """Handle a single TCP client connection (from kernel's ask_gemini via TCP)."""
+    print(f"[TCP-PROXY] Connection from {addr}")
+    try:
+        conn.settimeout(60)
+        data = b""
+        while b"@@END@@" not in data:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+
+        if REQ_START not in data or REQ_END not in data:
+            print(f"[TCP-PROXY] Malformed request ({len(data)} bytes)")
+            conn.close()
+            return
+
+        start = data.index(REQ_START) + len(REQ_START)
+        end = data.index(REQ_END)
+        payload = data[start:end]
+
+        print(f"[TCP-PROXY] Request: {payload[:100]}...")
+
+        try:
+            req = json.loads(payload)
+            prompt = req.get("prompt", payload.decode("utf-8", errors="replace"))
+        except json.JSONDecodeError:
+            prompt = payload.decode("utf-8", errors="replace")
+
+        # ── Load WASM from host filesystem ──
+        if prompt.startswith(LOAD_WASM_PREFIX):
+            wasm_path = prompt[len(LOAD_WASM_PREFIX):].rstrip("]").strip()
+            print(f"[TCP-PROXY] Loading WASM from: {wasm_path}")
+            try:
+                with open(wasm_path, "rb") as wf:
+                    wasm_binary = wf.read()
+                if len(wasm_binary) > MAX_WASM_SIZE:
+                    response = RESP_START + f"WASM too large: {len(wasm_binary)}".encode() + RESP_END + b"\n"
+                else:
+                    b64_data = base64.b64encode(wasm_binary).decode("ascii")
+                    resp_json = json.dumps({"action": "tool_ready", "binary": b64_data})
+                    response = RESP_START + resp_json.encode() + RESP_END + b"\n"
+                    print(f"[TCP-PROXY] WASM loaded: {len(wasm_binary)} bytes -> {len(b64_data)} b64")
+            except Exception as e:
+                response = RESP_START + f"Load error: {e}".encode()[:256] + RESP_END + b"\n"
+        # ── Intent-IP: HTTP GET via host network ──
+        elif prompt.startswith("__HTTP_GET__"):
+            url = prompt[12:].strip()
+            print(f"[TCP-PROXY] HTTP GET: {url[:80]}")
+            try:
+                import urllib.request, ssl
+                ctx = ssl.create_default_context()
+                req_obj = urllib.request.Request(url, headers={"User-Agent": "FolkeringOS/1.0"})
+                with urllib.request.urlopen(req_obj, context=ctx, timeout=15) as resp:
+                    body = resp.read(8192).decode("utf-8", errors="replace")
+                print(f"[TCP-PROXY] HTTP GET got {len(body)} chars")
+                response = RESP_START + body.encode("utf-8", errors="replace")[:8192] + RESP_END + b"\n"
+            except Exception as e:
+                err = f"HTTP error: {e}"
+                print(f"[TCP-PROXY] {err}")
+                response = RESP_START + err.encode()[:256] + RESP_END + b"\n"
+        # ── WASM generation ──
+        elif prompt.startswith("gemini generate ") or prompt.startswith("Generate a Rust"):
+            wasm_binary, error = _llm_to_wasm(prompt)
+            if error:
+                response = RESP_START + error.encode() + RESP_END + b"\n"
+            else:
+                b64_data = base64.b64encode(wasm_binary).decode("ascii")
+                resp_json = json.dumps({"action": "tool_ready", "binary": b64_data})
+                response = RESP_START + resp_json.encode() + RESP_END + b"\n"
+        # ── Default: LLM chat ──
+        else:
+            result = call_llm(prompt, tier="fast")
+            if result.startswith("Error:"):
+                result = call_llm(prompt, tier="medium")
+            response = RESP_START + result.encode("utf-8", errors="replace") + RESP_END + b"\n"
+
+        conn.sendall(response)
+        print(f"[TCP-PROXY] Sent {len(response)} bytes")
+
+    except Exception as e:
+        print(f"[TCP-PROXY] Error: {e}")
+    finally:
+        conn.close()
+
+
+def tcp_listener_thread():
+    """Background thread that listens for TCP connections from the kernel."""
+    TCP_PORT = 8080
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("0.0.0.0", TCP_PORT))
+    srv.listen(4)
+    print(f"[TCP-PROXY] Listening on 0.0.0.0:{TCP_PORT} (kernel AI proxy)")
+
+    while True:
+        try:
+            conn, addr = srv.accept()
+            # Handle each connection in a thread to avoid blocking
+            import threading
+            t = threading.Thread(target=handle_tcp_client, args=(conn, addr), daemon=True)
+            t.start()
+        except Exception as e:
+            print(f"[TCP-PROXY] Accept error: {e}")
+            time.sleep(1)
+
+
 def main():
+    # Start TCP listener for kernel AI proxy (in background thread)
+    import threading
+    tcp_thread = threading.Thread(target=tcp_listener_thread, daemon=True)
+    tcp_thread.start()
+
     print(f"[SERIAL-PROXY] Connecting to QEMU COM2 at {COM2_HOST}:{COM2_PORT}...")
 
     while True:

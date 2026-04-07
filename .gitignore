@@ -67,3 +67,4 @@ active_debug_log.md
 # Model files (download on demand, too large for git)
 boot/models/
 *.gguf
+wasm_cache/
