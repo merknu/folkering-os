@@ -459,12 +459,9 @@ pub fn poll() {
         }
     }
 
-    // ── Auto-ping gateway after first DHCP ────────────────────────────────
-    if state.has_ip && !state.auto_ping_done {
-        state.auto_ping_done = true;
-        let gateway = Ipv4Address::new(10, 0, 2, 2);
-        send_ping_inner(state, gateway);
-    }
+    // ── Auto-ping after first DHCP ─────────────────────────────────────
+    // Disabled: hardcoded gateway doesn't work with bridge networking.
+    // Ping can be triggered manually via the `ping` omnibar command.
 
     // ── Check for ICMP echo replies ──────────────────────────────────────
     check_ping_reply(state);

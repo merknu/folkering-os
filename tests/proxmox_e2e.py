@@ -83,9 +83,12 @@ def main():
 
     # ── Test 2: Network ──
     print("\n--- Test 2: Network ---")
+    # Inject DNS lookup to verify full network stack (DHCP + DNS + bridge routing)
+    inject("dns google.com")
+    time.sleep(8)
     results["network"] = all([
         check("DHCP.*got", "DHCP IP acquired"),
-        check("Ping.*reply", "Ping gateway"),
+        check("DNS.*resolved", "DNS resolution"),
     ])
 
     # ── Test 3: COM3 Injection ──
