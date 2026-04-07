@@ -4406,6 +4406,29 @@ fn main() -> ! {
                         win.push_line("Type commands, Enter to run, Esc for omnibar");
                     } else if cmd_str.starts_with("calc ") {
                         win.push_line("Calculator: coming soon");
+                    } else if starts_with_ci(cmd_str, "save app ") {
+                        // App Persistence: save last compiled WASM to VFS
+                        let app_name = cmd_str[9..].trim();
+                        if app_name.is_empty() {
+                            win.push_line("Usage: save app <name>");
+                        } else if let Some(ref wasm) = last_wasm_bytes {
+                            let filename = alloc::format!("{}.wasm", app_name);
+                            match libfolk::sys::synapse::write_file(&filename, wasm) {
+                                Ok(()) => {
+                                    win.push_line(&alloc::format!(
+                                        "[OS] Saved '{}' ({} bytes)", app_name, wasm.len()
+                                    ));
+                                    write_str("[COMPOSITOR] App saved to VFS: ");
+                                    write_str(&filename);
+                                    write_str("\n");
+                                }
+                                Err(_) => {
+                                    win.push_line("[OS] Save failed — VFS write error");
+                                }
+                            }
+                        } else {
+                            win.push_line("[OS] No app to save. Run 'load' or 'gemini generate' first.");
+                        }
                     } else if cmd_str.starts_with("save ") {
                         // VFS write: save <filename> <content>
                         let args = &cmd_str[5..];
@@ -5037,42 +5060,6 @@ fn main() -> ! {
                                 }
                                 let _ = libfolk::sys::munmap(LOAD_BUF_VADDR as *mut u8, LOAD_BUF_SIZE);
                             }
-                        }
-                    } else if starts_with_ci(cmd_str, "save app ") {
-                        // App Persistence: save last compiled WASM to VFS
-                        let app_name = cmd_str[9..].trim();
-                        if app_name.is_empty() {
-                            win.push_line("Usage: save app <name>");
-                        } else if let Some(ref wasm) = last_wasm_bytes {
-                            let filename = alloc::format!("{}.wasm", app_name);
-                            match libfolk::sys::synapse::write_file(&filename, wasm) {
-                                Ok(()) => {
-                                    win.push_line(&alloc::format!(
-                                        "[OS] Saved '{}' ({} bytes, {})",
-                                        app_name, wasm.len(),
-                                        if last_wasm_interactive { "interactive" } else { "one-shot" }
-                                    ));
-                                    write_str("[COMPOSITOR] App saved to VFS: ");
-                                    write_str(&filename);
-                                    write_str("\n");
-                                    // Add to categorized desktop folder
-                                    let cat = categorize_app(app_name);
-                                    if categories[cat].count < MAX_APPS_PER_CAT {
-                                        let name_bytes = app_name.as_bytes();
-                                        let copy_len = name_bytes.len().min(24);
-                                        let idx = categories[cat].count;
-                                        categories[cat].apps[idx].name[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
-                                        categories[cat].apps[idx].name_len = copy_len;
-                                        categories[cat].count += 1;
-                                        damage.damage_full();
-                                    }
-                                }
-                                Err(_) => {
-                                    win.push_line("[OS] Save failed — VFS write error");
-                                }
-                            }
-                        } else {
-                            win.push_line("[OS] No app to save. Run 'gemini ...' first.");
                         }
                     } else if starts_with_ci(cmd_str, "run ") {
                         // App Persistence: load and execute saved WASM from VFS
