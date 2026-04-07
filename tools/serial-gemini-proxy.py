@@ -123,30 +123,118 @@ LOAD_WASM_PREFIX = "[LOAD_WASM:"  # [LOAD_WASM:/path/to/file.wasm]
 # Maximum compiled WASM size (64KB) — prevents COM2 buffer overflow
 MAX_WASM_SIZE = 64 * 1024
 
-# Complete registry of all folk_* host functions available to WASM tools.
-# Used to auto-inject missing extern declarations after LLM code generation.
-FOLK_EXTERNS = {
+# ── Dynamic RAG: Load folk_* host function signatures from source ────────
+# Parses wasm_runtime.rs to build the extern registry automatically.
+# Falls back to hardcoded list if source file not found.
+
+def _load_folk_externs_from_source() -> dict:
+    """Parse wasm_runtime.rs for linker.func_wrap calls and extract folk_* signatures."""
+    import re as _re
+    # Try multiple paths (dev machine vs Proxmox deploy)
+    candidates = [
+        os.path.join(os.path.dirname(__file__), "..", "userspace", "compositor", "src", "wasm_runtime.rs"),
+        "/var/lib/vz/images/900/wasm_runtime.rs",
+    ]
+    source = None
+    for path in candidates:
+        try:
+            with open(path, "r") as f:
+                source = f.read()
+            break
+        except FileNotFoundError:
+            continue
+
+    if not source:
+        print("[RAG] wasm_runtime.rs not found — using hardcoded externs")
+        return _HARDCODED_EXTERNS
+
+    # Extract: linker.func_wrap("env", "folk_xxx", |caller, arg1: i32, arg2: i32| -> i32 { ... })
+    externs = {}
+    for m in _re.finditer(
+        r'func_wrap\("env",\s*"(folk_\w+)",\s*\|[^|]*\|'
+        r'([^{]*?)(?:->|{)',
+        source
+    ):
+        name = m.group(1)
+        # Already have this one parsed? Skip duplicates
+        if name in externs:
+            continue
+
+    # More robust: parse the Caller<HostState> signature
+    for m in _re.finditer(
+        r'func_wrap\("env",\s*"(folk_\w+)",\s*\|(?:mut\s+)?caller:\s*Caller<HostState>'
+        r'(?:,\s*(\w+:\s*i32(?:,\s*\w+:\s*i32)*))?'
+        r'\|\s*(?:->\s*(i32))?\s*\{',
+        source
+    ):
+        name = m.group(1)
+        params_raw = m.group(2) or ""
+        ret = m.group(3)
+
+        # Build signature
+        params = params_raw.strip().rstrip(",") if params_raw else ""
+        sig = f"fn {name}({params})"
+        if ret:
+            sig += f" -> {ret}"
+        sig += ";"
+        externs[name] = sig
+
+    if externs:
+        print(f"[RAG] Loaded {len(externs)} folk_* signatures from wasm_runtime.rs")
+    else:
+        print("[RAG] Parse found 0 signatures — using hardcoded fallback")
+        return _HARDCODED_EXTERNS
+
+    # Merge with hardcoded (source of truth for docs/comments)
+    for k, v in _HARDCODED_EXTERNS.items():
+        if k not in externs:
+            externs[k] = v
+
+    return externs
+
+
+_HARDCODED_EXTERNS = {
     # Drawing
     "folk_draw_rect": "fn folk_draw_rect(x: i32, y: i32, w: i32, h: i32, color: i32);",
     "folk_draw_line": "fn folk_draw_line(x1: i32, y1: i32, x2: i32, y2: i32, color: i32);",
     "folk_draw_circle": "fn folk_draw_circle(cx: i32, cy: i32, r: i32, color: i32);",
     "folk_draw_text": "fn folk_draw_text(x: i32, y: i32, ptr: i32, len: i32, color: i32);",
     "folk_fill_screen": "fn folk_fill_screen(color: i32);",
-    # System Metrics
+    # System
     "folk_get_time": "fn folk_get_time() -> i32;",
     "folk_screen_width": "fn folk_screen_width() -> i32;",
     "folk_screen_height": "fn folk_screen_height() -> i32;",
     "folk_random": "fn folk_random() -> i32;",
     "folk_get_datetime": "fn folk_get_datetime(ptr: i32) -> i32;",
+    "folk_os_metric": "fn folk_os_metric(metric_id: i32) -> i32;",
+    "folk_net_has_ip": "fn folk_net_has_ip() -> i32;",
+    "folk_fw_drops": "fn folk_fw_drops() -> i32;",
     # Input
     "folk_poll_event": "fn folk_poll_event(event_ptr: i32) -> i32;",
-    # Direct Pixel Access
+    # Surface
     "folk_get_surface": "fn folk_get_surface() -> i32;",
     "folk_surface_pitch": "fn folk_surface_pitch() -> i32;",
     "folk_surface_present": "fn folk_surface_present();",
-    # Async File
+    # Files
     "folk_request_file": "fn folk_request_file(path_ptr: i32, path_len: i32, dest_ptr: i32, dest_len: i32) -> i32;",
+    "folk_list_files": "fn folk_list_files(buf_ptr: i32, max_len: i32) -> i32;",
+    "folk_write_file": "fn folk_write_file(path_ptr: i32, path_len: i32, data_ptr: i32, data_len: i32) -> i32;",
+    "folk_query_files": "fn folk_query_files(query_ptr: i32, query_len: i32, result_ptr: i32, result_max_len: i32) -> i32;",
+    # Network
+    "folk_http_get": "fn folk_http_get(url_ptr: i32, url_len: i32, buf_ptr: i32, max_len: i32) -> i32;",
+    "folk_intent_fetch": "fn folk_intent_fetch(query_ptr: i32, query_len: i32, buf_ptr: i32, max_len: i32) -> i32;",
+    # AI
+    "folk_slm_generate": "fn folk_slm_generate(prompt_ptr: i32, prompt_len: i32, buf_ptr: i32, max_len: i32) -> i32;",
+    # Streams
+    "folk_stream_write": "fn folk_stream_write(ptr: i32, len: i32);",
+    "folk_stream_read": "fn folk_stream_read(ptr: i32, max_len: i32) -> i32;",
+    "folk_stream_done": "fn folk_stream_done();",
+    # Adapter
+    "folk_adapter_input": "fn folk_adapter_input(ptr: i32, max_len: i32) -> i32;",
+    "folk_adapter_output": "fn folk_adapter_output(ptr: i32, len: i32);",
 }
+
+FOLK_EXTERNS = _load_folk_externs_from_source()
 
 import re
 
@@ -840,7 +928,9 @@ def _llm_to_wasm(prompt: str, force: bool = False, tweak: str = "") -> tuple:
     source = fix_infinite_loop(source)
     print(f"[WASM] Source: {len(source)} chars")
 
-    # Compile
+    # ── Self-correcting compile loop (up to 3 attempts) ──
+    # If compilation fails, feed the error back to the LLM and let it fix its own mistakes.
+    MAX_FIX_ATTEMPTS = 3
     tmp_dir = tempfile.mkdtemp(prefix="folkwasm_")
     try:
         proj_dir = os.path.join(tmp_dir, "wasm_tool")
@@ -849,13 +939,67 @@ def _llm_to_wasm(prompt: str, force: bool = False, tweak: str = "") -> tuple:
             f.write('[package]\nname = "wasm_tool"\nversion = "0.1.0"\nedition = "2021"\n'
                     '[lib]\ncrate-type = ["cdylib"]\n[profile.release]\n'
                     'opt-level = "z"\nlto = true\nstrip = true\npanic = "abort"\n')
-        with open(os.path.join(proj_dir, "src", "lib.rs"), "w") as f:
-            f.write(source)
-        result = subprocess.run(
-            ["cargo", "build", "--target", "wasm32-unknown-unknown", "--release"],
-            capture_output=True, text=True, timeout=60, cwd=proj_dir)
-        if result.returncode != 0:
-            return None, f"Compile error: {result.stderr[:400]}"
+
+        for attempt in range(1, MAX_FIX_ATTEMPTS + 1):
+            with open(os.path.join(proj_dir, "src", "lib.rs"), "w") as f:
+                f.write(source)
+            result = subprocess.run(
+                ["cargo", "build", "--target", "wasm32-unknown-unknown", "--release"],
+                capture_output=True, text=True, timeout=60, cwd=proj_dir)
+
+            if result.returncode == 0:
+                break  # Compilation succeeded!
+
+            # ── Compilation failed — ask LLM to fix ──
+            if attempt < MAX_FIX_ATTEMPTS:
+                err_output = result.stderr[-800:]  # Last 800 chars of errors
+                # Count actual errors (not warnings)
+                error_count = err_output.count("error[E")
+                print(f"[WASM] Compile attempt {attempt}/{MAX_FIX_ATTEMPTS} FAILED ({error_count} errors). Asking LLM to fix...")
+
+                fix_prompt = (
+                    f"The following Rust code failed to compile for wasm32-unknown-unknown.\n\n"
+                    f"COMPILER ERRORS:\n```\n{err_output}\n```\n\n"
+                    f"SOURCE CODE:\n```rust\n{source}\n```\n\n"
+                    f"Fix ALL the compiler errors. Keep the same functionality.\n"
+                    f"Rules: #![no_std] #![no_main], no allocation, no std, extern \"C\" fn run().\n"
+                    f"Available folk_* functions:\n"
+                    + "\n".join(f"  {v}" for v in FOLK_EXTERNS.values())
+                    + "\n\nReturn ONLY the complete fixed source code in <TOOL_CODE>...</TOOL_CODE> tags."
+                )
+
+                fix_response = call_llm(fix_prompt, tier="medium")
+                if fix_response.startswith("Error:"):
+                    print(f"[WASM] LLM fix request failed: {fix_response[:100]}")
+                    return None, f"Compile error (attempt {attempt}): {result.stderr[:400]}"
+
+                # Extract fixed code
+                if "<think>" in fix_response and "</think>" in fix_response:
+                    fix_response = fix_response[fix_response.index("</think>") + 8:]
+                fixed = None
+                if "<TOOL_CODE>" in fix_response and "</TOOL_CODE>" in fix_response:
+                    fixed = fix_response.split("<TOOL_CODE>")[1].split("</TOOL_CODE>")[0].strip()
+                elif "```rust" in fix_response:
+                    fixed = fix_response.split("```rust")[1].split("```")[0].strip()
+                elif "```" in fix_response:
+                    parts = fix_response.split("```")
+                    if len(parts) >= 3:
+                        fixed = parts[1].strip()
+
+                if fixed and "#![no_std]" in fixed:
+                    source = fixed
+                    source = fix_missing_externs(source)
+                    source = fix_unsafe_calls(source)
+                    source = fix_infinite_loop(source)
+                    print(f"[WASM] LLM provided fix ({len(source)} chars), retrying compile...")
+                else:
+                    print(f"[WASM] LLM fix response didn't contain valid code")
+                    return None, f"Compile error: {result.stderr[:400]}"
+            else:
+                print(f"[WASM] All {MAX_FIX_ATTEMPTS} compile attempts failed")
+                return None, f"Compile error after {MAX_FIX_ATTEMPTS} attempts: {result.stderr[:400]}"
+
+        # Compilation succeeded
         wasm_path = os.path.join(proj_dir, "target", "wasm32-unknown-unknown", "release", "wasm_tool.wasm")
         if not os.path.exists(wasm_path):
             return None, "WASM output not found"
@@ -863,12 +1007,15 @@ def _llm_to_wasm(prompt: str, force: bool = False, tweak: str = "") -> tuple:
             wasm_binary = f.read()
         if len(wasm_binary) > MAX_WASM_SIZE:
             return None, f"WASM too large: {len(wasm_binary)} bytes"
-        print(f"[WASM] Compiled: {len(wasm_binary)} bytes")
+        if attempt > 1:
+            print(f"[WASM] Compiled after {attempt} attempts: {len(wasm_binary)} bytes")
+        else:
+            print(f"[WASM] Compiled: {len(wasm_binary)} bytes")
         # Detect dream mode from tweak text for lineage
         dream_mode_tag = ""
         parent = ""
         if tweak:
-            parent = prompt  # The original app is the parent
+            parent = prompt
             if "refactor" in tweak.lower(): dream_mode_tag = "refactor"
             elif "visual" in tweak.lower() or "improvement" in tweak.lower(): dream_mode_tag = "creative"
             elif "harden" in tweak.lower(): dream_mode_tag = "nightmare"
