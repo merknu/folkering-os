@@ -61,9 +61,9 @@ def cfg(key, default=""):
 # Three tiers: FAST (local, cheap), MEDIUM (cloud lite), HEAVY (cloud smart)
 # Each task is routed to the cheapest tier that can handle it.
 
-# FAST tier: local Ollama — free, instant, but limited reasoning
+# FAST tier: local Ollama — free, GPU-accelerated
 FAST_PROVIDER = cfg("FAST_LLM_PROVIDER", "local")
-FAST_MODEL = cfg("FAST_LLM_MODEL", "qwen2.5-coder:7b")
+FAST_MODEL = cfg("FAST_LLM_MODEL", "gemma4:31b-cloud")
 FAST_URL = cfg("FAST_LLM_URL", "http://localhost:11434/v1")
 
 # MEDIUM tier: cloud lite — cheap, good for code gen + simple tool calls
@@ -235,6 +235,49 @@ _HARDCODED_EXTERNS = {
 }
 
 FOLK_EXTERNS = _load_folk_externs_from_source()
+
+
+# ── Mega-Context: Load full source files for 256K context models ─────────
+
+def _load_full_context() -> str:
+    """Load entire source files for deep OS understanding.
+    Gemma 4 (256K context) can absorb the full WASM runtime + libfolk API."""
+    sources = {}
+    file_map = {
+        "wasm_runtime.rs": [
+            os.path.join(os.path.dirname(__file__), "..", "userspace", "compositor", "src", "wasm_runtime.rs"),
+            "/var/lib/vz/images/900/wasm_runtime.rs",
+        ],
+        "folkering_context.py": [
+            os.path.join(os.path.dirname(__file__), "folkering_context.py"),
+            "/var/lib/vz/images/900/folkering_context.py",
+        ],
+    }
+    for name, paths in file_map.items():
+        for path in paths:
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+                sources[name] = content
+                break
+            except FileNotFoundError:
+                continue
+
+    if not sources:
+        return ""
+
+    ctx = "=== FOLKERING OS SOURCE CONTEXT ===\n\n"
+    for name, content in sources.items():
+        # Trim to 60K chars per file (leaves room for conversation)
+        trimmed = content[:60000]
+        ctx += f"--- {name} ({len(trimmed)} chars) ---\n{trimmed}\n\n"
+
+    total = len(ctx)
+    print(f"[CTX] Loaded {len(sources)} source files ({total} chars total)")
+    return ctx
+
+
+_FULL_SOURCE_CONTEXT = _load_full_context()
 
 import re
 
@@ -903,46 +946,88 @@ def _llm_to_wasm(prompt: str, force: bool = False, tweak: str = "") -> tuple:
 # Agentic ReAct WASM Generator
 # ═══════════════════════════════════════════════════════════════════════════
 
+# ── Agent system prompt (injected as system message) ──
 _AGENT_SYSTEM = """You are the Folkering OS Toolsmith — an AI agent that builds WASM apps.
 
-You have three tools. Call them by writing EXACTLY this format (one per message):
-
-<tool>read_libfolk_docs(query)</tool>
-  Search the Folk host API. Returns matching function signatures and docs.
-  Example: <tool>read_libfolk_docs(drawing)</tool>
-
-<tool>write_file(lib.rs, CODE_HERE)</tool>
-  Write Rust source to lib.rs. The code must be a complete #![no_std] WASM module.
-  Everything after "lib.rs, " until </tool> is the file content.
-
-<tool>cargo_compile()</tool>
-  Compile the project. Returns "OK: N bytes" or compiler errors.
+You have three tools available via function calling. Use them to build, compile,
+and iterate on WASM applications for Folkering OS (bare-metal Rust, no_std).
 
 WORKFLOW:
-1. Think about what the app needs (drawing? input? network? time?)
-2. Use read_libfolk_docs to find the right APIs
-3. Write the code with write_file
-4. Compile with cargo_compile
-5. If errors: read the error, fix the code, write_file again, recompile
-6. When compilation succeeds, you're done
+1. Optionally call read_libfolk_docs to find APIs you need
+2. Call write_file with your complete Rust source code
+3. Call cargo_compile to compile it
+4. If compilation fails, read the errors, fix the code, write_file again, recompile
+5. Repeat until cargo_compile returns success
 
-RULES:
-- #![no_std] #![no_main] required
+STRICT RULES for the Rust code:
+- #![no_std] #![no_main] are REQUIRED at the top
 - Export: #[no_mangle] pub extern "C" fn run()
-- #[panic_handler] required
-- ALL folk_* calls must be in unsafe { }
+- Include: #[panic_handler] fn panic(_: &core::panic::PanicInfo) -> ! { loop {} }
+- The ENTIRE body of run() MUST be wrapped in unsafe { }
 - NO std, NO allocation (Vec/String/Box), NO extern crate
-- run() is called every frame — use static mut for state
-- Colors: 0x00RRGGBB format
-
-You MUST call at least one tool per response. Do NOT just write code in your response — use write_file.
+- run() is called every frame — use static mut for persistent state
+- Colors: 0x00RRGGBB (e.g., 0xFF0000 = red, 0x00FF00 = green)
+- Declare all folk_* functions in: extern "C" { fn folk_...; }
 """
+
+# ── Native tool definitions for Ollama function calling ──
+_AGENT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "read_libfolk_docs",
+            "description": "Search the Folkering OS host API documentation. Returns matching folk_* function signatures. Use queries like 'drawing', 'input', 'time', 'network', 'file', 'all'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query (e.g., 'drawing', 'input events', 'network http')"
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Write complete Rust source code to lib.rs. The code must be a full #![no_std] WASM module with run() exported. This overwrites any previous code.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "Complete Rust source code for the WASM app"
+                    }
+                },
+                "required": ["code"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cargo_compile",
+            "description": "Compile the current lib.rs to wasm32-unknown-unknown. Returns 'OK: N bytes' on success, or compiler error messages on failure. Always call this after write_file.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            }
+        }
+    },
+]
 
 _REACT_MAX_STEPS = 8
 
 
 def _react_wasm_agent(task: str) -> tuple:
-    """Run a ReAct agent loop. Returns (wasm_bytes, source, error)."""
+    """Run an agentic tool-calling loop. Returns (wasm_bytes, source, error).
+
+    Uses Ollama native function calling: the LLM returns structured tool_calls
+    instead of text-based <tool> tags. No regex parsing needed.
+    """
 
     tmp_dir = tempfile.mkdtemp(prefix="folkwasm_")
     proj_dir = os.path.join(tmp_dir, "wasm_tool")
@@ -952,92 +1037,106 @@ def _react_wasm_agent(task: str) -> tuple:
                 '[lib]\ncrate-type = ["cdylib"]\n[profile.release]\n'
                 'opt-level = "z"\nlto = true\nstrip = true\npanic = "abort"\n')
 
-    # Conversation history for multi-turn
+    # Build system prompt with full source context (256K models can handle it)
+    system_prompt = _AGENT_SYSTEM
+    if _FULL_SOURCE_CONTEXT:
+        system_prompt += "\n\n" + _FULL_SOURCE_CONTEXT
+
     history = [
-        {"role": "system", "content": _AGENT_SYSTEM},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": task},
     ]
 
     wasm_result = None
     last_source = None
     compile_failures = 0
-
-    # Start with fast (Ollama), escalate to medium (Flash Lite) after compile fails
     current_tier = "fast"
 
     try:
         for step in range(1, _REACT_MAX_STEPS + 1):
             print(f"[AGENT] Step {step}/{_REACT_MAX_STEPS} (tier={current_tier})")
 
-            # Call LLM with full history
-            response = _call_llm_chat(history, tier=current_tier)
-            if not response or response.startswith("Error:"):
-                # LLM failed — try escalating
+            # Call LLM with tools
+            response = _call_llm_with_tools(history, _AGENT_TOOLS, tier=current_tier)
+
+            if not response:
                 if current_tier == "fast" and GOOGLE_API_KEY:
                     print(f"[AGENT] {current_tier} failed, escalating to medium")
                     current_tier = "medium"
-                    response = _call_llm_chat(history, tier=current_tier)
-                if not response or response.startswith("Error:"):
-                    print(f"[AGENT] LLM error: {(response or 'empty')[:100]}")
+                    response = _call_llm_with_tools(history, _AGENT_TOOLS, tier=current_tier)
+                if not response:
+                    print(f"[AGENT] LLM returned nothing")
                     break
 
-            history.append({"role": "assistant", "content": response})
+            # Check if response has tool calls (native function calling)
+            tool_calls = response.get("tool_calls") if isinstance(response, dict) else None
 
-            # Strip <think>...</think>
-            clean = response
-            if "<think>" in clean and "</think>" in clean:
-                clean = clean[clean.index("</think>") + 8:]
+            if tool_calls:
+                # Native tool calling path
+                history.append({"role": "assistant", "content": "", "tool_calls": tool_calls})
 
-            # Parse tool call
-            tool_match = re.search(r'<tool>(.*?)</tool>', clean, re.DOTALL)
-            if not tool_match:
-                # No tool call — check if LLM wrote code directly (common mistake)
-                if "```rust" in clean and "#![no_std]" in clean:
-                    print(f"[AGENT] LLM wrote code without write_file — auto-extracting")
-                    code = clean.split("```rust")[1].split("```")[0].strip()
-                    observation = _tool_write_file(proj_dir, f"lib.rs, {code}")
-                    history.append({"role": "user", "content": f"<observation>{observation}</observation>\nNow call <tool>cargo_compile()</tool> to compile it."})
-                    continue
-                print(f"[AGENT] No tool call found, nudging")
-                history.append({"role": "user", "content": "You must call a tool. Use <tool>write_file(lib.rs, YOUR_CODE)</tool> then <tool>cargo_compile()</tool>."})
-                continue
+                for tc in tool_calls:
+                    fn = tc.get("function", {})
+                    name = fn.get("name", "")
+                    args = fn.get("arguments", {})
+                    if isinstance(args, str):
+                        try: args = json.loads(args)
+                        except: args = {}
 
-            tool_call = tool_match.group(1).strip()
+                    print(f"[AGENT] Tool: {name}({', '.join(f'{k}={str(v)[:40]}' for k,v in args.items())})")
 
-            # Dispatch tool
-            if tool_call.startswith("read_libfolk_docs("):
-                query = tool_call[18:].rstrip(")")
-                observation = _tool_read_docs(query)
-            elif tool_call.startswith("write_file("):
-                args = tool_call[11:].rstrip(")")
-                observation = _tool_write_file(proj_dir, args)
-                # Extract source for cache
-                comma = args.find(", ")
-                if comma >= 0:
-                    last_source = args[comma + 2:]
-            elif tool_call.startswith("cargo_compile("):
-                observation, wasm_result = _tool_cargo_compile(proj_dir)
-                if wasm_result:
-                    print(f"[AGENT] Compiled in step {step} ({current_tier}): {len(wasm_result)} bytes")
-                    return wasm_result, last_source, None
-                else:
-                    # Compile failed — escalate tier for smarter fixes
+                    if name == "read_libfolk_docs":
+                        result = _tool_read_docs(args.get("query", "all"))
+                    elif name == "write_file":
+                        code = args.get("code", "")
+                        result = _tool_write_file(proj_dir, f"lib.rs, {code}")
+                        last_source = code
+                    elif name == "cargo_compile":
+                        result, wasm_result = _tool_cargo_compile(proj_dir)
+                        if wasm_result:
+                            print(f"[AGENT] Compiled in step {step} ({current_tier}): {len(wasm_result)} bytes")
+                            return wasm_result, last_source, None
+                        compile_failures += 1
+                        if compile_failures == 1 and current_tier == "fast" and GOOGLE_API_KEY:
+                            current_tier = "medium"
+                            print(f"[AGENT] Compile failed, escalating to Flash Lite")
+                        elif compile_failures == 2 and current_tier == "medium" and GOOGLE_API_KEY:
+                            current_tier = "heavy"
+                            print(f"[AGENT] 2nd fail, escalating to Flash")
+                    else:
+                        result = f"Unknown tool: {name}"
+
+                    print(f"[AGENT] Result: {result[:120]}")
+                    history.append({"role": "tool", "content": result})
+
+            else:
+                # Fallback: LLM returned text (no tool calls)
+                content = response.get("content", "") if isinstance(response, dict) else str(response)
+                history.append({"role": "assistant", "content": content})
+
+                # Try to extract code from text response
+                if "```rust" in content and "#![no_std]" in content:
+                    print(f"[AGENT] Text response with code — auto-extracting")
+                    code = content.split("```rust")[1].split("```")[0].strip()
+                    result = _tool_write_file(proj_dir, f"lib.rs, {code}")
+                    last_source = code
+                    history.append({"role": "tool", "content": result})
+                    # Auto-compile
+                    result2, wasm_result = _tool_cargo_compile(proj_dir)
+                    history.append({"role": "tool", "content": result2})
+                    if wasm_result:
+                        print(f"[AGENT] Auto-compiled in step {step}: {len(wasm_result)} bytes")
+                        return wasm_result, last_source, None
                     compile_failures += 1
                     if compile_failures == 1 and current_tier == "fast" and GOOGLE_API_KEY:
                         current_tier = "medium"
-                        print(f"[AGENT] Compile failed, escalating to Gemini Flash Lite")
-                    elif compile_failures == 2 and current_tier == "medium" and GOOGLE_API_KEY:
-                        current_tier = "heavy"
-                        print(f"[AGENT] 2nd compile fail, escalating to Gemini Flash")
-            else:
-                observation = f"Unknown tool: {tool_call[:50]}. Available: read_libfolk_docs, write_file, cargo_compile"
+                        print(f"[AGENT] Compile failed, escalating to Flash Lite")
+                else:
+                    print(f"[AGENT] No tool calls in response, nudging")
+                    history.append({"role": "user", "content": "Please call the write_file tool with your Rust code, then call cargo_compile."})
 
-            print(f"[AGENT] Tool result: {observation[:120]}")
-            history.append({"role": "user", "content": f"<observation>{observation}</observation>"})
-
-        # Max steps reached
-        print(f"[AGENT] Max steps ({_REACT_MAX_STEPS}) reached without successful compile")
-        return None, last_source, f"Agent exhausted {_REACT_MAX_STEPS} steps without compiling"
+        print(f"[AGENT] Max steps ({_REACT_MAX_STEPS}) reached")
+        return None, last_source, f"Agent exhausted {_REACT_MAX_STEPS} steps"
 
     except Exception as e:
         print(f"[AGENT] Exception: {e}")
@@ -1046,15 +1145,15 @@ def _react_wasm_agent(task: str) -> tuple:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def _call_llm_chat(messages: list, tier: str = "fast") -> str:
-    """Call LLM with multi-turn message history.
+def _call_llm_with_tools(messages: list, tools: list = None, tier: str = "fast") -> dict:
+    """Call LLM with native tool/function calling support.
 
-    Routes to the right provider based on tier:
-      fast   → Ollama local (qwen2.5-coder:7b)
-      medium → Gemini Flash Lite (if API key) else Ollama
-      heavy  → Gemini Flash (if API key) else Ollama
+    Returns a dict with either:
+      {"tool_calls": [...]}  — LLM wants to call tools
+      {"content": "..."}    — LLM returned text
+
+    Routes: fast → Ollama, medium → Gemini Flash Lite, heavy → Gemini Flash
     """
-    # Determine provider + model for this tier
     tier_map = {
         "fast":   (FAST_PROVIDER,   FAST_MODEL,   FAST_URL),
         "medium": (MEDIUM_PROVIDER, MEDIUM_MODEL, MEDIUM_URL),
@@ -1062,54 +1161,66 @@ def _call_llm_chat(messages: list, tier: str = "fast") -> str:
     }
     provider, model, base_url = tier_map.get(tier, tier_map["fast"])
 
-    # Fall back to local if no API key for cloud
     if provider != "local" and not GOOGLE_API_KEY:
         provider, model, base_url = FAST_PROVIDER, FAST_MODEL, FAST_URL
 
-    # ── Local Ollama: native /api/chat with multi-turn ──
+    # ── Ollama: native /api/chat with tools ──
     if provider == "local":
         try:
             base = base_url.rstrip("/v1").rstrip("/")
             url = f"{base}/api/chat"
-            body = json.dumps({
-                "model": model, "messages": messages, "stream": False,
-            }).encode()
+            payload = {"model": model, "messages": messages, "stream": False}
+            if tools:
+                payload["tools"] = tools
+            body = json.dumps(payload).encode()
             req = urllib.request.Request(url, data=body,
                 headers={"Content-Type": "application/json"}, method="POST")
-            with urllib.request.urlopen(req, timeout=60) as resp:
+            with urllib.request.urlopen(req, timeout=120) as resp:
                 result = json.loads(resp.read())
                 msg = result.get("message", {})
+                tc = msg.get("tool_calls")
+                if tc:
+                    return {"tool_calls": tc}
                 content = msg.get("content", "")
-                thinking = msg.get("thinking", "")
-                if thinking:
-                    return f"<think>\n{thinking}\n</think>\n{content}"
-                return content
+                return {"content": content}
         except Exception as e:
-            # If local fails and we have a cloud key, escalate
             if GOOGLE_API_KEY:
-                print(f"[AGENT] Ollama failed ({e}), escalating to Gemini Flash Lite")
-                return _call_gemini_chat(messages, MEDIUM_MODEL, MEDIUM_URL)
-            return f"Error: {e}"
+                print(f"[AGENT] Ollama failed ({e}), escalating to Gemini")
+                return _call_gemini_with_tools(messages, tools, MEDIUM_MODEL, MEDIUM_URL)
+            return None
 
-    # ── Gemini Cloud: multi-turn chat ──
+    # ── Gemini: multi-turn with function calling ──
     if provider == "gemini":
-        return _call_gemini_chat(messages, model, base_url)
+        return _call_gemini_with_tools(messages, tools, model, base_url)
 
-    # ── Fallback: flatten to single prompt ──
-    flat = "\n\n".join(f"[{m['role']}]: {m['content']}" for m in messages)
-    return call_llm(flat, tier=tier)
+    # ── Fallback: text-only ──
+    flat = "\n\n".join(f"[{m['role']}]: {m.get('content','')}" for m in messages)
+    text = call_llm(flat, tier=tier)
+    return {"content": text} if text else None
 
 
-def _call_gemini_chat(messages: list, model: str, base_url: str) -> str:
-    """Multi-turn Gemini API call. Converts messages to Gemini format."""
-    # Gemini uses "user" and "model" roles, with "parts" containing text
+def _call_llm_chat(messages: list, tier: str = "fast") -> str:
+    """Simple chat without tools (for non-agent use). Returns text."""
+    result = _call_llm_with_tools(messages, tools=None, tier=tier)
+    if not result:
+        return ""
+    return result.get("content", "")
+
+
+def _call_gemini_with_tools(messages: list, tools: list, model: str, base_url: str) -> dict:
+    """Gemini API with native function calling."""
     contents = []
     system_text = ""
+
     for msg in messages:
         role = msg["role"]
-        text = msg["content"]
+        text = msg.get("content", "")
         if role == "system":
-            system_text = text  # Gemini handles system via systemInstruction
+            system_text = text
+            continue
+        if role == "tool":
+            # Gemini expects tool results as "user" role with functionResponse
+            contents.append({"role": "user", "parts": [{"text": f"[Tool result]: {text}"}]})
             continue
         gemini_role = "model" if role == "assistant" else "user"
         contents.append({"role": gemini_role, "parts": [{"text": text}]})
@@ -1118,17 +1229,49 @@ def _call_gemini_chat(messages: list, model: str, base_url: str) -> str:
     if system_text:
         body["systemInstruction"] = {"parts": [{"text": system_text}]}
 
+    # Convert tools to Gemini format
+    if tools:
+        gemini_tools = []
+        for t in tools:
+            fn = t.get("function", {})
+            gemini_tools.append({
+                "name": fn["name"],
+                "description": fn.get("description", ""),
+                "parameters": fn.get("parameters", {"type": "object", "properties": {}}),
+            })
+        body["tools"] = [{"functionDeclarations": gemini_tools}]
+
     url = f"{base_url}/models/{model}:generateContent?key={GOOGLE_API_KEY}"
     data = json.dumps(body).encode()
     req = urllib.request.Request(url, data=data,
         headers={"Content-Type": "application/json"}, method="POST")
     ctx = ssl.create_default_context()
     try:
-        with urllib.request.urlopen(req, context=ctx, timeout=60) as resp:
+        with urllib.request.urlopen(req, context=ctx, timeout=90) as resp:
             result = json.loads(resp.read())
-            return result["candidates"][0]["content"]["parts"][0]["text"]
+            parts = result["candidates"][0]["content"]["parts"]
+
+            # Check for function calls
+            tool_calls = []
+            text_parts = []
+            for part in parts:
+                if "functionCall" in part:
+                    fc = part["functionCall"]
+                    tool_calls.append({
+                        "function": {
+                            "name": fc["name"],
+                            "arguments": fc.get("args", {}),
+                        }
+                    })
+                elif "text" in part:
+                    text_parts.append(part["text"])
+
+            if tool_calls:
+                return {"tool_calls": tool_calls}
+            return {"content": "\n".join(text_parts)}
     except Exception as e:
-        return f"Error: Gemini API: {e}"
+        print(f"[AGENT] Gemini error: {e}")
+        return None
 
 
 # ── Agent Tools ──────────────────────────────────────────────────────────
