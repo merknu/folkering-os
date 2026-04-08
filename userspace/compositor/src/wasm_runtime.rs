@@ -23,6 +23,8 @@
 //! - `folk_get_surface() -> i32` — returns offset in WASM memory for pixel buffer
 //! - `folk_surface_pitch() -> i32` — bytes per row (width * 4)
 //! - `folk_surface_present()` — marks surface dirty for blit to framebuffer
+//! ## Tensor Inspection (Phase 10)
+//! - `folk_tensor_read(buf_ptr, buf_len, sector_offset) -> i32` — read TDMP mailbox
 
 extern crate alloc;
 
@@ -604,6 +606,35 @@ fn register_host_functions(linker: &mut Linker<HostState>) {
             if bytes == 0 { return -1; }
             let copy_len = bytes.min(max_len as usize);
             if mem.write(&mut caller, buf_ptr as usize, &response[..copy_len]).is_ok() {
+                copy_len as i32
+            } else { -1 }
+        },
+    );
+
+    // Phase 10: Tensor Inspection — Read inference tensor mailbox from VirtIO-blk
+    // folk_tensor_read(buf_ptr, buf_len, sector_offset) -> i32
+    // Reads from the TDMP (Tensor DuMP) disk mailbox written by the inference server.
+    //   sector_offset=0: Header sector (512 bytes) — magic, stats, shape, 100 summary floats
+    //   sector_offset=1+: Data sectors with raw f32 values (up to 256 sectors, 128KB)
+    // Returns bytes read, or -1 on error.
+    let _ = linker.func_wrap("env", "folk_tensor_read",
+        |mut caller: Caller<HostState>, buf_ptr: i32, buf_len: i32, sector_offset: i32| -> i32 {
+            if buf_len <= 0 || sector_offset < 0 || sector_offset > 256 { return -1; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+            // TDMP header is at sector 1, data starts at sector 2
+            let disk_sector = 1u64 + sector_offset as u64;
+            let sectors_to_read = ((buf_len as usize) + 511) / 512;
+            let sectors_to_read = sectors_to_read.min(257 - sector_offset as usize);
+            let total_bytes = sectors_to_read * 512;
+            let mut read_buf = alloc::vec![0u8; total_bytes];
+            if libfolk::sys::block::block_read(disk_sector, &mut read_buf, sectors_to_read).is_err() {
+                return -1;
+            }
+            let copy_len = total_bytes.min(buf_len as usize);
+            if mem.write(&mut caller, buf_ptr as usize, &read_buf[..copy_len]).is_ok() {
                 copy_len as i32
             } else { -1 }
         },
