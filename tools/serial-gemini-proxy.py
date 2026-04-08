@@ -960,16 +960,26 @@ def _react_wasm_agent(task: str) -> tuple:
 
     wasm_result = None
     last_source = None
+    compile_failures = 0
+
+    # Start with fast (Ollama), escalate to medium (Flash Lite) after compile fails
+    current_tier = "fast"
 
     try:
         for step in range(1, _REACT_MAX_STEPS + 1):
-            print(f"[AGENT] Step {step}/{_REACT_MAX_STEPS}")
+            print(f"[AGENT] Step {step}/{_REACT_MAX_STEPS} (tier={current_tier})")
 
             # Call LLM with full history
-            response = _call_llm_chat(history, tier="medium")
+            response = _call_llm_chat(history, tier=current_tier)
             if not response or response.startswith("Error:"):
-                print(f"[AGENT] LLM error: {(response or 'empty')[:100]}")
-                break
+                # LLM failed — try escalating
+                if current_tier == "fast" and GOOGLE_API_KEY:
+                    print(f"[AGENT] {current_tier} failed, escalating to medium")
+                    current_tier = "medium"
+                    response = _call_llm_chat(history, tier=current_tier)
+                if not response or response.startswith("Error:"):
+                    print(f"[AGENT] LLM error: {(response or 'empty')[:100]}")
+                    break
 
             history.append({"role": "assistant", "content": response})
 
@@ -988,8 +998,8 @@ def _react_wasm_agent(task: str) -> tuple:
                     observation = _tool_write_file(proj_dir, f"lib.rs, {code}")
                     history.append({"role": "user", "content": f"<observation>{observation}</observation>\nNow call <tool>cargo_compile()</tool> to compile it."})
                     continue
-                print(f"[AGENT] No tool call found, prompting to use tools")
-                history.append({"role": "user", "content": "You must call a tool. Use <tool>read_libfolk_docs(drawing)</tool> to start, or <tool>write_file(lib.rs, YOUR_CODE)</tool> to write code."})
+                print(f"[AGENT] No tool call found, nudging")
+                history.append({"role": "user", "content": "You must call a tool. Use <tool>write_file(lib.rs, YOUR_CODE)</tool> then <tool>cargo_compile()</tool>."})
                 continue
 
             tool_call = tool_match.group(1).strip()
@@ -1008,8 +1018,17 @@ def _react_wasm_agent(task: str) -> tuple:
             elif tool_call.startswith("cargo_compile("):
                 observation, wasm_result = _tool_cargo_compile(proj_dir)
                 if wasm_result:
-                    print(f"[AGENT] Compilation succeeded in step {step}: {len(wasm_result)} bytes")
+                    print(f"[AGENT] Compiled in step {step} ({current_tier}): {len(wasm_result)} bytes")
                     return wasm_result, last_source, None
+                else:
+                    # Compile failed — escalate tier for smarter fixes
+                    compile_failures += 1
+                    if compile_failures == 1 and current_tier == "fast" and GOOGLE_API_KEY:
+                        current_tier = "medium"
+                        print(f"[AGENT] Compile failed, escalating to Gemini Flash Lite")
+                    elif compile_failures == 2 and current_tier == "medium" and GOOGLE_API_KEY:
+                        current_tier = "heavy"
+                        print(f"[AGENT] 2nd compile fail, escalating to Gemini Flash")
             else:
                 observation = f"Unknown tool: {tool_call[:50]}. Available: read_libfolk_docs, write_file, cargo_compile"
 
@@ -1028,40 +1047,88 @@ def _react_wasm_agent(task: str) -> tuple:
 
 
 def _call_llm_chat(messages: list, tier: str = "fast") -> str:
-    """Call LLM with multi-turn message history."""
-    # For local Ollama, use native /api/chat with messages
-    raw_url = FAST_URL
-    base = raw_url.rstrip("/v1").rstrip("/")
-    url = f"{base}/api/chat"
+    """Call LLM with multi-turn message history.
 
-    # Select model based on tier
-    model = FAST_MODEL
-    if tier == "medium":
-        model = MEDIUM_MODEL if MEDIUM_PROVIDER == "local" else FAST_MODEL
-    elif tier == "heavy":
-        model = HEAVY_MODEL if HEAVY_PROVIDER == "local" else FAST_MODEL
+    Routes to the right provider based on tier:
+      fast   → Ollama local (qwen2.5-coder:7b)
+      medium → Gemini Flash Lite (if API key) else Ollama
+      heavy  → Gemini Flash (if API key) else Ollama
+    """
+    # Determine provider + model for this tier
+    tier_map = {
+        "fast":   (FAST_PROVIDER,   FAST_MODEL,   FAST_URL),
+        "medium": (MEDIUM_PROVIDER, MEDIUM_MODEL, MEDIUM_URL),
+        "heavy":  (HEAVY_PROVIDER,  HEAVY_MODEL,  HEAVY_URL),
+    }
+    provider, model, base_url = tier_map.get(tier, tier_map["fast"])
 
-    body = json.dumps({
-        "model": model,
-        "messages": messages,
-        "stream": False,
-    }).encode()
+    # Fall back to local if no API key for cloud
+    if provider != "local" and not GOOGLE_API_KEY:
+        provider, model, base_url = FAST_PROVIDER, FAST_MODEL, FAST_URL
 
+    # ── Local Ollama: native /api/chat with multi-turn ──
+    if provider == "local":
+        try:
+            base = base_url.rstrip("/v1").rstrip("/")
+            url = f"{base}/api/chat"
+            body = json.dumps({
+                "model": model, "messages": messages, "stream": False,
+            }).encode()
+            req = urllib.request.Request(url, data=body,
+                headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                result = json.loads(resp.read())
+                msg = result.get("message", {})
+                content = msg.get("content", "")
+                thinking = msg.get("thinking", "")
+                if thinking:
+                    return f"<think>\n{thinking}\n</think>\n{content}"
+                return content
+        except Exception as e:
+            # If local fails and we have a cloud key, escalate
+            if GOOGLE_API_KEY:
+                print(f"[AGENT] Ollama failed ({e}), escalating to Gemini Flash Lite")
+                return _call_gemini_chat(messages, MEDIUM_MODEL, MEDIUM_URL)
+            return f"Error: {e}"
+
+    # ── Gemini Cloud: multi-turn chat ──
+    if provider == "gemini":
+        return _call_gemini_chat(messages, model, base_url)
+
+    # ── Fallback: flatten to single prompt ──
+    flat = "\n\n".join(f"[{m['role']}]: {m['content']}" for m in messages)
+    return call_llm(flat, tier=tier)
+
+
+def _call_gemini_chat(messages: list, model: str, base_url: str) -> str:
+    """Multi-turn Gemini API call. Converts messages to Gemini format."""
+    # Gemini uses "user" and "model" roles, with "parts" containing text
+    contents = []
+    system_text = ""
+    for msg in messages:
+        role = msg["role"]
+        text = msg["content"]
+        if role == "system":
+            system_text = text  # Gemini handles system via systemInstruction
+            continue
+        gemini_role = "model" if role == "assistant" else "user"
+        contents.append({"role": gemini_role, "parts": [{"text": text}]})
+
+    body = {"contents": contents}
+    if system_text:
+        body["systemInstruction"] = {"parts": [{"text": system_text}]}
+
+    url = f"{base_url}/models/{model}:generateContent?key={GOOGLE_API_KEY}"
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(url, data=data,
+        headers={"Content-Type": "application/json"}, method="POST")
+    ctx = ssl.create_default_context()
     try:
-        req = urllib.request.Request(url, data=body,
-            headers={"Content-Type": "application/json"}, method="POST")
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, context=ctx, timeout=60) as resp:
             result = json.loads(resp.read())
-            msg = result.get("message", {})
-            content = msg.get("content", "")
-            thinking = msg.get("thinking", "")
-            if thinking:
-                return f"<think>\n{thinking}\n</think>\n{content}"
-            return content
+            return result["candidates"][0]["content"]["parts"][0]["text"]
     except Exception as e:
-        # Fallback: flatten to single prompt and use call_llm
-        flat = "\n\n".join(f"[{m['role']}]: {m['content']}" for m in messages)
-        return call_llm(flat, tier=tier)
+        return f"Error: Gemini API: {e}"
 
 
 # ── Agent Tools ──────────────────────────────────────────────────────────
@@ -1150,16 +1217,15 @@ def _tool_cargo_compile(proj_dir: str) -> tuple:
         return "Error: compilation timed out after 60s", None
 
     if result.returncode != 0:
-        # Extract just the errors, skip warnings
         stderr = result.stderr
-        # Find first "error[E" and take from there
-        first_err = stderr.find("error[E")
-        if first_err >= 0:
-            errors = stderr[first_err:]
+        # Extract errors: prefer "error[E..." lines, fall back to last 600 chars
+        error_lines = [l for l in stderr.split("\n") if "error" in l.lower()]
+        if error_lines:
+            errors = "\n".join(error_lines[-10:])  # Last 10 error lines
         else:
-            errors = stderr[-800:]
-        error_count = errors.count("error[E")
-        return f"COMPILE FAILED ({error_count} errors):\n{errors[-600:]}", None
+            errors = stderr[-600:]
+        error_count = stderr.count("error[E") + stderr.count("error: ")
+        return f"COMPILE FAILED ({error_count} errors):\n{errors}", None
 
     wasm_path = os.path.join(proj_dir, "target", "wasm32-unknown-unknown", "release", "wasm_tool.wasm")
     if not os.path.exists(wasm_path):
