@@ -4078,7 +4078,7 @@ fn main() -> ! {
                     }
                 } // end intent match guard
 
-                if deferred_app_handle == 0 {
+                if deferred_app_handle == 0 && active_wasm_app.is_none() {
                 write_str("[WM] Creating window for: ");
                 write_str(cmd_str);
                 write_str("\n");
