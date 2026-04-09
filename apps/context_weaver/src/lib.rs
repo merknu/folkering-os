@@ -53,7 +53,7 @@ const LINK_ACTIVE: i32 = 0x213352;
 const STATUS_BG: i32 = 0x161B22;
 
 // Layout
-const WEAVER_W: i32 = 300; // right panel width
+const WEAVER_W: i32 = 260; // right panel width (fits 1024px VGA mirror)
 const STATUS_H: i32 = 20;
 const TOP_H: i32 = 32;
 const MARGIN: i32 = 16;
@@ -340,8 +340,8 @@ unsafe fn handle_input() {
             _ => {
                 if WEAVER_ACTIVE {
                     match key {
-                        0x26 | 0x6B => { if SELECTED_LINK > 0 { SELECTED_LINK -= 1; } } // Up
-                        0x28 | 0x6A => { if SELECTED_LINK + 1 < LINK_COUNT { SELECTED_LINK += 1; } } // Down
+                        0x80 | 0x6B => { if SELECTED_LINK > 0 { SELECTED_LINK -= 1; } } // Up
+                        0x81 | 0x6A => { if SELECTED_LINK + 1 < LINK_COUNT { SELECTED_LINK += 1; } } // Down
                         _ => {}
                     }
                 } else {
@@ -367,9 +367,9 @@ unsafe fn handle_editor_key(key: u8) {
                 QUERY_PENDING = true;
             }
         }
-        0x25 => { if CURSOR_POS > 0 { CURSOR_POS -= 1; } } // Left
-        0x27 => { if CURSOR_POS < DOC_LEN { CURSOR_POS += 1; } } // Right
-        0x26 => { // Up — move cursor up one line
+        0x82 => { if CURSOR_POS > 0 { CURSOR_POS -= 1; } } // Left
+        0x83 => { if CURSOR_POS < DOC_LEN { CURSOR_POS += 1; } } // Right
+        0x80 => { // Up — move cursor up one line
             let col = cursor_col();
             let line_start = find_line_start(CURSOR_POS);
             if line_start > 0 {
@@ -378,7 +378,7 @@ unsafe fn handle_editor_key(key: u8) {
                 CURSOR_POS = prev_line_start + col.min(prev_line_len);
             }
         }
-        0x28 => { // Down — move cursor down one line
+        0x81 => { // Down — move cursor down one line
             let col = cursor_col();
             let next_nl = find_next_newline(CURSOR_POS);
             if next_nl < DOC_LEN {
@@ -445,7 +445,9 @@ unsafe fn find_next_newline(pos: usize) -> usize {
 unsafe fn render() {
     let sw = folk_screen_width();
     let sh = folk_screen_height();
-    let editor_w = sw - WEAVER_W;
+    // Clamp to 1024 for VGA mirror compatibility (VirtIO-GPU is 1280 but screendump is 1024)
+    let usable_w = if sw > 1024 { 1024 } else { sw };
+    let editor_w = usable_w - WEAVER_W;
 
     folk_fill_screen(BG);
 
@@ -465,7 +467,7 @@ unsafe fn render() {
     let wc = word_count();
     let mut wc_buf = [0u8; 16];
     let wc_len = { let mut m = Msg::new(&mut wc_buf); m.u32(wc as u32); m.s(b" words"); m.len() };
-    draw(sw - 120, 8, &wc_buf[..wc_len], TEXT_DIM);
+    draw(usable_w - 120, 8, &wc_buf[..wc_len], TEXT_DIM);
 
     // ── Editor panel ──
     let ed_x = MARGIN;
@@ -526,6 +528,7 @@ unsafe fn render() {
 
     // ── Vertical divider ──
     folk_draw_line(editor_w, TOP_H, editor_w, sh - STATUS_H, BORDER);
+    // All right-panel drawing uses editor_w as left edge (fits in usable_w)
 
     // ── Weaver panel (right) ──
     let wx = editor_w + 8;

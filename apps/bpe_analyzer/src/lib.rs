@@ -122,8 +122,8 @@ unsafe fn handle_input() {
                 while i < DOC_LEN - 1 { *d.add(i) = *d.add(i+1); i += 1; }
                 DOC_LEN -= 1; CURSOR_POS -= 1; DIRTY = true;
             }}
-            0x25 => { if CURSOR_POS > 0 { CURSOR_POS -= 1; } }
-            0x27 => { if CURSOR_POS < DOC_LEN { CURSOR_POS += 1; } }
+            0x82 => { if CURSOR_POS > 0 { CURSOR_POS -= 1; } }
+            0x83 => { if CURSOR_POS < DOC_LEN { CURSOR_POS += 1; } }
             0x24 => { CURSOR_POS = 0; }
             0x23 => { CURSOR_POS = DOC_LEN; }
             0x20..=0x7E => {

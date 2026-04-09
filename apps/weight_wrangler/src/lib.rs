@@ -290,16 +290,16 @@ unsafe fn handle_input() {
 
         match key {
             0x09 => { FOCUS_LEFT = !FOCUS_LEFT; } // Tab
-            0x74 => { start_benchmark(); } // F5
+            0xB5 => { start_benchmark(); } // F5
             0x72 => { load_tensor_page(); } // R — reload
             0x1B => {} // Esc
             _ => {
                 if FOCUS_LEFT {
                     match key {
-                        0x26 => { if CURSOR_ROW > 0 { CURSOR_ROW -= 1; } } // Up
-                        0x28 => { if CURSOR_ROW + 1 < GRID_ROWS { CURSOR_ROW += 1; } } // Down
-                        0x25 => { if CURSOR_COL > 0 { CURSOR_COL -= 1; } } // Left
-                        0x27 => { if CURSOR_COL + 1 < GRID_COLS { CURSOR_COL += 1; } } // Right
+                        0x80 => { if CURSOR_ROW > 0 { CURSOR_ROW -= 1; } } // Up
+                        0x81 => { if CURSOR_ROW + 1 < GRID_ROWS { CURSOR_ROW += 1; } } // Down
+                        0x82 => { if CURSOR_COL > 0 { CURSOR_COL -= 1; } } // Left
+                        0x83 => { if CURSOR_COL + 1 < GRID_COLS { CURSOR_COL += 1; } } // Right
                         0x2B | 0x3D => { write_selected_value(0.01); } // + or =
                         0x2D => { write_selected_value(-0.01); } // -
                         0x5D => { write_selected_value(0.1); } // ]  big +

@@ -4,8 +4,11 @@
 
 Built entirely in Rust `no_std` -- no Linux, no POSIX, no libc. From x86-64 bootloader to a self-improving AI desktop with 43 syscalls, WebSocket streaming, and an autonomous dream cycle. The AI isn't an app running on the OS. **The AI IS the operating system.**
 
-![Neural Desktop](screenshots/neural-desktop.png)
-*The Neural Desktop: date, clock, system tray, omnibar, and the Boot Test window. Every pixel rendered by our VirtIO-GPU compositor.*
+![App Showcase](screenshots/folkering-app-showcase.gif)
+*11 apps cycling: Neural Desktop, KernelSnoop, TensorView, PromptLab, PolyglotChat, ContextWeaver, VFS-Explorer, AsyncFlow, SlabVisualizer, WasmForge, and the 48/48 PASS test runner.*
+
+![ContextWeaver Demo](screenshots/context-weaver-demo.gif)
+*ContextWeaver: typing triggers debounced semantic search. "The Weaver" panel discovers related files as you write.*
 
 ---
 
@@ -47,13 +50,10 @@ Tools for developers who need x-ray vision into a bare-metal AI system.
 | **SlabVisualizer** | 2.4 KB | Defrag-style memory heatmap. 16x4 grid of allocation density (blue=free, red=heavy). 2-minute scrolling usage history. |
 | **AsyncFlow** | 5.4 KB | IPC bus visualizer. Task nodes in circular layout. Animated blue packets flow along edges. Congested queues turn red. |
 
-| KernelSnoop | TensorView | SlabVisualizer |
+| KernelSnoop | SlabVisualizer | AsyncFlow |
 |:-:|:-:|:-:|
-| ![KernelSnoop](screenshots/kernel-snoop-live.png) | ![TensorView](screenshots/tensor-view-live.png) | ![SlabVisualizer](screenshots/chaos-slab-visualizer.png) |
-
-| AsyncFlow | WasmForge | DriverStudio |
-|:-:|:-:|:-:|
-| ![AsyncFlow](screenshots/chaos-async-flow.png) | ![WasmForge](screenshots/chaos-wasm-forge.png) | *PCI + IRQ graphs* |
+| ![KernelSnoop](screenshots/kernel_snoop-demo.gif) | ![SlabVisualizer](screenshots/slab_visualizer-demo.gif) | ![AsyncFlow](screenshots/async_flow-demo.gif) |
+| *Opens → monitors NET/FW/SYS → AI analysis* | *Live memory heatmap updates* | *IPC graph: navigate between task nodes* |
 
 ### The Liquid Suite -- AI-Native Productivity
 
@@ -66,9 +66,10 @@ Apps that change shape based on context. No static UIs -- every panel adapts to 
 | **ContextWeaver** | 5.9 KB | Semantic second brain. Write in the editor; "The Weaver" sidebar finds related files from Synapse VFS as you type (800ms debounce). Tab to inject AI summaries inline. |
 | **SemanticMail** | 8.3 KB | Email without dates. Three Kanban columns: ACTION (red), QUESTION (yellow), FYI (green). AI categorizes each email. No inbox, just intent. |
 
-| PolyglotChat | PromptLab | ContextWeaver |
-|:-:|:-:|:-:|
-| ![PolyglotChat](screenshots/polyglot-chat-live.png) | ![PromptLab](screenshots/prompt-lab-editor.png) | ![ContextWeaver](screenshots/context-weaver-live.png) |
+| PolyglotChat | ContextWeaver |
+|:-:|:-:|
+| ![PolyglotChat](screenshots/polyglot_chat-demo.gif) | ![ContextWeaver](screenshots/context_weaver-demo.gif) |
+| *Ask "network" → system data, "status" → full report, "firewall" → drops* | *Type "bare metal inference" → debounce → Weaver searches* |
 
 ### Developer Tools
 
@@ -78,9 +79,10 @@ Apps that change shape based on context. No static UIs -- every panel adapts to 
 | **BPE-Analyzer** | 3.0 KB | Live tokenizer visualization. Type text, see colored BPE-style subword tokens instantly. 12 distinct colors cycling. |
 | **WasmForge** | 7.8 KB | FolkScript assembler IDE. Write `fill 0x1a1a2e` / `rect 100 100 200 150 0xFF0000`, press F5. Assembles to raw WASM binary, shadow-tests it, shows results. |
 
-| VFS-Explorer |
-|:-:|
-| ![VFS-Explorer](screenshots/vfs-explorer-live.png) |
+| VFS-Explorer | WasmForge |
+|:-:|:-:|
+| ![VFS-Explorer](screenshots/vfs_explorer-demo.gif) | ![WasmForge](screenshots/wasm_forge-demo.gif) |
+| *Browse files → navigate with arrows → preview content* | *FolkScript editor → F5 assembles → shadow test report* |
 
 ### Background Daemons & Visualization
 
@@ -160,8 +162,8 @@ FileAccessed | FileWritten | OmnibarCommand | MetricAlert
 
 **Result: 48/48 PASS** -- every app survives all three scenarios.
 
-![Test Runner](screenshots/test-runner-all-pass.png)
-*All 16 apps: PASS across Idle, Fuzz, and Net Drop. Report saved to `docs/test_report_latest.md`.*
+![Test Runner](screenshots/test-runner-demo.gif)
+*Auto-discovers apps → shadow-tests each through 3 scenarios → 48/48 PASS → saves report to VFS.*
 
 ---
 

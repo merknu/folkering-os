@@ -196,8 +196,8 @@ unsafe fn handle_input() {
         let key = *evt_ptr.add(3) as u8;
 
         match key {
-            0x26 | 0x6B => { if SELECTED > 0 { SELECTED -= 1; } }
-            0x28 | 0x6A => { if SELECTED + 1 < DEVICE_COUNT { SELECTED += 1; } }
+            0x80 | 0x6B => { if SELECTED > 0 { SELECTED -= 1; } }
+            0x81 | 0x6A => { if SELECTED + 1 < DEVICE_COUNT { SELECTED += 1; } }
             0x72 => { load_pci_devices(); } // R — refresh
             _ => {}
         }
