@@ -749,6 +749,9 @@ fn register_shadow_functions(linker: &mut Linker<ShadowState>) {
     let _ = linker.func_wrap("env", "folk_intent_fetch",
         |_: Caller<ShadowState>, _q: i32, _ql: i32, _b: i32, _bl: i32| -> i32 { -1 },
     );
+    let _ = linker.func_wrap("env", "folk_semantic_extract",
+        |_: Caller<ShadowState>, _h: i32, _hl: i32, _b: i32, _bl: i32| -> i32 { -1 },
+    );
 
     // Tensor — return empty
     let _ = linker.func_wrap("env", "folk_tensor_read",
