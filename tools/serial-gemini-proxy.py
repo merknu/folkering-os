@@ -2161,11 +2161,17 @@ def handle_serial(sock: socket.socket):
                     try:
                         import urllib.request, ssl
                         ctx = ssl.create_default_context()
-                        req = urllib.request.Request(url, headers={"User-Agent": "FolkeringOS/1.0"})
+                        ctx.check_hostname = False
+                        ctx.verify_mode = ssl.CERT_NONE
+                        req = urllib.request.Request(url, headers={
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
+                            "Accept": "text/html,application/xhtml+xml",
+                            "Accept-Language": "nb-NO,nb;q=0.9,en;q=0.5",
+                        })
                         with urllib.request.urlopen(req, context=ctx, timeout=15) as resp:
-                            body = resp.read(4096).decode("utf-8", errors="replace")
+                            body = resp.read(32768).decode("utf-8", errors="replace")
                         print(f"[INTENT-IP] Got {len(body)} chars")
-                        sock.sendall(RESP_START + body.encode("utf-8", errors="replace")[:4096] + RESP_END + b"\n")
+                        sock.sendall(RESP_START + body.encode("utf-8", errors="replace")[:8192] + RESP_END + b"\n")
                     except Exception as e:
                         err = f"HTTP error: {e}"
                         print(f"[INTENT-IP] {err}")

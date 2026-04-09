@@ -32,12 +32,12 @@ extern "C" {
 
 // ── Colors ──────────────────────────────────────────────────────────────
 
-const BG: i32 = 0xF5F5F5;        // light page background
-const TEXT_COLOR: i32 = 0x1A1A1A; // near-black text
-const LINK_COLOR: i32 = 0x0645AD; // blue links
-const H1_COLOR: i32 = 0x111111;
-const H2_COLOR: i32 = 0x222222;
-const CODE_BG: i32 = 0xE8E8E8;
+const BG: i32 = 0x0D1117;        // dark background (matches OS theme)
+const TEXT_COLOR: i32 = 0xC9D1D9; // light grey text
+const LINK_COLOR: i32 = 0x58A6FF; // blue links
+const H1_COLOR: i32 = 0xFFFFFF;   // white headings
+const H2_COLOR: i32 = 0xE6EDF3;   // slightly dimmer headings
+const CODE_BG: i32 = 0x161B22;    // dark code block background
 const URLBAR_BG: i32 = 0x2D333B;
 const URLBAR_TEXT: i32 = 0xC9D1D9;
 const STATUS_BG: i32 = 0x161B22;
@@ -197,6 +197,41 @@ unsafe fn parse_html() {
             if closing { continue; }
 
             let elem_type = match_tag(tag_name);
+
+            // Skip script/style content entirely (find matching closing tag)
+            if elem_type == ElemType::Unknown {
+                let lower_tag: [u8; 8] = {
+                    let mut l = [0u8; 8];
+                    for (j, &b) in tag_name.iter().take(8).enumerate() {
+                        l[j] = if b >= b'A' && b <= b'Z' { b + 32 } else { b };
+                    }
+                    l
+                };
+                let tlen = tag_name.len().min(8);
+                let is_skip = &lower_tag[..tlen] == b"script" || &lower_tag[..tlen] == b"style"
+                    || &lower_tag[..tlen] == b"noscript" || &lower_tag[..tlen] == b"svg";
+                if is_skip {
+                    // Scan forward to </script> or </style> etc.
+                    let mut close_tag = [0u8; 12];
+                    close_tag[0] = b'<'; close_tag[1] = b'/';
+                    let ct_len = 2 + tlen + 1; // "</tag>"
+                    for j in 0..tlen { close_tag[2 + j] = lower_tag[j]; }
+                    close_tag[2 + tlen] = b'>';
+
+                    while i < html.len() {
+                        if html[i] == b'<' && i + ct_len <= html.len() {
+                            let mut found = true;
+                            for j in 0..ct_len {
+                                let h = if html[i+j] >= b'A' && html[i+j] <= b'Z' { html[i+j] + 32 } else { html[i+j] };
+                                if h != close_tag[j] { found = false; break; }
+                            }
+                            if found { i += ct_len; break; }
+                        }
+                        i += 1;
+                    }
+                    continue;
+                }
+            }
 
             // Self-closing tags
             if elem_type == ElemType::Br || elem_type == ElemType::Hr {
@@ -409,7 +444,7 @@ unsafe fn build_display_list(viewport_w: i32, viewport_h: i32) {
                     *dl.add(pos) = 0x03; pos += 1;
                     let vals: [u16; 4] = [e.x as u16, ey as u16, (e.x + e.w) as u16, ey as u16];
                     for v in &vals { let b = v.to_le_bytes(); *dl.add(pos) = b[0]; *dl.add(pos+1) = b[1]; pos += 2; }
-                    let cb = (0x888888u32).to_le_bytes();
+                    let cb = (0x30363Du32).to_le_bytes();
                     for j in 0..4 { *dl.add(pos+j) = cb[j]; } pos += 4;
                 }
             }
@@ -719,7 +754,7 @@ pub extern "C" fn run() {
     unsafe {
         if !INITIALIZED {
             // Default URL — auto-fetch on launch
-            let default = b"https://httpbin.org/html";
+            let default = b"https://news.ycombinator.com";
             let u = core::ptr::addr_of_mut!(URL) as *mut u8;
             for i in 0..default.len() { *u.add(i) = default[i]; }
             URL_LEN = default.len();
