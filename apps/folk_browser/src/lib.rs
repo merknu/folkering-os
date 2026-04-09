@@ -14,6 +14,8 @@
 
 mod png;
 mod jpeg;
+mod gif;
+mod webp;
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! { loop {} }
@@ -636,6 +638,10 @@ unsafe fn try_load_first_image() {
             png::decode_png(raw_data, pixel_buf)
         } else if raw_data.len() > 2 && raw_data[0] == 0xFF && raw_data[1] == 0xD8 {
             jpeg::decode_jpeg(raw_data, pixel_buf)
+        } else if raw_data.len() > 4 && &raw_data[0..4] == b"GIF8" {
+            gif::decode_gif(raw_data, pixel_buf)
+        } else if raw_data.len() > 12 && &raw_data[0..4] == b"RIFF" && &raw_data[8..12] == b"WEBP" {
+            webp::decode_webp(raw_data, pixel_buf)
         } else {
             (0, 0)
         };
