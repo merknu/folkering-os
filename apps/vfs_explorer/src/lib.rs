@@ -396,11 +396,11 @@ unsafe fn handle_input() {
                     SEARCH_LEN = 0;
                 }
                 // Up arrow or k
-                0x26 | 0x6B => {
+                0x80 | 0x6B => {
                     if SELECTED_IDX > 0 { SELECTED_IDX -= 1; }
                 }
                 // Down arrow or j
-                0x28 | 0x6A => {
+                0x81 | 0x6A => {
                     if SELECTED_IDX + 1 < FILE_COUNT { SELECTED_IDX += 1; }
                 }
                 // Enter — load preview

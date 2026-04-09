@@ -309,9 +309,9 @@ unsafe fn handle_editor_key(key: u8) {
             }
         }
         // Left arrow
-        0x25 => { if CURSOR_POS > 0 { CURSOR_POS -= 1; } }
+        0x82 => { if CURSOR_POS > 0 { CURSOR_POS -= 1; } }
         // Right arrow
-        0x27 => { if CURSOR_POS < PROMPT_LEN { CURSOR_POS += 1; } }
+        0x83 => { if CURSOR_POS < PROMPT_LEN { CURSOR_POS += 1; } }
         // Home
         0x24 => { CURSOR_POS = 0; }
         // End
@@ -351,9 +351,9 @@ unsafe fn handle_editor_key(key: u8) {
 unsafe fn handle_inspector_key(key: u8) {
     match key {
         // Left arrow — previous token
-        0x25 => { if SELECTED_TOKEN > 0 { SELECTED_TOKEN -= 1; } }
+        0x82 => { if SELECTED_TOKEN > 0 { SELECTED_TOKEN -= 1; } }
         // Right arrow — next token
-        0x27 => { if SELECTED_TOKEN + 1 < TOKEN_COUNT { SELECTED_TOKEN += 1; } }
+        0x83 => { if SELECTED_TOKEN + 1 < TOKEN_COUNT { SELECTED_TOKEN += 1; } }
         // Home
         0x24 => { SELECTED_TOKEN = 0; }
         // End

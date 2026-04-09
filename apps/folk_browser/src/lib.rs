@@ -583,16 +583,16 @@ unsafe fn handle_input() {
                     URL_LEN -= 1; CURSOR_POS -= 1;
                 }
             }
-            0x25 => { // Left
+            0x82 => { // Left
                 if EDITING_URL && CURSOR_POS > 0 { CURSOR_POS -= 1; }
             }
-            0x27 => { // Right
+            0x83 => { // Right
                 if EDITING_URL && CURSOR_POS < URL_LEN { CURSOR_POS += 1; }
             }
-            0x26 => { // Up — scroll up
+            0x80 => { // Up — scroll up
                 if !EDITING_URL { SCROLL_Y = (SCROLL_Y - 40).max(0); }
             }
-            0x28 => { // Down — scroll down
+            0x81 => { // Down — scroll down
                 if !EDITING_URL { SCROLL_Y = (SCROLL_Y + 40).min(CONTENT_HEIGHT); }
             }
             0x21 => { SCROLL_Y = (SCROLL_Y - 200).max(0); } // PgUp

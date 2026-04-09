@@ -440,7 +440,7 @@ unsafe fn handle_input() {
             // key_down
             match data as u8 {
                 // Right arrow or 'l' — next page
-                0x27 | 0x6C => {
+                0x83 | 0x6C => {
                     if CURRENT_PAGE + 1 < TOTAL_PAGES {
                         CURRENT_PAGE += 1;
                         load_page_data();
@@ -448,7 +448,7 @@ unsafe fn handle_input() {
                     }
                 }
                 // Left arrow or 'h' — prev page
-                0x25 | 0x68 => {
+                0x82 | 0x68 => {
                     if CURRENT_PAGE > 0 {
                         CURRENT_PAGE -= 1;
                         load_page_data();

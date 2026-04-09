@@ -398,7 +398,7 @@ unsafe fn handle_input() {
 
         let key = data as u8;
         match key {
-            0x84 => { // F5 — Run
+            0xB5 => { // F5 — Run
                 if EDITING && PROMPT_LEN > 0 && !STREAMING {
                     start_inference();
                 }
@@ -418,8 +418,8 @@ unsafe fn handle_input() {
                     handle_editor_key(key);
                 } else if INSPECTING {
                     match key {
-                        0x25 => { if SELECTED_OUT_WORD > 0 { SELECTED_OUT_WORD -= 1; } }
-                        0x27 => { if SELECTED_OUT_WORD + 1 < OUTPUT_WORD_COUNT { SELECTED_OUT_WORD += 1; } }
+                        0x82 => { if SELECTED_OUT_WORD > 0 { SELECTED_OUT_WORD -= 1; } }
+                        0x83 => { if SELECTED_OUT_WORD + 1 < OUTPUT_WORD_COUNT { SELECTED_OUT_WORD += 1; } }
                         _ => {}
                     }
                 }
@@ -436,8 +436,8 @@ unsafe fn handle_editor_key(key: u8) {
             while i < PROMPT_LEN - 1 { *p.add(i) = *p.add(i+1); i += 1; }
             PROMPT_LEN -= 1; CURSOR_POS -= 1;
         }}
-        0x25 => { if CURSOR_POS > 0 { CURSOR_POS -= 1; } }
-        0x27 => { if CURSOR_POS < PROMPT_LEN { CURSOR_POS += 1; } }
+        0x82 => { if CURSOR_POS > 0 { CURSOR_POS -= 1; } }
+        0x83 => { if CURSOR_POS < PROMPT_LEN { CURSOR_POS += 1; } }
         0x24 => { CURSOR_POS = 0; }
         0x23 => { CURSOR_POS = PROMPT_LEN; }
         0x20..=0x7E => {

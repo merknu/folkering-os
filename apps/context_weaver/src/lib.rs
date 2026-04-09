@@ -340,8 +340,8 @@ unsafe fn handle_input() {
             _ => {
                 if WEAVER_ACTIVE {
                     match key {
-                        0x26 | 0x6B => { if SELECTED_LINK > 0 { SELECTED_LINK -= 1; } } // Up
-                        0x28 | 0x6A => { if SELECTED_LINK + 1 < LINK_COUNT { SELECTED_LINK += 1; } } // Down
+                        0x80 | 0x6B => { if SELECTED_LINK > 0 { SELECTED_LINK -= 1; } } // Up
+                        0x81 | 0x6A => { if SELECTED_LINK + 1 < LINK_COUNT { SELECTED_LINK += 1; } } // Down
                         _ => {}
                     }
                 } else {
@@ -367,9 +367,9 @@ unsafe fn handle_editor_key(key: u8) {
                 QUERY_PENDING = true;
             }
         }
-        0x25 => { if CURSOR_POS > 0 { CURSOR_POS -= 1; } } // Left
-        0x27 => { if CURSOR_POS < DOC_LEN { CURSOR_POS += 1; } } // Right
-        0x26 => { // Up — move cursor up one line
+        0x82 => { if CURSOR_POS > 0 { CURSOR_POS -= 1; } } // Left
+        0x83 => { if CURSOR_POS < DOC_LEN { CURSOR_POS += 1; } } // Right
+        0x80 => { // Up — move cursor up one line
             let col = cursor_col();
             let line_start = find_line_start(CURSOR_POS);
             if line_start > 0 {
@@ -378,7 +378,7 @@ unsafe fn handle_editor_key(key: u8) {
                 CURSOR_POS = prev_line_start + col.min(prev_line_len);
             }
         }
-        0x28 => { // Down — move cursor down one line
+        0x81 => { // Down — move cursor down one line
             let col = cursor_col();
             let next_nl = find_next_newline(CURSOR_POS);
             if next_nl < DOC_LEN {

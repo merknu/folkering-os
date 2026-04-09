@@ -297,8 +297,8 @@ unsafe fn handle_input() {
         if *e.add(0) != 3 { continue; }
         let key = *e.add(3) as u8;
         match key {
-            0x25 | 0x26 => { if SELECTED > 0 { SELECTED -= 1; } }
-            0x27 | 0x28 => { if SELECTED + 1 < TASK_COUNT { SELECTED += 1; } }
+            0x82 | 0x80 => { if SELECTED > 0 { SELECTED -= 1; } }
+            0x83 | 0x81 => { if SELECTED + 1 < TASK_COUNT { SELECTED += 1; } }
             0x72 => { poll_tasks(); } // R
             _ => {}
         }

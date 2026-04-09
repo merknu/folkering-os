@@ -283,10 +283,10 @@ unsafe fn handle_input() {
 
         match key {
             0x1B => { DETAIL_VIEW = false; } // Esc
-            0x25 => { if SELECTED_COL > 0 { SELECTED_COL -= 1; SELECTED_ROW = 0; } } // Left
-            0x27 => { if SELECTED_COL < 2 { SELECTED_COL += 1; SELECTED_ROW = 0; } } // Right
-            0x26 => { if SELECTED_ROW > 0 { SELECTED_ROW -= 1; } } // Up
-            0x28 => { SELECTED_ROW += 1; } // Down
+            0x82 => { if SELECTED_COL > 0 { SELECTED_COL -= 1; SELECTED_ROW = 0; } } // Left
+            0x83 => { if SELECTED_COL < 2 { SELECTED_COL += 1; SELECTED_ROW = 0; } } // Right
+            0x80 => { if SELECTED_ROW > 0 { SELECTED_ROW -= 1; } } // Up
+            0x81 => { SELECTED_ROW += 1; } // Down
             0x0D => { // Enter — toggle detail
                 DETAIL_VIEW = !DETAIL_VIEW;
                 folk_log_telemetry(3, SELECTED_COL as i32, 0);

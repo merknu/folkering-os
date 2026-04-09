@@ -208,8 +208,8 @@ unsafe fn handle_input() {
         let key = *e.add(3) as u8;
 
         match key {
-            0x25 | 0x26 => { if SELECTED > 0 { SELECTED -= 1; } } // Left/Up
-            0x27 | 0x28 => { if SELECTED + 1 < NODE_COUNT { SELECTED += 1; } } // Right/Down
+            0x82 | 0x80 => { if SELECTED > 0 { SELECTED -= 1; } } // Left/Up
+            0x83 | 0x81 => { if SELECTED + 1 < NODE_COUNT { SELECTED += 1; } } // Right/Down
             0x0D => { DETAIL_VIEW = !DETAIL_VIEW; } // Enter
             0x1B => { DETAIL_VIEW = false; } // Esc
             0x72 => { load_insights(); } // R
