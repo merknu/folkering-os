@@ -31,6 +31,10 @@
 //! - `folk_log_telemetry(action_type, target_id, duration_ms)` — push event to kernel ring buffer
 //! ## Shadow Runtime (Phase 13)
 //! - `execute_shadow_test(wasm_bytes, inputs) -> TestReport` — sandboxed WASM testing for AutoDream
+//! ## WebSocket (Phase 14)
+//! - `folk_ws_connect(url_ptr, url_len) -> i32` — open persistent connection
+//! - `folk_ws_send(socket_id, data_ptr, data_len) -> i32` — send text frame
+//! - `folk_ws_poll_recv(socket_id, buf_ptr, max_len) -> i32` — non-blocking receive
 
 extern crate alloc;
 
@@ -767,6 +771,100 @@ fn register_host_functions(linker: &mut Linker<HostState>) {
         },
     );
 
+    // Phase 14: WebSocket — Persistent streaming connections
+    // folk_ws_connect(url_ptr, url_len) -> i32 (slot_id or -1)
+    // URL format: "ws://host:port/path"
+    let _ = linker.func_wrap("env", "folk_ws_connect",
+        |mut caller: Caller<HostState>, url_ptr: i32, url_len: i32| -> i32 {
+            if url_len <= 0 || url_len > 256 { return -1; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+            let mut url_buf = alloc::vec![0u8; url_len as usize];
+            if mem.read(&caller, url_ptr as usize, &mut url_buf).is_err() { return -1; }
+            let url = match alloc::str::from_utf8(&url_buf) {
+                Ok(s) => s,
+                Err(_) => return -1,
+            };
+
+            // Parse "ws://host:port/path" or just "host:port/path"
+            let stripped = url.strip_prefix("ws://").unwrap_or(
+                url.strip_prefix("wss://").unwrap_or(url));
+            let (host_port, path) = match stripped.find('/') {
+                Some(i) => (&stripped[..i], &stripped[i..]),
+                None => (stripped, "/"),
+            };
+            let (host, port) = match host_port.rfind(':') {
+                Some(i) => {
+                    let p = host_port[i+1..].parse::<u16>().unwrap_or(80);
+                    (&host_port[..i], p)
+                }
+                None => (host_port, 80),
+            };
+
+            // Resolve to IP — for local proxy, use 127.0.0.1
+            // For production, would need DNS. Using loopback for now.
+            let ip = if host == "localhost" || host == "127.0.0.1" {
+                [127, 0, 0, 1]
+            } else {
+                // Try to parse as dotted quad
+                let parts: alloc::vec::Vec<&str> = host.split('.').collect();
+                if parts.len() == 4 {
+                    [
+                        parts[0].parse().unwrap_or(10),
+                        parts[1].parse().unwrap_or(0),
+                        parts[2].parse().unwrap_or(2),
+                        parts[3].parse().unwrap_or(2),
+                    ]
+                } else {
+                    [10, 0, 2, 2] // QEMU gateway default
+                }
+            };
+
+            match libfolk::sys::ws_connect(ip, port, host, path) {
+                Some(id) => id as i32,
+                None => -1,
+            }
+        },
+    );
+
+    // folk_ws_send(socket_id, data_ptr, data_len) -> i32 (0=ok, -1=error)
+    let _ = linker.func_wrap("env", "folk_ws_send",
+        |mut caller: Caller<HostState>, socket_id: i32, data_ptr: i32, data_len: i32| -> i32 {
+            if data_len <= 0 || data_len > 8192 || socket_id < 0 { return -1; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+            let mut data = alloc::vec![0u8; data_len as usize];
+            if mem.read(&caller, data_ptr as usize, &mut data).is_err() { return -1; }
+            if libfolk::sys::ws_send(socket_id as u8, &data) { 0 } else { -1 }
+        },
+    );
+
+    // folk_ws_poll_recv(socket_id, buf_ptr, max_len) -> i32
+    // Returns: bytes read (>0), 0 (nothing yet), -1 (closed/error)
+    let _ = linker.func_wrap("env", "folk_ws_poll_recv",
+        |mut caller: Caller<HostState>, socket_id: i32, buf_ptr: i32, max_len: i32| -> i32 {
+            if max_len <= 0 || socket_id < 0 { return -1; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+            let mut buf = alloc::vec![0u8; max_len as usize];
+            match libfolk::sys::ws_poll_recv(socket_id as u8, &mut buf) {
+                None => -1, // Connection closed/error
+                Some(0) => 0, // Nothing yet
+                Some(n) => {
+                    if mem.write(&mut caller, buf_ptr as usize, &buf[..n]).is_ok() {
+                        n as i32
+                    } else { -1 }
+                }
+            }
+        },
+    );
+
     // Phase 12: Telemetry Ring — App-level event logging for AutoDream
     // folk_log_telemetry(action_type, target_id, duration_ms)
     // Pushes an event into the kernel's telemetry ring buffer.
@@ -1463,6 +1561,17 @@ fn register_shadow_functions(linker: &mut Linker<ShadowState>) {
     );
     let _ = linker.func_wrap("env", "folk_surface_present",
         |_: Caller<ShadowState>| {},
+    );
+
+    // WebSocket — no-op in shadow (no real network)
+    let _ = linker.func_wrap("env", "folk_ws_connect",
+        |_: Caller<ShadowState>, _u: i32, _ul: i32| -> i32 { -1 },
+    );
+    let _ = linker.func_wrap("env", "folk_ws_send",
+        |_: Caller<ShadowState>, _s: i32, _d: i32, _dl: i32| -> i32 { -1 },
+    );
+    let _ = linker.func_wrap("env", "folk_ws_poll_recv",
+        |_: Caller<ShadowState>, _s: i32, _b: i32, _bl: i32| -> i32 { -1 },
     );
 }
 
