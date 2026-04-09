@@ -771,6 +771,134 @@ fn register_host_functions(linker: &mut Linker<HostState>) {
         },
     );
 
+    // Phase 23: Display List — Batch rendering for browser/complex UIs
+    // folk_submit_display_list(ptr, len) -> i32
+    // Takes a binary command buffer and executes ALL draw commands in one host call.
+    // This is critical for browser rendering — instead of 1000 individual folk_draw_rect
+    // calls (each costing ~50 fuel in host overhead), one call with 1000 commands.
+    //
+    // Binary protocol (little-endian):
+    //   0x01: Rect  → [x:u16, y:u16, w:u16, h:u16, color:u32] = 12 bytes
+    //   0x02: Text  → [x:u16, y:u16, ptr:u32, len:u16, color:u32] = 14 bytes
+    //   0x03: Line  → [x1:u16, y1:u16, x2:u16, y2:u16, color:u32] = 12 bytes
+    //   0x04: Fill  → [color:u32] = 4 bytes
+    //   0x05: Circle → [cx:u16, cy:u16, r:u16, color:u32] = 10 bytes
+    //
+    // Returns number of commands processed, or -1 on error.
+    let _ = linker.func_wrap("env", "folk_submit_display_list",
+        |mut caller: Caller<HostState>, ptr: i32, len: i32| -> i32 {
+            if len <= 0 || len > 65536 { return -1; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+
+            let mut buf = alloc::vec![0u8; len as usize];
+            if mem.read(&caller, ptr as usize, &mut buf).is_err() { return -1; }
+
+            // First pass: collect text strings that need WASM memory reads
+            // (must be done before taking mutable ref to state)
+            let mut text_entries: alloc::vec::Vec<(u32, u32, String, u32)> = alloc::vec::Vec::new();
+            {
+                let mut scan = 0usize;
+                while scan < buf.len() {
+                    let op = buf[scan];
+                    scan += 1;
+                    match op {
+                        0x01 => { scan += 12; }
+                        0x02 => {
+                            if scan + 14 > buf.len() { break; }
+                            let x = u16::from_le_bytes([buf[scan], buf[scan+1]]) as u32;
+                            let y = u16::from_le_bytes([buf[scan+2], buf[scan+3]]) as u32;
+                            let text_ptr = u32::from_le_bytes([buf[scan+4], buf[scan+5], buf[scan+6], buf[scan+7]]);
+                            let text_len = u16::from_le_bytes([buf[scan+8], buf[scan+9]]) as usize;
+                            let color = u32::from_le_bytes([buf[scan+10], buf[scan+11], buf[scan+12], buf[scan+13]]);
+                            scan += 14;
+                            if text_len > 0 && text_len < 4096 {
+                                let mut tb = alloc::vec![0u8; text_len];
+                                if mem.read(&caller, text_ptr as usize, &mut tb).is_ok() {
+                                    if let Ok(s) = alloc::str::from_utf8(&tb) {
+                                        text_entries.push((x, y, String::from(s), color));
+                                    }
+                                }
+                            }
+                        }
+                        0x03 => { scan += 12; }
+                        0x04 => { scan += 4; }
+                        0x05 => { scan += 10; }
+                        _ => { break; }
+                    }
+                }
+            }
+
+            // Second pass: emit all draw commands (no more mem reads needed)
+            let state = caller.data_mut();
+            let mut pos = 0usize;
+            let mut cmd_count = 0i32;
+            let mut text_idx = 0usize;
+
+            while pos < buf.len() {
+                let opcode = buf[pos];
+                pos += 1;
+
+                match opcode {
+                    0x01 => {
+                        if pos + 12 > buf.len() { break; }
+                        let x = u16::from_le_bytes([buf[pos], buf[pos+1]]) as u32;
+                        let y = u16::from_le_bytes([buf[pos+2], buf[pos+3]]) as u32;
+                        let w = u16::from_le_bytes([buf[pos+4], buf[pos+5]]) as u32;
+                        let h = u16::from_le_bytes([buf[pos+6], buf[pos+7]]) as u32;
+                        let color = u32::from_le_bytes([buf[pos+8], buf[pos+9], buf[pos+10], buf[pos+11]]);
+                        pos += 12;
+                        state.draw_commands.push(DrawCmd { x, y, w, h, color });
+                        cmd_count += 1;
+                    }
+                    0x02 => {
+                        if pos + 14 > buf.len() { break; }
+                        pos += 14;
+                        if text_idx < text_entries.len() {
+                            let (x, y, ref text, color) = text_entries[text_idx];
+                            state.text_commands.push(TextCmd { x, y, text: text.clone(), color });
+                            text_idx += 1;
+                        }
+                        cmd_count += 1;
+                    }
+                    0x03 => {
+                        if pos + 12 > buf.len() { break; }
+                        let x1 = u16::from_le_bytes([buf[pos], buf[pos+1]]) as i32;
+                        let y1 = u16::from_le_bytes([buf[pos+2], buf[pos+3]]) as i32;
+                        let x2 = u16::from_le_bytes([buf[pos+4], buf[pos+5]]) as i32;
+                        let y2 = u16::from_le_bytes([buf[pos+6], buf[pos+7]]) as i32;
+                        let color = u32::from_le_bytes([buf[pos+8], buf[pos+9], buf[pos+10], buf[pos+11]]);
+                        pos += 12;
+                        state.line_commands.push(LineCmd { x1, y1, x2, y2, color });
+                        cmd_count += 1;
+                    }
+                    0x04 => {
+                        if pos + 4 > buf.len() { break; }
+                        let color = u32::from_le_bytes([buf[pos], buf[pos+1], buf[pos+2], buf[pos+3]]);
+                        pos += 4;
+                        state.fill_screen = Some(color);
+                        cmd_count += 1;
+                    }
+                    0x05 => {
+                        if pos + 10 > buf.len() { break; }
+                        let cx = u16::from_le_bytes([buf[pos], buf[pos+1]]) as i32;
+                        let cy = u16::from_le_bytes([buf[pos+2], buf[pos+3]]) as i32;
+                        let r = u16::from_le_bytes([buf[pos+4], buf[pos+5]]) as i32;
+                        let color = u32::from_le_bytes([buf[pos+6], buf[pos+7], buf[pos+8], buf[pos+9]]);
+                        pos += 10;
+                        state.circle_commands.push(CircleCmd { cx, cy, r, color });
+                        cmd_count += 1;
+                    }
+                    _ => { break; }
+                }
+            }
+
+            cmd_count
+        },
+    );
+
     // Phase 22: Synchronous file read — load file directly into WASM memory
     // folk_read_file_sync(path_ptr, path_len, dest_ptr, max_len) -> i32
     // Reads a file from Synapse VFS SYNCHRONOUSLY (blocks until loaded).
@@ -1967,6 +2095,32 @@ fn register_shadow_functions(linker: &mut Linker<ShadowState>) {
     );
     let _ = linker.func_wrap("env", "folk_surface_present",
         |_: Caller<ShadowState>| {},
+    );
+
+    // Display list — count commands in shadow (no rendering)
+    let _ = linker.func_wrap("env", "folk_submit_display_list",
+        |mut caller: Caller<ShadowState>, ptr: i32, len: i32| -> i32 {
+            if len <= 0 { return 0; }
+            // Count opcodes without rendering
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return 0,
+            };
+            let mut buf = alloc::vec![0u8; (len as usize).min(65536)];
+            if mem.read(&caller, ptr as usize, &mut buf).is_err() { return 0; }
+            let mut pos = 0usize;
+            let mut count = 0i32;
+            while pos < buf.len() {
+                let skip = match buf[pos] {
+                    0x01 => 13, 0x02 => 15, 0x03 => 13, 0x04 => 5, 0x05 => 11,
+                    _ => break,
+                };
+                pos += skip;
+                caller.data_mut().draw_calls += 1;
+                count += 1;
+            }
+            count
+        },
     );
 
     // Adapters — no-op in shadow
