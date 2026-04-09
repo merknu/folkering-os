@@ -718,13 +718,15 @@ unsafe fn render() {
 pub extern "C" fn run() {
     unsafe {
         if !INITIALIZED {
-            // Default URL
+            // Default URL — auto-fetch on launch
             let default = b"https://httpbin.org/html";
             let u = core::ptr::addr_of_mut!(URL) as *mut u8;
             for i in 0..default.len() { *u.add(i) = default[i]; }
             URL_LEN = default.len();
             CURSOR_POS = URL_LEN;
+            EDITING_URL = false;
             folk_log_telemetry(0, 0, 0);
+            fetch_page(); // Auto-navigate on first launch
             INITIALIZED = true;
         }
         handle_input();
