@@ -771,6 +771,50 @@ fn register_host_functions(linker: &mut Linker<HostState>) {
         },
     );
 
+    // Phase 22: Synchronous file read — load file directly into WASM memory
+    // folk_read_file_sync(path_ptr, path_len, dest_ptr, max_len) -> i32
+    // Reads a file from Synapse VFS SYNCHRONOUSLY (blocks until loaded).
+    // Returns bytes loaded, or -1 on error.
+    let _ = linker.func_wrap("env", "folk_read_file_sync",
+        |mut caller: Caller<HostState>, path_ptr: i32, path_len: i32, dest_ptr: i32, max_len: i32| -> i32 {
+            if path_len <= 0 || path_len > 256 || max_len <= 0 { return -1; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+
+            let mut name_buf = alloc::vec![0u8; path_len as usize];
+            if mem.read(&caller, path_ptr as usize, &mut name_buf).is_err() { return -1; }
+            let name = match alloc::str::from_utf8(&name_buf) {
+                Ok(s) => s,
+                Err(_) => return -1,
+            };
+
+            // Use Synapse read_file_shmem (synchronous IPC)
+            match libfolk::sys::synapse::read_file_shmem(name) {
+                Ok(resp) => {
+                    const SYNC_READ_VADDR: usize = 0x50080000;
+                    if libfolk::sys::shmem_map(resp.shmem_handle, SYNC_READ_VADDR).is_ok() {
+                        let data = unsafe {
+                            core::slice::from_raw_parts(SYNC_READ_VADDR as *const u8, resp.size as usize)
+                        };
+                        let copy = data.len().min(max_len as usize);
+                        let result = if mem.write(&mut caller, dest_ptr as usize, &data[..copy]).is_ok() {
+                            copy as i32
+                        } else { -1 };
+                        let _ = libfolk::sys::shmem_unmap(resp.shmem_handle, SYNC_READ_VADDR);
+                        let _ = libfolk::sys::shmem_destroy(resp.shmem_handle);
+                        result
+                    } else {
+                        let _ = libfolk::sys::shmem_destroy(resp.shmem_handle);
+                        -1
+                    }
+                }
+                Err(_) => -1,
+            }
+        },
+    );
+
     // Phase 21: IPC Stats — Task list with IPC activity for AsyncFlow
     // folk_ipc_stats(buf_ptr, max_len) -> i32
     // Returns task list as compact text: "id:name:state:cpu_ms\n" per task
@@ -1923,6 +1967,19 @@ fn register_shadow_functions(linker: &mut Linker<ShadowState>) {
     );
     let _ = linker.func_wrap("env", "folk_surface_present",
         |_: Caller<ShadowState>| {},
+    );
+
+    // Adapters — no-op in shadow
+    let _ = linker.func_wrap("env", "folk_adapter_input",
+        |_: Caller<ShadowState>, _p: i32, _m: i32| -> i32 { 0 },
+    );
+    let _ = linker.func_wrap("env", "folk_adapter_output",
+        |_: Caller<ShadowState>, _p: i32, _l: i32| {},
+    );
+
+    // Sync file read — empty in shadow
+    let _ = linker.func_wrap("env", "folk_read_file_sync",
+        |_: Caller<ShadowState>, _p: i32, _pl: i32, _d: i32, _dl: i32| -> i32 { -1 },
     );
 
     // IPC stats — empty in shadow

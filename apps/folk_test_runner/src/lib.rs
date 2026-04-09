@@ -26,6 +26,7 @@ extern "C" {
     fn folk_poll_event(event_ptr: i32) -> i32;
     fn folk_list_files(buf_ptr: i32, max_len: i32) -> i32;
     fn folk_request_file(path_ptr: i32, path_len: i32, dest_ptr: i32, dest_len: i32) -> i32;
+    fn folk_read_file_sync(path_ptr: i32, path_len: i32, dest_ptr: i32, max_len: i32) -> i32;
     fn folk_shadow_test(wasm_ptr: i32, wasm_len: i32, result_ptr: i32, max_len: i32) -> i32;
     fn folk_write_file(path_ptr: i32, path_len: i32, data_ptr: i32, data_len: i32) -> i32;
     fn folk_random() -> i32;
@@ -213,7 +214,7 @@ unsafe fn run_next_test_step() {
     // Load WASM binary (once per app, reuse across scenarios)
     if CURRENT_SCENARIO == 0 && r.idle_status == TestStatus::Pending {
         let wasm_ptr = core::ptr::addr_of_mut!(WASM_BUF) as *mut u8;
-        let loaded = folk_request_file(
+        let loaded = folk_read_file_sync(
             name.as_ptr() as i32, name.len() as i32,
             wasm_ptr as i32, MAX_WASM_SIZE as i32);
 
@@ -560,6 +561,10 @@ pub extern "C" fn run() {
         if !INITIALIZED {
             discover_apps();
             folk_log_telemetry(0, 0, 0);
+            // Auto-start tests on launch (no F5 needed)
+            if APP_COUNT > 0 {
+                TESTING = true;
+            }
             INITIALIZED = true;
         }
 
