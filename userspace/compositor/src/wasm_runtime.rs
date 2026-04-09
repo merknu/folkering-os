@@ -771,6 +771,63 @@ fn register_host_functions(linker: &mut Linker<HostState>) {
         },
     );
 
+    // Phase 21: IPC Stats — Task list with IPC activity for AsyncFlow
+    // folk_ipc_stats(buf_ptr, max_len) -> i32
+    // Returns task list as compact text: "id:name:state:cpu_ms\n" per task
+    // Uses syscall 0x26 (task_list_detailed).
+    let _ = linker.func_wrap("env", "folk_ipc_stats",
+        |mut caller: Caller<HostState>, buf_ptr: i32, max_len: i32| -> i32 {
+            if max_len < 32 { return 0; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return 0,
+            };
+
+            // Read task list via syscall 0x26
+            // Buffer format: [task_id:u32][state:u32][name:[u8;16]][cpu_time_ms:u64] = 32 bytes/task
+            let mut raw = alloc::vec![0u8; 32 * 16]; // max 16 tasks
+            let count = unsafe {
+                libfolk::syscall::syscall2(0x26, raw.as_mut_ptr() as u64, raw.len() as u64) as usize
+            };
+
+            if count == 0 { return 0; }
+
+            // Format as text
+            let mut out = alloc::vec![0u8; max_len as usize];
+            let mut pos = 0usize;
+
+            for i in 0..count.min(16) {
+                let off = i * 32;
+                let tid = u32::from_le_bytes([raw[off], raw[off+1], raw[off+2], raw[off+3]]);
+                let state = u32::from_le_bytes([raw[off+4], raw[off+5], raw[off+6], raw[off+7]]);
+                let name_end = raw[off+8..off+24].iter().position(|&b| b == 0).unwrap_or(16);
+                let name = core::str::from_utf8(&raw[off+8..off+8+name_end]).unwrap_or("?");
+                let cpu_ms = u64::from_le_bytes([
+                    raw[off+24], raw[off+25], raw[off+26], raw[off+27],
+                    raw[off+28], raw[off+29], raw[off+30], raw[off+31],
+                ]);
+
+                let state_str = match state {
+                    0 => "ready",
+                    1 => "running",
+                    2 => "blocked",
+                    3 => "waiting",
+                    _ => "?",
+                };
+
+                let line = alloc::format!("{}:{}:{}:{}\n", tid, name, state_str, cpu_ms);
+                let bytes = line.as_bytes();
+                if pos + bytes.len() > out.len() { break; }
+                out[pos..pos+bytes.len()].copy_from_slice(bytes);
+                pos += bytes.len();
+            }
+
+            if pos > 0 && mem.write(&mut caller, buf_ptr as usize, &out[..pos]).is_ok() {
+                pos as i32
+            } else { 0 }
+        },
+    );
+
     // Phase 20: Shadow Test — Run WASM bytes in sandbox from another WASM app
     // folk_shadow_test(wasm_ptr, wasm_len, result_ptr, max_len) -> i32
     // Compiles and runs WASM bytes in the Shadow Runtime (mocked host functions).
@@ -1866,6 +1923,11 @@ fn register_shadow_functions(linker: &mut Linker<ShadowState>) {
     );
     let _ = linker.func_wrap("env", "folk_surface_present",
         |_: Caller<ShadowState>| {},
+    );
+
+    // IPC stats — empty in shadow
+    let _ = linker.func_wrap("env", "folk_ipc_stats",
+        |_: Caller<ShadowState>, _b: i32, _m: i32| -> i32 { 0 },
     );
 
     // Shadow test — no nesting in shadow
