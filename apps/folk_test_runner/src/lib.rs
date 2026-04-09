@@ -421,7 +421,7 @@ unsafe fn handle_input() {
         if *e.add(0) != 3 { continue; }
         let key = *e.add(3) as u8;
         match key {
-            0x74 | 0x72 => { // F5 or 'r' — start tests
+            0x84 | 0x72 => { // F5 or 'r' — start tests
                 if !TESTING {
                     CURRENT_TEST = 0; CURRENT_SCENARIO = 0;
                     PASS_COUNT = 0; FAIL_COUNT = 0; SKIP_COUNT = 0;

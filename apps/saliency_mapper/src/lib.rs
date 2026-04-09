@@ -398,7 +398,7 @@ unsafe fn handle_input() {
 
         let key = data as u8;
         match key {
-            0x74 => { // F5 — Run
+            0x84 => { // F5 — Run
                 if EDITING && PROMPT_LEN > 0 && !STREAMING {
                     start_inference();
                 }

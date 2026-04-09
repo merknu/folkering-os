@@ -412,7 +412,7 @@ unsafe fn handle_input() {
         let d = core::ptr::addr_of_mut!(SRC) as *mut u8;
 
         match key {
-            0x74 => { if SRC_LEN > 0 { build_and_test(); } } // F5
+            0x84 => { if SRC_LEN > 0 { build_and_test(); } } // F5
             0x08 => { if CURSOR_POS > 0 && SRC_LEN > 0 {
                 let mut i = CURSOR_POS - 1;
                 while i < SRC_LEN - 1 { *d.add(i) = *d.add(i+1); i += 1; }

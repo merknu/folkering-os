@@ -290,7 +290,7 @@ unsafe fn handle_input() {
 
         match key {
             0x09 => { FOCUS_LEFT = !FOCUS_LEFT; } // Tab
-            0x74 => { start_benchmark(); } // F5
+            0x84 => { start_benchmark(); } // F5
             0x72 => { load_tensor_page(); } // R — reload
             0x1B => {} // Esc
             _ => {
