@@ -400,4 +400,127 @@ pub fn register(linker: &mut Linker<HostState>) {
             } else { -1 }
         },
     );
+
+    // folk_semantic_extract(html_ptr, html_len, buf_ptr, max_len) -> i32
+    // Takes raw HTML, strips boilerplate (script/style/nav), sends to LLM
+    // for semantic extraction. Returns clean markdown text.
+    let _ = linker.func_wrap("env", "folk_semantic_extract",
+        |mut caller: Caller<HostState>, html_ptr: i32, html_len: i32, buf_ptr: i32, max_len: i32| -> i32 {
+            if html_len <= 0 || html_len > 8192 || max_len <= 0 { return -1; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+
+            // Read HTML from WASM memory
+            let mut html_buf = alloc::vec![0u8; html_len as usize];
+            if mem.read(&caller, html_ptr as usize, &mut html_buf).is_err() { return -1; }
+            let html = match alloc::str::from_utf8(&html_buf) {
+                Ok(s) => s,
+                Err(_) => return -1,
+            };
+
+            // Pre-process: strip <script>, <style>, <nav>, <header>, <footer>, <noscript> content
+            let mut cleaned = String::with_capacity(html.len());
+            let mut skip_depth: i32 = 0;
+            let mut i = 0;
+            let bytes = html.as_bytes();
+            while i < bytes.len() {
+                if bytes[i] == b'<' {
+                    // Check for opening skip tags
+                    let rest = &html[i..];
+                    let is_skip_open = rest.len() > 7 && (
+                        rest[..7].eq_ignore_ascii_case("<script") ||
+                        rest[..6].eq_ignore_ascii_case("<style") ||
+                        rest[..4].eq_ignore_ascii_case("<nav") ||
+                        rest[..7].eq_ignore_ascii_case("<header") ||
+                        rest[..7].eq_ignore_ascii_case("<footer") ||
+                        rest[..9].eq_ignore_ascii_case("<noscript")
+                    );
+                    let is_skip_close = rest.len() > 8 && (
+                        rest[..9].eq_ignore_ascii_case("</script") ||
+                        rest[..8].eq_ignore_ascii_case("</style") ||
+                        rest[..5].eq_ignore_ascii_case("</nav") ||
+                        rest[..9].eq_ignore_ascii_case("</header") ||
+                        rest[..9].eq_ignore_ascii_case("</footer") ||
+                        rest[..11].eq_ignore_ascii_case("</noscript")
+                    );
+
+                    if is_skip_open {
+                        skip_depth += 1;
+                        // Skip to end of tag
+                        while i < bytes.len() && bytes[i] != b'>' { i += 1; }
+                        i += 1;
+                        continue;
+                    }
+                    if is_skip_close {
+                        skip_depth -= 1;
+                        if skip_depth < 0 { skip_depth = 0; }
+                        while i < bytes.len() && bytes[i] != b'>' { i += 1; }
+                        i += 1;
+                        continue;
+                    }
+
+                    if skip_depth > 0 {
+                        i += 1;
+                        continue;
+                    }
+
+                    // Strip all other HTML tags but keep text content
+                    while i < bytes.len() && bytes[i] != b'>' { i += 1; }
+                    i += 1;
+                    // Add space to separate tag content
+                    if !cleaned.is_empty() && !cleaned.ends_with(' ') && !cleaned.ends_with('\n') {
+                        cleaned.push(' ');
+                    }
+                } else if skip_depth == 0 {
+                    cleaned.push(bytes[i] as char);
+                    i += 1;
+                } else {
+                    i += 1;
+                }
+            }
+
+            // Trim excessive whitespace
+            let trimmed: String = {
+                let mut result = String::with_capacity(cleaned.len());
+                let mut last_was_space = false;
+                for ch in cleaned.chars() {
+                    if ch == '\n' || ch == '\r' || ch == '\t' {
+                        if !last_was_space {
+                            result.push('\n');
+                            last_was_space = true;
+                        }
+                    } else if ch == ' ' {
+                        if !last_was_space {
+                            result.push(' ');
+                            last_was_space = true;
+                        }
+                    } else {
+                        result.push(ch);
+                        last_was_space = false;
+                    }
+                }
+                result
+            };
+
+            // Truncate to fit in gemini prompt (keep first ~3KB of clean text)
+            let text_for_llm = if trimmed.len() > 3000 { &trimmed[..3000] } else { &trimmed };
+
+            // Build semantic extraction prompt
+            let prompt = alloc::format!(
+                "__SLM_GENERATE__You are a semantic web browser. Extract the core information from this raw web page text. Remove all boilerplate, menus, ads, and navigation. Format the pure content as clean readable text with headings marked by '# '. Keep it concise.\n\nPage text:\n{}",
+                text_for_llm
+            );
+
+            let gemini_buf_size = (max_len as usize).max(8192);
+            let mut response = alloc::vec![0u8; gemini_buf_size];
+            let bytes = libfolk::sys::ask_gemini(&prompt, &mut response);
+            if bytes == 0 { return -1; }
+            let copy_len = bytes.min(max_len as usize).min(gemini_buf_size);
+            if mem.write(&mut caller, buf_ptr as usize, &response[..copy_len]).is_ok() {
+                copy_len as i32
+            } else { -1 }
+        },
+    );
 }

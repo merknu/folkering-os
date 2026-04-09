@@ -35,6 +35,7 @@ extern "C" {
     fn folk_draw_pixels(x: i32, y: i32, w: i32, h: i32, pixel_ptr: i32, pixel_len: i32) -> i32;
     fn folk_http_get_large(url_ptr: i32, url_len: i32, buf_ptr: i32, max_len: i32) -> i32;
     fn folk_log_telemetry(action: i32, target: i32, duration: i32);
+    fn folk_semantic_extract(html_ptr: i32, html_len: i32, buf_ptr: i32, max_len: i32) -> i32;
 }
 
 // ── Colors ──────────────────────────────────────────────────────────────
@@ -705,38 +706,23 @@ unsafe fn fetch_page() {
 unsafe fn generate_semantic_view() {
     if HTML_LEN == 0 { return; }
 
-    // Extract plain text from elements
-    let mut plain = [0u8; 1500];
-    let mut plen = 0usize;
-    let elems = core::ptr::addr_of!(ELEMENTS) as *const HtmlElement;
-
-    for i in 0..ELEM_COUNT {
-        let e = &*elems.add(i);
-        if e.text_len == 0 { continue; }
-        if e.elem_type == ElemType::Title { continue; }
-
-        let copy = e.text_len.min(1500 - plen - 1);
-        if copy == 0 { break; }
-        for j in 0..copy { plain[plen + j] = e.text[j]; }
-        plen += copy;
-        if plen < 1499 { plain[plen] = b' '; plen += 1; }
-    }
-
-    // Build AI prompt
-    let mut prompt = [0u8; 1800];
-    let prompt_len = {
-        let mut m = Msg::new(&mut prompt);
-        m.s(b"Summarize this web page content in 3-5 bullet points. Be concise. Content:\n");
-        m.s(&plain[..plen]);
-        m.len()
-    };
-
+    // Send raw HTML directly to folk_semantic_extract — it handles
+    // stripping <script>/<style>/<nav> and LLM semantic extraction.
+    let html_ptr = core::ptr::addr_of!(HTML_BUF) as *const u8;
     let sem_ptr = core::ptr::addr_of_mut!(SEMANTIC_BUF) as *mut u8;
-    let resp = folk_slm_generate(
-        prompt.as_ptr() as i32, prompt_len as i32,
+    let resp = folk_semantic_extract(
+        html_ptr as i32, HTML_LEN as i32,
         sem_ptr as i32, MAX_SEMANTIC as i32);
 
     SEMANTIC_LEN = if resp > 0 { resp as usize } else { 0 };
+
+    // If semantic extract failed, show a fallback message
+    if SEMANTIC_LEN == 0 {
+        let fallback = b"[Semantic extraction unavailable - connect to proxy]";
+        let copy = fallback.len().min(MAX_SEMANTIC);
+        for i in 0..copy { *sem_ptr.add(i) = fallback[i]; }
+        SEMANTIC_LEN = copy;
+    }
 }
 
 // ── Input ───────────────────────────────────────────────────────────────
@@ -745,7 +731,25 @@ unsafe fn handle_input() {
     loop {
         let e = core::ptr::addr_of_mut!(EVT) as *mut i32;
         if folk_poll_event(e as i32) == 0 { break; }
-        if *e.add(0) != 3 { continue; }
+        let event_type = *e.add(0);
+
+        // Mouse click on SEMANTIC button (top-left corner, 32x16 area)
+        if event_type == 2 {
+            let mx = *e.add(1);
+            let my = *e.add(2);
+            if mx >= 4 && mx < 36 && my >= 4 && my < 20 {
+                // Toggle semantic mode
+                if MODE == ViewMode::Standard {
+                    MODE = ViewMode::Semantic;
+                    if SEMANTIC_LEN == 0 { generate_semantic_view(); }
+                } else {
+                    MODE = ViewMode::Standard;
+                }
+            }
+            continue;
+        }
+
+        if event_type != 3 { continue; }
         let key = *e.add(3) as u8;
 
         match key {
@@ -828,10 +832,14 @@ unsafe fn render() {
     // URL bar (always on top, drawn with individual calls for clarity)
     folk_draw_rect(0, 0, usable_w, URLBAR_H, URLBAR_BG);
 
-    // Mode indicator
-    let mode_text = if MODE == ViewMode::Standard { b"STD" as &[u8] } else { b"SEM" };
-    let mode_color = if MODE == ViewMode::Standard { 0x3FB950 } else { 0xBC8CFF };
-    draw(8, 8, mode_text, mode_color);
+    // Mode toggle button (clickable)
+    let (mode_text, mode_bg, mode_fg) = if MODE == ViewMode::Standard {
+        (b"STD" as &[u8], 0x1B2838_i32, 0x3FB950_i32)
+    } else {
+        (b"SEM" as &[u8], 0x2D1B4E_i32, 0xBC8CFF_i32)
+    };
+    folk_draw_rect(4, 4, 32, 16, mode_bg);
+    draw(8, 8, mode_text, mode_fg);
 
     // URL text
     if URL_LEN > 0 {
