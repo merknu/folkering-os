@@ -27,6 +27,8 @@
 //! - `folk_tensor_read(buf_ptr, buf_len, sector_offset) -> i32` — read TDMP mailbox
 //! ## PromptLab (Phase 11)
 //! - `folk_slm_generate_with_logits(prompt_ptr, prompt_len, out_ptr, max_len) -> i32` — inference + PLAB result
+//! ## Telemetry (Phase 12)
+//! - `folk_log_telemetry(action_type, target_id, duration_ms)` — push event to kernel ring buffer
 
 extern crate alloc;
 
@@ -760,6 +762,21 @@ fn register_host_functions(linker: &mut Linker<HostState>) {
             if mem.write(&mut caller, out_ptr as usize, &out).is_ok() {
                 total_size as i32
             } else { -1 }
+        },
+    );
+
+    // Phase 12: Telemetry Ring — App-level event logging for AutoDream
+    // folk_log_telemetry(action_type, target_id, duration_ms)
+    // Pushes an event into the kernel's telemetry ring buffer.
+    // Action types: 0=AppOpened, 1=AppClosed, 2=IpcMessageSent,
+    //   3=UiInteraction, 4=AiInferenceRequested, 5=AiInferenceCompleted,
+    //   6=FileAccessed, 7=FileWritten, 8=OmnibarCommand, 9=MetricAlert
+    let _ = linker.func_wrap("env", "folk_log_telemetry",
+        |_caller: Caller<HostState>, action_type: i32, target_id: i32, duration_ms: i32| {
+            // Syscall 0x9B: record telemetry event
+            unsafe {
+                libfolk::syscall::syscall3(0x9B, action_type as u64, target_id as u64, duration_ms as u64);
+            }
         },
     );
 

@@ -3911,6 +3911,8 @@ fn main() -> ! {
                                             write_str("\n");
                                             // IQE: window open event
                                             libfolk::sys::com3_write(b"IQE,WIN_OPEN,0\n");
+                                            // Telemetry: AppOpened (syscall 0x9B)
+                                            unsafe { libfolk::syscall::syscall3(0x9B, 0, 0, 0); }
                                         } // Ok(app)
                                         } // match PersistentWasmApp::new
                                     } else {

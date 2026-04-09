@@ -1127,6 +1127,29 @@ extern "C" fn syscall_handler(
         0xB0 => syscall_net_dma_rx(arg1, arg2),     // Kernel-assisted RX: read DMA + deliver to smoltcp
         0xB1 => syscall_dma_sync_write(arg1, arg2), // Write to physical memory via HHDM
         0xB2 => syscall_net_metrics(arg1, arg2),    // OS metrics for AI introspection
+        // Telemetry Ring: record app-level event for AutoDream pattern mining
+        // arg1 = action_type (u8), arg2 = target_id (u32), arg3 = duration_ms (u32)
+        0x9B => {
+            crate::drivers::telemetry::record(
+                crate::drivers::telemetry::ActionType::from_u8(arg1 as u8),
+                arg2 as u32,
+                arg3 as u32,
+            );
+            0
+        },
+        // Telemetry Ring: drain all events to userspace buffer (AutoDream)
+        // arg1 = buf_ptr, arg2 = max_events
+        // Returns: number of events drained
+        0x9C => {
+            crate::drivers::telemetry::drain_to_user(arg1 as usize, arg2 as usize) as u64
+        },
+        // Telemetry Ring: get stats (pending, total, overflow)
+        // Returns: pending in bits 0-15, total in bits 16-31, overflow in bits 32-47
+        0x9D => {
+            let (pending, total, overflow) = crate::drivers::telemetry::stats();
+            (pending as u64) | ((total as u64) << 16) | ((overflow as u64) << 32)
+        },
+
         _ => {
             crate::drivers::serial::write_str("[HANDLER] Invalid syscall!\n");
             u64::MAX // Return error

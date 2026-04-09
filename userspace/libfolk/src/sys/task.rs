@@ -116,6 +116,31 @@ pub fn iqe_tsc_freq() -> u64 {
     unsafe { syscall0(0x92) }
 }
 
+/// Telemetry: Record an app-level event for AutoDream pattern mining.
+/// action_type: 0=AppOpened, 1=AppClosed, 2=IpcMessageSent, 3=UiInteraction,
+///   4=AiInferenceRequested, 5=AiInferenceCompleted, 6=FileAccessed,
+///   7=FileWritten, 8=OmnibarCommand, 9=MetricAlert
+pub fn telemetry_log(action_type: u8, target_id: u32, duration_ms: u32) {
+    unsafe { syscall3(0x9B, action_type as u64, target_id as u64, duration_ms as u64); }
+}
+
+/// Telemetry: Drain all pending events to buffer (for AutoDream).
+/// Returns number of events drained. Each event is 16 bytes.
+pub fn telemetry_drain(buf: &mut [u8], max_events: usize) -> usize {
+    let ret = unsafe { syscall2(0x9C, buf.as_mut_ptr() as u64, max_events as u64) };
+    ret as usize
+}
+
+/// Telemetry: Get ring buffer stats.
+/// Returns (pending_count, total_recorded, overflow_count).
+pub fn telemetry_stats() -> (u32, u32, u32) {
+    let packed = unsafe { syscall0(0x9D) };
+    let pending = (packed & 0xFFFF) as u32;
+    let total = ((packed >> 16) & 0xFFFF) as u32;
+    let overflow = ((packed >> 32) & 0xFFFF) as u32;
+    (pending, total, overflow)
+}
+
 /// Write bytes to COM3 via syscall 0x94.
 pub fn com3_write(data: &[u8]) {
     unsafe { syscall2(0x94, data.as_ptr() as u64, data.len() as u64); }
