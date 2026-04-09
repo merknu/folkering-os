@@ -771,6 +771,46 @@ fn register_host_functions(linker: &mut Linker<HostState>) {
         },
     );
 
+    // Phase 20: Shadow Test — Run WASM bytes in sandbox from another WASM app
+    // folk_shadow_test(wasm_ptr, wasm_len, result_ptr, max_len) -> i32
+    // Compiles and runs WASM bytes in the Shadow Runtime (mocked host functions).
+    // Writes TestReport summary to result_ptr as text.
+    // Returns bytes written, or -1 on error.
+    let _ = linker.func_wrap("env", "folk_shadow_test",
+        |mut caller: Caller<HostState>, wasm_ptr: i32, wasm_len: i32, result_ptr: i32, max_len: i32| -> i32 {
+            if wasm_len <= 0 || wasm_len > 65536 || max_len < 32 { return -1; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+
+            let mut wasm_bytes = alloc::vec![0u8; wasm_len as usize];
+            if mem.read(&caller, wasm_ptr as usize, &mut wasm_bytes).is_err() { return -1; }
+
+            // Run in shadow sandbox (no real side effects)
+            let report = execute_shadow_test(&wasm_bytes, &[]);
+
+            // Format report as compact text
+            let text = alloc::format!(
+                "ok:{} frames:{} fuel:{} draw:{} text:{} file:{} ai:{}{}\n",
+                if report.completed { 1 } else { 0 },
+                report.frames_executed,
+                report.fuel_consumed,
+                report.draw_call_count,
+                report.text_draw_count,
+                report.file_write_count,
+                report.ai_call_count,
+                if let Some(ref e) = report.error { alloc::format!(" err:{}", e) } else { String::new() },
+            );
+
+            let bytes = text.as_bytes();
+            let copy = bytes.len().min(max_len as usize);
+            if mem.write(&mut caller, result_ptr as usize, &bytes[..copy]).is_ok() {
+                copy as i32
+            } else { -1 }
+        },
+    );
+
     // Phase 18: Memory Map — Buddy allocator visualization
     // folk_memory_map(buf_ptr, max_len) -> i32
     // Writes memory stats: [total_pages:u32, free_pages:u32, used_pct:u32, heap_used_kb:u32]
@@ -1826,6 +1866,11 @@ fn register_shadow_functions(linker: &mut Linker<ShadowState>) {
     );
     let _ = linker.func_wrap("env", "folk_surface_present",
         |_: Caller<ShadowState>| {},
+    );
+
+    // Shadow test — no nesting in shadow
+    let _ = linker.func_wrap("env", "folk_shadow_test",
+        |_: Caller<ShadowState>, _w: i32, _wl: i32, _r: i32, _rl: i32| -> i32 { -1 },
     );
 
     // Memory map + tokenizer — defaults in shadow
