@@ -12,6 +12,9 @@
 #![no_std]
 #![no_main]
 
+mod png;
+mod jpeg;
+
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! { loop {} }
 
@@ -133,6 +136,14 @@ static mut DL_LEN: usize = 0;
 
 static mut SEMANTIC_BUF: [u8; MAX_SEMANTIC] = [0u8; MAX_SEMANTIC];
 static mut SEMANTIC_LEN: usize = 0;
+
+// Image cache — one loaded image at a time
+static mut IMG_PIXELS: [u8; 131072] = [0u8; 131072]; // 128KB RGBA (enough for ~180x180)
+static mut IMG_RAW: [u8; 65536] = [0u8; 65536];      // 64KB raw image data
+static mut IMG_W: u32 = 0;
+static mut IMG_H: u32 = 0;
+static mut IMG_LOADED: bool = false;
+static mut IMG_ELEM_IDX: usize = 0; // which element this image belongs to
 
 static mut SCROLL_Y: i32 = 0;
 static mut CONTENT_HEIGHT: i32 = 0;
@@ -537,17 +548,25 @@ unsafe fn build_display_list(viewport_w: i32, viewport_h: i32) {
                 pos = emit_text(dl, pos, e, ey, H2_COLOR);
             }
             ElemType::Img => {
-                // Draw placeholder rect for image
-                if pos + 13 <= MAX_DISPLAY_LIST {
-                    *dl.add(pos) = 0x01; pos += 1;
-                    let vals: [u16; 4] = [e.x as u16, ey as u16, e.w as u16, e.h as u16];
-                    for v in &vals { let b = v.to_le_bytes(); *dl.add(pos) = b[0]; *dl.add(pos+1) = b[1]; pos += 2; }
-                    let cb = (0x1A2332u32).to_le_bytes(); // dark placeholder bg
-                    for j in 0..4 { *dl.add(pos+j) = cb[j]; } pos += 4;
-                }
-                // Show "[IMG]" label + truncated URL
-                if e.text_len > 0 {
-                    pos = emit_text(dl, pos, e, ey + 4, 0x484F58);
+                if IMG_LOADED && i == IMG_ELEM_IDX && ey >= -600 && ey < viewport_h {
+                    // Render actual image via folk_draw_pixels
+                    folk_draw_pixels(
+                        e.x, ey, IMG_W as i32, IMG_H as i32,
+                        core::ptr::addr_of!(IMG_PIXELS) as i32,
+                        (IMG_W * IMG_H * 4) as i32,
+                    );
+                } else {
+                    // Placeholder rect
+                    if pos + 13 <= MAX_DISPLAY_LIST {
+                        *dl.add(pos) = 0x01; pos += 1;
+                        let vals: [u16; 4] = [e.x as u16, ey.max(0) as u16, e.w as u16, e.h as u16];
+                        for v in &vals { let b = v.to_le_bytes(); *dl.add(pos) = b[0]; *dl.add(pos+1) = b[1]; pos += 2; }
+                        let cb = (0x1A2332u32).to_le_bytes();
+                        for j in 0..4 { *dl.add(pos+j) = cb[j]; } pos += 4;
+                    }
+                    if e.text_len > 0 {
+                        pos = emit_text(dl, pos, e, ey + 4, 0x484F58);
+                    }
                 }
             }
             ElemType::A => {
@@ -584,6 +603,60 @@ unsafe fn emit_text(dl: *mut u8, mut pos: usize, e: &HtmlElement, screen_y: i32,
     pos
 }
 
+// ── Image Loading ───────────────────────────────────────────────────────
+
+unsafe fn try_load_first_image() {
+    if IMG_LOADED { return; }
+
+    let elems = core::ptr::addr_of!(ELEMENTS) as *const HtmlElement;
+    for i in 0..ELEM_COUNT {
+        let e = &*elems.add(i);
+        if e.elem_type != ElemType::Img || e.text_len == 0 { continue; }
+
+        let url = &e.text[..e.text_len];
+
+        // Skip data URIs and relative paths for now (need base URL resolution)
+        if url.len() < 8 { continue; }
+        if url[0] != b'h' && url[0] != b'H' { continue; } // must start with http
+
+        // Fetch image via folk_http_get_large
+        let raw = core::ptr::addr_of_mut!(IMG_RAW) as *mut u8;
+        let bytes = folk_http_get_large(
+            url.as_ptr() as i32, url.len() as i32,
+            raw as i32, 65536,
+        );
+        if bytes <= 0 { continue; }
+
+        let raw_data = core::slice::from_raw_parts(raw, bytes as usize);
+        let pixels = core::ptr::addr_of_mut!(IMG_PIXELS) as *mut u8;
+        let pixel_buf = core::slice::from_raw_parts_mut(pixels, 131072);
+
+        // Detect format and decode
+        let (w, h) = if raw_data.len() > 8 && &raw_data[0..8] == b"\x89PNG\r\n\x1A\n" {
+            png::decode_png(raw_data, pixel_buf)
+        } else if raw_data.len() > 2 && raw_data[0] == 0xFF && raw_data[1] == 0xD8 {
+            jpeg::decode_jpeg(raw_data, pixel_buf)
+        } else {
+            (0, 0)
+        };
+
+        if w > 0 && h > 0 {
+            IMG_W = w;
+            IMG_H = h;
+            IMG_LOADED = true;
+            IMG_ELEM_IDX = i;
+
+            // Update layout element size to match actual image
+            let elems_mut = core::ptr::addr_of_mut!(ELEMENTS) as *mut HtmlElement;
+            let em = &mut *elems_mut.add(i);
+            em.w = w.min(800) as i32;
+            em.h = h.min(600) as i32;
+
+            break; // Only load first image for now
+        }
+    }
+}
+
 // ── Page Fetch ──────────────────────────────────────────────────────────
 
 unsafe fn fetch_page() {
@@ -605,6 +678,9 @@ unsafe fn fetch_page() {
         let sw = folk_screen_width();
         layout_elements(sw.min(1024));
         folk_log_telemetry(10, bytes as i32, 0); // NetworkEvent
+        // Try to load the first image found on the page
+        IMG_LOADED = false;
+        try_load_first_image();
     } else {
         // Show error as HTML
         let err = b"<h1>Connection Failed</h1><p>Could not fetch the URL. Check network status.</p>";
