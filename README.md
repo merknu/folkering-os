@@ -4,8 +4,11 @@
 
 Built entirely in Rust `no_std` -- no Linux, no POSIX, no libc. From x86-64 bootloader to a self-improving AI desktop with 43 syscalls, WebSocket streaming, and an autonomous dream cycle. The AI isn't an app running on the OS. **The AI IS the operating system.**
 
-![Neural Desktop](screenshots/neural-desktop.png)
-*The Neural Desktop: date, clock, system tray, omnibar, and the Boot Test window. Every pixel rendered by our VirtIO-GPU compositor.*
+![App Showcase](screenshots/folkering-app-showcase.gif)
+*11 apps cycling: Neural Desktop, KernelSnoop, TensorView, PromptLab, PolyglotChat, ContextWeaver, VFS-Explorer, AsyncFlow, SlabVisualizer, WasmForge, and the 48/48 PASS test runner.*
+
+![ContextWeaver Demo](screenshots/context-weaver-demo.gif)
+*ContextWeaver: typing triggers debounced semantic search. "The Weaver" panel discovers related files as you write.*
 
 ---
 
