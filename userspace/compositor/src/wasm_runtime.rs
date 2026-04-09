@@ -771,6 +771,42 @@ fn register_host_functions(linker: &mut Linker<HostState>) {
         },
     );
 
+    // Phase 15: Tensor Write — Modify weights in TDMP mailbox (DANGEROUS)
+    // folk_tensor_write(sector_offset, byte_offset, value_bits) -> i32
+    // Writes a single f32 value to the TDMP data sectors on VirtIO-blk.
+    // sector_offset: 1+ (data sectors, 0=header is read-only)
+    // byte_offset: offset within the sector (0-508, must be 4-aligned)
+    // value_bits: f32 reinterpreted as i32 (IEEE 754 bits)
+    // Returns 0 on success, -1 on error.
+    // WARNING: Modifying live tensor data while inference runs WILL corrupt output.
+    // The write uses block_write which is serialized by the kernel's block device lock.
+    let _ = linker.func_wrap("env", "folk_tensor_write",
+        |_caller: Caller<HostState>, sector_offset: i32, byte_offset: i32, value_bits: i32| -> i32 {
+            if sector_offset < 1 || sector_offset > 256 { return -1; } // Can't write header
+            if byte_offset < 0 || byte_offset > 508 || byte_offset % 4 != 0 { return -1; }
+
+            // Read the sector, modify the float, write it back
+            let disk_sector = 1u64 + sector_offset as u64; // TDMP header at sector 1
+            let mut buf = [0u8; 512];
+            if libfolk::sys::block::read_sector(disk_sector, &mut buf).is_err() {
+                return -1;
+            }
+
+            // Write the f32 value at the specified offset
+            let off = byte_offset as usize;
+            let bytes = value_bits.to_le_bytes();
+            buf[off] = bytes[0];
+            buf[off+1] = bytes[1];
+            buf[off+2] = bytes[2];
+            buf[off+3] = bytes[3];
+
+            if libfolk::sys::block::write_sector(disk_sector, &buf).is_err() {
+                return -1;
+            }
+            0
+        },
+    );
+
     // Phase 14: WebSocket — Persistent streaming connections
     // folk_ws_connect(url_ptr, url_len) -> i32 (slot_id or -1)
     // URL format: "ws://host:port/path"
@@ -1561,6 +1597,11 @@ fn register_shadow_functions(linker: &mut Linker<ShadowState>) {
     );
     let _ = linker.func_wrap("env", "folk_surface_present",
         |_: Caller<ShadowState>| {},
+    );
+
+    // Tensor write — no-op in shadow
+    let _ = linker.func_wrap("env", "folk_tensor_write",
+        |_: Caller<ShadowState>, _s: i32, _b: i32, _v: i32| -> i32 { -1 },
     );
 
     // WebSocket — no-op in shadow (no real network)
