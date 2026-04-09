@@ -19,6 +19,45 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+// ── Heap Allocator (required for Vec/String) ────────────────────────────
+use core::alloc::{GlobalAlloc, Layout};
+use core::cell::UnsafeCell;
+
+const HEAP_SIZE: usize = 64 * 1024; // 64KB heap for dynamic cache
+
+struct BumpAllocator {
+    heap: UnsafeCell<[u8; HEAP_SIZE]>,
+    offset: UnsafeCell<usize>,
+}
+
+unsafe impl Sync for BumpAllocator {}
+
+unsafe impl GlobalAlloc for BumpAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let offset = &mut *self.offset.get();
+        let align = layout.align();
+        let aligned = (*offset + align - 1) & !(align - 1);
+        let new_offset = aligned + layout.size();
+        if new_offset > HEAP_SIZE {
+            core::ptr::null_mut() // OOM
+        } else {
+            *offset = new_offset;
+            (*self.heap.get()).as_mut_ptr().add(aligned)
+        }
+    }
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
+        // Bump allocator: no dealloc (acceptable for long-lived caches)
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: BumpAllocator = BumpAllocator {
+    heap: UnsafeCell::new([0; HEAP_SIZE]),
+    offset: UnsafeCell::new(0),
+};
+
 use libfolk::{entry, println};
 use libfolk::sys::{yield_cpu, get_pid, shmem_unmap, shmem_destroy};
 use libfolk::sys::ipc::{recv_async, reply_with_token, AsyncIpcMessage};
@@ -44,11 +83,11 @@ use libsqlite::shadow::has_shadow_tables;
 
 entry!(main);
 
-/// Maximum cached directory entries (for FPK fallback)
-const MAX_ENTRIES: usize = 16;
+/// Initial capacity for directory cache (grows dynamically via Vec)
+const INITIAL_CACHE_CAPACITY: usize = 32;
 
-/// Maximum SQLite database size (2MB — must fit files.db with all ELFs + data)
-const MAX_DB_SIZE: usize = 2 * 1024 * 1024;
+/// Maximum SQLite database size (4MB — dynamically allocated, only uses what's needed)
+const MAX_DB_SIZE: usize = 4 * 1024 * 1024;
 
 /// SQLite database filename
 const DB_FILENAME: &str = "files.db";
@@ -67,13 +106,12 @@ enum Backend {
     Sqlite,
 }
 
-/// Directory cache state for FPK backend - kept in a single struct to ensure memory layout
-#[repr(C, align(64))]
+/// Directory cache — dynamically grows as files are added.
+/// No hardcoded limit: uses Vec<DirEntry> from the global allocator.
 struct DirCacheState {
     count: usize,
     valid: bool,
-    _padding: [u8; 7],
-    entries: [DirEntry; MAX_ENTRIES],
+    entries: alloc::vec::Vec<DirEntry>,
 }
 
 /// Maximum SQLite pages (MAX_DB_SIZE / 4096)
@@ -122,13 +160,7 @@ unsafe fn clear_dirty() {
 static mut DIR_CACHE_STATE: DirCacheState = DirCacheState {
     count: 0,
     valid: false,
-    _padding: [0; 7],
-    entries: [DirEntry {
-        id: 0,
-        entry_type: 0,
-        name: [0u8; 32],
-        size: 0,
-    }; MAX_ENTRIES],
+    entries: alloc::vec::Vec::new(),
 };
 
 static mut SQLITE_STATE: SqliteState = SqliteState {
@@ -354,7 +386,12 @@ fn get_sqlite_db<'a>() -> Option<SqliteDb<'a>> {
 /// Refresh the FPK directory cache from the ramdisk
 fn refresh_fpk_cache() {
     unsafe {
+        // Ensure enough space for ramdisk entries
+        DIR_CACHE_STATE.entries.resize(64, DirEntry {
+            id: 0, entry_type: 0, name: [0u8; 32], size: 0,
+        });
         let result = read_dir(&mut DIR_CACHE_STATE.entries);
+        DIR_CACHE_STATE.entries.truncate(result);
         DIR_CACHE_STATE.count = result;
         DIR_CACHE_STATE.valid = true;
     }
@@ -365,35 +402,40 @@ fn refresh_fpk_cache() {
 fn refresh_sqlite_cache() {
     if let Some(db) = get_sqlite_db() {
         if let Ok(scanner) = db.table_scan("files") {
-            let mut count = 0;
+            // Dynamic: clear and rebuild — no hardcoded limit
+            unsafe {
+                DIR_CACHE_STATE.entries.clear();
+                DIR_CACHE_STATE.count = 0;
+            }
+
             for result in scanner {
-                if count >= MAX_ENTRIES { break; }
                 if let Ok(record) = result {
                     if let Some(Value::Text(name)) = record.get(1) {
                         let name_bytes = name.as_bytes();
                         let name_len = name_bytes.len().min(32);
+
+                        let mut entry = DirEntry {
+                            id: 0, entry_type: 0, name: [0u8; 32], size: 0,
+                        };
+                        entry.name[..name_len].copy_from_slice(&name_bytes[..name_len]);
+                        entry.id = record.get(0)
+                            .and_then(|v| v.as_int())
+                            .unwrap_or(0) as u16;
+                        entry.size = record.get(3)
+                            .and_then(|v| v.as_int())
+                            .unwrap_or(0) as u64;
+                        entry.entry_type = if record.get(2)
+                            .and_then(|v| v.as_int())
+                            .unwrap_or(1) == KIND_ELF { 0 } else { 1 };
+
                         unsafe {
-                            let entry = &mut DIR_CACHE_STATE.entries[count];
-                            entry.name = [0u8; 32];
-                            entry.name[..name_len].copy_from_slice(&name_bytes[..name_len]);
-                            entry.id = record.get(0)
-                                .and_then(|v| v.as_int())
-                                .unwrap_or(count as i64) as u16;
-                            entry.size = record.get(3)
-                                .and_then(|v| v.as_int())
-                                .unwrap_or(0) as u64;
-                            entry.entry_type = if record.get(2)
-                                .and_then(|v| v.as_int())
-                                .unwrap_or(1) == KIND_ELF { 0 } else { 1 };
-                            count += 1;
+                            DIR_CACHE_STATE.entries.push(entry);
+                            DIR_CACHE_STATE.count = DIR_CACHE_STATE.entries.len();
                         }
                     }
                 }
             }
-            unsafe {
-                DIR_CACHE_STATE.count = count;
-                DIR_CACHE_STATE.valid = true;
-            }
+            unsafe { DIR_CACHE_STATE.valid = true; }
         }
     }
 }
@@ -2577,18 +2619,17 @@ fn read_sqlite_blob_large(name: &str, buf: &mut [u8]) -> usize {
 /// Update DIR_CACHE_STATE with the newly inserted file
 fn update_dir_cache(rowid: i64, name_bytes: &[u8], size: usize) {
     unsafe {
-        let count = DIR_CACHE_STATE.count;
-        if count >= MAX_ENTRIES {
-            return;
-        }
-        let entry = &mut DIR_CACHE_STATE.entries[count];
-        entry.id = rowid as u16;
-        entry.name = [0u8; 32];
+        // Dynamic: just push — no limit check needed
+        let mut entry = DirEntry {
+            id: rowid as u16,
+            entry_type: 1, // DATA type
+            name: [0u8; 32],
+            size: size as u64,
+        };
         let nl = name_bytes.len().min(32);
         entry.name[..nl].copy_from_slice(&name_bytes[..nl]);
-        entry.size = size as u64;
-        entry.entry_type = 1; // DATA type
-        DIR_CACHE_STATE.count = count + 1;
+        DIR_CACHE_STATE.entries.push(entry);
+        DIR_CACHE_STATE.count = DIR_CACHE_STATE.entries.len();
     }
 }
 

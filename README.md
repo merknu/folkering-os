@@ -1,103 +1,228 @@
 # Folkering OS
 
-**The world's first AI-native bare-metal operating system that writes its own tools, generates its own drivers, and improves itself overnight.**
+**The world's first AI-native bare-metal operating system that writes its own tools, dreams up its own improvements overnight, and has 17 apps that collectively weigh less than a single JPEG.**
 
-Built entirely in Rust `no_std` — no Linux, no POSIX, no libc. From x86-64 bootloader to AI desktop in 2 months. The AI isn't an app running on the OS. **The AI IS the operating system.**
+Built entirely in Rust `no_std` -- no Linux, no POSIX, no libc. From x86-64 bootloader to a self-improving AI desktop with 43 syscalls, WebSocket streaming, and an autonomous dream cycle. The AI isn't an app running on the OS. **The AI IS the operating system.**
+
+![Neural Desktop](screenshots/neural-desktop.png)
+*The Neural Desktop: date, clock, system tray, omnibar, and the Boot Test window. Every pixel rendered by our VirtIO-GPU compositor.*
+
+---
 
 ## What Makes It Different
 
 ```
-You type: Get-SystemStats |> Format-Dashboard
+You type: open polyglot_chat
 
 The OS:
-1. Parses the pipe syntax (FolkShell AST)
-2. Discovers "Get-SystemStats" doesn't exist
-3. Asks Gemini to write it in Rust
-4. Compiles it to WebAssembly (669 bytes)
-5. Signs it cryptographically (SHA-256)
-6. Discovers "Format-Dashboard" also doesn't exist
-7. Generates THAT too (652 bytes, with visual rendering)
-8. Signs it, chains the pipeline
-9. Launches a live, interactive dashboard widget
-10. All in ~10 seconds. From nothing.
+1. Finds polyglot_chat.wasm in Synapse VFS (semantic file lookup)
+2. Loads 24KB of WASM bytecode from SQLite B-tree (with overflow pages)
+3. Instantiates it in the wasmi runtime with 43 host functions
+4. Opens a WebSocket to the AI proxy for streaming tokens
+5. You ask "What did AutoDream find last night?"
+6. The app routes your intent to Synapse VFS, reads the insight file
+7. Renders the AI's self-analysis in purple text
+8. All without touching Linux, glibc, or a single line of JavaScript.
 ```
 
-**The terminal is not a text interface. It's an infinite canvas.**
+**The terminal is not a text interface. It's a portal to the OS's consciousness.**
+
+---
+
+## The App Suites
+
+Folkering OS ships with 17 custom WASM apps (plus 5 built-in), organized into purpose-built suites. Total size: **~125 KB**.
+
+### The Power User Suite -- System & ML Inspection
+
+Tools for developers who need x-ray vision into a bare-metal AI system.
+
+| App | Size | What It Does |
+|-----|------|-------------|
+| **KernelSnoop** | 13.7 KB | Real-time OS monitor. Polls network, firewall, suspicious packet counts every second. AI explains anomalies via `folk_slm_generate()`. |
+| **TensorView** | 7.4 KB | Reads the inference server's TDMP tensor mailbox. 16x16 heatmap (Inferno colormap) + 24-bin histogram + automatic health indicator. |
+| **WeightWrangler** | 5.0 KB | **Dangerous.** Live tensor editing via `folk_tensor_write()`. Modify a weight, press F5, watch the benchmark output change. |
+| **SaliencyMapper** | 6.8 KB | Attention visualization. Input words glow blue-to-red based on how much the AI focused on them when generating each output token. |
+| **DriverStudio** | 4.0 KB | PCI device dashboard. Lists VirtIO-Net/Blk/GPU with vendor:device IDs. Live graph of memory, network, and firewall metrics. |
+| **SlabVisualizer** | 2.4 KB | Defrag-style memory heatmap. 16x4 grid of allocation density (blue=free, red=heavy). 2-minute scrolling usage history. |
+| **AsyncFlow** | 5.4 KB | IPC bus visualizer. Task nodes in circular layout. Animated blue packets flow along edges. Congested queues turn red. |
+
+| KernelSnoop | TensorView | SlabVisualizer |
+|:-:|:-:|:-:|
+| ![KernelSnoop](screenshots/kernel-snoop-live.png) | ![TensorView](screenshots/tensor-view-live.png) | ![SlabVisualizer](screenshots/chaos-slab-visualizer.png) |
+
+| AsyncFlow | WasmForge | DriverStudio |
+|:-:|:-:|:-:|
+| ![AsyncFlow](screenshots/chaos-async-flow.png) | ![WasmForge](screenshots/chaos-wasm-forge.png) | *PCI + IRQ graphs* |
+
+### The Liquid Suite -- AI-Native Productivity
+
+Apps that change shape based on context. No static UIs -- every panel adapts to what you're doing.
+
+| App | Size | What It Does |
+|-----|------|-------------|
+| **PolyglotChat** | 24.0 KB | Talk to the OS's consciousness. Ask about network status, AutoDream insights, or paste C++ code for translation. WebSocket streaming with typewriter effect. |
+| **PromptLab** | 6.6 KB | Prompt engineering workbench. Per-token confidence heatmap (green >80%, yellow 50-80%, red <50%). Token inspector with top-3 alternative probabilities. |
+| **ContextWeaver** | 5.9 KB | Semantic second brain. Write in the editor; "The Weaver" sidebar finds related files from Synapse VFS as you type (800ms debounce). Tab to inject AI summaries inline. |
+| **SemanticMail** | 8.3 KB | Email without dates. Three Kanban columns: ACTION (red), QUESTION (yellow), FYI (green). AI categorizes each email. No inbox, just intent. |
+
+| PolyglotChat | PromptLab | ContextWeaver |
+|:-:|:-:|:-:|
+| ![PolyglotChat](screenshots/polyglot-chat-live.png) | ![PromptLab](screenshots/prompt-lab-editor.png) | ![ContextWeaver](screenshots/context-weaver-live.png) |
+
+### Developer Tools
+
+| App | Size | What It Does |
+|-----|------|-------------|
+| **VFS-Explorer** | 5.7 KB | Semantic file browser. Type `~` for vector search. AI auto-tags text files. Hex dump for binaries (null-byte detection). |
+| **BPE-Analyzer** | 3.0 KB | Live tokenizer visualization. Type text, see colored BPE-style subword tokens instantly. 12 distinct colors cycling. |
+| **WasmForge** | 7.8 KB | FolkScript assembler IDE. Write `fill 0x1a1a2e` / `rect 100 100 200 150 0xFF0000`, press F5. Assembles to raw WASM binary, shadow-tests it, shows results. |
+
+| VFS-Explorer |
+|:-:|
+| ![VFS-Explorer](screenshots/vfs-explorer-live.png) |
+
+### Background Daemons & Visualization
+
+| App | Size | What It Does |
+|-----|------|-------------|
+| **AutoDoc** | 4.7 KB | Headless daemon. Watches telemetry for FileWritten events on `.rs`/`.wasm` files. Reads code, generates Markdown docs via AI, saves to `docs/` in VFS. |
+| **DreamState** | 3.7 KB | AutoDream knowledge graph. Reads `#AutoDreamInsight` files, renders as connected node graph. Edges = shared keyword overlap. |
+| **folk_test_runner** | 7.0 KB | Automated regression test suite. Discovers all .wasm apps, shadow-tests each through 3 scenarios (idle/fuzz/net-drop), saves Markdown report. |
+
+---
+
+## AutoDream -- The Self-Improving AI Cycle
+
+Folkering OS doesn't just run apps. It **dreams about them**.
+
+```
+                    ┌─────────────────────────────────────┐
+                    │         The AutoDream Cycle          │
+                    │                                     │
+   System idle     │  Phase 1: Pattern-Mining            │
+   (5+ min) ──────>│  Drain telemetry ring buffer         │
+                    │  Format 500 events as text log       │
+                    │  Send to LLM for strategic analysis  │
+                    │  Save insight to Synapse VFS         │
+                    │          │                           │
+                    │          v                           │
+                    │  Phase 2: Code Generation            │
+                    │  WasmForge assembles FolkScript       │
+                    │  Or LLM generates full Rust WASM      │
+                    │  Binary compiled in-memory             │
+                    │          │                           │
+                    │          v                           │
+                    │  Phase 3: Shadow Testing             │
+                    │  execute_shadow_test() runs WASM      │
+                    │  in mocked sandbox (no real I/O)       │
+                    │  10M fuel limit per frame              │
+                    │  Reports: fuel, draws, crashes         │
+                    │          │                           │
+                    │          v                           │
+                    │  Phase 4: Deploy or Discard           │
+                    │  PASS → Apply to live system           │
+                    │  FAIL → Log to known_issues            │
+                    │  3 strikes → App is "perfected"        │
+                    └─────────────────────────────────────┘
+```
+
+### The Shadow Runtime
+
+Every proposed change is tested in a **sandboxed WASM runtime** before touching the live system:
+
+- `folk_draw_rect` -- counted but **never rendered**
+- `folk_write_file` -- writes to in-memory Vec, **not real VFS**
+- `folk_slm_generate` -- counted but **returns empty** (no LLM cost)
+- `folk_ws_connect` -- returns -1 (**no network access**)
+- `folk_random` -- returns 42 (**deterministic**)
+- Fuel limit: **10M instructions per frame** (kills infinite loops)
+
+### Telemetry Ring Buffer
+
+The kernel maintains a lock-free ring buffer of 8,192 events that AutoDream harvests:
+
+```
+AppOpened | AppClosed | IpcMessageSent | UiInteraction
+AiInferenceRequested | AiInferenceCompleted
+FileAccessed | FileWritten | OmnibarCommand | MetricAlert
+```
+
+### Regression Testing
+
+`folk_test_runner` validates all 16 custom apps across 3 scenarios:
+
+| Scenario | What It Tests |
+|----------|--------------|
+| **Idle** | 5 frames, no input. Does the app render without crashing? |
+| **Fuzz** | Re-run in shadow (all network mocked as -1). Handles errors? |
+| **Net Drop** | WebSocket returns -1. Graceful degradation? |
+
+**Result: 48/48 PASS** -- every app survives all three scenarios.
+
+![Test Runner](screenshots/test-runner-all-pass.png)
+*All 16 apps: PASS across Idle, Fuzz, and Net Drop. Report saved to `docs/test_report_latest.md`.*
+
+---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    FolkShell                             │
-│  Command |> Command ~> "semantic query" [Confidence: H] │
-│  JIT Synthesis · Holographic Output · Spatial Pipelining │
-├─────────────────────────────────────────────────────────┤
-│  Compositor (wasmi 2.0)        │  On-Device SLM        │
-│  40+ WASM Host Functions       │  Zero-latency local AI │
-│  Semantic Streams (Tick-Tock)  │  Pattern matching brain│
-├────────────────────────────────┼────────────────────────┤
-│  Semantic VFS (Synapse)        │  Driver Runtime        │
-│  SQLite + Intent JSON          │  DriverCapability SFI  │
-│  query:// adapt:// mime://     │  MMIO · Port I/O · IRQ │
-├────────────────────────────────┼────────────────────────┤
-│  Rust no_std Microkernel                                │
-│  SMP (4 cores) · VirtIO-GPU · smoltcp TCP/TLS 1.3      │
-│  Intel VT-d IOMMU (10 DMA domains per device)          │
-│  PCI Enumerate · IRQ Routing · DMA Allocation           │
-└─────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│  WASM App Layer (17 custom apps, ~125 KB total)                │
+│  43 folk_* host functions · WebSocket streaming · Telemetry     │
+├─────────────────────────────────────────────────────────────────┤
+│  Compositor (wasmi 2.0)        │  AutoDream (Draug Daemon)     │
+│  VirtIO-GPU 2D + VGA Mirror   │  Pattern-Mining → Shadow Test  │
+│  Window Manager + Omnibar     │  Friction Sensor + Dream Budget│
+├────────────────────────────────┼────────────────────────────────┤
+│  Semantic VFS (Synapse)        │  Network Stack                │
+│  SQLite B-tree + Dynamic Cache │  smoltcp TCP/IP + TLS 1.3    │
+│  Overflow pages for large BLOBs│  WebSocket client (RFC 6455) │
+│  query:// semantic search      │  DHCP, DNS, HTTP, Gemini API │
+├────────────────────────────────┼────────────────────────────────┤
+│  Rust no_std Microkernel                                       │
+│  SMP 4 cores · Buddy allocator · Lock-free telemetry ring      │
+│  VirtIO-GPU/Net/Blk · Intel VT-d IOMMU · PCI enumeration     │
+│  IPC: async message passing + shared memory + capability tokens│
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-## Key Features
+### Host Function API (43 functions)
 
-### FolkShell — AI-Native Semantic Shell
-- **JIT Command Synthesis**: Unknown commands are auto-generated via LLM, compiled to WASM, and executed
-- **Pipe Syntax**: `|>` deterministic pipes, `~>` fuzzy semantic pipes with cosine similarity
-- **Holographic Output**: Commands return live WASM widgets instead of text
-- **Spatial Pipelining**: Drag cables between floating windows to connect data streams
+| Category | Functions |
+|----------|----------|
+| **Drawing** | `folk_draw_rect`, `folk_draw_text`, `folk_draw_line`, `folk_draw_circle`, `folk_fill_screen` |
+| **Surface** | `folk_get_surface`, `folk_surface_pitch`, `folk_surface_present` |
+| **System** | `folk_get_time`, `folk_screen_width/height`, `folk_random`, `folk_get_datetime` |
+| **Input** | `folk_poll_event` (mouse, keyboard, asset_loaded) |
+| **Metrics** | `folk_os_metric`, `folk_net_has_ip`, `folk_fw_drops` |
+| **Files** | `folk_list_files`, `folk_request_file`, `folk_read_file_sync`, `folk_query_files`, `folk_write_file` |
+| **Network** | `folk_http_get`, `folk_ws_connect`, `folk_ws_send`, `folk_ws_poll_recv` |
+| **AI** | `folk_slm_generate`, `folk_slm_generate_with_logits`, `folk_intent_fetch` |
+| **Tensor** | `folk_tensor_read`, `folk_tensor_write` |
+| **Telemetry** | `folk_log_telemetry`, `folk_telemetry_poll` |
+| **Hardware** | `folk_pci_list`, `folk_irq_stats`, `folk_memory_map` |
+| **Tokenizer** | `folk_tokenize` |
+| **IPC** | `folk_ipc_stats` |
+| **Testing** | `folk_shadow_test` |
+| **Streams** | `folk_stream_write`, `folk_stream_read`, `folk_stream_done` |
 
-### Autonomous Driver Generation
-- PCI device enumeration exposed to userspace
-- Capability-gated port I/O (kernel validates every access against PCI BARs)
-- 18 `folk_*` host functions for MMIO, interrupts, DMA, and device identity
-- LLM synthesizes complete hardware drivers from PCI vendor:device IDs
-- IOMMU per-device page tables for DMA isolation
+---
 
-### Semantic Virtual File System
-- Files stored as semantic intents (JSON + MIME + vector embeddings)
-- `query://calculator` — find files by concept, not path
-- `adapt://json/csv/data.json` — format conversion via JIT-compiled WASM adapters
-- View Adapter framework auto-generates data translators
+## Chaos Engineering Results
 
-### Cryptographic Lineage
-- Every LLM-generated WASM binary is signed: `SHA-256(prompt + wasm_hash + timestamp)`
-- OS verifies signature before execution
-- Intention signatures bind code to the intent that created it
+We opened 6 apps simultaneously while SemanticMail hammered the Gemini API via TCP:
 
-### AutoDream — Self-Improving Software
-- **Draug daemon** monitors system health and improves apps overnight
-- Three dream modes: Refactor (optimize), Creative (enhance), Nightmare (harden)
-- **Digital Homeostasis**: only dreams when apps need improvement
-- Morning Briefing for user approval of creative changes
+| Check | Result |
+|-------|--------|
+| Buddy allocator fragmentation | **None.** Heap density 1-23/255, only kernel region at 240+. |
+| IPC queue congestion | **None.** All edges grey in AsyncFlow. No deadlocks. |
+| Kernel panic | **None.** 37K+ keyboard events processed. |
+| Memory leak | **None.** SlabVisualizer shows stable 2-minute history. |
+| Draug daemon | **Normal.** Background analysis started during load. |
 
-### Intel VT-d IOMMU
-- Hardware DMA isolation with per-device second-level page tables
-- 10 isolated domains on q35 machine type
-- AI-generated WASM drivers are physically prevented from corrupting kernel memory
-
-### On-Device SLM
-- Local pattern-matching brain for zero-latency AI responses
-- Auto-complete, system introspection, command prediction
-- "Spinal cord" (local, 0ms) / "Cerebral cortex" (cloud) architecture
-
-## Screenshots
-
-| Neural Desktop | Calculator | Paint |
-|:-:|:-:|:-:|
-| ![Desktop](screenshots/neural-desktop.png) | ![Calculator](screenshots/calculator.png) | ![Paint](screenshots/paint-app.png) |
-| About Dialog | Zero-Copy Gradient | Bouncing Ball |
-| ![About](screenshots/about-app.png) | ![Gradient](screenshots/gradient-surface.png) | ![Bouncing](screenshots/bouncing-ball.png) |
-
-*Row 1: Neural Desktop with system tray, interactive Calculator, Mini Paint with 8-color palette. Row 2: About Dialog with animated starfield, zero-copy rainbow gradient (786K pixels from WASM memory), bouncing ball screensaver.*
+---
 
 ## Tech Stack
 
@@ -105,64 +230,69 @@ The OS:
 |-------|-----------|
 | Bootloader | Limine 8.7 |
 | Kernel | Rust no_std, x86-64, SMP 4 cores |
-| WASM Engine | wasmi 2.0.0-beta.2 (memory64, multi-memory, SIMD) |
-| Graphics | VirtIO-GPU 2D, shadow buffer, zero-copy surface |
-| Network | smoltcp TCP/IP, embedded-tls 1.3, DHCP, DNS |
-| Storage | VirtIO-Blk, SQLite B-tree (custom no_std reader) |
+| WASM Engine | wasmi 2.0 (fuel metering, multi-memory) |
+| Graphics | VirtIO-GPU 2D + VGA Mirror (dual output) |
+| Network | smoltcp TCP/IP, TLS 1.3, WebSocket (RFC 6455) |
+| Storage | VirtIO-Blk, SQLite B-tree (no_std, overflow pages) |
 | AI (local) | On-Device SLM pattern model |
-| AI (cloud) | 4-tier: Ollama Qwen 7B → Gemini Flash Lite → Gemini Flash → Gemini Pro |
+| AI (cloud) | 4-tier: Ollama Qwen 7B -> Gemini Flash Lite -> Flash -> Pro |
 | IPC | Async message passing, shared memory, capability tokens |
-| Security | SHA-256 WASM signing, IOMMU DMA isolation, SFI boundaries |
+| Security | SHA-256 WASM signing, IOMMU DMA isolation, Shadow Runtime |
+| Telemetry | Lock-free 8192-event ring buffer, 12 event types |
 
 ## Building
 
 ```bash
 # Kernel
-cd kernel && cargo build --release
+cd kernel && cargo build --target x86_64-folkering.json --release
 
 # Userspace
-cd userspace && cargo build --release
+cd userspace && cargo build --target x86_64-folkering-userspace.json --release
 
-# Create initrd
-cargo run --manifest-path tools/folk-pack/Cargo.toml -- create \
-  boot/iso_root/boot/initrd.fpk \
-  --add synapse:elf:userspace/target/x86_64-folkering-userspace/release/synapse \
-  --add shell:elf:userspace/target/x86_64-folkering-userspace/release/shell \
-  --add compositor:elf:userspace/target/x86_64-folkering-userspace/release/compositor \
-  --add intent-service:elf:userspace/target/x86_64-folkering-userspace/release/intent-service \
-  --add inference:elf:userspace/target/x86_64-folkering-userspace/release/inference
+# WASM Apps (example: KernelSnoop)
+cd apps/kernel_snoop && cargo build --target wasm32-unknown-unknown --release
 
-# Inject into boot image
-py -3 tools/fat_inject.py
+# Pack initrd with all apps
+cd tools/folk-pack && cargo run --release -- create \
+  ../../boot/iso_root/boot/initrd.fpk \
+  --add synapse:elf:../../userspace/target/.../synapse \
+  --add shell:elf:../../userspace/target/.../shell \
+  --add compositor:elf:../../userspace/target/.../compositor \
+  --add intent-service:elf:../../userspace/target/.../intent-service \
+  --add kernel_snoop.wasm:data:../../wasm-apps/kernel_snoop.wasm \
+  # ... add all .wasm files from wasm-apps/
 
 # Run (Windows with WHPX)
 powershell tools/start-folkering.ps1
 
-# Run (with IOMMU)
+# Run (Linux with KVM / Proxmox)
 bash tools/start-folkering-q35.sh
 ```
 
 ## Project Stats
 
-- **~30,000+ lines** of Rust (kernel + userspace)
-- **40+ WASM host functions** across 3 runtimes (apps, drivers, adapters)
-- **10 IOMMU DMA domains** with per-device page tables
-- **0 bare `unwrap()`** in compositor — all error handling uses safe fallbacks
-- **wasmi 2.0** with memory64, SIMD, multi-memory
-- **2 months** from first boot to complete AI-native desktop
+- **~35,000+ lines** of Rust (kernel + userspace + 17 WASM apps)
+- **43 WASM host functions** across 4 runtimes (apps, drivers, adapters, shadow)
+- **17 custom WASM apps** totaling ~125 KB
+- **48/48 regression tests** passing (3 scenarios x 16 apps)
+- **8,192-event telemetry ring** for AutoDream pattern mining
+- **0 hardcoded limits** in Synapse VFS cache (dynamic Vec)
+- **2 months** from first boot to self-improving AI desktop
 
 ## License
 
 Folkering OS is **dual-licensed**:
 
-- **AGPL-3.0** ([LICENSE](LICENSE)) — Free for open-source use. If you modify Folkering OS and distribute it (including as a network service), you must release your source code under the same license.
+- **AGPL-3.0** ([LICENSE](LICENSE)) -- Free for open-source use. If you modify Folkering OS and distribute it (including as a network service), you must release your source code under the same license.
 
-- **Commercial License** — For proprietary, closed-source, or embedded use without AGPL obligations. Contact **ikkjekvifull@gmail.com** for enterprise licensing.
+- **Commercial License** -- For proprietary, closed-source, or embedded use without AGPL obligations. Contact **ikkjekvifull@gmail.com** for enterprise licensing.
 
 All contributors must sign a [Contributor License Agreement](CONTRIBUTING.md) (CLA) before pull requests are merged. This enables dual licensing while contributors retain their copyright.
 
-**"Folkering OS"** is a trademark of Knut Ingmar Merødningen. Forks may not use the Folkering OS name or branding without permission.
+**"Folkering OS"** is a trademark of Knut Ingmar Meroedningen. Forks may not use the Folkering OS name or branding without permission.
 
 ## Author
 
-Knut Ingmar Merødningen — [meray.no](https://meray.no)
+**Knut Ingmar Meroedningen** -- Building the future of human-AI computing, one syscall at a time.
+
+*Folkering OS: Where the machine learns to understand itself.*

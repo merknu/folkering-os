@@ -771,6 +771,147 @@ fn register_host_functions(linker: &mut Linker<HostState>) {
         },
     );
 
+    // Phase 22: Synchronous file read — load file directly into WASM memory
+    // folk_read_file_sync(path_ptr, path_len, dest_ptr, max_len) -> i32
+    // Reads a file from Synapse VFS SYNCHRONOUSLY (blocks until loaded).
+    // Returns bytes loaded, or -1 on error.
+    let _ = linker.func_wrap("env", "folk_read_file_sync",
+        |mut caller: Caller<HostState>, path_ptr: i32, path_len: i32, dest_ptr: i32, max_len: i32| -> i32 {
+            if path_len <= 0 || path_len > 256 || max_len <= 0 { return -1; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+
+            let mut name_buf = alloc::vec![0u8; path_len as usize];
+            if mem.read(&caller, path_ptr as usize, &mut name_buf).is_err() { return -1; }
+            let name = match alloc::str::from_utf8(&name_buf) {
+                Ok(s) => s,
+                Err(_) => return -1,
+            };
+
+            // Use Synapse read_file_shmem (synchronous IPC)
+            match libfolk::sys::synapse::read_file_shmem(name) {
+                Ok(resp) => {
+                    const SYNC_READ_VADDR: usize = 0x50080000;
+                    if libfolk::sys::shmem_map(resp.shmem_handle, SYNC_READ_VADDR).is_ok() {
+                        let data = unsafe {
+                            core::slice::from_raw_parts(SYNC_READ_VADDR as *const u8, resp.size as usize)
+                        };
+                        let copy = data.len().min(max_len as usize);
+                        let result = if mem.write(&mut caller, dest_ptr as usize, &data[..copy]).is_ok() {
+                            copy as i32
+                        } else { -1 };
+                        let _ = libfolk::sys::shmem_unmap(resp.shmem_handle, SYNC_READ_VADDR);
+                        let _ = libfolk::sys::shmem_destroy(resp.shmem_handle);
+                        result
+                    } else {
+                        let _ = libfolk::sys::shmem_destroy(resp.shmem_handle);
+                        -1
+                    }
+                }
+                Err(_) => -1,
+            }
+        },
+    );
+
+    // Phase 21: IPC Stats — Task list with IPC activity for AsyncFlow
+    // folk_ipc_stats(buf_ptr, max_len) -> i32
+    // Returns task list as compact text: "id:name:state:cpu_ms\n" per task
+    // Uses syscall 0x26 (task_list_detailed).
+    let _ = linker.func_wrap("env", "folk_ipc_stats",
+        |mut caller: Caller<HostState>, buf_ptr: i32, max_len: i32| -> i32 {
+            if max_len < 32 { return 0; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return 0,
+            };
+
+            // Read task list via syscall 0x26
+            // Buffer format: [task_id:u32][state:u32][name:[u8;16]][cpu_time_ms:u64] = 32 bytes/task
+            let mut raw = alloc::vec![0u8; 32 * 16]; // max 16 tasks
+            let count = unsafe {
+                libfolk::syscall::syscall2(0x26, raw.as_mut_ptr() as u64, raw.len() as u64) as usize
+            };
+
+            if count == 0 { return 0; }
+
+            // Format as text
+            let mut out = alloc::vec![0u8; max_len as usize];
+            let mut pos = 0usize;
+
+            for i in 0..count.min(16) {
+                let off = i * 32;
+                let tid = u32::from_le_bytes([raw[off], raw[off+1], raw[off+2], raw[off+3]]);
+                let state = u32::from_le_bytes([raw[off+4], raw[off+5], raw[off+6], raw[off+7]]);
+                let name_end = raw[off+8..off+24].iter().position(|&b| b == 0).unwrap_or(16);
+                let name = core::str::from_utf8(&raw[off+8..off+8+name_end]).unwrap_or("?");
+                let cpu_ms = u64::from_le_bytes([
+                    raw[off+24], raw[off+25], raw[off+26], raw[off+27],
+                    raw[off+28], raw[off+29], raw[off+30], raw[off+31],
+                ]);
+
+                let state_str = match state {
+                    0 => "ready",
+                    1 => "running",
+                    2 => "blocked",
+                    3 => "waiting",
+                    _ => "?",
+                };
+
+                let line = alloc::format!("{}:{}:{}:{}\n", tid, name, state_str, cpu_ms);
+                let bytes = line.as_bytes();
+                if pos + bytes.len() > out.len() { break; }
+                out[pos..pos+bytes.len()].copy_from_slice(bytes);
+                pos += bytes.len();
+            }
+
+            if pos > 0 && mem.write(&mut caller, buf_ptr as usize, &out[..pos]).is_ok() {
+                pos as i32
+            } else { 0 }
+        },
+    );
+
+    // Phase 20: Shadow Test — Run WASM bytes in sandbox from another WASM app
+    // folk_shadow_test(wasm_ptr, wasm_len, result_ptr, max_len) -> i32
+    // Compiles and runs WASM bytes in the Shadow Runtime (mocked host functions).
+    // Writes TestReport summary to result_ptr as text.
+    // Returns bytes written, or -1 on error.
+    let _ = linker.func_wrap("env", "folk_shadow_test",
+        |mut caller: Caller<HostState>, wasm_ptr: i32, wasm_len: i32, result_ptr: i32, max_len: i32| -> i32 {
+            if wasm_len <= 0 || wasm_len > 65536 || max_len < 32 { return -1; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+
+            let mut wasm_bytes = alloc::vec![0u8; wasm_len as usize];
+            if mem.read(&caller, wasm_ptr as usize, &mut wasm_bytes).is_err() { return -1; }
+
+            // Run in shadow sandbox (no real side effects)
+            let report = execute_shadow_test(&wasm_bytes, &[]);
+
+            // Format report as compact text
+            let text = alloc::format!(
+                "ok:{} frames:{} fuel:{} draw:{} text:{} file:{} ai:{}{}\n",
+                if report.completed { 1 } else { 0 },
+                report.frames_executed,
+                report.fuel_consumed,
+                report.draw_call_count,
+                report.text_draw_count,
+                report.file_write_count,
+                report.ai_call_count,
+                if let Some(ref e) = report.error { alloc::format!(" err:{}", e) } else { String::new() },
+            );
+
+            let bytes = text.as_bytes();
+            let copy = bytes.len().min(max_len as usize);
+            if mem.write(&mut caller, result_ptr as usize, &bytes[..copy]).is_ok() {
+                copy as i32
+            } else { -1 }
+        },
+    );
+
     // Phase 18: Memory Map — Buddy allocator visualization
     // folk_memory_map(buf_ptr, max_len) -> i32
     // Writes memory stats: [total_pages:u32, free_pages:u32, used_pct:u32, heap_used_kb:u32]
@@ -1826,6 +1967,29 @@ fn register_shadow_functions(linker: &mut Linker<ShadowState>) {
     );
     let _ = linker.func_wrap("env", "folk_surface_present",
         |_: Caller<ShadowState>| {},
+    );
+
+    // Adapters — no-op in shadow
+    let _ = linker.func_wrap("env", "folk_adapter_input",
+        |_: Caller<ShadowState>, _p: i32, _m: i32| -> i32 { 0 },
+    );
+    let _ = linker.func_wrap("env", "folk_adapter_output",
+        |_: Caller<ShadowState>, _p: i32, _l: i32| {},
+    );
+
+    // Sync file read — empty in shadow
+    let _ = linker.func_wrap("env", "folk_read_file_sync",
+        |_: Caller<ShadowState>, _p: i32, _pl: i32, _d: i32, _dl: i32| -> i32 { -1 },
+    );
+
+    // IPC stats — empty in shadow
+    let _ = linker.func_wrap("env", "folk_ipc_stats",
+        |_: Caller<ShadowState>, _b: i32, _m: i32| -> i32 { 0 },
+    );
+
+    // Shadow test — no nesting in shadow
+    let _ = linker.func_wrap("env", "folk_shadow_test",
+        |_: Caller<ShadowState>, _w: i32, _wl: i32, _r: i32, _rl: i32| -> i32 { -1 },
     );
 
     // Memory map + tokenizer — defaults in shadow
