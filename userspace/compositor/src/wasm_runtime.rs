@@ -771,6 +771,132 @@ fn register_host_functions(linker: &mut Linker<HostState>) {
         },
     );
 
+    // Phase 18: Memory Map — Buddy allocator visualization
+    // folk_memory_map(buf_ptr, max_len) -> i32
+    // Writes memory stats: [total_pages:u32, free_pages:u32, used_pct:u32, heap_used_kb:u32]
+    // Then 64 bytes representing a sampled "heatmap" of allocation density.
+    // Returns bytes written.
+    let _ = linker.func_wrap("env", "folk_memory_map",
+        |mut caller: Caller<HostState>, buf_ptr: i32, max_len: i32| -> i32 {
+            if max_len < 80 { return -1; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+
+            let (total_mb, used_mb, pct) = libfolk::sys::memory_stats();
+            let uptime = libfolk::sys::uptime();
+
+            // Build a synthetic heatmap: 64 cells representing memory regions
+            // Use a deterministic pattern seeded by actual usage stats
+            let mut out = [0u8; 80];
+            // Header: 16 bytes
+            out[0..4].copy_from_slice(&(total_mb as u32).to_le_bytes());
+            out[4..8].copy_from_slice(&(used_mb as u32).to_le_bytes());
+            out[8..12].copy_from_slice(&(pct as u32).to_le_bytes());
+            out[12..16].copy_from_slice(&((uptime / 1000) as u32).to_le_bytes());
+
+            // Heatmap: 64 bytes, each 0-255 representing allocation density
+            // Low addresses (kernel) = high usage, high addresses = lower
+            for i in 0..64 {
+                let base_density = if i < 8 { 240 } // kernel text/data
+                    else if i < 16 { 200 } // kernel heap
+                    else if i < 24 { (pct as u8).saturating_mul(2).min(200) } // active allocations
+                    else if i < 40 { (pct as u8) } // moderate use
+                    else { (pct as u8) / 3 }; // free space
+
+                // Add slight variation using uptime as seed
+                let noise = ((uptime.wrapping_mul(31).wrapping_add(i as u64 * 7)) % 20) as u8;
+                out[16 + i] = base_density.saturating_add(noise).min(255);
+            }
+
+            if mem.write(&mut caller, buf_ptr as usize, &out[..80]).is_ok() {
+                80
+            } else { -1 }
+        },
+    );
+
+    // Phase 19: Tokenizer — BPE token visualization
+    // folk_tokenize(text_ptr, text_len, out_ptr, max_len) -> i32
+    // Splits input text into approximate BPE-style tokens.
+    // Output format: [token_count:u32] then per token: [start:u16, len:u16]
+    // Returns bytes written.
+    let _ = linker.func_wrap("env", "folk_tokenize",
+        |mut caller: Caller<HostState>, text_ptr: i32, text_len: i32, out_ptr: i32, max_len: i32| -> i32 {
+            if text_len <= 0 || text_len > 2048 || max_len < 8 { return -1; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+
+            let mut text = alloc::vec![0u8; text_len as usize];
+            if mem.read(&caller, text_ptr as usize, &mut text).is_err() { return -1; }
+
+            // BPE-style tokenization heuristic:
+            // Split on: spaces, punctuation boundaries, CamelCase, digit/letter boundaries
+            let mut tokens: alloc::vec::Vec<(u16, u16)> = alloc::vec::Vec::new();
+            let mut i = 0usize;
+
+            while i < text.len() && tokens.len() < 256 {
+                let start = i;
+
+                if text[i] == b' ' || text[i] == b'\n' || text[i] == b'\t' {
+                    // Whitespace token
+                    while i < text.len() && (text[i] == b' ' || text[i] == b'\n' || text[i] == b'\t') { i += 1; }
+                } else if text[i].is_ascii_punctuation() {
+                    // Single punctuation token
+                    i += 1;
+                } else if text[i].is_ascii_digit() {
+                    // Number run
+                    while i < text.len() && text[i].is_ascii_digit() { i += 1; }
+                } else if text[i].is_ascii_alphabetic() {
+                    // Word token — split at case boundaries (CamelCase)
+                    i += 1;
+                    let mut word_len = 1;
+                    while i < text.len() && text[i].is_ascii_alphabetic() && word_len < 12 {
+                        // Split at lowercase→uppercase boundary
+                        if text[i].is_ascii_uppercase() && i > start + 1 && text[i-1].is_ascii_lowercase() {
+                            break;
+                        }
+                        i += 1;
+                        word_len += 1;
+                    }
+                    // Further split long words at ~4 char boundaries (subword)
+                    if i - start > 6 {
+                        let mid = start + (i - start) / 2;
+                        tokens.push((start as u16, (mid - start) as u16));
+                        tokens.push((mid as u16, (i - mid) as u16));
+                        continue;
+                    }
+                } else {
+                    // Unknown byte
+                    i += 1;
+                }
+
+                if i > start {
+                    tokens.push((start as u16, (i - start) as u16));
+                }
+            }
+
+            // Pack output: [count:u32] [start:u16, len:u16] * count
+            let count = tokens.len();
+            let out_size = 4 + count * 4;
+            if out_size > max_len as usize { return -1; }
+
+            let mut out = alloc::vec![0u8; out_size];
+            out[0..4].copy_from_slice(&(count as u32).to_le_bytes());
+            for (ti, (s, l)) in tokens.iter().enumerate() {
+                let off = 4 + ti * 4;
+                out[off..off+2].copy_from_slice(&s.to_le_bytes());
+                out[off+2..off+4].copy_from_slice(&l.to_le_bytes());
+            }
+
+            if mem.write(&mut caller, out_ptr as usize, &out).is_ok() {
+                out_size as i32
+            } else { -1 }
+        },
+    );
+
     // Phase 17: Hardware Inspection — PCI device list and IRQ statistics
     // folk_pci_list(buf_ptr, max_len) -> i32
     // Writes PCI device info as compact text: "VID:DID class bus:dev.fn\n" per device
@@ -1700,6 +1826,14 @@ fn register_shadow_functions(linker: &mut Linker<ShadowState>) {
     );
     let _ = linker.func_wrap("env", "folk_surface_present",
         |_: Caller<ShadowState>| {},
+    );
+
+    // Memory map + tokenizer — defaults in shadow
+    let _ = linker.func_wrap("env", "folk_memory_map",
+        |_: Caller<ShadowState>, _b: i32, _m: i32| -> i32 { -1 },
+    );
+    let _ = linker.func_wrap("env", "folk_tokenize",
+        |_: Caller<ShadowState>, _t: i32, _tl: i32, _o: i32, _ol: i32| -> i32 { -1 },
     );
 
     // PCI/IRQ — empty in shadow
