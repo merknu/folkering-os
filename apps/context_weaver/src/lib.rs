@@ -53,7 +53,7 @@ const LINK_ACTIVE: i32 = 0x213352;
 const STATUS_BG: i32 = 0x161B22;
 
 // Layout
-const WEAVER_W: i32 = 300; // right panel width
+const WEAVER_W: i32 = 260; // right panel width (fits 1024px VGA mirror)
 const STATUS_H: i32 = 20;
 const TOP_H: i32 = 32;
 const MARGIN: i32 = 16;
@@ -445,7 +445,9 @@ unsafe fn find_next_newline(pos: usize) -> usize {
 unsafe fn render() {
     let sw = folk_screen_width();
     let sh = folk_screen_height();
-    let editor_w = sw - WEAVER_W;
+    // Clamp to 1024 for VGA mirror compatibility (VirtIO-GPU is 1280 but screendump is 1024)
+    let usable_w = if sw > 1024 { 1024 } else { sw };
+    let editor_w = usable_w - WEAVER_W;
 
     folk_fill_screen(BG);
 
@@ -465,7 +467,7 @@ unsafe fn render() {
     let wc = word_count();
     let mut wc_buf = [0u8; 16];
     let wc_len = { let mut m = Msg::new(&mut wc_buf); m.u32(wc as u32); m.s(b" words"); m.len() };
-    draw(sw - 120, 8, &wc_buf[..wc_len], TEXT_DIM);
+    draw(usable_w - 120, 8, &wc_buf[..wc_len], TEXT_DIM);
 
     // ── Editor panel ──
     let ed_x = MARGIN;
@@ -526,6 +528,7 @@ unsafe fn render() {
 
     // ── Vertical divider ──
     folk_draw_line(editor_w, TOP_H, editor_w, sh - STATUS_H, BORDER);
+    // All right-panel drawing uses editor_w as left edge (fits in usable_w)
 
     // ── Weaver panel (right) ──
     let wx = editor_w + 8;
