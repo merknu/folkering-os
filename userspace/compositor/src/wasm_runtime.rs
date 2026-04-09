@@ -29,6 +29,8 @@
 //! - `folk_slm_generate_with_logits(prompt_ptr, prompt_len, out_ptr, max_len) -> i32` — inference + PLAB result
 //! ## Telemetry (Phase 12)
 //! - `folk_log_telemetry(action_type, target_id, duration_ms)` — push event to kernel ring buffer
+//! ## Shadow Runtime (Phase 13)
+//! - `execute_shadow_test(wasm_bytes, inputs) -> TestReport` — sandboxed WASM testing for AutoDream
 
 extern crate alloc;
 
@@ -1219,6 +1221,390 @@ pub fn execute_adapter(adapter_wasm: &[u8], input_data: &[u8]) -> Option<Vec<u8>
 
     let output = ::core::mem::replace(&mut store.data_mut().output, Vec::new());
     if output.is_empty() { None } else { Some(output) }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Shadow Runtime — AutoDream Phase 3: Safe WASM testing sandbox
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// A secondary wasmi runtime with MOCKED host functions that cannot:
+// - Write to real Synapse VFS (writes go to in-memory hashmap)
+// - Draw to real framebuffer (draw calls are counted but discarded)
+// - Access network or serial ports
+//
+// Used by AutoDream to test proposed WASM app modifications before
+// applying them to the live system.
+
+/// Result of a shadow test execution
+pub struct TestReport {
+    /// Did the app complete without crashing?
+    pub completed: bool,
+    /// Fuel consumed (proxy for CPU cycles)
+    pub fuel_consumed: u64,
+    /// Number of draw calls made
+    pub draw_call_count: u32,
+    /// Number of text draws made
+    pub text_draw_count: u32,
+    /// Number of file writes attempted
+    pub file_write_count: u32,
+    /// Number of AI inference calls attempted
+    pub ai_call_count: u32,
+    /// Total frames executed (run() calls)
+    pub frames_executed: u32,
+    /// Error message if crashed
+    pub error: Option<String>,
+    /// Virtual files written (name → size)
+    pub virtual_files: Vec<(String, usize)>,
+}
+
+/// Synthetic input event for shadow testing
+#[derive(Clone)]
+pub struct InputEvent {
+    pub event_type: i32,
+    pub x: i32,
+    pub y: i32,
+    pub data: i32,
+}
+
+/// State for the shadow (mocked) runtime — no side effects on real system
+struct ShadowState {
+    config: WasmConfig,
+    /// Pending synthetic input events
+    pending_events: Vec<FolkEvent>,
+    /// Counters
+    draw_calls: u32,
+    text_draws: u32,
+    file_writes: u32,
+    ai_calls: u32,
+    /// Virtual filesystem (in-memory, not persisted)
+    virtual_files: Vec<(String, Vec<u8>)>,
+}
+
+/// Shadow fuel budget — hard limit to prevent infinite loops
+const SHADOW_FUEL_LIMIT: u64 = 10_000_000; // 10M instructions per frame
+/// Max frames to simulate
+const SHADOW_MAX_FRAMES: u32 = 5;
+
+/// Register MOCKED host functions for the shadow runtime.
+/// All drawing is no-op, all I/O goes to in-memory state.
+fn register_shadow_functions(linker: &mut Linker<ShadowState>) {
+    // Drawing — count but don't render
+    let _ = linker.func_wrap("env", "folk_draw_rect",
+        |mut caller: Caller<ShadowState>, _x: i32, _y: i32, _w: i32, _h: i32, _color: i32| {
+            caller.data_mut().draw_calls += 1;
+        },
+    );
+
+    let _ = linker.func_wrap("env", "folk_draw_text",
+        |mut caller: Caller<ShadowState>, _x: i32, _y: i32, _ptr: i32, _len: i32, _color: i32| {
+            caller.data_mut().text_draws += 1;
+        },
+    );
+
+    let _ = linker.func_wrap("env", "folk_draw_line",
+        |mut caller: Caller<ShadowState>, _x1: i32, _y1: i32, _x2: i32, _y2: i32, _color: i32| {
+            caller.data_mut().draw_calls += 1;
+        },
+    );
+
+    let _ = linker.func_wrap("env", "folk_draw_circle",
+        |mut caller: Caller<ShadowState>, _cx: i32, _cy: i32, _r: i32, _color: i32| {
+            caller.data_mut().draw_calls += 1;
+        },
+    );
+
+    let _ = linker.func_wrap("env", "folk_fill_screen",
+        |mut caller: Caller<ShadowState>, _color: i32| {
+            caller.data_mut().draw_calls += 1;
+        },
+    );
+
+    // System info — return config values
+    let _ = linker.func_wrap("env", "folk_get_time",
+        |caller: Caller<ShadowState>| -> i32 { caller.data().config.uptime_ms as i32 },
+    );
+    let _ = linker.func_wrap("env", "folk_screen_width",
+        |caller: Caller<ShadowState>| -> i32 { caller.data().config.screen_width as i32 },
+    );
+    let _ = linker.func_wrap("env", "folk_screen_height",
+        |caller: Caller<ShadowState>| -> i32 { caller.data().config.screen_height as i32 },
+    );
+    let _ = linker.func_wrap("env", "folk_random",
+        |_: Caller<ShadowState>| -> i32 { 42 }, // Deterministic for reproducibility
+    );
+    let _ = linker.func_wrap("env", "folk_get_datetime",
+        |mut caller: Caller<ShadowState>, ptr: i32| -> i32 {
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+            // Fake datetime: 2026-04-09 12:00:00
+            let dt: [i32; 6] = [2026, 4, 9, 12, 0, 0];
+            let bytes: [u8; 24] = unsafe { core::mem::transmute(dt) };
+            let _ = mem.write(&mut caller, ptr as usize, &bytes);
+            0
+        },
+    );
+
+    // Metrics — return safe defaults
+    let _ = linker.func_wrap("env", "folk_os_metric",
+        |_: Caller<ShadowState>, _id: i32| -> i32 { 0 },
+    );
+    let _ = linker.func_wrap("env", "folk_net_has_ip",
+        |_: Caller<ShadowState>| -> i32 { 1 }, // Pretend online
+    );
+    let _ = linker.func_wrap("env", "folk_fw_drops",
+        |_: Caller<ShadowState>| -> i32 { 0 },
+    );
+
+    // Input — drain synthetic events
+    let _ = linker.func_wrap("env", "folk_poll_event",
+        |mut caller: Caller<ShadowState>, event_ptr: i32| -> i32 {
+            let event = match caller.data_mut().pending_events.pop() {
+                Some(e) => e,
+                None => return 0,
+            };
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return 0,
+            };
+            let buf = [
+                event.event_type.to_le_bytes(),
+                event.x.to_le_bytes(),
+                event.y.to_le_bytes(),
+                event.data.to_le_bytes(),
+            ].concat();
+            let _ = mem.write(&mut caller, event_ptr as usize, &buf);
+            1
+        },
+    );
+
+    // File I/O — mock: write to in-memory hashmap
+    let _ = linker.func_wrap("env", "folk_write_file",
+        |mut caller: Caller<ShadowState>, path_ptr: i32, path_len: i32, data_ptr: i32, data_len: i32| -> i32 {
+            if path_len <= 0 || data_len < 0 { return -1; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+            let mut path_buf = alloc::vec![0u8; path_len as usize];
+            let mut data_buf = alloc::vec![0u8; data_len as usize];
+            if mem.read(&caller, path_ptr as usize, &mut path_buf).is_err() { return -1; }
+            if data_len > 0 {
+                if mem.read(&caller, data_ptr as usize, &mut data_buf).is_err() { return -1; }
+            }
+            let name = String::from(core::str::from_utf8(&path_buf).unwrap_or("?"));
+            caller.data_mut().virtual_files.push((name, data_buf));
+            caller.data_mut().file_writes += 1;
+            0
+        },
+    );
+
+    // File read — return empty (shadow has no real VFS)
+    let _ = linker.func_wrap("env", "folk_list_files",
+        |_: Caller<ShadowState>, _buf_ptr: i32, _max_len: i32| -> i32 { 0 },
+    );
+    let _ = linker.func_wrap("env", "folk_request_file",
+        |_: Caller<ShadowState>, _p: i32, _pl: i32, _d: i32, _dl: i32| -> i32 { -1 },
+    );
+    let _ = linker.func_wrap("env", "folk_query_files",
+        |_: Caller<ShadowState>, _q: i32, _ql: i32, _r: i32, _rl: i32| -> i32 { 0 },
+    );
+
+    // Network — no-op
+    let _ = linker.func_wrap("env", "folk_http_get",
+        |_: Caller<ShadowState>, _u: i32, _ul: i32, _b: i32, _bl: i32| -> i32 { -1 },
+    );
+
+    // AI — count but return empty (no real LLM calls in shadow)
+    let _ = linker.func_wrap("env", "folk_slm_generate",
+        |mut caller: Caller<ShadowState>, _p: i32, _pl: i32, _b: i32, _bl: i32| -> i32 {
+            caller.data_mut().ai_calls += 1;
+            0 // Return 0 bytes (empty response)
+        },
+    );
+    let _ = linker.func_wrap("env", "folk_slm_generate_with_logits",
+        |mut caller: Caller<ShadowState>, _p: i32, _pl: i32, _o: i32, _ol: i32| -> i32 {
+            caller.data_mut().ai_calls += 1;
+            -1
+        },
+    );
+    let _ = linker.func_wrap("env", "folk_intent_fetch",
+        |_: Caller<ShadowState>, _q: i32, _ql: i32, _b: i32, _bl: i32| -> i32 { -1 },
+    );
+
+    // Tensor — return empty
+    let _ = linker.func_wrap("env", "folk_tensor_read",
+        |_: Caller<ShadowState>, _b: i32, _bl: i32, _s: i32| -> i32 { -1 },
+    );
+
+    // Telemetry — silent no-op
+    let _ = linker.func_wrap("env", "folk_log_telemetry",
+        |_: Caller<ShadowState>, _a: i32, _t: i32, _d: i32| {},
+    );
+
+    // Streams — no-op
+    let _ = linker.func_wrap("env", "folk_stream_write",
+        |_: Caller<ShadowState>, _p: i32, _l: i32| {},
+    );
+    let _ = linker.func_wrap("env", "folk_stream_read",
+        |_: Caller<ShadowState>, _p: i32, _l: i32| -> i32 { 0 },
+    );
+    let _ = linker.func_wrap("env", "folk_stream_done",
+        |_: Caller<ShadowState>| {},
+    );
+
+    // Surface — return 0 (no surface in shadow)
+    let _ = linker.func_wrap("env", "folk_get_surface",
+        |_: Caller<ShadowState>| -> i32 { 0 },
+    );
+    let _ = linker.func_wrap("env", "folk_surface_pitch",
+        |_: Caller<ShadowState>| -> i32 { 0 },
+    );
+    let _ = linker.func_wrap("env", "folk_surface_present",
+        |_: Caller<ShadowState>| {},
+    );
+}
+
+/// Execute a WASM app in the shadow sandbox.
+///
+/// The app runs in complete isolation: no real VFS writes, no real
+/// screen draws, no real network access, no real AI calls.
+/// AutoDream uses this to test proposed modifications before applying.
+///
+/// # Arguments
+/// * `wasm_bytes` — The WASM module to test
+/// * `synthetic_inputs` — Fake input events to inject (key presses, mouse clicks)
+///
+/// # Returns
+/// `TestReport` with fuel consumed, crash status, call counts, and virtual files.
+pub fn execute_shadow_test(
+    wasm_bytes: &[u8],
+    synthetic_inputs: &[InputEvent],
+) -> TestReport {
+    let engine = Engine::default();
+
+    let module = match Module::new(&engine, wasm_bytes) {
+        Ok(m) => m,
+        Err(e) => return TestReport {
+            completed: false,
+            fuel_consumed: 0,
+            draw_call_count: 0,
+            text_draw_count: 0,
+            file_write_count: 0,
+            ai_call_count: 0,
+            frames_executed: 0,
+            error: Some(alloc::format!("Module parse: {:?}", e)),
+            virtual_files: Vec::new(),
+        },
+    };
+
+    let config = WasmConfig {
+        screen_width: 1280,
+        screen_height: 800,
+        uptime_ms: 60_000, // Pretend 1 minute uptime
+    };
+
+    // Pre-load synthetic events (reversed so pop() gives them in order)
+    let mut events: Vec<FolkEvent> = synthetic_inputs.iter().rev().map(|e| FolkEvent {
+        event_type: e.event_type,
+        x: e.x,
+        y: e.y,
+        data: e.data,
+    }).collect();
+
+    let mut state = ShadowState {
+        config: config.clone(),
+        pending_events: events,
+        draw_calls: 0,
+        text_draws: 0,
+        file_writes: 0,
+        ai_calls: 0,
+        virtual_files: Vec::new(),
+    };
+
+    let mut store = Store::new(&engine, state);
+    store.set_fuel(SHADOW_FUEL_LIMIT).unwrap_or(());
+
+    let mut linker = Linker::<ShadowState>::new(&engine);
+    register_shadow_functions(&mut linker);
+
+    let instance = match linker.instantiate_and_start(&mut store, &module) {
+        Ok(i) => i,
+        Err(e) => return TestReport {
+            completed: false,
+            fuel_consumed: 0,
+            draw_call_count: 0,
+            text_draw_count: 0,
+            file_write_count: 0,
+            ai_call_count: 0,
+            frames_executed: 0,
+            error: Some(alloc::format!("Instantiation: {:?}", e)),
+            virtual_files: Vec::new(),
+        },
+    };
+
+    let run_fn = match instance.get_typed_func::<(), ()>(&store, "run") {
+        Ok(f) => f,
+        Err(_) => return TestReport {
+            completed: false,
+            fuel_consumed: 0,
+            draw_call_count: 0,
+            text_draw_count: 0,
+            file_write_count: 0,
+            ai_call_count: 0,
+            frames_executed: 0,
+            error: Some(String::from("No 'run' export")),
+            virtual_files: Vec::new(),
+        },
+    };
+
+    // Execute multiple frames (simulates the compositor calling run() each frame)
+    let fuel_start = store.get_fuel().unwrap_or(0);
+    let mut frames = 0u32;
+    let mut error_msg: Option<String> = None;
+
+    for frame in 0..SHADOW_MAX_FRAMES {
+        // Refuel between frames (each frame gets its own budget)
+        store.set_fuel(SHADOW_FUEL_LIMIT).unwrap_or(());
+
+        // Advance fake time
+        store.data_mut().config.uptime_ms += 16; // ~60fps
+
+        match run_fn.call(&mut store, ()) {
+            Ok(()) => {
+                frames += 1;
+            }
+            Err(e) => {
+                let msg = alloc::format!("{:?}", e);
+                if msg.contains("fuel") {
+                    error_msg = Some(String::from("Out of fuel (possible infinite loop)"));
+                } else {
+                    error_msg = Some(alloc::format!("Trap at frame {}: {}", frame, msg));
+                }
+                frames = frame + 1;
+                break;
+            }
+        }
+    }
+
+    let fuel_remaining = store.get_fuel().unwrap_or(0);
+    let fuel_consumed = SHADOW_FUEL_LIMIT.saturating_sub(fuel_remaining);
+
+    let state = store.into_data();
+    TestReport {
+        completed: error_msg.is_none(),
+        fuel_consumed: fuel_consumed + (frames.saturating_sub(1) as u64 * SHADOW_FUEL_LIMIT),
+        draw_call_count: state.draw_calls,
+        text_draw_count: state.text_draws,
+        file_write_count: state.file_writes,
+        ai_call_count: state.ai_calls,
+        frames_executed: frames,
+        error: error_msg,
+        virtual_files: state.virtual_files.iter()
+            .map(|(n, d)| (n.clone(), d.len()))
+            .collect(),
+    }
 }
 
 /// Build the LLM prompt for generating a View Adapter.
