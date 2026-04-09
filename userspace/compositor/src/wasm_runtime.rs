@@ -771,6 +771,82 @@ fn register_host_functions(linker: &mut Linker<HostState>) {
         },
     );
 
+    // Phase 17: Hardware Inspection — PCI device list and IRQ statistics
+    // folk_pci_list(buf_ptr, max_len) -> i32
+    // Writes PCI device info as compact text: "VID:DID class bus:dev.fn\n" per device
+    // Returns bytes written.
+    let _ = linker.func_wrap("env", "folk_pci_list",
+        |mut caller: Caller<HostState>, buf_ptr: i32, max_len: i32| -> i32 {
+            if max_len <= 0 { return 0; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return 0,
+            };
+
+            // Zero-initialize device array (PciDeviceInfo has private fields)
+            let mut devices: [libfolk::sys::pci::PciDeviceInfo; 16] = unsafe {
+                core::mem::zeroed()
+            };
+            let count = libfolk::sys::pci::enumerate(&mut devices);
+
+            // Format as compact text
+            let mut out = alloc::vec![0u8; max_len as usize];
+            let mut pos = 0usize;
+
+            for i in 0..count {
+                let d = &devices[i];
+                // "VID:DID CC:SS B:D.F IRQ\n"
+                let line = alloc::format!(
+                    "{:04X}:{:04X} {:02X}:{:02X} {}:{}.{} IRQ{}\n",
+                    d.vendor_id, d.device_id,
+                    d.class_code, d.subclass,
+                    d.bus, d.device_num, d.function,
+                    d.interrupt_line
+                );
+                let bytes = line.as_bytes();
+                if pos + bytes.len() > out.len() { break; }
+                out[pos..pos + bytes.len()].copy_from_slice(bytes);
+                pos += bytes.len();
+            }
+
+            if pos > 0 && mem.write(&mut caller, buf_ptr as usize, &out[..pos]).is_ok() {
+                pos as i32
+            } else { 0 }
+        },
+    );
+
+    // folk_irq_stats(buf_ptr, max_len) -> i32
+    // Writes IRQ/driver statistics as compact text:
+    // "net_rx:1234 net_tx:567 gpu_fence:89 uptime:12345\n"
+    let _ = linker.func_wrap("env", "folk_irq_stats",
+        |mut caller: Caller<HostState>, buf_ptr: i32, max_len: i32| -> i32 {
+            if max_len <= 0 { return 0; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return 0,
+            };
+
+            // Read network stats via os_metric syscalls
+            let net_metric = libfolk::sys::pci::os_metric(0); // network
+            let fw_metric = libfolk::sys::pci::os_metric(1);  // firewall
+            let net_rx = (fw_metric >> 32) as u32; // allows from high 32
+            let net_tx = fw_metric as u32; // drops from low 32
+            let uptime = libfolk::sys::uptime();
+            let (mem_total, mem_used, mem_pct) = libfolk::sys::memory_stats();
+
+            let line = alloc::format!(
+                "fw_allow:{} fw_drop:{} mem:{}%({}/{}MB) up:{}s net:{:#x}\n",
+                net_rx, net_tx, mem_pct, mem_used, mem_total, uptime / 1000, net_metric
+            );
+
+            let bytes = line.as_bytes();
+            let copy = bytes.len().min(max_len as usize);
+            if mem.write(&mut caller, buf_ptr as usize, &bytes[..copy]).is_ok() {
+                copy as i32
+            } else { 0 }
+        },
+    );
+
     // Phase 16: Telemetry Read — Poll events from kernel ring buffer
     // folk_telemetry_poll(buf_ptr, max_events) -> i32
     // Drains up to max_events from the kernel telemetry ring into WASM memory.
@@ -1624,6 +1700,14 @@ fn register_shadow_functions(linker: &mut Linker<ShadowState>) {
     );
     let _ = linker.func_wrap("env", "folk_surface_present",
         |_: Caller<ShadowState>| {},
+    );
+
+    // PCI/IRQ — empty in shadow
+    let _ = linker.func_wrap("env", "folk_pci_list",
+        |_: Caller<ShadowState>, _b: i32, _m: i32| -> i32 { 0 },
+    );
+    let _ = linker.func_wrap("env", "folk_irq_stats",
+        |_: Caller<ShadowState>, _b: i32, _m: i32| -> i32 { 0 },
     );
 
     // Telemetry poll — empty in shadow
