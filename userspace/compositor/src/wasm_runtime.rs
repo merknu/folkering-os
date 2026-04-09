@@ -25,6 +25,16 @@
 //! - `folk_surface_present()` — marks surface dirty for blit to framebuffer
 //! ## Tensor Inspection (Phase 10)
 //! - `folk_tensor_read(buf_ptr, buf_len, sector_offset) -> i32` — read TDMP mailbox
+//! ## PromptLab (Phase 11)
+//! - `folk_slm_generate_with_logits(prompt_ptr, prompt_len, out_ptr, max_len) -> i32` — inference + PLAB result
+//! ## Telemetry (Phase 12)
+//! - `folk_log_telemetry(action_type, target_id, duration_ms)` — push event to kernel ring buffer
+//! ## Shadow Runtime (Phase 13)
+//! - `execute_shadow_test(wasm_bytes, inputs) -> TestReport` — sandboxed WASM testing for AutoDream
+//! ## WebSocket (Phase 14)
+//! - `folk_ws_connect(url_ptr, url_len) -> i32` — open persistent connection
+//! - `folk_ws_send(socket_id, data_ptr, data_len) -> i32` — send text frame
+//! - `folk_ws_poll_recv(socket_id, buf_ptr, max_len) -> i32` — non-blocking receive
 
 extern crate alloc;
 
@@ -581,6 +591,560 @@ fn register_host_functions(linker: &mut Linker<HostState>) {
         },
     );
 
+    // Phase 11: PromptLab — Inference with per-token logit analysis
+    // folk_slm_generate_with_logits(prompt_ptr, prompt_len, out_ptr, max_len) -> i32
+    // Runs inference AND returns structured PLAB result with per-token confidence.
+    // After text generation, reads TDMP tensor mailbox for last-token logits,
+    // computes softmax for top-K probabilities, and estimates per-word confidence.
+    //
+    // PLAB wire format (written to out_ptr):
+    //   [0-3]   magic "PLAB"
+    //   [4-7]   text_len: u32
+    //   [8-11]  token_count: u32
+    //   [12-15] flags: u32 (bit0=has_real_logits_for_last_token)
+    //   [16..16+text_len] UTF-8 text (padded to 4-byte boundary)
+    //   Then token_count × 24-byte entries:
+    //     [0-1]  start: u16 (byte offset in text)
+    //     [2-3]  len: u16
+    //     [4-7]  prob: f32 (0.0-1.0)
+    //     [8-11] alt1_prob: f32
+    //     [12-15] alt2_prob: f32
+    //     [16-19] alt3_prob: f32
+    //     [20-23] reserved
+    let _ = linker.func_wrap("env", "folk_slm_generate_with_logits",
+        |mut caller: Caller<HostState>, prompt_ptr: i32, prompt_len: i32, out_ptr: i32, max_len: i32| -> i32 {
+            if prompt_len <= 0 || prompt_len > 4096 || max_len < 64 { return -1; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+
+            // Read prompt from WASM memory
+            let mut prompt_buf = alloc::vec![0u8; prompt_len as usize];
+            if mem.read(&caller, prompt_ptr as usize, &mut prompt_buf).is_err() { return -1; }
+            let prompt = match alloc::str::from_utf8(&prompt_buf) {
+                Ok(s) => String::from(s),
+                Err(_) => return -1,
+            };
+
+            // Step 1: Run inference (same path as folk_slm_generate)
+            let mut gen_buf = alloc::vec![0u8; 2048];
+            let gen_len;
+
+            // Try local brain first
+            if let Some(local_resp) = crate::slm_runtime::brain().generate(&prompt) {
+                let bytes = local_resp.as_bytes();
+                let copy = bytes.len().min(gen_buf.len());
+                gen_buf[..copy].copy_from_slice(&bytes[..copy]);
+                gen_len = copy;
+            } else {
+                // Fallback to proxy
+                let full_prompt = alloc::format!("__SLM_GENERATE__{}", prompt);
+                let bytes = libfolk::sys::ask_gemini(&full_prompt, &mut gen_buf);
+                if bytes == 0 { return -1; }
+                gen_len = bytes;
+            }
+
+            // Step 2: Split generated text into word-tokens
+            let text = &gen_buf[..gen_len];
+            let mut tokens: alloc::vec::Vec<(u16, u16)> = alloc::vec::Vec::new(); // (start, len)
+            {
+                let mut i = 0usize;
+                while i < gen_len {
+                    // Skip whitespace
+                    while i < gen_len && (text[i] == b' ' || text[i] == b'\n' || text[i] == b'\t') {
+                        i += 1;
+                    }
+                    if i >= gen_len { break; }
+                    let word_start = i;
+                    // Consume word
+                    while i < gen_len && text[i] != b' ' && text[i] != b'\n' && text[i] != b'\t' {
+                        i += 1;
+                    }
+                    if i > word_start && tokens.len() < 128 {
+                        tokens.push((word_start as u16, (i - word_start) as u16));
+                    }
+                }
+            }
+
+            // Step 3: Try to read TDMP tensor mailbox for real logits
+            let mut has_real_logits = false;
+            let mut last_token_probs = [0.0f32; 4]; // top-4 softmax probs
+            {
+                let mut hdr = [0u8; 512];
+                if libfolk::sys::block::read_sector(1, &mut hdr).is_ok() {
+                    if hdr[0] == b'T' && hdr[1] == b'D' && hdr[2] == b'M' && hdr[3] == b'P' {
+                        // Read summary floats from header (offset 112, up to 100 × f32)
+                        // These are the first 100 logit values — find top-4
+                        let mut top4: [(f32, usize); 4] = [(-1e30, 0); 4];
+                        for j in 0..100 {
+                            let off = 112 + j * 4;
+                            if off + 4 > 512 { break; }
+                            let v = f32::from_le_bytes([hdr[off], hdr[off+1], hdr[off+2], hdr[off+3]]);
+                            // Insert into top4 if larger than smallest
+                            if v > top4[3].0 {
+                                top4[3] = (v, j);
+                                // Bubble sort
+                                for k in (1..4).rev() {
+                                    if top4[k].0 > top4[k-1].0 {
+                                        top4.swap(k, k-1);
+                                    }
+                                }
+                            }
+                        }
+                        // Compute softmax on top-4
+                        let max_val = top4[0].0;
+                        let mut sum = 0.0f32;
+                        let mut exps = [0.0f32; 4];
+                        for k in 0..4 {
+                            // Clamp to prevent overflow
+                            let x = (top4[k].0 - max_val).max(-20.0);
+                            // Fast exp approximation: e^x ≈ (1 + x/256)^256
+                            let mut e = 1.0 + x / 16.0;
+                            e = e * e; e = e * e; e = e * e; e = e * e; // ^16
+                            exps[k] = e;
+                            sum += e;
+                        }
+                        if sum > 0.0 {
+                            for k in 0..4 {
+                                last_token_probs[k] = exps[k] / sum;
+                            }
+                            has_real_logits = true;
+                        }
+                    }
+                }
+            }
+
+            // Step 4: Assign per-token probabilities
+            // Last token gets real logits (if available), others get heuristic estimates
+            let token_count = tokens.len();
+
+            // Build PLAB buffer
+            let text_padded = (gen_len + 3) & !3; // align to 4
+            let total_size = 16 + text_padded + token_count * 24;
+            if total_size > max_len as usize { return -1; }
+
+            let mut out = alloc::vec![0u8; total_size];
+
+            // Header
+            out[0..4].copy_from_slice(b"PLAB");
+            out[4..8].copy_from_slice(&(gen_len as u32).to_le_bytes());
+            out[8..12].copy_from_slice(&(token_count as u32).to_le_bytes());
+            let flags: u32 = if has_real_logits { 1 } else { 0 };
+            out[12..16].copy_from_slice(&flags.to_le_bytes());
+
+            // Text
+            out[16..16 + gen_len].copy_from_slice(text);
+
+            // Token entries
+            let entries_start = 16 + text_padded;
+            for (idx, &(start, len)) in tokens.iter().enumerate() {
+                let off = entries_start + idx * 24;
+                out[off..off+2].copy_from_slice(&start.to_le_bytes());
+                out[off+2..off+4].copy_from_slice(&len.to_le_bytes());
+
+                if idx == token_count - 1 && has_real_logits {
+                    // Last token: real TDMP probabilities
+                    out[off+4..off+8].copy_from_slice(&last_token_probs[0].to_le_bytes());
+                    out[off+8..off+12].copy_from_slice(&last_token_probs[1].to_le_bytes());
+                    out[off+12..off+16].copy_from_slice(&last_token_probs[2].to_le_bytes());
+                    out[off+16..off+20].copy_from_slice(&last_token_probs[3].to_le_bytes());
+                } else {
+                    // Heuristic: common short words get high confidence,
+                    // longer/rarer words get lower confidence
+                    let word_len = len as f32;
+                    let base = if word_len <= 3.0 { 0.92 } else if word_len <= 6.0 { 0.78 } else { 0.55 };
+                    // Add slight variation based on position
+                    let pos_factor = 1.0 - (idx as f32 * 0.003).min(0.15);
+                    let prob = (base * pos_factor).max(0.1).min(0.99);
+                    out[off+4..off+8].copy_from_slice(&prob.to_le_bytes());
+                    out[off+8..off+12].copy_from_slice(&(prob * 0.3).to_le_bytes());
+                    out[off+12..off+16].copy_from_slice(&(prob * 0.15).to_le_bytes());
+                    out[off+16..off+20].copy_from_slice(&(prob * 0.08).to_le_bytes());
+                }
+            }
+
+            // Write to WASM memory
+            if mem.write(&mut caller, out_ptr as usize, &out).is_ok() {
+                total_size as i32
+            } else { -1 }
+        },
+    );
+
+    // Phase 18: Memory Map — Buddy allocator visualization
+    // folk_memory_map(buf_ptr, max_len) -> i32
+    // Writes memory stats: [total_pages:u32, free_pages:u32, used_pct:u32, heap_used_kb:u32]
+    // Then 64 bytes representing a sampled "heatmap" of allocation density.
+    // Returns bytes written.
+    let _ = linker.func_wrap("env", "folk_memory_map",
+        |mut caller: Caller<HostState>, buf_ptr: i32, max_len: i32| -> i32 {
+            if max_len < 80 { return -1; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+
+            let (total_mb, used_mb, pct) = libfolk::sys::memory_stats();
+            let uptime = libfolk::sys::uptime();
+
+            // Build a synthetic heatmap: 64 cells representing memory regions
+            // Use a deterministic pattern seeded by actual usage stats
+            let mut out = [0u8; 80];
+            // Header: 16 bytes
+            out[0..4].copy_from_slice(&(total_mb as u32).to_le_bytes());
+            out[4..8].copy_from_slice(&(used_mb as u32).to_le_bytes());
+            out[8..12].copy_from_slice(&(pct as u32).to_le_bytes());
+            out[12..16].copy_from_slice(&((uptime / 1000) as u32).to_le_bytes());
+
+            // Heatmap: 64 bytes, each 0-255 representing allocation density
+            // Low addresses (kernel) = high usage, high addresses = lower
+            for i in 0..64 {
+                let base_density = if i < 8 { 240 } // kernel text/data
+                    else if i < 16 { 200 } // kernel heap
+                    else if i < 24 { (pct as u8).saturating_mul(2).min(200) } // active allocations
+                    else if i < 40 { (pct as u8) } // moderate use
+                    else { (pct as u8) / 3 }; // free space
+
+                // Add slight variation using uptime as seed
+                let noise = ((uptime.wrapping_mul(31).wrapping_add(i as u64 * 7)) % 20) as u8;
+                out[16 + i] = base_density.saturating_add(noise).min(255);
+            }
+
+            if mem.write(&mut caller, buf_ptr as usize, &out[..80]).is_ok() {
+                80
+            } else { -1 }
+        },
+    );
+
+    // Phase 19: Tokenizer — BPE token visualization
+    // folk_tokenize(text_ptr, text_len, out_ptr, max_len) -> i32
+    // Splits input text into approximate BPE-style tokens.
+    // Output format: [token_count:u32] then per token: [start:u16, len:u16]
+    // Returns bytes written.
+    let _ = linker.func_wrap("env", "folk_tokenize",
+        |mut caller: Caller<HostState>, text_ptr: i32, text_len: i32, out_ptr: i32, max_len: i32| -> i32 {
+            if text_len <= 0 || text_len > 2048 || max_len < 8 { return -1; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+
+            let mut text = alloc::vec![0u8; text_len as usize];
+            if mem.read(&caller, text_ptr as usize, &mut text).is_err() { return -1; }
+
+            // BPE-style tokenization heuristic:
+            // Split on: spaces, punctuation boundaries, CamelCase, digit/letter boundaries
+            let mut tokens: alloc::vec::Vec<(u16, u16)> = alloc::vec::Vec::new();
+            let mut i = 0usize;
+
+            while i < text.len() && tokens.len() < 256 {
+                let start = i;
+
+                if text[i] == b' ' || text[i] == b'\n' || text[i] == b'\t' {
+                    // Whitespace token
+                    while i < text.len() && (text[i] == b' ' || text[i] == b'\n' || text[i] == b'\t') { i += 1; }
+                } else if text[i].is_ascii_punctuation() {
+                    // Single punctuation token
+                    i += 1;
+                } else if text[i].is_ascii_digit() {
+                    // Number run
+                    while i < text.len() && text[i].is_ascii_digit() { i += 1; }
+                } else if text[i].is_ascii_alphabetic() {
+                    // Word token — split at case boundaries (CamelCase)
+                    i += 1;
+                    let mut word_len = 1;
+                    while i < text.len() && text[i].is_ascii_alphabetic() && word_len < 12 {
+                        // Split at lowercase→uppercase boundary
+                        if text[i].is_ascii_uppercase() && i > start + 1 && text[i-1].is_ascii_lowercase() {
+                            break;
+                        }
+                        i += 1;
+                        word_len += 1;
+                    }
+                    // Further split long words at ~4 char boundaries (subword)
+                    if i - start > 6 {
+                        let mid = start + (i - start) / 2;
+                        tokens.push((start as u16, (mid - start) as u16));
+                        tokens.push((mid as u16, (i - mid) as u16));
+                        continue;
+                    }
+                } else {
+                    // Unknown byte
+                    i += 1;
+                }
+
+                if i > start {
+                    tokens.push((start as u16, (i - start) as u16));
+                }
+            }
+
+            // Pack output: [count:u32] [start:u16, len:u16] * count
+            let count = tokens.len();
+            let out_size = 4 + count * 4;
+            if out_size > max_len as usize { return -1; }
+
+            let mut out = alloc::vec![0u8; out_size];
+            out[0..4].copy_from_slice(&(count as u32).to_le_bytes());
+            for (ti, (s, l)) in tokens.iter().enumerate() {
+                let off = 4 + ti * 4;
+                out[off..off+2].copy_from_slice(&s.to_le_bytes());
+                out[off+2..off+4].copy_from_slice(&l.to_le_bytes());
+            }
+
+            if mem.write(&mut caller, out_ptr as usize, &out).is_ok() {
+                out_size as i32
+            } else { -1 }
+        },
+    );
+
+    // Phase 17: Hardware Inspection — PCI device list and IRQ statistics
+    // folk_pci_list(buf_ptr, max_len) -> i32
+    // Writes PCI device info as compact text: "VID:DID class bus:dev.fn\n" per device
+    // Returns bytes written.
+    let _ = linker.func_wrap("env", "folk_pci_list",
+        |mut caller: Caller<HostState>, buf_ptr: i32, max_len: i32| -> i32 {
+            if max_len <= 0 { return 0; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return 0,
+            };
+
+            // Zero-initialize device array (PciDeviceInfo has private fields)
+            let mut devices: [libfolk::sys::pci::PciDeviceInfo; 16] = unsafe {
+                core::mem::zeroed()
+            };
+            let count = libfolk::sys::pci::enumerate(&mut devices);
+
+            // Format as compact text
+            let mut out = alloc::vec![0u8; max_len as usize];
+            let mut pos = 0usize;
+
+            for i in 0..count {
+                let d = &devices[i];
+                // "VID:DID CC:SS B:D.F IRQ\n"
+                let line = alloc::format!(
+                    "{:04X}:{:04X} {:02X}:{:02X} {}:{}.{} IRQ{}\n",
+                    d.vendor_id, d.device_id,
+                    d.class_code, d.subclass,
+                    d.bus, d.device_num, d.function,
+                    d.interrupt_line
+                );
+                let bytes = line.as_bytes();
+                if pos + bytes.len() > out.len() { break; }
+                out[pos..pos + bytes.len()].copy_from_slice(bytes);
+                pos += bytes.len();
+            }
+
+            if pos > 0 && mem.write(&mut caller, buf_ptr as usize, &out[..pos]).is_ok() {
+                pos as i32
+            } else { 0 }
+        },
+    );
+
+    // folk_irq_stats(buf_ptr, max_len) -> i32
+    // Writes IRQ/driver statistics as compact text:
+    // "net_rx:1234 net_tx:567 gpu_fence:89 uptime:12345\n"
+    let _ = linker.func_wrap("env", "folk_irq_stats",
+        |mut caller: Caller<HostState>, buf_ptr: i32, max_len: i32| -> i32 {
+            if max_len <= 0 { return 0; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return 0,
+            };
+
+            // Read network stats via os_metric syscalls
+            let net_metric = libfolk::sys::pci::os_metric(0); // network
+            let fw_metric = libfolk::sys::pci::os_metric(1);  // firewall
+            let net_rx = (fw_metric >> 32) as u32; // allows from high 32
+            let net_tx = fw_metric as u32; // drops from low 32
+            let uptime = libfolk::sys::uptime();
+            let (mem_total, mem_used, mem_pct) = libfolk::sys::memory_stats();
+
+            let line = alloc::format!(
+                "fw_allow:{} fw_drop:{} mem:{}%({}/{}MB) up:{}s net:{:#x}\n",
+                net_rx, net_tx, mem_pct, mem_used, mem_total, uptime / 1000, net_metric
+            );
+
+            let bytes = line.as_bytes();
+            let copy = bytes.len().min(max_len as usize);
+            if mem.write(&mut caller, buf_ptr as usize, &bytes[..copy]).is_ok() {
+                copy as i32
+            } else { 0 }
+        },
+    );
+
+    // Phase 16: Telemetry Read — Poll events from kernel ring buffer
+    // folk_telemetry_poll(buf_ptr, max_events) -> i32
+    // Drains up to max_events from the kernel telemetry ring into WASM memory.
+    // Each event is 16 bytes: [action:u8, flags:u8, source:u16, target:u32, duration:u32, timestamp:u32]
+    // Returns number of events drained, or 0 if empty.
+    let _ = linker.func_wrap("env", "folk_telemetry_poll",
+        |mut caller: Caller<HostState>, buf_ptr: i32, max_events: i32| -> i32 {
+            if max_events <= 0 || max_events > 256 { return 0; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return 0,
+            };
+            let event_size = 16usize;
+            let buf_size = max_events as usize * event_size;
+            let mut buf = alloc::vec![0u8; buf_size];
+            // Syscall 0x9C: drain telemetry
+            let drained = unsafe {
+                libfolk::syscall::syscall2(0x9C, buf.as_mut_ptr() as u64, max_events as u64) as usize
+            };
+            if drained == 0 { return 0; }
+            let copy_bytes = drained * event_size;
+            if mem.write(&mut caller, buf_ptr as usize, &buf[..copy_bytes]).is_ok() {
+                drained as i32
+            } else { 0 }
+        },
+    );
+
+    // Phase 15: Tensor Write — Modify weights in TDMP mailbox (DANGEROUS)
+    // folk_tensor_write(sector_offset, byte_offset, value_bits) -> i32
+    // Writes a single f32 value to the TDMP data sectors on VirtIO-blk.
+    // sector_offset: 1+ (data sectors, 0=header is read-only)
+    // byte_offset: offset within the sector (0-508, must be 4-aligned)
+    // value_bits: f32 reinterpreted as i32 (IEEE 754 bits)
+    // Returns 0 on success, -1 on error.
+    // WARNING: Modifying live tensor data while inference runs WILL corrupt output.
+    // The write uses block_write which is serialized by the kernel's block device lock.
+    let _ = linker.func_wrap("env", "folk_tensor_write",
+        |_caller: Caller<HostState>, sector_offset: i32, byte_offset: i32, value_bits: i32| -> i32 {
+            if sector_offset < 1 || sector_offset > 256 { return -1; } // Can't write header
+            if byte_offset < 0 || byte_offset > 508 || byte_offset % 4 != 0 { return -1; }
+
+            // Read the sector, modify the float, write it back
+            let disk_sector = 1u64 + sector_offset as u64; // TDMP header at sector 1
+            let mut buf = [0u8; 512];
+            if libfolk::sys::block::read_sector(disk_sector, &mut buf).is_err() {
+                return -1;
+            }
+
+            // Write the f32 value at the specified offset
+            let off = byte_offset as usize;
+            let bytes = value_bits.to_le_bytes();
+            buf[off] = bytes[0];
+            buf[off+1] = bytes[1];
+            buf[off+2] = bytes[2];
+            buf[off+3] = bytes[3];
+
+            if libfolk::sys::block::write_sector(disk_sector, &buf).is_err() {
+                return -1;
+            }
+            0
+        },
+    );
+
+    // Phase 14: WebSocket — Persistent streaming connections
+    // folk_ws_connect(url_ptr, url_len) -> i32 (slot_id or -1)
+    // URL format: "ws://host:port/path"
+    let _ = linker.func_wrap("env", "folk_ws_connect",
+        |mut caller: Caller<HostState>, url_ptr: i32, url_len: i32| -> i32 {
+            if url_len <= 0 || url_len > 256 { return -1; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+            let mut url_buf = alloc::vec![0u8; url_len as usize];
+            if mem.read(&caller, url_ptr as usize, &mut url_buf).is_err() { return -1; }
+            let url = match alloc::str::from_utf8(&url_buf) {
+                Ok(s) => s,
+                Err(_) => return -1,
+            };
+
+            // Parse "ws://host:port/path" or just "host:port/path"
+            let stripped = url.strip_prefix("ws://").unwrap_or(
+                url.strip_prefix("wss://").unwrap_or(url));
+            let (host_port, path) = match stripped.find('/') {
+                Some(i) => (&stripped[..i], &stripped[i..]),
+                None => (stripped, "/"),
+            };
+            let (host, port) = match host_port.rfind(':') {
+                Some(i) => {
+                    let p = host_port[i+1..].parse::<u16>().unwrap_or(80);
+                    (&host_port[..i], p)
+                }
+                None => (host_port, 80),
+            };
+
+            // Resolve to IP — for local proxy, use 127.0.0.1
+            // For production, would need DNS. Using loopback for now.
+            let ip = if host == "localhost" || host == "127.0.0.1" {
+                [127, 0, 0, 1]
+            } else {
+                // Try to parse as dotted quad
+                let parts: alloc::vec::Vec<&str> = host.split('.').collect();
+                if parts.len() == 4 {
+                    [
+                        parts[0].parse().unwrap_or(10),
+                        parts[1].parse().unwrap_or(0),
+                        parts[2].parse().unwrap_or(2),
+                        parts[3].parse().unwrap_or(2),
+                    ]
+                } else {
+                    [10, 0, 2, 2] // QEMU gateway default
+                }
+            };
+
+            match libfolk::sys::ws_connect(ip, port, host, path) {
+                Some(id) => id as i32,
+                None => -1,
+            }
+        },
+    );
+
+    // folk_ws_send(socket_id, data_ptr, data_len) -> i32 (0=ok, -1=error)
+    let _ = linker.func_wrap("env", "folk_ws_send",
+        |mut caller: Caller<HostState>, socket_id: i32, data_ptr: i32, data_len: i32| -> i32 {
+            if data_len <= 0 || data_len > 8192 || socket_id < 0 { return -1; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+            let mut data = alloc::vec![0u8; data_len as usize];
+            if mem.read(&caller, data_ptr as usize, &mut data).is_err() { return -1; }
+            if libfolk::sys::ws_send(socket_id as u8, &data) { 0 } else { -1 }
+        },
+    );
+
+    // folk_ws_poll_recv(socket_id, buf_ptr, max_len) -> i32
+    // Returns: bytes read (>0), 0 (nothing yet), -1 (closed/error)
+    let _ = linker.func_wrap("env", "folk_ws_poll_recv",
+        |mut caller: Caller<HostState>, socket_id: i32, buf_ptr: i32, max_len: i32| -> i32 {
+            if max_len <= 0 || socket_id < 0 { return -1; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+            let mut buf = alloc::vec![0u8; max_len as usize];
+            match libfolk::sys::ws_poll_recv(socket_id as u8, &mut buf) {
+                None => -1, // Connection closed/error
+                Some(0) => 0, // Nothing yet
+                Some(n) => {
+                    if mem.write(&mut caller, buf_ptr as usize, &buf[..n]).is_ok() {
+                        n as i32
+                    } else { -1 }
+                }
+            }
+        },
+    );
+
+    // Phase 12: Telemetry Ring — App-level event logging for AutoDream
+    // folk_log_telemetry(action_type, target_id, duration_ms)
+    // Pushes an event into the kernel's telemetry ring buffer.
+    // Action types: 0=AppOpened, 1=AppClosed, 2=IpcMessageSent,
+    //   3=UiInteraction, 4=AiInferenceRequested, 5=AiInferenceCompleted,
+    //   6=FileAccessed, 7=FileWritten, 8=OmnibarCommand, 9=MetricAlert
+    let _ = linker.func_wrap("env", "folk_log_telemetry",
+        |_caller: Caller<HostState>, action_type: i32, target_id: i32, duration_ms: i32| {
+            // Syscall 0x9B: record telemetry event
+            unsafe {
+                libfolk::syscall::syscall3(0x9B, action_type as u64, target_id as u64, duration_ms as u64);
+            }
+        },
+    );
+
     // folk_intent_fetch(query_ptr, query_len, buf_ptr, max_len) -> i32
     // Semantic network request: "Get weather in Oslo" → OS translates to API call.
     // The LLM proxy interprets the intent, calls the appropriate API, and returns
@@ -1020,6 +1584,427 @@ pub fn execute_adapter(adapter_wasm: &[u8], input_data: &[u8]) -> Option<Vec<u8>
 
     let output = ::core::mem::replace(&mut store.data_mut().output, Vec::new());
     if output.is_empty() { None } else { Some(output) }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Shadow Runtime — AutoDream Phase 3: Safe WASM testing sandbox
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// A secondary wasmi runtime with MOCKED host functions that cannot:
+// - Write to real Synapse VFS (writes go to in-memory hashmap)
+// - Draw to real framebuffer (draw calls are counted but discarded)
+// - Access network or serial ports
+//
+// Used by AutoDream to test proposed WASM app modifications before
+// applying them to the live system.
+
+/// Result of a shadow test execution
+pub struct TestReport {
+    /// Did the app complete without crashing?
+    pub completed: bool,
+    /// Fuel consumed (proxy for CPU cycles)
+    pub fuel_consumed: u64,
+    /// Number of draw calls made
+    pub draw_call_count: u32,
+    /// Number of text draws made
+    pub text_draw_count: u32,
+    /// Number of file writes attempted
+    pub file_write_count: u32,
+    /// Number of AI inference calls attempted
+    pub ai_call_count: u32,
+    /// Total frames executed (run() calls)
+    pub frames_executed: u32,
+    /// Error message if crashed
+    pub error: Option<String>,
+    /// Virtual files written (name → size)
+    pub virtual_files: Vec<(String, usize)>,
+}
+
+/// Synthetic input event for shadow testing
+#[derive(Clone)]
+pub struct InputEvent {
+    pub event_type: i32,
+    pub x: i32,
+    pub y: i32,
+    pub data: i32,
+}
+
+/// State for the shadow (mocked) runtime — no side effects on real system
+struct ShadowState {
+    config: WasmConfig,
+    /// Pending synthetic input events
+    pending_events: Vec<FolkEvent>,
+    /// Counters
+    draw_calls: u32,
+    text_draws: u32,
+    file_writes: u32,
+    ai_calls: u32,
+    /// Virtual filesystem (in-memory, not persisted)
+    virtual_files: Vec<(String, Vec<u8>)>,
+}
+
+/// Shadow fuel budget — hard limit to prevent infinite loops
+const SHADOW_FUEL_LIMIT: u64 = 10_000_000; // 10M instructions per frame
+/// Max frames to simulate
+const SHADOW_MAX_FRAMES: u32 = 5;
+
+/// Register MOCKED host functions for the shadow runtime.
+/// All drawing is no-op, all I/O goes to in-memory state.
+fn register_shadow_functions(linker: &mut Linker<ShadowState>) {
+    // Drawing — count but don't render
+    let _ = linker.func_wrap("env", "folk_draw_rect",
+        |mut caller: Caller<ShadowState>, _x: i32, _y: i32, _w: i32, _h: i32, _color: i32| {
+            caller.data_mut().draw_calls += 1;
+        },
+    );
+
+    let _ = linker.func_wrap("env", "folk_draw_text",
+        |mut caller: Caller<ShadowState>, _x: i32, _y: i32, _ptr: i32, _len: i32, _color: i32| {
+            caller.data_mut().text_draws += 1;
+        },
+    );
+
+    let _ = linker.func_wrap("env", "folk_draw_line",
+        |mut caller: Caller<ShadowState>, _x1: i32, _y1: i32, _x2: i32, _y2: i32, _color: i32| {
+            caller.data_mut().draw_calls += 1;
+        },
+    );
+
+    let _ = linker.func_wrap("env", "folk_draw_circle",
+        |mut caller: Caller<ShadowState>, _cx: i32, _cy: i32, _r: i32, _color: i32| {
+            caller.data_mut().draw_calls += 1;
+        },
+    );
+
+    let _ = linker.func_wrap("env", "folk_fill_screen",
+        |mut caller: Caller<ShadowState>, _color: i32| {
+            caller.data_mut().draw_calls += 1;
+        },
+    );
+
+    // System info — return config values
+    let _ = linker.func_wrap("env", "folk_get_time",
+        |caller: Caller<ShadowState>| -> i32 { caller.data().config.uptime_ms as i32 },
+    );
+    let _ = linker.func_wrap("env", "folk_screen_width",
+        |caller: Caller<ShadowState>| -> i32 { caller.data().config.screen_width as i32 },
+    );
+    let _ = linker.func_wrap("env", "folk_screen_height",
+        |caller: Caller<ShadowState>| -> i32 { caller.data().config.screen_height as i32 },
+    );
+    let _ = linker.func_wrap("env", "folk_random",
+        |_: Caller<ShadowState>| -> i32 { 42 }, // Deterministic for reproducibility
+    );
+    let _ = linker.func_wrap("env", "folk_get_datetime",
+        |mut caller: Caller<ShadowState>, ptr: i32| -> i32 {
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+            // Fake datetime: 2026-04-09 12:00:00
+            let dt: [i32; 6] = [2026, 4, 9, 12, 0, 0];
+            let bytes: [u8; 24] = unsafe { core::mem::transmute(dt) };
+            let _ = mem.write(&mut caller, ptr as usize, &bytes);
+            0
+        },
+    );
+
+    // Metrics — return safe defaults
+    let _ = linker.func_wrap("env", "folk_os_metric",
+        |_: Caller<ShadowState>, _id: i32| -> i32 { 0 },
+    );
+    let _ = linker.func_wrap("env", "folk_net_has_ip",
+        |_: Caller<ShadowState>| -> i32 { 1 }, // Pretend online
+    );
+    let _ = linker.func_wrap("env", "folk_fw_drops",
+        |_: Caller<ShadowState>| -> i32 { 0 },
+    );
+
+    // Input — drain synthetic events
+    let _ = linker.func_wrap("env", "folk_poll_event",
+        |mut caller: Caller<ShadowState>, event_ptr: i32| -> i32 {
+            let event = match caller.data_mut().pending_events.pop() {
+                Some(e) => e,
+                None => return 0,
+            };
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return 0,
+            };
+            let buf = [
+                event.event_type.to_le_bytes(),
+                event.x.to_le_bytes(),
+                event.y.to_le_bytes(),
+                event.data.to_le_bytes(),
+            ].concat();
+            let _ = mem.write(&mut caller, event_ptr as usize, &buf);
+            1
+        },
+    );
+
+    // File I/O — mock: write to in-memory hashmap
+    let _ = linker.func_wrap("env", "folk_write_file",
+        |mut caller: Caller<ShadowState>, path_ptr: i32, path_len: i32, data_ptr: i32, data_len: i32| -> i32 {
+            if path_len <= 0 || data_len < 0 { return -1; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+            let mut path_buf = alloc::vec![0u8; path_len as usize];
+            let mut data_buf = alloc::vec![0u8; data_len as usize];
+            if mem.read(&caller, path_ptr as usize, &mut path_buf).is_err() { return -1; }
+            if data_len > 0 {
+                if mem.read(&caller, data_ptr as usize, &mut data_buf).is_err() { return -1; }
+            }
+            let name = String::from(core::str::from_utf8(&path_buf).unwrap_or("?"));
+            caller.data_mut().virtual_files.push((name, data_buf));
+            caller.data_mut().file_writes += 1;
+            0
+        },
+    );
+
+    // File read — return empty (shadow has no real VFS)
+    let _ = linker.func_wrap("env", "folk_list_files",
+        |_: Caller<ShadowState>, _buf_ptr: i32, _max_len: i32| -> i32 { 0 },
+    );
+    let _ = linker.func_wrap("env", "folk_request_file",
+        |_: Caller<ShadowState>, _p: i32, _pl: i32, _d: i32, _dl: i32| -> i32 { -1 },
+    );
+    let _ = linker.func_wrap("env", "folk_query_files",
+        |_: Caller<ShadowState>, _q: i32, _ql: i32, _r: i32, _rl: i32| -> i32 { 0 },
+    );
+
+    // Network — no-op
+    let _ = linker.func_wrap("env", "folk_http_get",
+        |_: Caller<ShadowState>, _u: i32, _ul: i32, _b: i32, _bl: i32| -> i32 { -1 },
+    );
+
+    // AI — count but return empty (no real LLM calls in shadow)
+    let _ = linker.func_wrap("env", "folk_slm_generate",
+        |mut caller: Caller<ShadowState>, _p: i32, _pl: i32, _b: i32, _bl: i32| -> i32 {
+            caller.data_mut().ai_calls += 1;
+            0 // Return 0 bytes (empty response)
+        },
+    );
+    let _ = linker.func_wrap("env", "folk_slm_generate_with_logits",
+        |mut caller: Caller<ShadowState>, _p: i32, _pl: i32, _o: i32, _ol: i32| -> i32 {
+            caller.data_mut().ai_calls += 1;
+            -1
+        },
+    );
+    let _ = linker.func_wrap("env", "folk_intent_fetch",
+        |_: Caller<ShadowState>, _q: i32, _ql: i32, _b: i32, _bl: i32| -> i32 { -1 },
+    );
+
+    // Tensor — return empty
+    let _ = linker.func_wrap("env", "folk_tensor_read",
+        |_: Caller<ShadowState>, _b: i32, _bl: i32, _s: i32| -> i32 { -1 },
+    );
+
+    // Telemetry — silent no-op
+    let _ = linker.func_wrap("env", "folk_log_telemetry",
+        |_: Caller<ShadowState>, _a: i32, _t: i32, _d: i32| {},
+    );
+
+    // Streams — no-op
+    let _ = linker.func_wrap("env", "folk_stream_write",
+        |_: Caller<ShadowState>, _p: i32, _l: i32| {},
+    );
+    let _ = linker.func_wrap("env", "folk_stream_read",
+        |_: Caller<ShadowState>, _p: i32, _l: i32| -> i32 { 0 },
+    );
+    let _ = linker.func_wrap("env", "folk_stream_done",
+        |_: Caller<ShadowState>| {},
+    );
+
+    // Surface — return 0 (no surface in shadow)
+    let _ = linker.func_wrap("env", "folk_get_surface",
+        |_: Caller<ShadowState>| -> i32 { 0 },
+    );
+    let _ = linker.func_wrap("env", "folk_surface_pitch",
+        |_: Caller<ShadowState>| -> i32 { 0 },
+    );
+    let _ = linker.func_wrap("env", "folk_surface_present",
+        |_: Caller<ShadowState>| {},
+    );
+
+    // Memory map + tokenizer — defaults in shadow
+    let _ = linker.func_wrap("env", "folk_memory_map",
+        |_: Caller<ShadowState>, _b: i32, _m: i32| -> i32 { -1 },
+    );
+    let _ = linker.func_wrap("env", "folk_tokenize",
+        |_: Caller<ShadowState>, _t: i32, _tl: i32, _o: i32, _ol: i32| -> i32 { -1 },
+    );
+
+    // PCI/IRQ — empty in shadow
+    let _ = linker.func_wrap("env", "folk_pci_list",
+        |_: Caller<ShadowState>, _b: i32, _m: i32| -> i32 { 0 },
+    );
+    let _ = linker.func_wrap("env", "folk_irq_stats",
+        |_: Caller<ShadowState>, _b: i32, _m: i32| -> i32 { 0 },
+    );
+
+    // Telemetry poll — empty in shadow
+    let _ = linker.func_wrap("env", "folk_telemetry_poll",
+        |_: Caller<ShadowState>, _b: i32, _m: i32| -> i32 { 0 },
+    );
+
+    // Tensor write — no-op in shadow
+    let _ = linker.func_wrap("env", "folk_tensor_write",
+        |_: Caller<ShadowState>, _s: i32, _b: i32, _v: i32| -> i32 { -1 },
+    );
+
+    // WebSocket — no-op in shadow (no real network)
+    let _ = linker.func_wrap("env", "folk_ws_connect",
+        |_: Caller<ShadowState>, _u: i32, _ul: i32| -> i32 { -1 },
+    );
+    let _ = linker.func_wrap("env", "folk_ws_send",
+        |_: Caller<ShadowState>, _s: i32, _d: i32, _dl: i32| -> i32 { -1 },
+    );
+    let _ = linker.func_wrap("env", "folk_ws_poll_recv",
+        |_: Caller<ShadowState>, _s: i32, _b: i32, _bl: i32| -> i32 { -1 },
+    );
+}
+
+/// Execute a WASM app in the shadow sandbox.
+///
+/// The app runs in complete isolation: no real VFS writes, no real
+/// screen draws, no real network access, no real AI calls.
+/// AutoDream uses this to test proposed modifications before applying.
+///
+/// # Arguments
+/// * `wasm_bytes` — The WASM module to test
+/// * `synthetic_inputs` — Fake input events to inject (key presses, mouse clicks)
+///
+/// # Returns
+/// `TestReport` with fuel consumed, crash status, call counts, and virtual files.
+pub fn execute_shadow_test(
+    wasm_bytes: &[u8],
+    synthetic_inputs: &[InputEvent],
+) -> TestReport {
+    let engine = Engine::default();
+
+    let module = match Module::new(&engine, wasm_bytes) {
+        Ok(m) => m,
+        Err(e) => return TestReport {
+            completed: false,
+            fuel_consumed: 0,
+            draw_call_count: 0,
+            text_draw_count: 0,
+            file_write_count: 0,
+            ai_call_count: 0,
+            frames_executed: 0,
+            error: Some(alloc::format!("Module parse: {:?}", e)),
+            virtual_files: Vec::new(),
+        },
+    };
+
+    let config = WasmConfig {
+        screen_width: 1280,
+        screen_height: 800,
+        uptime_ms: 60_000, // Pretend 1 minute uptime
+    };
+
+    // Pre-load synthetic events (reversed so pop() gives them in order)
+    let mut events: Vec<FolkEvent> = synthetic_inputs.iter().rev().map(|e| FolkEvent {
+        event_type: e.event_type,
+        x: e.x,
+        y: e.y,
+        data: e.data,
+    }).collect();
+
+    let mut state = ShadowState {
+        config: config.clone(),
+        pending_events: events,
+        draw_calls: 0,
+        text_draws: 0,
+        file_writes: 0,
+        ai_calls: 0,
+        virtual_files: Vec::new(),
+    };
+
+    let mut store = Store::new(&engine, state);
+    store.set_fuel(SHADOW_FUEL_LIMIT).unwrap_or(());
+
+    let mut linker = Linker::<ShadowState>::new(&engine);
+    register_shadow_functions(&mut linker);
+
+    let instance = match linker.instantiate_and_start(&mut store, &module) {
+        Ok(i) => i,
+        Err(e) => return TestReport {
+            completed: false,
+            fuel_consumed: 0,
+            draw_call_count: 0,
+            text_draw_count: 0,
+            file_write_count: 0,
+            ai_call_count: 0,
+            frames_executed: 0,
+            error: Some(alloc::format!("Instantiation: {:?}", e)),
+            virtual_files: Vec::new(),
+        },
+    };
+
+    let run_fn = match instance.get_typed_func::<(), ()>(&store, "run") {
+        Ok(f) => f,
+        Err(_) => return TestReport {
+            completed: false,
+            fuel_consumed: 0,
+            draw_call_count: 0,
+            text_draw_count: 0,
+            file_write_count: 0,
+            ai_call_count: 0,
+            frames_executed: 0,
+            error: Some(String::from("No 'run' export")),
+            virtual_files: Vec::new(),
+        },
+    };
+
+    // Execute multiple frames (simulates the compositor calling run() each frame)
+    let fuel_start = store.get_fuel().unwrap_or(0);
+    let mut frames = 0u32;
+    let mut error_msg: Option<String> = None;
+
+    for frame in 0..SHADOW_MAX_FRAMES {
+        // Refuel between frames (each frame gets its own budget)
+        store.set_fuel(SHADOW_FUEL_LIMIT).unwrap_or(());
+
+        // Advance fake time
+        store.data_mut().config.uptime_ms += 16; // ~60fps
+
+        match run_fn.call(&mut store, ()) {
+            Ok(()) => {
+                frames += 1;
+            }
+            Err(e) => {
+                let msg = alloc::format!("{:?}", e);
+                if msg.contains("fuel") {
+                    error_msg = Some(String::from("Out of fuel (possible infinite loop)"));
+                } else {
+                    error_msg = Some(alloc::format!("Trap at frame {}: {}", frame, msg));
+                }
+                frames = frame + 1;
+                break;
+            }
+        }
+    }
+
+    let fuel_remaining = store.get_fuel().unwrap_or(0);
+    let fuel_consumed = SHADOW_FUEL_LIMIT.saturating_sub(fuel_remaining);
+
+    let state = store.into_data();
+    TestReport {
+        completed: error_msg.is_none(),
+        fuel_consumed: fuel_consumed + (frames.saturating_sub(1) as u64 * SHADOW_FUEL_LIMIT),
+        draw_call_count: state.draw_calls,
+        text_draw_count: state.text_draws,
+        file_write_count: state.file_writes,
+        ai_call_count: state.ai_calls,
+        frames_executed: frames,
+        error: error_msg,
+        virtual_files: state.virtual_files.iter()
+            .map(|(n, d)| (n.clone(), d.len()))
+            .collect(),
+    }
 }
 
 /// Build the LLM prompt for generating a View Adapter.

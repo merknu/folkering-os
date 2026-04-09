@@ -11,4 +11,5 @@ pub mod virtio_gpu;
 pub mod cmos;
 pub mod rng;
 pub mod iqe;
+pub mod telemetry;
 pub mod iommu;

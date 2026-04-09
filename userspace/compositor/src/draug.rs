@@ -44,6 +44,18 @@ pub const DREAM_IDLE_NIGHT_MS: u64 = 300_000; // 5 minutes
 /// AutoDream: cooldown between dreams (10 minutes)
 pub const DREAM_COOLDOWN_MS: u64 = 600_000;
 
+/// Pattern-Mining: minimum idle before mining starts (5 minutes)
+pub const PATTERN_MINE_IDLE_MS: u64 = 300_000;
+
+/// Pattern-Mining: cooldown between mining runs (30 minutes)
+pub const PATTERN_MINE_COOLDOWN_MS: u64 = 1_800_000;
+
+/// Pattern-Mining: max telemetry events to include in LLM prompt
+pub const PATTERN_MINE_MAX_EVENTS: usize = 500;
+
+/// Pattern-Mining: max chars per LLM chunk (avoid context overflow)
+pub const PATTERN_MINE_CHUNK_SIZE: usize = 1800;
+
 /// AutoDream: max dreams per session
 pub const DREAM_MAX_PER_SESSION: u32 = 10;
 
@@ -264,6 +276,12 @@ pub struct DraugDaemon {
 
     /// Crash tracker: apps that hit fuel limit repeatedly (for Nightmare priority)
     crash_hashes: [(u32, u8); 8],
+
+    /// Pattern-Mining state (Phase 1 of new AutoDream cycle)
+    last_pattern_mine_ms: u64,
+    pattern_mine_count: u32,
+    /// Last insight stored — avoid duplicates
+    last_insight_hash: u32,
 }
 
 /// Compact observation summary for the log
@@ -299,6 +317,9 @@ impl DraugDaemon {
             pending_creative: alloc::vec::Vec::new(),
             friction: FrictionTracker::new(),
             crash_hashes: [(0, 0); 8],
+            last_pattern_mine_ms: 0,
+            pattern_mine_count: 0,
+            last_insight_hash: 0,
         }
     }
 
@@ -996,6 +1017,185 @@ impl DraugDaemon {
         if now_ms.saturating_sub(self.last_user_input_ms) < 30_000 { return true; }
         false
     }
+
+    // ═══════ Pattern-Mining: Phase 1 of AutoDream Cycle ══════════════════
+    //
+    // Drains the kernel telemetry ring buffer, formats events as a compact
+    // text log, sends to LLM for analysis, and saves insights to Synapse VFS.
+    // Runs BEFORE app dreams — provides strategic context for optimization.
+
+    /// Check if Pattern-Mining should run.
+    /// Requires: 5 min idle, cooldown elapsed, not dreaming, telemetry available.
+    pub fn should_mine_patterns(&self, now_ms: u64) -> bool {
+        self.active
+            && !self.dreaming
+            && !self.waiting_for_llm
+            && now_ms.saturating_sub(self.last_user_input_ms) > PATTERN_MINE_IDLE_MS
+            && now_ms.saturating_sub(self.last_pattern_mine_ms) > PATTERN_MINE_COOLDOWN_MS
+    }
+
+    /// Execute Pattern-Mining: drain telemetry → format → LLM analyze → save insight.
+    /// Returns Some(insight_text) on success, None on failure or no data.
+    pub fn mine_patterns(&mut self, now_ms: u64) -> Option<String> {
+        // Step 1: Drain telemetry ring buffer via syscall 0x9C
+        const EVENT_SIZE: usize = 16; // sizeof TelemetryEvent
+        let max_events = PATTERN_MINE_MAX_EVENTS;
+        let buf_size = max_events * EVENT_SIZE;
+        let mut buf = alloc::vec![0u8; buf_size];
+        let drained = libfolk::sys::telemetry_drain(&mut buf, max_events);
+
+        if drained == 0 {
+            // No telemetry data — nothing to mine
+            self.last_pattern_mine_ms = now_ms;
+            return None;
+        }
+
+        libfolk::sys::io::write_str("[Draug] Pattern-Mining: draining ");
+        write_dec(drained as u32);
+        libfolk::sys::io::write_str(" telemetry events\n");
+
+        // Step 2: Format events as compact text log
+        let log_text = format_telemetry_log(&buf, drained);
+
+        if log_text.is_empty() {
+            self.last_pattern_mine_ms = now_ms;
+            return None;
+        }
+
+        // Step 3: Chunk if necessary (avoid LLM context overflow)
+        let analysis_input = if log_text.len() > PATTERN_MINE_CHUNK_SIZE {
+            // Take the most recent chunk (end of log)
+            let start = log_text.len() - PATTERN_MINE_CHUNK_SIZE;
+            // Find a newline boundary
+            let boundary = log_text[start..].find('\n').unwrap_or(0) + start + 1;
+            &log_text[boundary..]
+        } else {
+            &log_text
+        };
+
+        // Step 4: Send to LLM for analysis
+        let prompt = format!(
+            "Analyze this telemetry log from Folkering OS. \
+             Identify repeating patterns, high friction (apps that crash or are used inefficiently together), \
+             and suggest ONE concrete architectural improvement or IPC shortcut.\n\
+             Be concise (max 3 sentences).\n\n\
+             TELEMETRY LOG ({} events):\n{}",
+            drained, analysis_input
+        );
+
+        let mut response = alloc::vec![0u8; 512];
+        let resp_len = libfolk::sys::ask_gemini(&prompt, &mut response);
+
+        if resp_len == 0 {
+            libfolk::sys::io::write_str("[Draug] Pattern-Mining: LLM returned empty response\n");
+            self.last_pattern_mine_ms = now_ms;
+            return None;
+        }
+
+        let insight = match core::str::from_utf8(&response[..resp_len]) {
+            Ok(s) => String::from(s.trim()),
+            Err(_) => {
+                self.last_pattern_mine_ms = now_ms;
+                return None;
+            }
+        };
+
+        // Step 5: Deduplicate — skip if same insight as last time
+        let insight_hash = Self::key_hash(&insight);
+        if insight_hash == self.last_insight_hash {
+            libfolk::sys::io::write_str("[Draug] Pattern-Mining: duplicate insight, skipping save\n");
+            self.last_pattern_mine_ms = now_ms;
+            return Some(insight);
+        }
+
+        // Step 6: Save to Synapse VFS
+        let rtc = libfolk::sys::get_rtc();
+        let filename = format!(
+            "autodream/insights/{:04}-{:02}-{:02}_{:02}{:02}.txt",
+            rtc.year, rtc.month, rtc.day, rtc.hour, rtc.minute
+        );
+
+        let file_content = format!(
+            "#AutoDreamInsight\n\
+             # Pattern-Mining Phase 1 — {}\n\
+             # Events analyzed: {} | Uptime: {}s\n\n\
+             {}\n",
+            filename, drained, now_ms / 1000, insight
+        );
+
+        let _ = libfolk::sys::synapse::write_file(&filename, file_content.as_bytes());
+
+        libfolk::sys::io::write_str("[Draug] Pattern-Mining: insight saved to ");
+        libfolk::sys::io::write_str(&filename);
+        libfolk::sys::io::write_str("\n");
+
+        // Update state
+        self.last_pattern_mine_ms = now_ms;
+        self.last_insight_hash = insight_hash;
+        self.pattern_mine_count += 1;
+
+        Some(insight)
+    }
+
+    /// Get pattern mining statistics.
+    pub fn pattern_mine_count(&self) -> u32 { self.pattern_mine_count }
+}
+
+// ═══════ Pattern-Mining Helpers ══════════════════════════════════════════
+
+/// Action type names for telemetry formatting
+const ACTION_NAMES: [&str; 12] = [
+    "AppOpened", "AppClosed", "IpcSent", "UiInteract",
+    "AiReq", "AiDone", "FileRead", "FileWrite",
+    "Omnibar", "Alert", "NetEvt", "AppErr",
+];
+
+/// Format telemetry events as a compact text log for LLM consumption.
+/// Each line: "T+{seconds} {action} target={id} dur={ms}"
+fn format_telemetry_log(buf: &[u8], count: usize) -> String {
+    let mut out = String::with_capacity(count * 40);
+    let event_size = 16; // sizeof TelemetryEvent
+
+    for i in 0..count {
+        let off = i * event_size;
+        if off + event_size > buf.len() { break; }
+
+        let action_type = buf[off] as usize;
+        let _flags = buf[off + 1];
+        let source_task = u16::from_le_bytes([buf[off + 2], buf[off + 3]]);
+        let target_id = u32::from_le_bytes([buf[off + 4], buf[off + 5], buf[off + 6], buf[off + 7]]);
+        let duration_ms = u32::from_le_bytes([buf[off + 8], buf[off + 9], buf[off + 10], buf[off + 11]]);
+        let timestamp_ms = u32::from_le_bytes([buf[off + 12], buf[off + 13], buf[off + 14], buf[off + 15]]);
+
+        let action_name = if action_type < ACTION_NAMES.len() {
+            ACTION_NAMES[action_type]
+        } else {
+            "Unknown"
+        };
+
+        // Compact format: "T+123s AppOpened t3 id=0x1234 dur=50ms"
+        use core::fmt::Write;
+        let _ = write!(out, "T+{}s {} t{} id={:#x}",
+            timestamp_ms / 1000, action_name, source_task, target_id);
+        if duration_ms > 0 {
+            let _ = write!(out, " dur={}ms", duration_ms);
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Simple decimal writer (for serial output without format!)
+fn write_dec(val: u32) {
+    if val == 0 {
+        libfolk::sys::io::write_char(b'0');
+        return;
+    }
+    let mut buf = [0u8; 10];
+    let mut n = val;
+    let mut i = 0;
+    while n > 0 { buf[i] = b'0' + (n % 10) as u8; n /= 10; i += 1; }
+    while i > 0 { i -= 1; libfolk::sys::io::write_char(buf[i]); }
 }
 
 /// Extract a string value from JSON — delegates to shared libfolk::json parser.

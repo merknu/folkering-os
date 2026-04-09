@@ -116,6 +116,69 @@ pub fn iqe_tsc_freq() -> u64 {
     unsafe { syscall0(0x92) }
 }
 
+/// WebSocket: Connect to a WebSocket server.
+/// Returns slot_id (0-3) on success, u64::MAX on error.
+pub fn ws_connect(ip: [u8; 4], port: u16, host: &str, path: &str) -> Option<u8> {
+    // Pack: "host\0path" into a buffer
+    let mut buf = [0u8; 256];
+    let hb = host.as_bytes();
+    let pb = path.as_bytes();
+    let total = hb.len() + 1 + pb.len();
+    if total > 256 { return None; }
+    buf[..hb.len()].copy_from_slice(hb);
+    buf[hb.len()] = 0; // null separator
+    buf[hb.len()+1..hb.len()+1+pb.len()].copy_from_slice(pb);
+
+    let packed_ip = ip[0] as u64 | ((ip[1] as u64) << 8) | ((ip[2] as u64) << 16) | ((ip[3] as u64) << 24);
+    let packed_port = port as u64 | ((total as u64) << 16);
+
+    let ret = unsafe { syscall3(0xA0, packed_ip, packed_port, buf.as_ptr() as u64) };
+    if ret == u64::MAX { None } else { Some(ret as u8) }
+}
+
+/// WebSocket: Send text data on a connection.
+pub fn ws_send(slot_id: u8, data: &[u8]) -> bool {
+    let ret = unsafe { syscall3(0xA1, slot_id as u64, data.as_ptr() as u64, data.len() as u64) };
+    ret == 0
+}
+
+/// WebSocket: Non-blocking receive poll. Returns bytes read (0 = nothing yet).
+/// Returns None on connection closed/error.
+pub fn ws_poll_recv(slot_id: u8, buf: &mut [u8]) -> Option<usize> {
+    let ret = unsafe { syscall3(0xA2, slot_id as u64, buf.as_mut_ptr() as u64, buf.len() as u64) };
+    if ret == u64::MAX { None } else { Some(ret as usize) }
+}
+
+/// WebSocket: Close a connection.
+pub fn ws_close(slot_id: u8) {
+    unsafe { syscall1(0xA3, slot_id as u64); }
+}
+
+/// Telemetry: Record an app-level event for AutoDream pattern mining.
+/// action_type: 0=AppOpened, 1=AppClosed, 2=IpcMessageSent, 3=UiInteraction,
+///   4=AiInferenceRequested, 5=AiInferenceCompleted, 6=FileAccessed,
+///   7=FileWritten, 8=OmnibarCommand, 9=MetricAlert
+pub fn telemetry_log(action_type: u8, target_id: u32, duration_ms: u32) {
+    unsafe { syscall3(0x9B, action_type as u64, target_id as u64, duration_ms as u64); }
+}
+
+/// Telemetry: Drain all pending events to buffer (for AutoDream).
+/// Returns number of events drained. Each event is 16 bytes.
+pub fn telemetry_drain(buf: &mut [u8], max_events: usize) -> usize {
+    let ret = unsafe { syscall2(0x9C, buf.as_mut_ptr() as u64, max_events as u64) };
+    ret as usize
+}
+
+/// Telemetry: Get ring buffer stats.
+/// Returns (pending_count, total_recorded, overflow_count).
+pub fn telemetry_stats() -> (u32, u32, u32) {
+    let packed = unsafe { syscall0(0x9D) };
+    let pending = (packed & 0xFFFF) as u32;
+    let total = ((packed >> 16) & 0xFFFF) as u32;
+    let overflow = ((packed >> 32) & 0xFFFF) as u32;
+    (pending, total, overflow)
+}
+
 /// Write bytes to COM3 via syscall 0x94.
 pub fn com3_write(data: &[u8]) {
     unsafe { syscall2(0x94, data.as_ptr() as u64, data.len() as u64); }

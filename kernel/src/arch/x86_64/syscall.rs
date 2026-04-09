@@ -1127,6 +1127,85 @@ extern "C" fn syscall_handler(
         0xB0 => syscall_net_dma_rx(arg1, arg2),     // Kernel-assisted RX: read DMA + deliver to smoltcp
         0xB1 => syscall_dma_sync_write(arg1, arg2), // Write to physical memory via HHDM
         0xB2 => syscall_net_metrics(arg1, arg2),    // OS metrics for AI introspection
+        // WebSocket: connect to server
+        // arg1 = packed IP (a | b<<8 | c<<16 | d<<24), arg2 = port | (path_len << 16)
+        // arg3 = ptr to "host\0path" string
+        // Returns: slot_id (0-3) or u64::MAX on error
+        0xA0 => {
+            let ip = [arg1 as u8, (arg1 >> 8) as u8, (arg1 >> 16) as u8, (arg1 >> 24) as u8];
+            let port = (arg2 & 0xFFFF) as u16;
+            let path_len = ((arg2 >> 16) & 0xFFFF) as usize;
+            let ptr = arg3 as *const u8;
+            if ptr.is_null() || arg3 < 0x200000 { u64::MAX } else {
+                let data = unsafe { core::slice::from_raw_parts(ptr, path_len.min(256)) };
+                // Split at first null byte: host\0path
+                let split = data.iter().position(|&b| b == 0).unwrap_or(data.len());
+                let host = core::str::from_utf8(&data[..split]).unwrap_or("localhost");
+                let path = if split + 1 < data.len() {
+                    core::str::from_utf8(&data[split+1..]).unwrap_or("/")
+                } else { "/" };
+                match crate::net::websocket::ws_connect(ip, port, host, path) {
+                    Ok(id) => id as u64,
+                    Err(_) => u64::MAX,
+                }
+            }
+        },
+        // WebSocket: send text data
+        // arg1 = slot_id, arg2 = data_ptr, arg3 = data_len
+        // Returns: 0 on success, u64::MAX on error
+        0xA1 => {
+            let ptr = arg2 as *const u8;
+            let len = (arg3 as usize).min(8192);
+            if ptr.is_null() || arg2 < 0x200000 || len == 0 { u64::MAX } else {
+                let data = unsafe { core::slice::from_raw_parts(ptr, len) };
+                match crate::net::websocket::ws_send(arg1 as u8, data) {
+                    Ok(()) => 0,
+                    Err(_) => u64::MAX,
+                }
+            }
+        },
+        // WebSocket: non-blocking receive poll
+        // arg1 = slot_id, arg2 = buf_ptr, arg3 = max_len
+        // Returns: bytes read (0 = nothing yet, u64::MAX-1 = closed/error)
+        0xA2 => {
+            let ptr = arg2 as *mut u8;
+            let max = (arg3 as usize).min(8192);
+            if ptr.is_null() || arg2 < 0x200000 { u64::MAX } else {
+                let buf = unsafe { core::slice::from_raw_parts_mut(ptr, max) };
+                let result = crate::net::websocket::ws_poll_recv(arg1 as u8, buf);
+                if result < 0 { u64::MAX } else { result as u64 }
+            }
+        },
+        // WebSocket: close connection
+        // arg1 = slot_id
+        0xA3 => {
+            crate::net::websocket::ws_close(arg1 as u8);
+            0
+        },
+
+        // Telemetry Ring: record app-level event for AutoDream pattern mining
+        // arg1 = action_type (u8), arg2 = target_id (u32), arg3 = duration_ms (u32)
+        0x9B => {
+            crate::drivers::telemetry::record(
+                crate::drivers::telemetry::ActionType::from_u8(arg1 as u8),
+                arg2 as u32,
+                arg3 as u32,
+            );
+            0
+        },
+        // Telemetry Ring: drain all events to userspace buffer (AutoDream)
+        // arg1 = buf_ptr, arg2 = max_events
+        // Returns: number of events drained
+        0x9C => {
+            crate::drivers::telemetry::drain_to_user(arg1 as usize, arg2 as usize) as u64
+        },
+        // Telemetry Ring: get stats (pending, total, overflow)
+        // Returns: pending in bits 0-15, total in bits 16-31, overflow in bits 32-47
+        0x9D => {
+            let (pending, total, overflow) = crate::drivers::telemetry::stats();
+            (pending as u64) | ((total as u64) << 16) | ((overflow as u64) << 32)
+        },
+
         _ => {
             crate::drivers::serial::write_str("[HANDLER] Invalid syscall!\n");
             u64::MAX // Return error
