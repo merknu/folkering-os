@@ -1631,6 +1631,25 @@ fn main() -> ! {
             }
         }
 
+        // ===== Pattern-Mining: Phase 1 of AutoDream Cycle =====
+        // Runs BEFORE app dreams — analyzes telemetry for system insights.
+        {
+            let mine_ms = if tsc_per_us > 0 { rdtsc() / tsc_per_us / 1000 } else { 0 };
+            if draug.should_mine_patterns(mine_ms)
+                && active_agent.is_none()
+                && async_tool_gen.is_none()
+                && !draug.should_yield_tokens(active_agent.is_some(), mine_ms)
+            {
+                if let Some(insight) = draug.mine_patterns(mine_ms) {
+                    // Show insight in status bar briefly
+                    write_str("[Draug] Insight: ");
+                    let show_len = insight.len().min(80);
+                    write_str(&insight[..show_len]);
+                    write_str("\n");
+                }
+            }
+        }
+
         // ===== AutoDream: Two-Hemisphere Self-Improving Software =====
         let dream_ms = if tsc_per_us > 0 { rdtsc() / tsc_per_us / 1000 } else { 0 };
         if draug.should_dream(dream_ms) && active_agent.is_none() && async_tool_gen.is_none()
