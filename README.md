@@ -289,7 +289,7 @@ Folkering OS is **dual-licensed**:
 
 All contributors must sign a [Contributor License Agreement](CONTRIBUTING.md) (CLA) before pull requests are merged. This enables dual licensing while contributors retain their copyright.
 
-**"Folkering OS"** is a trademark of Knut Ingmar Meroedningen. Forks may not use the Folkering OS name or branding without permission.
+**"Folkering OS"** is a trademark of Knut Ingmar Merødningen. Forks may not use the Folkering OS name or branding without permission.
 
 ## Author
 
