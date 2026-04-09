@@ -787,9 +787,18 @@ fn main() -> ! {
         use_gpu = true;
     }
 
+    // ── VGA Mirror: dual-output for VNC/screendump compatibility ──
+    // When using VirtIO-GPU, QMP screendump captures the Bochs VGA linear FB
+    // (not the VirtIO scanout). Mirror the shadow buffer to BOTH outputs so
+    // VNC/screendump always shows the current frame.
+    let vga_mirror_ptr: *mut u8 = if use_gpu { FRAMEBUFFER_VADDR as *mut u8 } else { core::ptr::null_mut() };
+    let vga_mirror_pitch = fb_config.pitch as usize;
+    let vga_mirror_w = fb_config.width as usize;
+    let vga_mirror_h = fb_config.height as usize;
+
     // Use VirtIO-GPU framebuffer when available — gpu_flush() sends THIS memory
     // to the display via TRANSFER_TO_HOST_2D + RESOURCE_FLUSH (instant update).
-    // Falling back to Limine VGA FB means VNC only polls VGA memory every ~3s.
+    // VGA mirror ensures VNC/screendump also gets the pixels.
     let mut fb = if use_gpu && gpu_w_saved > 0 {
         let gpu_config = libfolk::sys::boot_info::FramebufferConfig {
             physical_address: 0,
@@ -1139,6 +1148,24 @@ fn main() -> ! {
         // Flush to VirtIO-GPU so VNC shows the initial frame immediately
         if use_gpu {
             libfolk::sys::gpu_flush(0, 0, fb.width as u32, fb.height as u32);
+            // VGA Mirror: also copy initial frame to Limine VGA FB for screendump
+            if !vga_mirror_ptr.is_null() {
+                let shadow = fb.shadow_ptr_raw();
+                if !shadow.is_null() {
+                    let copy_w = (fb.width).min(vga_mirror_w);
+                    let copy_h = (fb.height).min(vga_mirror_h);
+                    for row in 0..copy_h {
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                shadow.add(row * fb.pitch),
+                                vga_mirror_ptr.add(row * vga_mirror_pitch),
+                                copy_w * 4,
+                            );
+                        }
+                    }
+                    write_str("[VGA_MIRROR] Initial frame copied to Limine FB\n");
+                }
+            }
         }
         write_str("[WM] Boot test window drawn\n");
         // Pixel probe: verify compositor actually painted non-black pixels
@@ -3834,7 +3861,22 @@ fn main() -> ! {
                                 wasm_fname[nb.len()..nb.len()+ext.len()].copy_from_slice(ext);
                                 let wasm_str = unsafe { core::str::from_utf8_unchecked(&wasm_fname[..nb.len()+ext.len()]) };
                                 const VFS_OPEN_VADDR: usize = 0x50040000;
-                                if let Ok(resp) = libfolk::sys::synapse::read_file_shmem(wasm_str) {
+                                write_str("[OPEN] Trying VFS: ");
+                                write_str(wasm_str);
+                                write_str("\n");
+                                match libfolk::sys::synapse::read_file_shmem(wasm_str) {
+                                Err(e) => {
+                                    write_str("[OPEN] VFS read failed: ");
+                                    match e {
+                                        libfolk::sys::synapse::SynapseError::NotFound => write_str("NotFound"),
+                                        libfolk::sys::synapse::SynapseError::ServiceUnavailable => write_str("ServiceUnavailable"),
+                                        libfolk::sys::synapse::SynapseError::InvalidRequest => write_str("InvalidRequest"),
+                                        libfolk::sys::synapse::SynapseError::IpcFailed => write_str("IpcFailed"),
+                                        _ => write_str("Unknown"),
+                                    }
+                                    write_str("\n");
+                                }
+                                Ok(resp) => {
                                     if shmem_map(resp.shmem_handle, VFS_OPEN_VADDR).is_ok() {
                                         let data = unsafe {
                                             core::slice::from_raw_parts(VFS_OPEN_VADDR as *const u8, resp.size as usize)
@@ -3847,7 +3889,16 @@ fn main() -> ! {
                                             screen_height: fb.height as u32,
                                             uptime_ms: libfolk::sys::uptime() as u32,
                                         };
-                                        if let Ok(app) = compositor::wasm_runtime::PersistentWasmApp::new(&wasm_bytes, config) {
+                                        match compositor::wasm_runtime::PersistentWasmApp::new(&wasm_bytes, config) {
+                                        Err(e) => {
+                                            write_str("[WM] WASM compile failed: ");
+                                            // Print first 80 chars of error
+                                            let err_bytes = e.as_bytes();
+                                            let show = err_bytes.len().min(80);
+                                            for &b in &err_bytes[..show] { write_char(b); }
+                                            write_str("\n");
+                                        }
+                                        Ok(app) => {
                                             active_wasm_app = Some(app);
                                             active_wasm_app_key = Some(alloc::string::String::from(app_name));
                                             wasm_app_open_since_ms = libfolk::sys::uptime();
@@ -3860,11 +3911,13 @@ fn main() -> ! {
                                             write_str("\n");
                                             // IQE: window open event
                                             libfolk::sys::com3_write(b"IQE,WIN_OPEN,0\n");
-                                        }
+                                        } // Ok(app)
+                                        } // match PersistentWasmApp::new
                                     } else {
                                         let _ = shmem_destroy(resp.shmem_handle);
                                     }
-                                }
+                                } // Ok(resp)
+                                } // match read_file_shmem
                             }
                         }
 
@@ -7132,6 +7185,36 @@ fn main() -> ! {
                 }
                 libfolk::sys::gpu_flush_batch(&batch[..n]);
             }
+
+            // ── VGA Mirror: copy dirty regions from shadow → Limine VGA FB ──
+            // This makes QMP screendump and VNC show the current frame even when
+            // the primary output is VirtIO-GPU (whose scanout QMP can't capture on TCG).
+            if !vga_mirror_ptr.is_null() {
+                let shadow_ptr = fb.shadow_ptr_raw();
+                if !shadow_ptr.is_null() {
+                    let gpu_pitch = fb.pitch;
+                    for r in regions {
+                        let rx = r.x as usize;
+                        let ry = r.y as usize;
+                        let rw = (r.w as usize).min(vga_mirror_w.saturating_sub(rx));
+                        let rh = (r.h as usize).min(vga_mirror_h.saturating_sub(ry));
+                        if rw == 0 || rh == 0 { continue; }
+                        let bytes_per_row = rw * 4; // 32bpp
+                        for row in ry..ry + rh {
+                            let src_off = row * gpu_pitch + rx * 4;
+                            let dst_off = row * vga_mirror_pitch + rx * 4;
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(
+                                    shadow_ptr.add(src_off),
+                                    vga_mirror_ptr.add(dst_off),
+                                    bytes_per_row,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
             damage.clear();
         } else {
             damage.clear();

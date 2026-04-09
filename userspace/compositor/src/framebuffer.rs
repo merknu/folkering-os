@@ -118,6 +118,12 @@ impl FramebufferView {
         }
     }
 
+    /// Get raw shadow buffer base pointer (for VGA mirror bulk copy).
+    #[inline]
+    pub fn shadow_ptr_raw(&self) -> *const u8 {
+        self.shadow as *const u8
+    }
+
     /// Get shadow buffer pixel pointer (normal RAM — reliable reads)
     #[inline]
     fn shadow_ptr(&self, x: usize, y: usize) -> *mut u32 {

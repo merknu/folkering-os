@@ -35,7 +35,7 @@ use libfolk::sys::synapse::{
     SYNAPSE_VERSION, hash_name,
 };
 use libfolk::sys::{shmem_create, shmem_map, shmem_grant};
-use libsqlite::{SqliteDb, Value, encode_varint};
+use libsqlite::{SqliteDb, Value, encode_varint, decode_varint};
 use libsqlite::vector::{
     Embedding, SearchResult, search_similar_auto,
     get_embedding_by_file_id, count_embeddings, EMBEDDING_SIZE
@@ -743,6 +743,22 @@ fn handle_read_file_shmem(msg: AsyncIpcMessage) {
     match unsafe { BACKEND } {
         Backend::Sqlite => {
             // Step 1: Find file name from cache (fast, no table scan)
+            // Debug: log cache contents for first few lookups
+            static mut SHMEM_DBG_COUNT: u32 = 0;
+            unsafe {
+                SHMEM_DBG_COUNT += 1;
+                if SHMEM_DBG_COUNT <= 3 {
+                    println!("[SYNAPSE] read_file_shmem: looking for hash={:#010x}, cache has {} entries",
+                        request_hash, DIR_CACHE_STATE.count);
+                    for i in 0..DIR_CACHE_STATE.count {
+                        let e = &DIR_CACHE_STATE.entries[i];
+                        let n = e.name_str();
+                        println!("[SYNAPSE]   [{}] '{}' hash={:#010x} size={}",
+                            i, n, hash_name(n), e.size);
+                    }
+                }
+            }
+
             let file_name: Option<&str> = unsafe {
                 DIR_CACHE_STATE.entries[..DIR_CACHE_STATE.count]
                     .iter()
@@ -750,30 +766,26 @@ fn handle_read_file_shmem(msg: AsyncIpcMessage) {
                     .map(|e| e.name_str())
             };
 
-            let name = match file_name {
-                Some(n) => n,
+            // Also grab file size from cache for shmem allocation
+            let (name, file_size) = match file_name {
+                Some(n) => {
+                    let sz = unsafe {
+                        DIR_CACHE_STATE.entries[..DIR_CACHE_STATE.count]
+                            .iter()
+                            .find(|e| hash_name(e.name_str()) == request_hash)
+                            .map(|e| e.size as usize)
+                            .unwrap_or(4096)
+                    };
+                    (n, sz)
+                }
                 None => {
                     let _ = reply(SYN_STATUS_NOT_FOUND, 0);
                     return;
                 }
             };
 
-            // Step 2: Read file content — try ramdisk first, fallback to SQLite BLOB
-            let mut file_buf = [0u8; 4096];
-            let bytes_read = read_file(name, &mut file_buf);
-            // If ramdisk has nothing, read BLOB from SQLite directly
-            let bytes_read = if bytes_read == 0 {
-                read_sqlite_blob(name, &mut file_buf)
-            } else {
-                bytes_read
-            };
-            if bytes_read == 0 {
-                let _ = reply(SYN_STATUS_NOT_FOUND, 0);
-                return;
-            }
-
-            // Step 3: Create shmem and copy content
-            let buffer_size = ((bytes_read + 4095) / 4096) * 4096;
+            // Step 2: Allocate shmem big enough for the full file
+            let buffer_size = ((file_size + 4095) / 4096) * 4096;
             let shmem_handle = match shmem_create(buffer_size) {
                 Ok(handle) => handle,
                 Err(_) => {
@@ -787,18 +799,31 @@ fn handle_read_file_shmem(msg: AsyncIpcMessage) {
             }
 
             if shmem_map(shmem_handle, SHMEM_BUFFER_VADDR).is_err() {
+                let _ = shmem_destroy(shmem_handle);
                 let _ = reply(SYN_STATUS_ERROR, 0);
                 return;
             }
 
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    file_buf.as_ptr(),
-                    SHMEM_BUFFER_VADDR as *mut u8,
-                    bytes_read,
-                );
+            // Step 3: Read file content into shmem buffer
+            let shmem_buf = unsafe {
+                core::slice::from_raw_parts_mut(SHMEM_BUFFER_VADDR as *mut u8, buffer_size)
+            };
+            // Try ramdisk first
+            let bytes_read = read_file(name, shmem_buf);
+            // If ramdisk has nothing, read BLOB from SQLite (with overflow page support)
+            let bytes_read = if bytes_read == 0 {
+                read_sqlite_blob_large(name, shmem_buf)
+            } else {
+                bytes_read
+            };
+            if bytes_read == 0 {
+                let _ = shmem_unmap(shmem_handle, SHMEM_BUFFER_VADDR);
+                let _ = shmem_destroy(shmem_handle);
+                let _ = reply(SYN_STATUS_NOT_FOUND, 0);
+                return;
             }
 
+            // Data is already in shmem_buf (read directly into mapped shmem)
             let _ = shmem_unmap(shmem_handle, SHMEM_BUFFER_VADDR);
             let response = ((bytes_read as u64) << 32) | (shmem_handle as u64);
             let _ = reply(response, 0);
@@ -2281,21 +2306,271 @@ fn handle_query_intent(msg: AsyncIpcMessage) {
 fn read_sqlite_blob(name: &str, buf: &mut [u8]) -> usize {
     if let Some(db) = get_sqlite_db() {
         if let Ok(scanner) = db.table_scan("files") {
+            let mut row_count = 0u32;
             for result in scanner {
+                row_count += 1;
                 if let Ok(record) = result {
                     if let Some(Value::Text(rec_name)) = record.get(1) {
                         if rec_name == name {
                             if let Some(Value::Blob(data)) = record.get(4) {
                                 let copy_len = data.len().min(buf.len());
                                 buf[..copy_len].copy_from_slice(&data[..copy_len]);
+                                println!("[SYNAPSE] read_sqlite_blob: found '{}' blob={}B copy={}B",
+                                    name, data.len(), copy_len);
                                 return copy_len;
+                            } else {
+                                println!("[SYNAPSE] read_sqlite_blob: '{}' matched but col4 is not Blob", name);
                             }
                         }
                     }
                 }
             }
+            println!("[SYNAPSE] read_sqlite_blob: scanned {} rows, '{}' not found", row_count, name);
+        } else {
+            println!("[SYNAPSE] read_sqlite_blob: table_scan failed");
+        }
+    } else {
+        println!("[SYNAPSE] read_sqlite_blob: no sqlite db");
+    }
+    0
+}
+
+/// Decode a varint, returning Option<(u64, bytes_consumed)> for easy use with match
+fn dv(bytes: &[u8]) -> Option<(u64, usize)> {
+    decode_varint(bytes).ok().map(|(v, n)| (v as u64, n))
+}
+
+/// Read a file's BLOB data from SQLite with overflow page support.
+/// SQLite stores large BLOBs across multiple pages. The B-tree leaf cell
+/// contains the first N bytes inline, then a 4-byte overflow page number.
+/// Each overflow page: [4-byte next_page][content (page_size - 4 bytes)].
+fn read_sqlite_blob_large(name: &str, buf: &mut [u8]) -> usize {
+    let db = match get_sqlite_db() {
+        Some(d) => d,
+        None => return 0,
+    };
+
+    let page_size = db.page_size() as usize;
+    let usable_size = page_size - db.header().reserved_bytes as usize;
+
+    // Scan table to find the right row's cell raw data
+    // We need to find the cell ourselves to read overflow pages
+    let root_page = 2u32; // "files" table is typically on page 2
+
+    // Walk the B-tree to find the cell containing our file name
+    let mut pages_to_scan = [0u32; 64];
+    pages_to_scan[0] = root_page;
+    let mut scan_count = 1usize;
+    let mut total_written = 0usize;
+
+    while scan_count > 0 {
+        scan_count -= 1;
+        let page_num = pages_to_scan[scan_count];
+        let page_data = match db.page(page_num) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        // Parse page header
+        let hdr_offset = if page_num == 1 { 100 } else { 0 };
+        if hdr_offset + 8 > page_data.len() { continue; }
+        let page_type = page_data[hdr_offset];
+        let cell_count = u16::from_be_bytes([
+            page_data[hdr_offset + 3], page_data[hdr_offset + 4]
+        ]) as usize;
+
+        let is_leaf = page_type == 0x0D; // leaf table
+        let is_interior = page_type == 0x05; // interior table
+
+        if is_interior {
+            // Interior: follow child pointers (rightmost child + per-cell left children)
+            let right_child = u32::from_be_bytes([
+                page_data[hdr_offset + 8], page_data[hdr_offset + 9],
+                page_data[hdr_offset + 10], page_data[hdr_offset + 11],
+            ]);
+            if scan_count < 63 { pages_to_scan[scan_count] = right_child; scan_count += 1; }
+            let cell_ptr_start = hdr_offset + 12;
+            for i in 0..cell_count {
+                let ptr_off = cell_ptr_start + i * 2;
+                if ptr_off + 2 > page_data.len() { break; }
+                let cell_off = u16::from_be_bytes([page_data[ptr_off], page_data[ptr_off+1]]) as usize;
+                if cell_off + 4 > page_data.len() { continue; }
+                let left_child = u32::from_be_bytes([
+                    page_data[cell_off], page_data[cell_off+1],
+                    page_data[cell_off+2], page_data[cell_off+3],
+                ]);
+                if scan_count < 63 { pages_to_scan[scan_count] = left_child; scan_count += 1; }
+            }
+            continue;
+        }
+
+        if !is_leaf { continue; }
+
+        // Leaf: scan cells for matching file name
+        let cell_ptr_start = hdr_offset + 8;
+        for i in 0..cell_count {
+            let ptr_off = cell_ptr_start + i * 2;
+            if ptr_off + 2 > page_data.len() { break; }
+            let cell_off = u16::from_be_bytes([page_data[ptr_off], page_data[ptr_off+1]]) as usize;
+            if cell_off >= page_data.len() { continue; }
+            let cell = &page_data[cell_off..];
+
+            // Parse varint: payload_size, rowid
+            let (payload_size, ps_len) = match dv(cell) {
+                Some(v) => v,
+                None => continue,
+            };
+            let (_, rowid_len) = match dv(&cell[ps_len..]) {
+                Some(v) => v,
+                None => continue,
+            };
+
+            let hdr_start = ps_len + rowid_len;
+            let payload_size = payload_size as usize;
+
+            // Calculate local payload size (SQLite overflow formula)
+            let max_local = usable_size - 35;
+            let local_size = if payload_size <= max_local {
+                payload_size
+            } else {
+                let min_local = ((usable_size - 12) * 32 / 255) - 23;
+                let m = min_local + ((payload_size - min_local) % (usable_size - 4));
+                if m <= max_local { m } else { min_local }
+            };
+
+            // Read the inline portion of the record header to check file name
+            if hdr_start + 10 > cell.len() { continue; } // need at least header
+            let record_data = &cell[hdr_start..hdr_start + local_size.min(cell.len() - hdr_start)];
+
+            // Quick check: parse record header to find name column
+            let (hdr_size, hdr_size_len) = match dv(record_data) {
+                Some(v) => v,
+                None => continue,
+            };
+            let hdr_size = hdr_size as usize;
+            if hdr_size > record_data.len() { continue; }
+
+            // Parse column serial types from header
+            let mut col_types = [0u64; 6]; // id, name, kind, size, data
+            let mut pos = hdr_size_len;
+            let mut col_idx = 0;
+            while pos < hdr_size && col_idx < 6 {
+                let (st, st_len) = match dv(&record_data[pos..]) {
+                    Some(v) => v,
+                    None => break,
+                };
+                col_types[col_idx] = st;
+                pos += st_len;
+                col_idx += 1;
+            }
+
+            // Column 1 (name) serial type: >=13 and odd means TEXT, length=(st-13)/2
+            let name_st = col_types[1];
+            if name_st < 13 || name_st % 2 == 0 { continue; }
+            let name_len = ((name_st - 13) / 2) as usize;
+
+            // Calculate offset of name value: skip id column
+            let id_size = match col_types[0] {
+                0 => 0, 1 => 1, 2 => 2, 3 => 3, 4 => 4, 5 => 6, 6 => 8, 7 => 8,
+                8 | 9 => 0, _ => ((col_types[0] - 12) / 2) as usize,
+            };
+            let name_offset = hdr_size + id_size;
+            if name_offset + name_len > record_data.len() { continue; }
+            let rec_name = &record_data[name_offset..name_offset + name_len];
+
+            // Compare name
+            if rec_name != name.as_bytes() { continue; }
+
+            // Found it! Now read the full payload (inline + overflow)
+            // Calculate data (col4) offset by skipping cols 0-3
+            let kind_size = match col_types[2] {
+                0 => 0, 1 => 1, 2 => 2, 3 => 3, 4 => 4, 5 => 6, 6 => 8, 7 => 8,
+                8 | 9 => 0, _ => ((col_types[2] - 12) / 2) as usize,
+            };
+            let size_col_size = match col_types[3] {
+                0 => 0, 1 => 1, 2 => 2, 3 => 3, 4 => 4, 5 => 6, 6 => 8, 7 => 8,
+                8 | 9 => 0, _ => ((col_types[3] - 12) / 2) as usize,
+            };
+            let data_start = hdr_size + id_size + name_len + kind_size + size_col_size;
+            let blob_size = if col_types[4] >= 12 && col_types[4] % 2 == 0 {
+                ((col_types[4] - 12) / 2) as usize
+            } else {
+                // Not a blob
+                println!("[SYNAPSE] blob_large: col4 type={} is not BLOB", col_types[4]);
+                return 0;
+            };
+
+            // Copy inline portion of blob
+            let inline_blob_start = hdr_start + data_start;
+            let inline_blob_avail = local_size.saturating_sub(data_start);
+            let inline_copy = inline_blob_avail.min(blob_size).min(buf.len());
+            if inline_blob_start + inline_copy <= cell.len() {
+                buf[..inline_copy].copy_from_slice(
+                    &cell[inline_blob_start..inline_blob_start + inline_copy],
+                );
+                total_written = inline_copy;
+            }
+
+            // Follow overflow pages for the rest
+            if payload_size > local_size {
+                // Overflow page number is right after local payload
+                let ovfl_ptr_off = hdr_start + local_size;
+                if ovfl_ptr_off + 4 <= cell.len() {
+                    let mut ovfl_page = u32::from_be_bytes([
+                        cell[ovfl_ptr_off], cell[ovfl_ptr_off+1],
+                        cell[ovfl_ptr_off+2], cell[ovfl_ptr_off+3],
+                    ]);
+                    let content_per_page = usable_size - 4;
+                    let mut remaining = blob_size.saturating_sub(inline_copy);
+                    // But we also need to account for non-blob data in overflow
+                    let payload_in_overflow = payload_size - local_size;
+                    let blob_data_before_overflow = data_start + inline_copy;
+                    let non_blob_in_overflow = if payload_in_overflow > remaining {
+                        payload_in_overflow - remaining
+                    } else { 0 };
+                    // Skip non-blob overflow bytes
+                    let mut skip = if data_start > local_size {
+                        data_start - local_size // blob hasn't started yet in overflow
+                    } else { 0 };
+
+                    while ovfl_page != 0 && remaining > 0 && total_written < buf.len() {
+                        let ovfl_data = match db.page(ovfl_page) {
+                            Ok(p) => p,
+                            Err(_) => break,
+                        };
+                        if ovfl_data.len() < 4 { break; }
+                        let next_page = u32::from_be_bytes([
+                            ovfl_data[0], ovfl_data[1], ovfl_data[2], ovfl_data[3],
+                        ]);
+                        let content = &ovfl_data[4..usable_size.min(ovfl_data.len())];
+
+                        if skip > 0 {
+                            let skip_here = skip.min(content.len());
+                            let usable = &content[skip_here..];
+                            let copy = usable.len().min(remaining).min(buf.len() - total_written);
+                            buf[total_written..total_written + copy].copy_from_slice(&usable[..copy]);
+                            total_written += copy;
+                            remaining -= copy;
+                            skip -= skip_here;
+                        } else {
+                            let copy = content.len().min(remaining).min(buf.len() - total_written);
+                            buf[total_written..total_written + copy].copy_from_slice(&content[..copy]);
+                            total_written += copy;
+                            remaining -= copy;
+                        }
+
+                        ovfl_page = next_page;
+                    }
+                }
+            }
+
+            println!("[SYNAPSE] blob_large: '{}' read {} bytes (blob_size={})",
+                name, total_written, blob_size);
+            return total_written;
         }
     }
+
+    println!("[SYNAPSE] blob_large: '{}' not found in B-tree", name);
     0
 }
 
