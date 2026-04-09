@@ -9,28 +9,34 @@ use super::HostState;
 
 pub fn register(linker: &mut Linker<HostState>) {
     // folk_http_get(url_ptr, url_len, buf_ptr, max_len) -> i32
-    // Makes an HTTP GET request via kernel network stack.
+    // Makes an HTTP GET request. Tries kernel TLS first, falls back to proxy.
     // Returns bytes written to buf, or -1 on error.
     let _ = linker.func_wrap("env", "folk_http_get",
         |mut caller: Caller<HostState>, url_ptr: i32, url_len: i32, buf_ptr: i32, max_len: i32| -> i32 {
-            // folk_http_get: WASM app fetches data from internet via TCP proxy
             if url_len <= 0 || url_len > 512 || max_len <= 0 { return -1; }
             let mem = match caller.get_export("memory") {
                 Some(Extern::Memory(m)) => m,
                 _ => return -1,
             };
-            // Read URL from WASM memory
             let mut url_buf = alloc::vec![0u8; url_len as usize];
             if mem.read(&caller, url_ptr as usize, &mut url_buf).is_err() { return -1; }
             let url = match alloc::str::from_utf8(&url_buf) {
                 Ok(s) => s,
                 Err(_) => return -1,
             };
-            // Use kernel ask_gemini syscall with __HTTP_GET__ prefix
-            // The proxy intercepts this and performs actual HTTP GET
+
+            // Try 1: Direct kernel HTTPS fetch (no proxy dependency)
+            let mut direct_buf = alloc::vec![0u8; max_len as usize];
+            let direct_bytes = libfolk::sys::http_fetch(url, &mut direct_buf);
+            if direct_bytes > 0 {
+                let copy_len = direct_bytes.min(max_len as usize);
+                if mem.write(&mut caller, buf_ptr as usize, &direct_buf[..copy_len]).is_ok() {
+                    return copy_len as i32;
+                }
+            }
+
+            // Try 2: Fallback to serial proxy (handles sites that fail direct TLS)
             let prompt = alloc::format!("__HTTP_GET__{}", url);
-            // IMPORTANT: ask_gemini syscall doesn't receive buffer length —
-            // kernel writes up to 8KB. Always allocate 8KB to prevent heap overflow.
             let gemini_buf_size = 8192usize;
             let mut response = alloc::vec![0u8; gemini_buf_size];
             let bytes = libfolk::sys::ask_gemini(&prompt, &mut response);

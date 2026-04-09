@@ -964,6 +964,8 @@ extern "C" fn syscall_handler(
         0x54 => syscall_https_test(arg1),
         0x55 => syscall_github_fetch(arg1, arg2, arg3, arg4),
         0x56 => syscall_github_clone(arg1, arg2, arg3, arg4),
+        // Direct HTTP fetch (URL → DNS → TLS → body)
+        0x57 => syscall_http_fetch(arg1, arg2, arg3, arg4),
         // SMP: Parallel GEMM
         0x60 => syscall_parallel_gemm(arg1, arg2, arg3, arg4, arg5, arg6),
         // Hybrid AI: Ask Gemini cloud API
@@ -2056,6 +2058,90 @@ fn syscall_https_test(ip_packed: u64) -> u64 {
     }
 }
 
+/// Direct HTTP(S) fetch: takes URL from userspace, resolves DNS, does TLS GET,
+/// returns response body. Eliminates proxy dependency for simple page fetches.
+///
+/// Args: url_ptr, url_len, buf_ptr, buf_len
+/// Returns: bytes written to buf, or u64::MAX on error
+fn syscall_http_fetch(url_ptr: u64, url_len: u64, buf_ptr: u64, buf_len: u64) -> u64 {
+    if url_len == 0 || url_len > 512 || buf_len == 0 || buf_len > 65536 {
+        return u64::MAX;
+    }
+
+    let url = unsafe {
+        let slice = core::slice::from_raw_parts(url_ptr as *const u8, url_len as usize);
+        match core::str::from_utf8(slice) {
+            Ok(s) => s,
+            Err(_) => return u64::MAX,
+        }
+    };
+
+    // Parse URL: strip https:// prefix, split host/path
+    let stripped = url.strip_prefix("https://").unwrap_or(
+        url.strip_prefix("http://").unwrap_or(url));
+    let (host, path) = match stripped.find('/') {
+        Some(i) => (&stripped[..i], &stripped[i..]),
+        None => (stripped, "/"),
+    };
+
+    crate::serial_str!("[HTTP_FETCH] ");
+    crate::serial_str!(host);
+    crate::serial_str!(path);
+    crate::serial_str!("\n");
+
+    // DNS resolve
+    let ip_packed = crate::net::dns_lookup(host);
+    if ip_packed == 0 || ip_packed == u64::MAX {
+        crate::serial_strln!("[HTTP_FETCH] DNS failed");
+        return u64::MAX;
+    }
+    let ip = [
+        (ip_packed >> 24) as u8,
+        (ip_packed >> 16) as u8,
+        (ip_packed >> 8) as u8,
+        ip_packed as u8,
+    ];
+
+    // Build HTTP/1.1 request
+    let mut request = alloc::vec::Vec::with_capacity(256 + host.len() + path.len());
+    request.extend_from_slice(b"GET ");
+    request.extend_from_slice(path.as_bytes());
+    request.extend_from_slice(b" HTTP/1.1\r\nHost: ");
+    request.extend_from_slice(host.as_bytes());
+    request.extend_from_slice(b"\r\nUser-Agent: FolkeringOS/1.0\r\nAccept: text/html,*/*\r\nConnection: close\r\n\r\n");
+
+    // Do HTTPS GET
+    let response = match crate::net::tls::https_get_raw(ip, host, &request) {
+        Ok(data) => data,
+        Err(e) => {
+            crate::serial_str!("[HTTP_FETCH] TLS failed: ");
+            crate::serial_strln!(e);
+            return u64::MAX;
+        }
+    };
+
+    // Find HTTP body (after \r\n\r\n)
+    let body_start = response.windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|p| p + 4)
+        .unwrap_or(0);
+
+    let body = &response[body_start..];
+    let copy_len = body.len().min(buf_len as usize);
+
+    // Copy to userspace buffer
+    unsafe {
+        let dst = core::slice::from_raw_parts_mut(buf_ptr as *mut u8, copy_len);
+        dst.copy_from_slice(&body[..copy_len]);
+    }
+
+    crate::serial_str!("[HTTP_FETCH] OK, ");
+    crate::drivers::serial::write_dec(copy_len as u32);
+    crate::serial_str!(" bytes body\n");
+
+    copy_len as u64
+}
+
 fn syscall_spawn(binary_ptr: u64, binary_len: u64) -> u64 {
     use crate::task::spawn;
 
@@ -2078,9 +2164,23 @@ fn syscall_spawn(binary_ptr: u64, binary_len: u64) -> u64 {
 }
 
 fn syscall_exit(exit_code: u64) -> u64 {
-    // TODO: Implement task exit
-    crate::serial_println!("syscall: exit(code={})", exit_code);
-    // Mark task as exited and never return
+    use crate::task::task::{self, TaskState};
+
+    let current_id = task::get_current_task();
+    crate::serial_println!("syscall: exit(code={}) task={}", exit_code, current_id);
+
+    // Mark task as Exited so scheduler skips it and IPC senders get errors
+    if let Some(task_arc) = task::get_task(current_id) {
+        let mut t = task_arc.lock();
+        t.state = TaskState::Exited;
+    }
+
+    // Remove from task table (Arc refcount will drop when all refs gone)
+    let _ = task::remove_task(current_id);
+
+    crate::serial_println!("[EXIT] Task {} removed from scheduler", current_id);
+
+    // Yield to let scheduler pick another task — we'll never return
     loop {
         x86_64::instructions::hlt();
     }

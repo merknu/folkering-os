@@ -67,11 +67,11 @@ const H2_SIZE: i32 = 20;
 
 // Limits
 const MAX_URL: usize = 256;
-const MAX_HTML: usize = 4096;
-const MAX_ELEMENTS: usize = 128;
+const MAX_HTML: usize = 8192;
+const MAX_ELEMENTS: usize = 256;
 const MAX_TEXT_PER_ELEM: usize = 200;
-const MAX_DISPLAY_LIST: usize = 8192;
-const MAX_SEMANTIC: usize = 1024;
+const MAX_DISPLAY_LIST: usize = 16384;
+const MAX_SEMANTIC: usize = 2048;
 
 // ── HTML Element types ──────────────────────────────────────────────────
 
