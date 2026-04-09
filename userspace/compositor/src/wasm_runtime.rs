@@ -771,6 +771,33 @@ fn register_host_functions(linker: &mut Linker<HostState>) {
         },
     );
 
+    // Phase 16: Telemetry Read — Poll events from kernel ring buffer
+    // folk_telemetry_poll(buf_ptr, max_events) -> i32
+    // Drains up to max_events from the kernel telemetry ring into WASM memory.
+    // Each event is 16 bytes: [action:u8, flags:u8, source:u16, target:u32, duration:u32, timestamp:u32]
+    // Returns number of events drained, or 0 if empty.
+    let _ = linker.func_wrap("env", "folk_telemetry_poll",
+        |mut caller: Caller<HostState>, buf_ptr: i32, max_events: i32| -> i32 {
+            if max_events <= 0 || max_events > 256 { return 0; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return 0,
+            };
+            let event_size = 16usize;
+            let buf_size = max_events as usize * event_size;
+            let mut buf = alloc::vec![0u8; buf_size];
+            // Syscall 0x9C: drain telemetry
+            let drained = unsafe {
+                libfolk::syscall::syscall2(0x9C, buf.as_mut_ptr() as u64, max_events as u64) as usize
+            };
+            if drained == 0 { return 0; }
+            let copy_bytes = drained * event_size;
+            if mem.write(&mut caller, buf_ptr as usize, &buf[..copy_bytes]).is_ok() {
+                drained as i32
+            } else { 0 }
+        },
+    );
+
     // Phase 15: Tensor Write — Modify weights in TDMP mailbox (DANGEROUS)
     // folk_tensor_write(sector_offset, byte_offset, value_bits) -> i32
     // Writes a single f32 value to the TDMP data sectors on VirtIO-blk.
@@ -1597,6 +1624,11 @@ fn register_shadow_functions(linker: &mut Linker<ShadowState>) {
     );
     let _ = linker.func_wrap("env", "folk_surface_present",
         |_: Caller<ShadowState>| {},
+    );
+
+    // Telemetry poll — empty in shadow
+    let _ = linker.func_wrap("env", "folk_telemetry_poll",
+        |_: Caller<ShadowState>, _b: i32, _m: i32| -> i32 { 0 },
     );
 
     // Tensor write — no-op in shadow
