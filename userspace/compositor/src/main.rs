@@ -23,6 +23,8 @@ mod allocator;
 mod util;
 mod ui_dump;
 mod ipc_helpers;
+mod iqe;
+mod god_mode;
 
 use util::*;
 use ui_dump::*;
@@ -664,86 +666,8 @@ fn main() -> ! {
             write_str("[LOOP ALIVE]\n");
         }
 
-        // ===== IQE: Poll telemetry events =====
-        if tsc_per_us > 0 {
-            let n = libfolk::sys::iqe_read(&mut iqe.buf, 12);
-            // Debug: log IQE poll result (first 3 only)
-            static mut IQE_DBG: u32 = 0;
-            if n > 0 { unsafe {
-                if IQE_DBG < 3 {
-                    write_str("[IQE-POLL] n=");
-                    write_char(b'0' + n as u8);
-                    write_str("\n");
-                    IQE_DBG += 1;
-                }
-            }}
-            for i in 0..n {
-                let base = i * 24;
-                let etype = iqe.buf[base];
-                let tsc = u64::from_le_bytes([
-                    iqe.buf[base+8], iqe.buf[base+9], iqe.buf[base+10], iqe.buf[base+11],
-                    iqe.buf[base+12], iqe.buf[base+13], iqe.buf[base+14], iqe.buf[base+15],
-                ]);
-                match etype {
-                    5 => { iqe.last_kbd_tsc = tsc; }       // KeyboardIrq
-                    0 => { iqe.last_mou_tsc = tsc; }       // MouseIrq
-                    6 => { iqe.last_kbd_read_tsc = tsc; }   // KeyboardRead
-                    7 => { iqe.last_mou_read_tsc = tsc; }   // MouseRead
-                    1 => {                               // GpuFlushSubmit
-                        // Keyboard split times
-                        if iqe.last_kbd_tsc > 0 && tsc > iqe.last_kbd_tsc {
-                            let total = (tsc - iqe.last_kbd_tsc) / tsc_per_us;
-                            if total < 100_000 {
-                                iqe.ewma_kbd_us = iqe.ewma_kbd_us - (iqe.ewma_kbd_us >> 3) + (total >> 3);
-                                let mut l = [0u8; 32];
-                                let n = fmt_iqe_line(&mut l, b"KBD", total);
-                                libfolk::sys::com3_write(&l[..n]);
-                                // Split: wakeup (IRQ -> read)
-                                if iqe.last_kbd_read_tsc > iqe.last_kbd_tsc {
-                                    let wake = (iqe.last_kbd_read_tsc - iqe.last_kbd_tsc) / tsc_per_us;
-                                    let rend = if tsc > iqe.last_kbd_read_tsc { (tsc - iqe.last_kbd_read_tsc) / tsc_per_us } else { 0 };
-                                    iqe.ewma_kbd_wake = iqe.ewma_kbd_wake - (iqe.ewma_kbd_wake >> 3) + (wake >> 3);
-                                    iqe.ewma_kbd_rend = iqe.ewma_kbd_rend - (iqe.ewma_kbd_rend >> 3) + (rend >> 3);
-                                    let mut l2 = [0u8; 32];
-                                    let n2 = fmt_iqe_line(&mut l2, b"KW", wake);
-                                    libfolk::sys::com3_write(&l2[..n2]);
-                                    let mut l3 = [0u8; 32];
-                                    let n3 = fmt_iqe_line(&mut l3, b"KR", rend);
-                                    libfolk::sys::com3_write(&l3[..n3]);
-                                }
-                            }
-                            iqe.last_kbd_tsc = 0;
-                            iqe.last_kbd_read_tsc = 0;
-                        }
-                        // Mouse split times
-                        if iqe.last_mou_tsc > 0 && tsc > iqe.last_mou_tsc {
-                            let total = (tsc - iqe.last_mou_tsc) / tsc_per_us;
-                            if total < 100_000 {
-                                iqe.ewma_mou_us = iqe.ewma_mou_us - (iqe.ewma_mou_us >> 3) + (total >> 3);
-                                let mut l = [0u8; 32];
-                                let n = fmt_iqe_line(&mut l, b"MOU", total);
-                                libfolk::sys::com3_write(&l[..n]);
-                                if iqe.last_mou_read_tsc > iqe.last_mou_tsc {
-                                    let wake = (iqe.last_mou_read_tsc - iqe.last_mou_tsc) / tsc_per_us;
-                                    let rend = if tsc > iqe.last_mou_read_tsc { (tsc - iqe.last_mou_read_tsc) / tsc_per_us } else { 0 };
-                                    iqe.ewma_mou_wake = iqe.ewma_mou_wake - (iqe.ewma_mou_wake >> 3) + (wake >> 3);
-                                    iqe.ewma_mou_rend = iqe.ewma_mou_rend - (iqe.ewma_mou_rend >> 3) + (rend >> 3);
-                                    let mut l2 = [0u8; 32];
-                                    let n2 = fmt_iqe_line(&mut l2, b"MW", wake);
-                                    libfolk::sys::com3_write(&l2[..n2]);
-                                    let mut l3 = [0u8; 32];
-                                    let n3 = fmt_iqe_line(&mut l3, b"MR", rend);
-                                    libfolk::sys::com3_write(&l3[..n3]);
-                                }
-                            }
-                            iqe.last_mou_tsc = 0;
-                            iqe.last_mou_read_tsc = 0;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
+        // IQE: Poll telemetry events (moved to iqe.rs)
+        iqe::poll_telemetry(&mut iqe, tsc_per_us);
 
         // Consolidated redraw flag — any subsystem can set this
         // WASM apps need continuous redraws for animation (60fps game loop)
@@ -1841,24 +1765,9 @@ fn main() -> ! {
             }
         }
 
-        // ===== GOD MODE PIPE (COM3) — Poll for injected commands =====
-        // Read ALL pending bytes (no break — process entire buffer per frame)
-        while let Some(byte) = libfolk::sys::com3_read() {
-            if byte == b'\n' && com3_len > 0 {
-                // Complete command received — inject into omnibar dispatcher
-                if let Ok(cmd) = alloc::str::from_utf8(&com3_buf[..com3_len]) {
-                    write_str("[COM3] Inject: ");
-                    write_str(cmd);
-                    write_str("\n");
-                    com3_queue.push(alloc::string::String::from(cmd));
-                }
-                com3_len = 0;
-                did_work = true;
-                // Don't break — keep reading to drain buffer
-            } else if byte != b'\n' && byte != b'\r' && com3_len < com3_buf.len() {
-                com3_buf[com3_len] = byte;
-                com3_len += 1;
-            }
+        // GOD MODE: Poll COM3 for injected commands (moved to god_mode.rs)
+        if god_mode::poll_com3(&mut com3_buf, &mut com3_len, &mut com3_queue) {
+            did_work = true;
         }
         // COM3 God Mode: if a command is pending and WASM is fullscreen,
         // force-close the WASM app so the command can be processed by the omnibar.
