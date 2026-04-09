@@ -20,6 +20,23 @@ pub fn ap_apic_ids() -> &'static [u8] {
     unsafe { &AP_APIC_IDS[..count] }
 }
 
+// ── IOMMU / VT-d State ─────────────────────────────────────────────────
+
+/// IOMMU register base physical address (from DMAR DRHD entry)
+static mut IOMMU_BASE_ADDR: u64 = 0;
+/// Whether VT-d IOMMU hardware was detected
+static mut IOMMU_AVAILABLE: bool = false;
+
+/// Check if IOMMU hardware is available
+pub fn iommu_available() -> bool {
+    unsafe { IOMMU_AVAILABLE }
+}
+
+/// Get IOMMU register base physical address
+pub fn iommu_base() -> u64 {
+    unsafe { IOMMU_BASE_ADDR }
+}
+
 // --- ACPI table structures ---
 
 #[repr(C, packed)]
@@ -62,6 +79,28 @@ struct MadtHeader {
 }
 
 const MADT_LOCAL_APIC: u8 = 0;
+
+// ── DMAR (DMA Remapping) Table Structures ───────────────────────────────
+
+#[repr(C, packed)]
+struct DmarHeader {
+    header: SdtHeader,
+    host_address_width: u8,
+    flags: u8,
+    _reserved: [u8; 10],
+    // Variable-length remapping structures follow
+}
+
+#[repr(C, packed)]
+struct DrhdEntry {
+    entry_type: u16,   // 0 = DRHD
+    length: u16,
+    flags: u8,
+    _reserved: u8,
+    segment: u16,
+    register_base: u64,
+    // Device scope entries follow
+}
 
 #[repr(C, packed)]
 struct MadtLocalApic {
@@ -184,6 +223,67 @@ pub fn init(rsdp_addr: usize) {
     crate::serial_str!(" CPUs (");
     crate::drivers::serial::write_dec(ap_count as u32);
     crate::serial_str!(" APs)\n");
+
+    // ── IOMMU Detection: Search for DMAR table (Intel VT-d) ──
+    let dmar_virt = if rsdp.revision >= 2 {
+        let rsdp20 = unsafe { &*((hhdm + rsdp_addr) as *const Rsdp20) };
+        let xsdt_phys = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!(rsdp20.xsdt_address)) };
+        find_table_in_xsdt(hhdm, xsdt_phys as usize, b"DMAR")
+    } else {
+        let rsdt_phys = rsdp.rsdt_address as usize;
+        find_table_in_rsdt(hhdm, rsdt_phys, b"DMAR")
+    };
+
+    match dmar_virt {
+        Some(virt) => {
+            let dmar = unsafe { &*(virt as *const DmarHeader) };
+            let host_addr_width = dmar.host_address_width;
+            let flags = dmar.flags;
+            crate::serial_str!("[ACPI] DMAR found! VT-d available\n");
+            crate::serial_str!("[ACPI]   Host address width: ");
+            crate::drivers::serial::write_dec(host_addr_width as u32);
+            crate::serial_str!(", flags: ");
+            crate::drivers::serial::write_hex(flags as u64);
+            crate::drivers::serial::write_newline();
+
+            // Walk DMAR remapping structures to find DRHD (hardware unit)
+            let dmar_length = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!(dmar.header.length)) } as usize;
+            ensure_mapped(hhdm, virt - hhdm, dmar_length);
+            let mut off = virt + core::mem::size_of::<DmarHeader>();
+            let end = virt + dmar_length;
+
+            while off + 4 <= end {
+                let entry_type = unsafe { *(off as *const u16) };
+                let entry_len = unsafe { *((off + 2) as *const u16) } as usize;
+                if entry_len < 4 { break; }
+
+                if entry_type == 0 {
+                    // DRHD: DMA Remapping Hardware Unit
+                    let drhd = unsafe { &*(off as *const DrhdEntry) };
+                    let base = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!(drhd.register_base)) };
+                    let segment = drhd.segment;
+                    let flags = drhd.flags;
+                    crate::serial_str!("[ACPI]   DRHD: base=");
+                    crate::drivers::serial::write_hex(base);
+                    crate::serial_str!(" segment=");
+                    crate::drivers::serial::write_dec(segment as u32);
+                    crate::serial_str!(" flags=");
+                    crate::drivers::serial::write_hex(flags as u64);
+                    crate::drivers::serial::write_newline();
+
+                    // Store for kernel use
+                    unsafe {
+                        IOMMU_BASE_ADDR = base;
+                        IOMMU_AVAILABLE = true;
+                    }
+                }
+                off += entry_len;
+            }
+        }
+        None => {
+            crate::serial_str!("[ACPI] No DMAR table — IOMMU not available\n");
+        }
+    }
 }
 
 /// Ensure a physical address range is accessible via HHDM by mapping the page(s)

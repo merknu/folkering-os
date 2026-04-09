@@ -60,7 +60,14 @@ pub mod ui_serialize;
 pub mod vector_font;
 pub mod graphics;
 pub mod wasm_runtime;
+pub mod driver_runtime;
+pub mod folkshell;
+pub mod spatial;
+pub mod state;
+pub mod slm_runtime;
 pub mod window_manager;
+pub mod agent;
+pub mod draug;
 
 extern crate alloc;
 

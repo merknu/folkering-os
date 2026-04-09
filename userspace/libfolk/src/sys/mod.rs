@@ -20,9 +20,10 @@ pub mod ping;
 pub mod random;
 pub mod time;
 pub mod inference;
+pub mod pci;
 
 // Re-export commonly used functions at the sys level
-pub use task::{exit, yield_cpu, get_pid, spawn, parallel_gemm, ask_gemini, gpu_flush, gpu_flush_batch, gpu_vsync, gpu_info, gpu_move_cursor, com3_read, com3_write, get_rtc, get_rtc_packed, DateTime, memory_stats, iqe_read, iqe_tsc_freq};
+pub use task::{exit, yield_cpu, get_pid, spawn, parallel_gemm, ask_gemini, gpu_flush, gpu_flush_batch, gpu_vsync, gpu_info, gpu_move_cursor, com3_read, com3_write, com2_write_raw, com2_async_send, com2_async_poll, com2_async_read, com2_async_poll_legacy, wait_for_irq, get_rtc, get_rtc_packed, DateTime, memory_stats, iqe_read, iqe_tsc_freq};
 pub use io::{read_key, read_mouse, write_char, poweroff, check_interrupt, clear_interrupt, MouseEvent};
 pub use ipc::{send, receive, reply};
 pub use memory::{shmem_create, shmem_map, shmem_grant, shmem_unmap, shmem_destroy, mmap, mmap_at, munmap, PROT_READ, PROT_WRITE, PROT_EXEC, MmapError};

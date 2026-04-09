@@ -56,14 +56,25 @@ pub fn com3_write(data: &[u8]) {
 
 // ── COM2 (Gemini Proxy Channel) ─────────────────────────────────────────
 
-/// Write bytes to COM2 (Gemini proxy channel)
+/// Write bytes to COM2 (Gemini proxy channel).
+/// Uses raw port I/O. Interrupts are NOT disabled — WHPX needs VM-exits
+/// (triggered by interrupts) to process UART TX buffer. Disabling interrupts
+/// causes an infinite busy-wait deadlock.
 pub fn com2_write(data: &[u8]) {
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        let mut serial = SERIAL2.lock();
-        for &byte in data {
-            serial.send(byte);
+    for &byte in data {
+        unsafe {
+            // Wait for TX buffer empty (LSR bit 5) with timeout
+            let mut wait = 0u32;
+            loop {
+                let lsr: u8 = x86_64::instructions::port::Port::<u8>::new(0x2F8 + 5).read();
+                if lsr & 0x20 != 0 { break; }
+                wait += 1;
+                if wait > 1_000_000 { break; } // Safety timeout — don't hang forever
+                core::hint::spin_loop();
+            }
+            x86_64::instructions::port::Port::<u8>::new(0x2F8).write(byte);
         }
-    });
+    }
 }
 
 /// Read a byte from COM2 (non-blocking). Returns None if no data.
@@ -123,6 +134,117 @@ pub fn com2_read_until(delimiter: &[u8], buf: &mut [u8], timeout_ms: u64) -> usi
         for _ in 0..100 { core::hint::spin_loop(); }
     }
     pos
+}
+
+// ── COM2 Async Ring Buffer ──────────────────────────────────────────────
+// Non-blocking COM2 I/O for the compositor: send request, poll for response
+// without blocking the main event loop.
+
+use core::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
+
+const COM2_RING_SIZE: usize = 131072; // 128KB — enough for WASM base64 payloads
+static mut COM2_RX_RING: [u8; COM2_RING_SIZE] = [0; COM2_RING_SIZE];
+static COM2_RX_HEAD: AtomicUsize = AtomicUsize::new(0); // write position
+static COM2_RX_TAIL: AtomicUsize = AtomicUsize::new(0); // read position
+static COM2_ASYNC_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Start async COM2 session: send request bytes, then enable background polling.
+/// Call com2_async_poll() each frame to drain COM2 RX into the ring buffer.
+pub fn com2_async_send(data: &[u8]) {
+    // Reset ring buffer
+    COM2_RX_HEAD.store(0, Ordering::Release);
+    COM2_RX_TAIL.store(0, Ordering::Release);
+    // Write request to COM2
+    com2_write(data);
+    // Enable async polling
+    COM2_ASYNC_ACTIVE.store(true, Ordering::Release);
+}
+
+/// Poll COM2 RX (non-blocking). Call this every frame from the compositor.
+/// Drains any available COM2 bytes into the ring buffer.
+pub fn com2_async_poll() {
+    if !COM2_ASYNC_ACTIVE.load(Ordering::Acquire) {
+        return;
+    }
+    // Drain all available COM2 bytes into ring (up to 4096 per poll to avoid starving the main loop)
+    for _ in 0..4096 {
+        if let Some(byte) = com2_read_byte() {
+            let head = COM2_RX_HEAD.load(Ordering::Relaxed);
+            if head < COM2_RING_SIZE {
+                unsafe { COM2_RX_RING[head] = byte; }
+                COM2_RX_HEAD.store(head + 1, Ordering::Release);
+            }
+            // else: ring full, drop byte (shouldn't happen with 128KB)
+        } else {
+            break; // No more data available
+        }
+    }
+}
+
+/// Check if async COM2 response contains a 0x00 sentinel (COBS frame delimiter).
+/// Returns Some(len) = frame length BEFORE the sentinel, None if still waiting.
+/// Also supports legacy @@END@@ delimiter for backward compatibility.
+pub fn com2_async_check_sentinel() -> Option<usize> {
+    if !COM2_ASYNC_ACTIVE.load(Ordering::Acquire) {
+        return None;
+    }
+    let head = COM2_RX_HEAD.load(Ordering::Acquire);
+    if head == 0 {
+        return None;
+    }
+    let ring = unsafe { &COM2_RX_RING[..head] };
+    // Search for 0x00 sentinel (COBS frame end)
+    for i in 0..head {
+        if ring[i] == 0x00 {
+            return Some(i); // Length of COBS-encoded data before sentinel
+        }
+    }
+    None
+}
+
+/// Legacy: check for @@END@@ delimiter (backward compat with old protocol)
+pub fn com2_async_check_legacy() -> Option<usize> {
+    if !COM2_ASYNC_ACTIVE.load(Ordering::Acquire) {
+        return None;
+    }
+    let head = COM2_RX_HEAD.load(Ordering::Acquire);
+    let delimiter = b"@@END@@";
+    if head < delimiter.len() {
+        return None;
+    }
+    let ring = unsafe { &COM2_RX_RING[..head] };
+    for i in 0..=(head - delimiter.len()) {
+        if &ring[i..i + delimiter.len()] == delimiter {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Read async COM2 response data into userspace buffer.
+/// Resets the ring buffer position but keeps async mode ACTIVE for next frame.
+/// Returns number of bytes copied.
+pub fn com2_async_read(buf: &mut [u8], len: usize) -> usize {
+    let head = COM2_RX_HEAD.load(Ordering::Acquire);
+    let copy_len = len.min(buf.len()).min(head);
+    let ring = unsafe { &COM2_RX_RING[..copy_len] };
+    buf[..copy_len].copy_from_slice(ring);
+    // Reset ring position for next frame — but keep ACTIVE so polling continues!
+    COM2_RX_HEAD.store(0, Ordering::Release);
+    COM2_RX_TAIL.store(0, Ordering::Release);
+    // DO NOT set ASYNC_ACTIVE to false — we want to keep receiving
+    copy_len
+}
+
+/// Cancel async COM2 session.
+pub fn com2_async_cancel() {
+    COM2_ASYNC_ACTIVE.store(false, Ordering::Release);
+    COM2_RX_HEAD.store(0, Ordering::Release);
+}
+
+/// Check if async COM2 session is active.
+pub fn com2_async_is_active() -> bool {
+    COM2_ASYNC_ACTIVE.load(Ordering::Acquire)
 }
 
 /// Print formatted arguments to serial console

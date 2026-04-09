@@ -62,11 +62,11 @@ pub enum BarType {
 }
 
 /// Discovered PCI devices
-static PCI_DEVICES: Mutex<PciDeviceList> = Mutex::new(PciDeviceList::new());
+pub static PCI_DEVICES: Mutex<PciDeviceList> = Mutex::new(PciDeviceList::new());
 
-struct PciDeviceList {
-    devices: [Option<PciDevice>; 64],
-    count: usize,
+pub struct PciDeviceList {
+    pub devices: [Option<PciDevice>; 64],
+    pub count: usize,
 }
 
 impl PciDeviceList {

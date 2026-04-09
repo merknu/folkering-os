@@ -427,6 +427,18 @@ pub fn memory_stats() -> (usize, usize) {
     (total, free)
 }
 
+/// Allocate contiguous physical pages for DMA.
+/// Rounds up to nearest power-of-2 order.
+pub fn alloc_contiguous(num_pages: usize) -> Option<usize> {
+    if num_pages == 0 { return None; }
+    // Find smallest order that satisfies: 2^order >= num_pages
+    let mut order = 0;
+    while (1 << order) < num_pages && order < 10 {
+        order += 1;
+    }
+    alloc_pages(order)
+}
+
 /// Allocate a single page (convenience wrapper)
 #[inline]
 pub fn alloc_page() -> Option<usize> {

@@ -26,6 +26,20 @@ lazy_static! {
         // VirtIO block device interrupt (vector 45)
         idt[45].set_handler_fn(virtio_blk_interrupt_handler);
 
+        // WASM driver IRQ vectors (46-63) — dynamically bound to tasks
+        idt[46].set_handler_fn(wasm_irq_handler_46);
+        idt[47].set_handler_fn(wasm_irq_handler_47);
+        idt[48].set_handler_fn(wasm_irq_handler_48);
+        idt[49].set_handler_fn(wasm_irq_handler_49);
+        idt[50].set_handler_fn(wasm_irq_handler_50);
+        idt[51].set_handler_fn(wasm_irq_handler_51);
+        idt[52].set_handler_fn(wasm_irq_handler_52);
+        idt[53].set_handler_fn(wasm_irq_handler_53);
+        idt[54].set_handler_fn(wasm_irq_handler_54);
+        idt[55].set_handler_fn(wasm_irq_handler_55);
+        idt[56].set_handler_fn(wasm_irq_handler_56);
+        idt[57].set_handler_fn(wasm_irq_handler_57);
+
         idt
     };
 }
@@ -126,3 +140,34 @@ extern "x86-interrupt" fn virtio_blk_interrupt_handler(_stack_frame: InterruptSt
     // Handle VirtIO block device interrupt
     crate::drivers::virtio_blk::irq_handler();
 }
+
+// ── WASM Driver IRQ Handlers (vectors 46-57) ────────────────────────────
+// Each handler: signal the binding table + mask at IOAPIC + send APIC EOI.
+// The WASM driver will unmask via folk_ack_irq when it's done processing.
+
+macro_rules! wasm_irq_handler {
+    ($name:ident, $vector:expr) => {
+        extern "x86-interrupt" fn $name(_stack_frame: InterruptStackFrame) {
+            // Signal the IRQ binding table (sets pending flag)
+            super::syscall::signal_irq($vector);
+            // Mask this IRQ at IOAPIC to prevent storm (driver unmasks via ACK)
+            let irq = $vector - 46; // IRQ line = vector - base
+            super::ioapic::disable_irq(irq);
+            // Send EOI to LAPIC
+            super::apic::send_eoi();
+        }
+    };
+}
+
+wasm_irq_handler!(wasm_irq_handler_46, 46);
+wasm_irq_handler!(wasm_irq_handler_47, 47);
+wasm_irq_handler!(wasm_irq_handler_48, 48);
+wasm_irq_handler!(wasm_irq_handler_49, 49);
+wasm_irq_handler!(wasm_irq_handler_50, 50);
+wasm_irq_handler!(wasm_irq_handler_51, 51);
+wasm_irq_handler!(wasm_irq_handler_52, 52);
+wasm_irq_handler!(wasm_irq_handler_53, 53);
+wasm_irq_handler!(wasm_irq_handler_54, 54);
+wasm_irq_handler!(wasm_irq_handler_55, 55);
+wasm_irq_handler!(wasm_irq_handler_56, 56);
+wasm_irq_handler!(wasm_irq_handler_57, 57);

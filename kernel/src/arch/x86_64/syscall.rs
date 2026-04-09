@@ -961,7 +961,7 @@ extern "C" fn syscall_handler(
         0x52 => syscall_get_time(),
         0x53 => syscall_get_random(arg1, arg2),
         // Milestone 30-32: HTTPS, GitHub & Clone
-        0x54 => syscall_https_test(),
+        0x54 => syscall_https_test(arg1),
         0x55 => syscall_github_fetch(arg1, arg2, arg3, arg4),
         0x56 => syscall_github_clone(arg1, arg2, arg3, arg4),
         // SMP: Parallel GEMM
@@ -1016,6 +1016,76 @@ extern "C" fn syscall_handler(
             }
             0
         },
+        // Async COM2: send + activate RX polling. len=0 activates polling without sending.
+        0x96 => {
+            let len = (arg2 as usize).min(8192);
+            if len == 0 {
+                // Activate RX polling only (no TX)
+                crate::drivers::serial::com2_async_send(&[]);
+                0
+            } else {
+                let ptr = arg1 as *const u8;
+                if !ptr.is_null() && arg1 >= 0x200000 && arg1 < 0xFFFF_8000_0000_0000 {
+                    let data = unsafe { core::slice::from_raw_parts(ptr, len) };
+                    crate::drivers::serial::com2_async_send(data);
+                    0
+                } else {
+                    u64::MAX
+                }
+            }
+        },
+        // Async COM2: poll for RX bytes + check for 0x00 COBS sentinel
+        // arg1: 0 = COBS sentinel (0x00), 1 = legacy @@END@@ delimiter
+        // Returns: 0 = still waiting, >0 = frame length before delimiter
+        0x97 => {
+            crate::drivers::serial::com2_async_poll();
+            let use_legacy = arg1 == 1;
+            let result = if use_legacy {
+                crate::drivers::serial::com2_async_check_legacy()
+            } else {
+                crate::drivers::serial::com2_async_check_sentinel()
+            };
+            match result {
+                Some(len) => len as u64,
+                None => 0,
+            }
+        },
+        // Async COM2: read response into userspace buffer, arg1=buf_ptr, arg2=max_len
+        // Returns bytes copied
+        0x98 => {
+            let max_len = arg2 as usize;
+            let ptr = arg1 as *mut u8;
+            if !ptr.is_null() && arg1 >= 0x200000 && arg1 < 0xFFFF_8000_0000_0000 && max_len > 0 {
+                let buf = unsafe { core::slice::from_raw_parts_mut(ptr, max_len.min(131072)) };
+                crate::drivers::serial::com2_async_read(buf, max_len) as u64
+            } else {
+                u64::MAX
+            }
+        },
+        // Wait for interrupt (HLT). Enables interrupts, halts CPU, wakes on ANY IRQ.
+        // This is the correct idle primitive under WHPX: causes VM-exit so hypervisor
+        // can inject pending interrupts (mouse, keyboard, timer).
+        0x99 => {
+            // Poll network stack before halting (replaces timer-ISR polling
+            // which caused #GP from misaligned SSE in smoltcp)
+            crate::net::poll();
+            unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)); }
+            0
+        },
+        // COM2 raw TX write (does NOT reset async RX state).
+        // Used for MCP frames (send without disrupting RX polling).
+        // arg1=buf_ptr, arg2=len (max 8KB)
+        0x9A => {
+            let len = (arg2 as usize).min(8192);
+            let ptr = arg1 as *const u8;
+            if !ptr.is_null() && arg1 >= 0x200000 && arg1 < 0xFFFF_8000_0000_0000 && len > 0 {
+                let data = unsafe { core::slice::from_raw_parts(ptr, len) };
+                crate::drivers::serial::com2_write(data);
+                len as u64
+            } else {
+                u64::MAX
+            }
+        },
         // COM3 write: export telemetry to host (arg1=buf_ptr, arg2=len)
         0x94 => {
             let len = (arg2 as usize).min(64); // cap at 64 bytes for safety
@@ -1029,6 +1099,34 @@ extern "C" fn syscall_handler(
             }
             len as u64
         },
+        // Phase 10: Hardware Discovery — PCI device enumeration for WASM drivers
+        // arg1 = userspace buffer ptr, arg2 = buffer size in bytes
+        // Returns: number of devices written, or u64::MAX on error
+        // Each device is 64 bytes (PciDeviceUserInfo struct)
+        0xA0 => syscall_pci_enumerate(arg1, arg2),
+        // Phase 10: Capability-gated Port I/O for WASM drivers
+        // arg1 = port number, arg2 = value (for OUT), returns value (for IN)
+        0xA1 => syscall_port_inb(arg1),     // IN byte
+        0xA2 => syscall_port_inw(arg1),     // IN word
+        0xA3 => syscall_port_inl(arg1),     // IN dword
+        0xA4 => syscall_port_outb(arg1, arg2), // OUT byte
+        0xA5 => syscall_port_outw(arg1, arg2), // OUT word
+        0xA6 => syscall_port_outl(arg1, arg2), // OUT dword
+        // Phase 10: IRQ routing for WASM drivers
+        0xA7 => syscall_bind_irq(arg1, arg2),  // Bind IRQ vector to task
+        0xA8 => syscall_ack_irq(arg1),          // Acknowledge IRQ (unmask)
+        0xA9 => syscall_check_irq(arg1),         // Check if IRQ fired (non-blocking)
+        // Phase 10: DMA + IOMMU
+        0xAA => syscall_dma_alloc(arg1, arg2),   // Allocate DMA buffer (size, vaddr)
+        0xAB => syscall_iommu_status(),            // Query IOMMU availability
+        // Phase 11: WASM Network Driver Bridge
+        0xAC => syscall_net_register(arg1, arg2),    // Register WASM net driver (mac_hi, mac_lo)
+        0xAD => syscall_net_submit_rx(arg1, arg2),   // Submit received packet (vaddr, len)
+        0xAE => syscall_net_poll_tx(arg1, arg2),     // Poll for TX packet (vaddr, max_len)
+        0xAF => syscall_dma_sync_read(arg1, arg2),  // Read physical memory via HHDM
+        0xB0 => syscall_net_dma_rx(arg1, arg2),     // Kernel-assisted RX: read DMA + deliver to smoltcp
+        0xB1 => syscall_dma_sync_write(arg1, arg2), // Write to physical memory via HHDM
+        0xB2 => syscall_net_metrics(arg1, arg2),    // OS metrics for AI introspection
         _ => {
             crate::drivers::serial::write_str("[HANDLER] Invalid syscall!\n");
             u64::MAX // Return error
@@ -1656,23 +1754,20 @@ fn syscall_block_write(sector: u64, buf_ptr: u64, count: u64) -> u64 {
     use crate::drivers::virtio_blk;
 
     if !virtio_blk::is_initialized() {
-        return u64::MAX; // No block device
+        return u64::MAX;
     }
 
     if buf_ptr == 0 || count == 0 || count > 128 {
-        return u64::MAX; // EINVAL
+        return u64::MAX;
     }
 
     let buf_len = (count as usize) * virtio_blk::SECTOR_SIZE;
 
-    // Validate userspace pointer
     if buf_ptr >= 0x0000_8000_0000_0000 {
-        return u64::MAX; // EFAULT
+        return u64::MAX;
     }
 
     let current_task = crate::task::task::get_current_task();
-
-    // Write journal entry before actual write (crash recovery)
     let _ = virtio_blk::write_journal_entry(current_task, 1, sector, count);
 
     let buf = unsafe {
@@ -1854,13 +1949,31 @@ fn syscall_github_clone(user_ptr: u64, user_len: u64, repo_ptr: u64, repo_len: u
     ((size as u64) << 32) | (handle as u64)
 }
 
-/// Test HTTPS connection to a hardcoded Google IP
-fn syscall_https_test() -> u64 {
-    // Google IP (hardcoded to bypass DNS)
-    let ip = [142, 250, 74, 142];
-    match crate::net::tls::https_get(ip, "www.google.com", "/") {
-        Ok(()) => 0,
-        Err(_) => u64::MAX,
+/// HTTPS test — TLS handshake only (DNS done by caller).
+/// Uses the already-resolved IP from the DNS lookup syscall.
+fn syscall_https_test(ip_packed: u64) -> u64 {
+    // Use DNS-resolved IP if provided, otherwise fallback
+    let ip = if ip_packed != 0 {
+        [
+            (ip_packed >> 24) as u8,
+            (ip_packed >> 16) as u8,
+            (ip_packed >> 8) as u8,
+            ip_packed as u8,
+        ]
+    } else {
+        [93, 184, 215, 14] // example.com fallback
+    };
+    crate::serial_str!("[TLS] HTTPS GET to example.com...");
+    match crate::net::tls::https_get(ip, "example.com", "/") {
+        Ok(()) => {
+            crate::serial_strln!("[TLS] HTTPS SUCCESS!");
+            0
+        }
+        Err(e) => {
+            crate::serial_str!("[TLS] HTTPS failed: ");
+            crate::serial_strln!(e);
+            u64::MAX
+        }
     }
 }
 
@@ -2623,14 +2736,14 @@ fn syscall_map_physical(phys_addr: u64, virt_addr: u64, size: u64, flags: u64, _
         return u64::MAX;
     }
 
-    // Check capability
-    if !capability::has_framebuffer_access(task_id, phys_addr, size) {
-        crate::serial_str!("[MAP_PHYSICAL] Error: No framebuffer capability for task ");
+    // Check capability — allow framebuffer AND PCI MMIO BAR regions
+    // PCI MMIO BARs are typically above 0xF0000000 (MMIO hole)
+    let is_pci_mmio = phys_addr >= 0xF000_0000 && size <= 1024 * 1024; // Max 1MB BAR
+    if !is_pci_mmio && !capability::has_framebuffer_access(task_id, phys_addr, size) {
+        crate::serial_str!("[MAP_PHYSICAL] Error: No capability for task ");
         crate::drivers::serial::write_dec(task_id);
         crate::serial_str!(" phys=");
         crate::drivers::serial::write_hex(phys_addr);
-        crate::serial_str!(" size=");
-        crate::drivers::serial::write_hex(size);
         crate::drivers::serial::write_newline();
         return u64::MAX;
     }
@@ -2685,4 +2798,703 @@ fn syscall_map_physical(phys_addr: u64, virt_addr: u64, size: u64, flags: u64, _
 
     crate::serial_println!("[MAP_PHYSICAL] Successfully mapped {} pages", num_pages);
     0
+}
+
+// ===== Phase 10: PCI Enumeration for WASM Drivers =====
+
+/// Compact PCI device info for userspace (64 bytes, C-repr)
+/// This is the bridge between kernel PCI discovery and WASM driver generation.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PciDeviceUserInfo {
+    vendor_id: u16,       // 0
+    device_id: u16,       // 2
+    class_code: u8,       // 4
+    subclass: u8,         // 5
+    prog_if: u8,          // 6
+    revision: u8,         // 7
+    header_type: u8,      // 8
+    interrupt_line: u8,   // 9
+    interrupt_pin: u8,    // 10
+    bus: u8,              // 11
+    device: u8,           // 12
+    function: u8,         // 13
+    capabilities_ptr: u8, // 14
+    _pad: u8,             // 15
+    bar_addrs: [u64; 3],  // 16-39: BAR physical addresses (MMIO base, decoded)
+    bar_sizes: [u32; 6],  // 40-63: BAR sizes in bytes
+}
+
+/// Syscall 0xA0: Enumerate PCI devices into userspace buffer.
+/// arg1 = userspace buffer ptr, arg2 = buffer size
+/// Returns number of devices written.
+fn syscall_pci_enumerate(buf_ptr: u64, buf_size: u64) -> u64 {
+    let entry_size = core::mem::size_of::<PciDeviceUserInfo>();
+    let max_entries = (buf_size as usize) / entry_size;
+
+    if buf_ptr < 0x200000 || buf_ptr >= 0xFFFF_8000_0000_0000 || max_entries == 0 {
+        return u64::MAX;
+    }
+
+    let list = crate::drivers::pci::PCI_DEVICES.lock();
+    let mut written = 0usize;
+
+    for i in 0..list.count.min(max_entries) {
+        if let Some(ref dev) = list.devices[i] {
+            // Decode BARs into physical addresses
+            let mut bar_addrs = [0u64; 3];
+            let mut bar_sizes = [0u32; 6];
+
+            for b in 0..6 {
+                bar_sizes[b] = crate::drivers::pci::bar_size(dev.bus, dev.device, dev.function, b as u8);
+                match crate::drivers::pci::decode_bar(dev, b) {
+                    crate::drivers::pci::BarType::Mmio32 { base, .. } => {
+                        if b < 3 { bar_addrs[b] = base as u64; }
+                    }
+                    crate::drivers::pci::BarType::Mmio64 { base, .. } => {
+                        if b < 3 { bar_addrs[b] = base; }
+                    }
+                    crate::drivers::pci::BarType::Io { base } => {
+                        if b < 3 { bar_addrs[b] = base as u64 | 0x1_0000_0000; } // Flag: bit 32 = I/O
+                    }
+                    crate::drivers::pci::BarType::None => {}
+                }
+            }
+
+            let info = PciDeviceUserInfo {
+                vendor_id: dev.vendor_id,
+                device_id: dev.device_id,
+                class_code: dev.class_code,
+                subclass: dev.subclass,
+                prog_if: dev.prog_if,
+                revision: dev.revision,
+                header_type: dev.header_type,
+                interrupt_line: dev.interrupt_line,
+                interrupt_pin: dev.interrupt_pin,
+                bus: dev.bus,
+                device: dev.device,
+                function: dev.function,
+                capabilities_ptr: dev.capabilities_ptr,
+                _pad: 0,
+                bar_addrs,
+                bar_sizes,
+            };
+
+            // Write to userspace buffer
+            let dest = (buf_ptr as usize) + written * entry_size;
+            unsafe {
+                let src = &info as *const PciDeviceUserInfo as *const u8;
+                let dst = dest as *mut u8;
+                core::ptr::copy_nonoverlapping(src, dst, entry_size);
+            }
+            written += 1;
+        }
+    }
+
+    crate::serial_str!("[PCI] Enumerated ");
+    crate::drivers::serial::write_dec(written as u32);
+    crate::serial_strln!(" devices to userspace");
+
+    written as u64
+}
+
+// ===== Phase 10: Capability-Gated Port I/O =====
+//
+// These syscalls validate that the requested port falls within a known
+// PCI device's I/O BAR range. This implements the seL4-style capability
+// model: userspace WASM drivers can only touch ports they're authorized for.
+//
+// BLOCKED ports (kernel-reserved):
+//   0x0020-0x0021: PIC1
+//   0x00A0-0x00A1: PIC2
+//   0x0040-0x0043: PIT timer
+//   0x0060, 0x0064: PS/2 keyboard/mouse controller
+//   0x0070-0x0071: CMOS/RTC
+//   0x03F8-0x03FF: COM1 (kernel serial log)
+//   0x02F8-0x02FF: COM2 (MCP proxy)
+//   0x03E8-0x03EF: COM3 (God Mode pipe)
+//   0x0CF8-0x0CFF: PCI configuration space
+
+/// Check if a port is within a known PCI device's I/O BAR range.
+/// Returns true if the port is permitted for userspace access.
+fn port_io_allowed(port: u16) -> bool {
+    // Blocklist: kernel-critical ports
+    match port {
+        0x0020..=0x0021 => return false, // PIC1
+        0x00A0..=0x00A1 => return false, // PIC2
+        0x0040..=0x0043 => return false, // PIT
+        0x0060 | 0x0064 => return false, // PS/2
+        0x0070..=0x0071 => return false, // CMOS
+        0x03F8..=0x03FF => return false, // COM1
+        0x02F8..=0x02FF => return false, // COM2
+        0x03E8..=0x03EF => return false, // COM3
+        0x0CF8..=0x0CFF => return false, // PCI config
+        _ => {}
+    }
+
+    // Allowlist: check PCI device I/O BARs
+    let list = crate::drivers::pci::PCI_DEVICES.lock();
+    for i in 0..list.count {
+        if let Some(ref dev) = list.devices[i] {
+            for bar_idx in 0..6u8 {
+                let bar_val = dev.bars[bar_idx as usize];
+                if bar_val & 1 != 0 {
+                    // I/O BAR: base is bits 2-15, size from bar_size()
+                    let base = (bar_val & 0xFFFC) as u16;
+                    let size = crate::drivers::pci::bar_size(
+                        dev.bus, dev.device, dev.function, bar_idx
+                    ) as u16;
+                    if size > 0 && port >= base && port < base.saturating_add(size) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    false
+}
+
+// ===== Phase 10: IRQ Routing for WASM Drivers =====
+//
+// Binding table: maps IDT vector → task_id + pending flag.
+// When an interrupt fires, the IDT handler sets the pending flag.
+// Userspace polls via SYS_CHECK_IRQ (non-blocking) or uses HLT + poll.
+// This is the MINIX-3 pattern adapted for wasmi call_resumable.
+
+/// Maximum bindable IRQ vectors (vectors 46-63 for WASM drivers)
+const MAX_IRQ_BINDINGS: usize = 24;
+/// First vector available for WASM driver binding
+const WASM_IRQ_BASE_VECTOR: u8 = 46;
+
+/// IRQ binding entry
+struct IrqBinding {
+    vector: u8,       // IDT vector number
+    task_id: u32,     // Bound userspace task
+    pending: bool,    // Set by IDT handler, cleared by ACK
+    active: bool,     // Binding is live
+}
+
+/// Global IRQ binding table (accessed from IDT handlers and syscalls)
+static IRQ_BINDINGS: spin::Mutex<[IrqBinding; MAX_IRQ_BINDINGS]> = spin::Mutex::new({
+    const EMPTY: IrqBinding = IrqBinding { vector: 0, task_id: 0, pending: false, active: false };
+    [EMPTY; MAX_IRQ_BINDINGS]
+});
+
+/// Called from IDT handlers to signal a bound IRQ.
+/// Sets the pending flag so userspace can detect it via poll.
+pub fn signal_irq(vector: u8) {
+    // Fast path: direct array index
+    let idx = vector.wrapping_sub(WASM_IRQ_BASE_VECTOR) as usize;
+    if idx < MAX_IRQ_BINDINGS {
+        if let Some(mut bindings) = IRQ_BINDINGS.try_lock() {
+            if bindings[idx].active && bindings[idx].vector == vector {
+                bindings[idx].pending = true;
+            }
+        }
+        // If lock fails (contention from nested IRQ), the signal is lost.
+        // Acceptable: hardware will re-assert level-triggered interrupts.
+    }
+}
+
+/// Syscall 0xA7: Bind an IRQ vector to the calling task.
+/// arg1 = PCI interrupt_line (will be mapped to a vector)
+/// arg2 = 0 (reserved)
+/// Returns: the IDT vector number assigned, or u64::MAX on error.
+fn syscall_bind_irq(irq_line: u64, _reserved: u64) -> u64 {
+    let irq = irq_line as u8;
+    let task_id = crate::task::task::get_current_task();
+
+    // Map IRQ line to an IDT vector (base + offset)
+    // IRQ lines 0-23 map to vectors WASM_IRQ_BASE_VECTOR + irq
+    if irq >= MAX_IRQ_BINDINGS as u8 {
+        crate::serial_strln!("[IRQ] Bind failed: IRQ line out of range");
+        return u64::MAX;
+    }
+
+    let vector = WASM_IRQ_BASE_VECTOR + irq;
+    let idx = irq as usize;
+
+    {
+        let mut bindings = IRQ_BINDINGS.lock();
+        bindings[idx] = IrqBinding {
+            vector,
+            task_id,
+            pending: false,
+            active: true,
+        };
+    }
+
+    // Enable the IRQ at the IOAPIC (level-triggered for PCI)
+    super::ioapic::enable_irq_level(irq, vector);
+
+    crate::serial_str!("[IRQ] Bound IRQ");
+    crate::drivers::serial::write_dec(irq as u32);
+    crate::serial_str!(" -> vector ");
+    crate::drivers::serial::write_dec(vector as u32);
+    crate::serial_str!(" for task ");
+    crate::drivers::serial::write_dec(task_id);
+    crate::serial_strln!("");
+
+    vector as u64
+}
+
+/// Syscall 0xA8: Acknowledge an IRQ (clear pending + unmask at IOAPIC).
+/// arg1 = IRQ line number
+fn syscall_ack_irq(irq_line: u64) -> u64 {
+    let irq = irq_line as u8;
+    let idx = irq as usize;
+
+    if idx >= MAX_IRQ_BINDINGS { return u64::MAX; }
+
+    {
+        let mut bindings = IRQ_BINDINGS.lock();
+        if bindings[idx].active {
+            bindings[idx].pending = false;
+        }
+    }
+
+    // Re-enable at IOAPIC (was masked by handler)
+    let vector = WASM_IRQ_BASE_VECTOR + irq;
+    super::ioapic::enable_irq_level(irq, vector);
+
+    0
+}
+
+/// Syscall 0xA9: Check if a bound IRQ has fired (non-blocking poll).
+/// arg1 = IRQ line number
+/// Returns: 1 if pending, 0 if not, u64::MAX if not bound.
+fn syscall_check_irq(irq_line: u64) -> u64 {
+    let idx = irq_line as usize;
+    if idx >= MAX_IRQ_BINDINGS { return u64::MAX; }
+
+    let bindings = IRQ_BINDINGS.lock();
+    if !bindings[idx].active { return u64::MAX; }
+    if bindings[idx].pending { 1 } else { 0 }
+}
+
+/// Syscall 0xA1: Read byte from I/O port (capability-gated)
+fn syscall_port_inb(port: u64) -> u64 {
+    let port = port as u16;
+    if !port_io_allowed(port) {
+        return u64::MAX;
+    }
+    unsafe {
+        let mut p = x86_64::instructions::port::Port::<u8>::new(port);
+        p.read() as u64
+    }
+}
+
+/// Syscall 0xA2: Read word from I/O port (capability-gated)
+fn syscall_port_inw(port: u64) -> u64 {
+    let port = port as u16;
+    if !port_io_allowed(port) {
+        return u64::MAX;
+    }
+    unsafe {
+        let mut p = x86_64::instructions::port::Port::<u16>::new(port);
+        p.read() as u64
+    }
+}
+
+/// Syscall 0xA3: Read dword from I/O port (capability-gated)
+fn syscall_port_inl(port: u64) -> u64 {
+    let port = port as u16;
+    if !port_io_allowed(port) {
+        return u64::MAX;
+    }
+    unsafe {
+        let mut p = x86_64::instructions::port::Port::<u32>::new(port);
+        p.read() as u64
+    }
+}
+
+/// Syscall 0xA4: Write byte to I/O port (capability-gated)
+fn syscall_port_outb(port: u64, value: u64) -> u64 {
+    let port = port as u16;
+    if !port_io_allowed(port) {
+        return u64::MAX;
+    }
+    unsafe {
+        let mut p = x86_64::instructions::port::Port::<u8>::new(port);
+        p.write(value as u8);
+    }
+    0
+}
+
+/// Syscall 0xA5: Write word to I/O port (capability-gated)
+fn syscall_port_outw(port: u64, value: u64) -> u64 {
+    let port = port as u16;
+    if !port_io_allowed(port) {
+        return u64::MAX;
+    }
+    unsafe {
+        let mut p = x86_64::instructions::port::Port::<u16>::new(port);
+        p.write(value as u16);
+    }
+    0
+}
+
+/// Syscall 0xA6: Write dword to I/O port (capability-gated)
+fn syscall_port_outl(port: u64, value: u64) -> u64 {
+    let port = port as u16;
+    if !port_io_allowed(port) {
+        return u64::MAX;
+    }
+    unsafe {
+        let mut p = x86_64::instructions::port::Port::<u32>::new(port);
+        p.write(value as u32);
+    }
+    0
+}
+
+// ===== Phase 10: DMA Buffer Allocation + IOMMU Status =====
+
+/// Syscall 0xAA: Allocate a contiguous physical DMA buffer.
+/// arg1 = size (bytes, rounded up to page boundary)
+/// arg2 = virtual address to map at in caller's address space
+/// Returns: physical address of buffer, or u64::MAX on error.
+///
+/// The physical memory is allocated contiguously (required for DMA).
+/// When IOMMU is available, it would also set up IOMMU page tables.
+fn syscall_dma_alloc(size: u64, vaddr: u64) -> u64 {
+    let num_pages = ((size as usize) + 4095) / 4096;
+    if num_pages == 0 || num_pages > 256 { // Max 1MB DMA buffer
+        return u64::MAX;
+    }
+    if vaddr < 0x200000 || vaddr >= 0xFFFF_8000_0000_0000 {
+        return u64::MAX;
+    }
+
+    // Allocate contiguous physical pages
+    // Use the physical allocator to get a contiguous block
+    let phys_addr = match crate::memory::physical::alloc_contiguous(num_pages) {
+        Some(addr) => addr,
+        None => {
+            crate::serial_strln!("[DMA] Failed to allocate contiguous memory");
+            return u64::MAX;
+        }
+    };
+
+    // Map into caller's address space with Uncacheable attributes (for DMA)
+    use crate::memory::paging;
+    use crate::task::task::{get_current_task, get_task};
+    use x86_64::structures::paging::PageTableFlags as Ptf;
+    let task_id = get_current_task();
+    let pml4_phys = match get_task(task_id) {
+        Some(task) => task.lock().page_table_phys,
+        None => return u64::MAX,
+    };
+
+    let ptf = Ptf::PRESENT | Ptf::WRITABLE | Ptf::USER_ACCESSIBLE | Ptf::NO_EXECUTE
+        | Ptf::WRITE_THROUGH | Ptf::NO_CACHE;
+
+    for i in 0..num_pages {
+        let virt = vaddr as usize + i * 4096;
+        let phys = phys_addr + i * 4096;
+        if paging::map_page_in_table(pml4_phys, virt, phys, ptf).is_err() {
+            crate::serial_strln!("[DMA] Page mapping failed");
+            return u64::MAX;
+        }
+    }
+
+    // TODO: When IOMMU is initialized, create IOMMU page table entries here
+    // to restrict which PCI device can access this physical memory.
+    let iommu = super::acpi::iommu_available();
+
+    crate::serial_str!("[DMA] Allocated ");
+    crate::drivers::serial::write_dec(num_pages as u32);
+    crate::serial_str!(" pages at phys=");
+    crate::drivers::serial::write_hex(phys_addr as u64);
+    crate::serial_str!(" vaddr=");
+    crate::drivers::serial::write_hex(vaddr);
+    if iommu {
+        crate::serial_str!(" (IOMMU available)");
+    }
+    crate::drivers::serial::write_newline();
+
+    phys_addr as u64
+}
+
+/// Syscall 0xAB: Query IOMMU status.
+/// Returns: (iommu_base << 32) | available_flag
+fn syscall_iommu_status() -> u64 {
+    let available = super::acpi::iommu_available();
+    let base = super::acpi::iommu_base();
+    if available {
+        (base & 0xFFFFFFFF_00000000) | 1
+    } else {
+        0
+    }
+}
+
+// ── Phase 11: WASM Network Driver Bridge ──────────────────────────────────
+
+/// Syscall 0xAC: Register a WASM network driver.
+/// arg1 = MAC bytes 0-3 (little-endian), arg2 = MAC bytes 4-5 (little-endian)
+/// Initializes the smoltcp stack with this MAC address.
+fn syscall_net_register(mac_lo: u64, mac_hi: u64) -> u64 {
+    let mac = [
+        (mac_lo & 0xFF) as u8,
+        ((mac_lo >> 8) & 0xFF) as u8,
+        ((mac_lo >> 16) & 0xFF) as u8,
+        ((mac_lo >> 24) & 0xFF) as u8,
+        (mac_hi & 0xFF) as u8,
+        ((mac_hi >> 8) & 0xFF) as u8,
+    ];
+    crate::net::init_wasm_net(mac);
+    0
+}
+
+/// Syscall 0xAD: Submit a received Ethernet frame to the kernel network stack.
+/// arg1 = virtual address of frame data (in caller's address space)
+/// arg2 = length in bytes
+/// Returns: 0 on success, u64::MAX on error
+fn syscall_net_submit_rx(vaddr: u64, length: u64) -> u64 {
+    let len = length as usize;
+    if len == 0 || len > 1514 || vaddr < 0x200000 {
+        return u64::MAX;
+    }
+    let data = unsafe {
+        core::slice::from_raw_parts(vaddr as *const u8, len)
+    };
+    if crate::net::wasm_net_submit_rx(data) {
+        0
+    } else {
+        u64::MAX
+    }
+}
+
+/// Syscall 0xAE: Poll for a packet to transmit.
+/// arg1 = virtual address of buffer (caller provides)
+/// arg2 = max buffer length
+/// Returns: packet length if available, 0 if no packet, u64::MAX on error
+fn syscall_net_poll_tx(vaddr: u64, max_len: u64) -> u64 {
+    let max = max_len as usize;
+    if max == 0 || max > 2048 || vaddr < 0x200000 {
+        return u64::MAX;
+    }
+    let buf = unsafe {
+        core::slice::from_raw_parts_mut(vaddr as *mut u8, max)
+    };
+    match crate::net::wasm_net_poll_tx(buf) {
+        Some(len) => {
+            static TX_POP_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+            let c = TX_POP_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if c < 5 {
+                crate::serial_str!("[NET-POP] ");
+                crate::drivers::serial::write_dec(len as u32);
+                crate::serial_strln!("B popped from TX ring");
+            }
+            len as u64
+        }
+        None => 0,
+    }
+}
+
+/// Syscall 0xAF: Read physical memory via HHDM (DMA coherency fallback).
+/// Used when userspace NO_CACHE mapping doesn't reflect DMA writeback (WHPX bug).
+/// arg1 = physical address to read from
+/// arg2 = destination virtual address in caller's space + (len << 32)
+/// Returns: number of bytes read, or u64::MAX on error.
+/// Syscall 0xAF: Read from physical memory via HHDM.
+/// Mode 1 (len > 0): Copy len bytes from phys to dest (bulk copy)
+/// Mode 2 (len == 0): Read u64 from phys_addr, return directly (no buffer needed)
+fn syscall_dma_sync_read(phys_addr: u64, dest_and_len: u64) -> u64 {
+    if phys_addr == 0 { return u64::MAX; }
+
+    let hhdm = crate::HHDM_OFFSET.load(core::sync::atomic::Ordering::Relaxed);
+    let src_virt = hhdm + phys_addr as usize;
+
+    let len = ((dest_and_len >> 32) & 0xFFFF) as usize;
+
+    if len == 0 {
+        // Mode 2: read u64 directly — flush cache line first to see DMA writes
+        unsafe {
+            // CLFLUSH invalidates the cache line containing this address
+            core::arch::asm!("clflush [{}]", in(reg) src_virt, options(nostack));
+            // Memory fence to ensure the flush completes
+            core::arch::asm!("mfence", options(nostack));
+        }
+        let val = unsafe { core::ptr::read_volatile(src_virt as *const u64) };
+        return val;
+    }
+
+    // Mode 1: bulk copy
+    let dest_vaddr = (dest_and_len & 0xFFFFFFFF) as usize;
+    if len > 4096 || dest_vaddr < 0x200000 {
+        return u64::MAX;
+    }
+
+    let src = src_virt as *const u8;
+    let dst = dest_vaddr as *mut u8;
+    unsafe {
+        // Flush cache lines for the source range to see DMA writes
+        let mut addr = src_virt;
+        while addr < src_virt + len {
+            core::arch::asm!("clflush [{}]", in(reg) addr, options(nostack));
+            addr += 64; // cache line size
+        }
+        core::arch::asm!("mfence", options(nostack));
+
+        for i in 0..len {
+            let byte = core::ptr::read_volatile(src.add(i));
+            core::ptr::write_volatile(dst.add(i), byte);
+        }
+    }
+
+    len as u64
+}
+
+/// Syscall 0xB0: Kernel-assisted DMA RX — read packet from physical DMA buffers
+/// and deliver directly to smoltcp. Bypasses ALL userspace cache coherency issues.
+///
+/// arg1 = ring_phys | (desc_idx << 48) — physical address of descriptor ring + index
+/// arg2 = buf_phys | (buf_size << 48) — physical address of packet buffer pool + per-buffer size
+///
+/// The kernel reads the E1000 RX descriptor via HHDM, extracts packet length,
+/// reads the packet data from the buffer, and submits it to smoltcp.
+/// Returns: packet length on success, 0 if no packet, u64::MAX on error.
+fn syscall_net_dma_rx(ring_and_idx: u64, buf_and_size: u64) -> u64 {
+    let ring_phys = ring_and_idx & 0x0000_FFFF_FFFF_FFFF;
+    let desc_idx = ((ring_and_idx >> 48) & 0xFFFF) as usize;
+    let buf_phys = buf_and_size & 0x0000_FFFF_FFFF_FFFF;
+    let buf_size = ((buf_and_size >> 48) & 0xFFFF) as usize;
+
+    if ring_phys == 0 || buf_phys == 0 || buf_size == 0 || desc_idx > 7 {
+        return u64::MAX;
+    }
+
+    let hhdm = crate::HHDM_OFFSET.load(core::sync::atomic::Ordering::Relaxed);
+
+    // Read the descriptor (16 bytes) from physical memory via HHDM
+    let desc_phys = ring_phys + (desc_idx as u64 * 16);
+    let desc_virt = hhdm + desc_phys as usize;
+
+    // Flush cache line to see DMA writes
+    unsafe {
+        core::arch::asm!("clflush [{}]", in(reg) desc_virt, options(nostack));
+        core::arch::asm!("mfence", options(nostack));
+    }
+
+    // Read length (bytes 8-9 of descriptor) and status (byte 12)
+    let len_status = unsafe { core::ptr::read_volatile((desc_virt + 8) as *const u64) };
+    let pkt_len = (len_status & 0xFFFF) as usize;
+
+    if pkt_len == 0 || pkt_len > 2048 {
+        return 0; // No packet or invalid length
+    }
+
+    // Read packet data from the buffer pool
+    let pkt_phys = buf_phys + (desc_idx as u64 * buf_size as u64);
+    let pkt_virt = hhdm + pkt_phys as usize;
+
+    // Flush cache lines for the packet data
+    unsafe {
+        let mut addr = pkt_virt;
+        let end = pkt_virt + pkt_len;
+        while addr < end {
+            core::arch::asm!("clflush [{}]", in(reg) addr, options(nostack));
+            addr += 64;
+        }
+        core::arch::asm!("mfence", options(nostack));
+    }
+
+    // Read packet data into a temporary buffer
+    let mut pkt_buf = [0u8; 2048];
+    unsafe {
+        let src = pkt_virt as *const u8;
+        for i in 0..pkt_len {
+            pkt_buf[i] = core::ptr::read_volatile(src.add(i));
+        }
+    }
+
+    // Submit to smoltcp via the WASM_NET ring
+    if crate::net::wasm_net_submit_rx(&pkt_buf[..pkt_len]) {
+        pkt_len as u64
+    } else {
+        0 // Ring full
+    }
+}
+
+/// Syscall 0xB1: Write to physical memory via HHDM (DMA coherency for writes).
+/// arg1 = physical address, arg2 = source vaddr | (len << 32)
+fn syscall_dma_sync_write(phys_addr: u64, src_and_len: u64) -> u64 {
+    let src_vaddr = (src_and_len & 0xFFFFFFFF) as usize;
+    let len = ((src_and_len >> 32) & 0xFFFF) as usize;
+
+    if len == 0 || len > 4096 || phys_addr == 0 || src_vaddr < 0x200000 {
+        return u64::MAX;
+    }
+
+    let hhdm = crate::HHDM_OFFSET.load(core::sync::atomic::Ordering::Relaxed);
+    let dst_virt = hhdm + phys_addr as usize;
+    let src = src_vaddr as *const u8;
+    let dst = dst_virt as *mut u8;
+
+    unsafe {
+        for i in 0..len {
+            let byte = core::ptr::read_volatile(src.add(i));
+            core::ptr::write_volatile(dst.add(i), byte);
+        }
+        // Flush written cache lines so DMA device sees them
+        let mut addr = dst_virt;
+        while addr < dst_virt + len {
+            core::arch::asm!("clflush [{}]", in(reg) addr, options(nostack));
+            addr += 64;
+        }
+        core::arch::asm!("mfence", options(nostack));
+    }
+
+    len as u64
+}
+
+/// Syscall 0xB2: OS metrics for AI introspection.
+/// The kernel's own AI (Draug, WASM apps) can query live system state.
+///
+/// arg1 = metric_id:
+///   0 = network summary (packed: has_ip(1) | ip_bytes(32))
+///   1 = firewall stats (packed: allows(32) | drops(32))
+///   2 = uptime_ms
+///   3 = suspicious packet count
+///
+/// Returns: packed u64 with the requested metric.
+fn syscall_net_metrics(metric_id: u64, _reserved: u64) -> u64 {
+    match metric_id {
+        0 => {
+            // Network: has_ip(1) | ip_a(8) | ip_b(8) | ip_c(8) | ip_d(8)
+            let has_ip = if crate::net::has_ip() { 1u64 } else { 0u64 };
+            let guard = crate::net::NET_STATE.lock();
+            if let Some(ref state) = *guard {
+                let addrs = state.iface.ip_addrs();
+                if let Some(cidr) = addrs.first() {
+                    if let smoltcp::wire::IpAddress::Ipv4(v4) = cidr.address() {
+                        let o = v4.octets();
+                        drop(guard);
+                        return has_ip
+                            | ((o[0] as u64) << 8)
+                            | ((o[1] as u64) << 16)
+                            | ((o[2] as u64) << 24)
+                            | ((o[3] as u64) << 32);
+                    }
+                }
+            }
+            drop(guard);
+            has_ip
+        }
+        1 => {
+            // Firewall: allows(32) | drops(32)
+            let allows = crate::net::firewall::ALLOWS.load(core::sync::atomic::Ordering::Relaxed) as u64;
+            let drops = crate::net::firewall::DROPS.load(core::sync::atomic::Ordering::Relaxed) as u64;
+            allows | (drops << 32)
+        }
+        2 => crate::timer::uptime_ms(),
+        3 => crate::net::firewall::SUSPICIOUS.count.load(core::sync::atomic::Ordering::Relaxed) as u64,
+        4 => {
+            // Anomaly detection stats: blocked_ips(16) | total_syn_attempts(16)
+            let (blocked, attempts) = crate::net::firewall::anomaly_stats();
+            (blocked as u64) | ((attempts as u64) << 16)
+        }
+        _ => u64::MAX,
+    }
 }

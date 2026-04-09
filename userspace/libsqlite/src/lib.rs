@@ -38,7 +38,7 @@ pub mod shadow;
 pub use header::DbHeader;
 pub use record::{Record, Value};
 pub use btree::TableScanner;
-pub use varint::encode_varint;
+pub use varint::{encode_varint, decode_varint};
 pub use vector::{Embedding, SearchResult, EMBEDDING_DIM, EMBEDDING_SIZE};
 pub use quantize::{BinaryVector, ScalarVector, quantize_binary, quantize_scalar, BQ_SIZE, SQ8_SIZE};
 pub use simd::{CpuFeatures, detect_cpu_features};

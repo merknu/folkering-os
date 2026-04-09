@@ -62,6 +62,7 @@ $qemuArgs = @(
     "-netdev", "user,id=net0",
     "-device", "virtio-net-pci,netdev=net0",
     "-vga", "virtio",
+    "-usb", "-device", "usb-tablet",
     "-accel", "whpx",
     "-accel", "tcg",
     "-cpu", "qemu64,rdrand=on,+avx2,+fma,+avx,+sse4.1,+sse4.2",
@@ -95,7 +96,6 @@ if (Test-Path $vnc) {
     Write-Host "  VNC connected!" -ForegroundColor Green
 } else {
     Write-Host "  TigerVNC not found at $vnc" -ForegroundColor Red
-    Write-Host "  Download from: github.com/TigerVNC/tigervnc/releases" -ForegroundColor Yellow
     Write-Host "  Connect manually: localhost:5900" -ForegroundColor Yellow
 }
 

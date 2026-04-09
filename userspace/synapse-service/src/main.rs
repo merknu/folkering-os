@@ -29,12 +29,13 @@ use libfolk::sys::synapse::{
     SYN_OP_FILE_INFO, SYN_OP_READ_FILE, SYN_OP_READ_FILE_BY_NAME, SYN_OP_READ_FILE_CHUNK,
     SYN_OP_READ_FILE_SHMEM, SYN_OP_SQL_QUERY,
     SYN_OP_VECTOR_SEARCH, SYN_OP_GET_EMBEDDING, SYN_OP_EMBEDDING_COUNT,
-    SYN_OP_WRITE_FILE,
+    SYN_OP_WRITE_FILE, SYN_OP_WRITE_INTENT, SYN_OP_READ_INTENT, SYN_OP_QUERY_MIME,
+    SYN_OP_QUERY_INTENT,
     SYN_STATUS_NOT_FOUND, SYN_STATUS_INVALID, SYN_STATUS_ERROR,
     SYNAPSE_VERSION, hash_name,
 };
 use libfolk::sys::{shmem_create, shmem_map, shmem_grant};
-use libsqlite::{SqliteDb, Value, encode_varint};
+use libsqlite::{SqliteDb, Value, encode_varint, decode_varint};
 use libsqlite::vector::{
     Embedding, SearchResult, search_similar_auto,
     get_embedding_by_file_id, count_embeddings, EMBEDDING_SIZE
@@ -75,6 +76,9 @@ struct DirCacheState {
     entries: [DirEntry; MAX_ENTRIES],
 }
 
+/// Maximum SQLite pages (MAX_DB_SIZE / 4096)
+const MAX_PAGES: usize = MAX_DB_SIZE / 4096;
+
 /// SQLite backend state
 #[repr(C, align(4096))]
 struct SqliteState {
@@ -84,6 +88,35 @@ struct SqliteState {
     size: usize,
     /// Whether the database is valid
     valid: bool,
+    /// Dirty page bitmap — one bit per 4KB SQLite page (512 pages = 64 bytes)
+    dirty: [u8; MAX_PAGES / 8],
+}
+
+/// Mark a SQLite page as dirty (needs flush to disk)
+unsafe fn mark_page_dirty(page_num: usize) {
+    if page_num < MAX_PAGES {
+        SQLITE_STATE.dirty[page_num / 8] |= 1 << (page_num % 8);
+    }
+}
+
+/// Mark a range of bytes as dirty (auto-computes page numbers)
+unsafe fn mark_range_dirty(offset: usize, len: usize) {
+    let start_page = offset / 4096;
+    let end_page = (offset + len + 4095) / 4096;
+    for p in start_page..end_page.min(MAX_PAGES) {
+        SQLITE_STATE.dirty[p / 8] |= 1 << (p % 8);
+    }
+}
+
+/// Check if a page is dirty
+unsafe fn is_page_dirty(page_num: usize) -> bool {
+    if page_num >= MAX_PAGES { return false; }
+    (SQLITE_STATE.dirty[page_num / 8] & (1 << (page_num % 8))) != 0
+}
+
+/// Clear all dirty flags
+unsafe fn clear_dirty() {
+    for b in SQLITE_STATE.dirty.iter_mut() { *b = 0; }
 }
 
 static mut DIR_CACHE_STATE: DirCacheState = DirCacheState {
@@ -102,6 +135,7 @@ static mut SQLITE_STATE: SqliteState = SqliteState {
     data: [0u8; MAX_DB_SIZE],
     size: 0,
     valid: false,
+    dirty: [0u8; MAX_PAGES / 8],
 };
 
 static mut BACKEND: Backend = Backend::Fpk;
@@ -380,6 +414,10 @@ fn handle_request(msg: AsyncIpcMessage) {
         SYN_OP_READ_FILE_SHMEM => handle_read_file_shmem(msg),
         SYN_OP_SQL_QUERY => handle_sql_query(msg),
         SYN_OP_WRITE_FILE => handle_write_file(msg),
+        SYN_OP_WRITE_INTENT => handle_write_intent(msg),
+        SYN_OP_READ_INTENT => handle_read_intent(msg),
+        SYN_OP_QUERY_MIME => handle_query_mime(msg),
+        SYN_OP_QUERY_INTENT => handle_query_intent(msg),
         SYN_OP_VECTOR_SEARCH => handle_vector_search(msg),
         SYN_OP_GET_EMBEDDING => handle_get_embedding(msg),
         SYN_OP_EMBEDDING_COUNT => handle_embedding_count(msg),
@@ -705,6 +743,22 @@ fn handle_read_file_shmem(msg: AsyncIpcMessage) {
     match unsafe { BACKEND } {
         Backend::Sqlite => {
             // Step 1: Find file name from cache (fast, no table scan)
+            // Debug: log cache contents for first few lookups
+            static mut SHMEM_DBG_COUNT: u32 = 0;
+            unsafe {
+                SHMEM_DBG_COUNT += 1;
+                if SHMEM_DBG_COUNT <= 3 {
+                    println!("[SYNAPSE] read_file_shmem: looking for hash={:#010x}, cache has {} entries",
+                        request_hash, DIR_CACHE_STATE.count);
+                    for i in 0..DIR_CACHE_STATE.count {
+                        let e = &DIR_CACHE_STATE.entries[i];
+                        let n = e.name_str();
+                        println!("[SYNAPSE]   [{}] '{}' hash={:#010x} size={}",
+                            i, n, hash_name(n), e.size);
+                    }
+                }
+            }
+
             let file_name: Option<&str> = unsafe {
                 DIR_CACHE_STATE.entries[..DIR_CACHE_STATE.count]
                     .iter()
@@ -712,30 +766,26 @@ fn handle_read_file_shmem(msg: AsyncIpcMessage) {
                     .map(|e| e.name_str())
             };
 
-            let name = match file_name {
-                Some(n) => n,
+            // Also grab file size from cache for shmem allocation
+            let (name, file_size) = match file_name {
+                Some(n) => {
+                    let sz = unsafe {
+                        DIR_CACHE_STATE.entries[..DIR_CACHE_STATE.count]
+                            .iter()
+                            .find(|e| hash_name(e.name_str()) == request_hash)
+                            .map(|e| e.size as usize)
+                            .unwrap_or(4096)
+                    };
+                    (n, sz)
+                }
                 None => {
                     let _ = reply(SYN_STATUS_NOT_FOUND, 0);
                     return;
                 }
             };
 
-            // Step 2: Read file content — try ramdisk first, fallback to SQLite BLOB
-            let mut file_buf = [0u8; 4096];
-            let bytes_read = read_file(name, &mut file_buf);
-            // If ramdisk has nothing, read BLOB from SQLite directly
-            let bytes_read = if bytes_read == 0 {
-                read_sqlite_blob(name, &mut file_buf)
-            } else {
-                bytes_read
-            };
-            if bytes_read == 0 {
-                let _ = reply(SYN_STATUS_NOT_FOUND, 0);
-                return;
-            }
-
-            // Step 3: Create shmem and copy content
-            let buffer_size = ((bytes_read + 4095) / 4096) * 4096;
+            // Step 2: Allocate shmem big enough for the full file
+            let buffer_size = ((file_size + 4095) / 4096) * 4096;
             let shmem_handle = match shmem_create(buffer_size) {
                 Ok(handle) => handle,
                 Err(_) => {
@@ -749,18 +799,31 @@ fn handle_read_file_shmem(msg: AsyncIpcMessage) {
             }
 
             if shmem_map(shmem_handle, SHMEM_BUFFER_VADDR).is_err() {
+                let _ = shmem_destroy(shmem_handle);
                 let _ = reply(SYN_STATUS_ERROR, 0);
                 return;
             }
 
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    file_buf.as_ptr(),
-                    SHMEM_BUFFER_VADDR as *mut u8,
-                    bytes_read,
-                );
+            // Step 3: Read file content into shmem buffer
+            let shmem_buf = unsafe {
+                core::slice::from_raw_parts_mut(SHMEM_BUFFER_VADDR as *mut u8, buffer_size)
+            };
+            // Try ramdisk first
+            let bytes_read = read_file(name, shmem_buf);
+            // If ramdisk has nothing, read BLOB from SQLite (with overflow page support)
+            let bytes_read = if bytes_read == 0 {
+                read_sqlite_blob_large(name, shmem_buf)
+            } else {
+                bytes_read
+            };
+            if bytes_read == 0 {
+                let _ = shmem_unmap(shmem_handle, SHMEM_BUFFER_VADDR);
+                let _ = shmem_destroy(shmem_handle);
+                let _ = reply(SYN_STATUS_NOT_FOUND, 0);
+                return;
             }
 
+            // Data is already in shmem_buf (read directly into mapped shmem)
             let _ = shmem_unmap(shmem_handle, SHMEM_BUFFER_VADDR);
             let response = ((bytes_read as u64) << 32) | (shmem_handle as u64);
             let _ = reply(response, 0);
@@ -1131,6 +1194,9 @@ fn overwrite_blob_inplace(name: &str, new_data: &[u8]) -> bool {
                             ]);
                             let new_cc = cc.wrapping_add(1).to_be_bytes();
                             SQLITE_STATE.data[24..28].copy_from_slice(&new_cc);
+                            // Mark dirty pages covering the blob + header
+                            mark_range_dirty(offset, old_blob.len());
+                            mark_page_dirty(0); // page 1: change counter
                             return true;
                         }
                     }
@@ -1222,10 +1288,15 @@ fn handle_write_file(msg: AsyncIpcMessage) {
         return;
     }
 
-    // Copy content to a local buffer (we need it after unmapping shmem)
-    let mut content_buf = [0u8; 4096];
-    let content_len = content.len().min(content_buf.len());
+    // Copy content to local buffer (shmem will be unmapped before insert)
+    // 16KB supports most WASM apps — larger files need overflow pages (future)
+    const MAX_CONTENT: usize = 16384;
+    let mut content_buf = [0u8; MAX_CONTENT];
+    let content_len = content.len().min(MAX_CONTENT);
     content_buf[..content_len].copy_from_slice(&content[..content_len]);
+    if content.len() > MAX_CONTENT {
+        println!("[SYNAPSE] WARNING: file truncated from {} to {} bytes", content.len(), MAX_CONTENT);
+    }
 
     // Copy name to local buffer
     let mut name_buf = [0u8; 32];
@@ -1248,13 +1319,17 @@ fn handle_write_file(msg: AsyncIpcMessage) {
     // Update DIR_CACHE_STATE for immediate visibility
     update_dir_cache(next_rowid, &name_buf[..nl], content_len);
 
+    // Semantic VFS: auto-detect MIME type and create intent record
+    let mime = auto_detect_mime(name_str, &content_buf[..content_len]);
+    let _ = sqlite_insert_intent(next_rowid, mime, "");
+
     // Flush to VirtIO disk
     if !flush_sqlite_to_disk() {
         println!("[SYNAPSE] write_file: disk flush failed (data in memory only)");
     }
 
-    println!("[SYNAPSE] Wrote '{}' ({} bytes, rowid={})", name_str, content_len, next_rowid);
-    let _ = reply(0, 0); // Success
+    println!("[SYNAPSE] Wrote '{}' ({} bytes, rowid={}, mime={})", name_str, content_len, next_rowid, mime);
+    let _ = reply(next_rowid as u64, 0); // Return rowid on success (0 = error in old protocol)
 }
 
 /// Find the maximum rowid in the files table
@@ -1273,6 +1348,78 @@ fn find_max_rowid() -> i64 {
         }
     }
     0
+}
+
+/// Look up a file's size by rowid from the files table.
+fn get_file_size(file_id: i64) -> u32 {
+    if let Some(db) = get_sqlite_db() {
+        if let Ok(scanner) = db.table_scan("files") {
+            for result in scanner {
+                if let Ok(record) = result {
+                    if record.rowid == file_id {
+                        if let Some(Value::Integer(size)) = record.get(3) {
+                            return size as u32;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    0
+}
+
+/// Look up a file's name by rowid from the files table.
+fn get_file_name(file_id: i64, buf: &mut [u8]) -> usize {
+    if let Some(db) = get_sqlite_db() {
+        if let Ok(scanner) = db.table_scan("files") {
+            for result in scanner {
+                if let Ok(record) = result {
+                    if record.rowid == file_id {
+                        if let Some(Value::Text(name)) = record.get(1) {
+                            let n = name.len().min(buf.len());
+                            buf[..n].copy_from_slice(&name.as_bytes()[..n]);
+                            return n;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    0
+}
+
+/// Auto-detect MIME type from filename extension and content magic bytes.
+fn auto_detect_mime<'a>(name: &str, content: &[u8]) -> &'a str {
+    // Check extension
+    if name.ends_with(".wasm") { return "application/wasm"; }
+    if name.ends_with(".txt")  { return "text/plain"; }
+    if name.ends_with(".json") { return "application/json"; }
+    if name.ends_with(".csv")  { return "text/csv"; }
+    if name.ends_with(".html") { return "text/html"; }
+    if name.ends_with(".rs")   { return "text/x-rust"; }
+
+    // Check content magic bytes
+    if content.len() >= 4 {
+        // WASM magic: \0asm
+        if content[0] == 0x00 && content[1] == b'a' && content[2] == b's' && content[3] == b'm' {
+            return "application/wasm";
+        }
+        // ELF magic: \x7fELF
+        if content[0] == 0x7f && content[1] == b'E' && content[2] == b'L' && content[3] == b'F' {
+            return "application/x-elf";
+        }
+        // JSON start
+        if content[0] == b'{' || content[0] == b'[' {
+            return "application/json";
+        }
+    }
+
+    // Check if content is valid UTF-8 text
+    if content.len() > 0 && core::str::from_utf8(content).is_ok() {
+        return "text/plain";
+    }
+
+    "application/octet-stream"
 }
 
 /// Pick the smallest SQLite integer type code for a value
@@ -1353,18 +1500,27 @@ fn sqlite_insert_file(rowid: i64, name: &str, content: &[u8]) -> bool {
         let page_size = db.page_size() as usize;
 
         // Traverse B-tree to find the rightmost leaf page
-        // Interior pages (type 0x05) have a right-pointer; follow it to get the last leaf
         let mut current_page = root_page;
+        let page_count = u32::from_be_bytes([
+            SQLITE_STATE.data[28], SQLITE_STATE.data[29],
+            SQLITE_STATE.data[30], SQLITE_STATE.data[31],
+        ]) as usize;
         for _ in 0..10 {
-            // Safety depth limit
+            if current_page == 0 || (current_page as usize) > page_count {
+                println!("[SYNAPSE] insert: page {} out of range (max {})", current_page, page_count);
+                return false;
+            }
             let page_off = (current_page as usize - 1) * page_size;
             let hdr_off = if current_page == 1 { 100 } else { 0 };
+            if page_off + hdr_off >= SQLITE_STATE.size {
+                println!("[SYNAPSE] insert: page {} beyond db_size", current_page);
+                return false;
+            }
             let page_type = SQLITE_STATE.data[page_off + hdr_off];
 
             if page_type == 0x0d {
                 break; // Found leaf page
             } else if page_type == 0x05 {
-                // Interior page: right-pointer is at header offset + 8 (BE u32)
                 let rp_offset = page_off + hdr_off + 8;
                 let right_child = u32::from_be_bytes([
                     SQLITE_STATE.data[rp_offset],
@@ -1374,7 +1530,7 @@ fn sqlite_insert_file(rowid: i64, name: &str, content: &[u8]) -> bool {
                 ]);
                 current_page = right_child;
             } else {
-                println!("[SYNAPSE] insert: unexpected page type 0x{:02x}", page_type);
+                println!("[SYNAPSE] insert: unexpected page type 0x{:02x} at page {}", page_type, current_page);
                 return false;
             }
         }
@@ -1455,7 +1611,13 @@ fn sqlite_insert_file(rowid: i64, name: &str, content: &[u8]) -> bool {
         let record_body_size = header_size + name_bytes.len() + size_int_size + content.len();
 
         // Build the full cell: [payload_size: varint][rowid: varint][record body]
-        let mut cell_buf = [0u8; 8192];
+        // 16KB + 64 bytes for varints and header
+        const MAX_CELL: usize = 16448;
+        if record_body_size + 20 > MAX_CELL {
+            println!("[SYNAPSE] insert: cell too large ({} bytes)", record_body_size);
+            return false;
+        }
+        let mut cell_buf = [0u8; MAX_CELL];
         let mut cell_pos = 0usize;
 
         cell_pos += encode_varint(record_body_size as u64, &mut cell_buf[cell_pos..]);
@@ -1489,15 +1651,137 @@ fn sqlite_insert_file(rowid: i64, name: &str, content: &[u8]) -> bool {
         let cell_len = cell_pos;
 
         // Check free space
-        // Pointer array ends at: header_offset + 8 + cell_count * 2
         let pointer_array_end = header_offset + 8 + cell_count * 2;
         let free_space = cell_content_start - pointer_array_end;
         if cell_len + 2 > free_space {
-            println!("[SYNAPSE] insert: no space (need {}, have {})", cell_len + 2, free_space);
-            return false;
+            // Leaf page full — allocate a NEW leaf page
+            println!("[SYNAPSE] Leaf full (need {}, have {}) — allocating new page", cell_len + 2, free_space);
+
+            // Read current page count from DB header (offset 28, BE u32)
+            let page_count = u32::from_be_bytes([
+                SQLITE_STATE.data[28], SQLITE_STATE.data[29],
+                SQLITE_STATE.data[30], SQLITE_STATE.data[31],
+            ]) as usize;
+            let new_page_num = page_count + 1;
+            let new_page_offset = page_count * page_size; // 0-indexed
+
+            // Check we have room in the 2MB buffer (not the loaded DB size)
+            if new_page_offset + page_size > MAX_DB_SIZE {
+                println!("[SYNAPSE] insert: DB buffer full ({} pages max)", MAX_DB_SIZE / page_size);
+                return false;
+            }
+
+            // Initialize new leaf page (type 0x0d)
+            // Header: [type(1)][freeblock(2)][cell_count(2)][cell_start(2)][fragmented(1)] = 8 bytes
+            let np = new_page_offset;
+            SQLITE_STATE.data[np] = 0x0d; // leaf table b-tree page
+            SQLITE_STATE.data[np + 1] = 0; SQLITE_STATE.data[np + 2] = 0; // first freeblock = 0
+            SQLITE_STATE.data[np + 3] = 0; SQLITE_STATE.data[np + 4] = 1; // cell_count = 1
+            // cell_content_start = page_size - cell_len
+            let new_cell_start = page_size - cell_len;
+            let cs_bytes = (new_cell_start as u16).to_be_bytes();
+            SQLITE_STATE.data[np + 5] = cs_bytes[0];
+            SQLITE_STATE.data[np + 6] = cs_bytes[1];
+            SQLITE_STATE.data[np + 7] = 0; // fragmented bytes = 0
+
+            // Write cell at end of new page
+            SQLITE_STATE.data[np + new_cell_start..np + new_cell_start + cell_len]
+                .copy_from_slice(&cell_buf[..cell_len]);
+
+            // Write cell pointer at offset 8 (first pointer slot)
+            let cell_ptr = (new_cell_start as u16).to_be_bytes();
+            SQLITE_STATE.data[np + 8] = cell_ptr[0];
+            SQLITE_STATE.data[np + 9] = cell_ptr[1];
+
+            // Update DB header: increment page_count
+            let new_count_bytes = (new_page_num as u32).to_be_bytes();
+            SQLITE_STATE.data[28] = new_count_bytes[0];
+            SQLITE_STATE.data[29] = new_count_bytes[1];
+            SQLITE_STATE.data[30] = new_count_bytes[2];
+            SQLITE_STATE.data[31] = new_count_bytes[3];
+
+            // Also update the "database size in pages" field (same at offset 28)
+            // and increment change counter
+            let change_counter = u32::from_be_bytes([
+                SQLITE_STATE.data[24], SQLITE_STATE.data[25],
+                SQLITE_STATE.data[26], SQLITE_STATE.data[27],
+            ]);
+            let counter_bytes = change_counter.wrapping_add(1).to_be_bytes();
+            SQLITE_STATE.data[24] = counter_bytes[0];
+            SQLITE_STATE.data[25] = counter_bytes[1];
+            SQLITE_STATE.data[26] = counter_bytes[2];
+            SQLITE_STATE.data[27] = counter_bytes[3];
+
+            // Update the parent interior page to know about the new leaf
+            // For simplicity: update the rightmost pointer of the root's interior page
+            // to point to the new page (this works because SQLite table scan
+            // walks ALL leaf pages via the interior page's child pointers)
+            //
+            // The root page or its rightmost interior child should have a
+            // right-pointer (offset +8 from header) that we update.
+            // Find the interior page that pointed to our old full leaf:
+            {
+                let mut parent_page = root_page;
+                for _ in 0..10 {
+                    let pp_off = (parent_page as usize - 1) * page_size;
+                    let pp_hdr = if parent_page == 1 { 100 } else { 0 };
+                    let ptype = SQLITE_STATE.data[pp_off + pp_hdr];
+                    if ptype == 0x05 {
+                        // Interior page — check if its right-pointer leads to the full leaf
+                        let rp_off = pp_off + pp_hdr + 8;
+                        let right_child = u32::from_be_bytes([
+                            SQLITE_STATE.data[rp_off], SQLITE_STATE.data[rp_off + 1],
+                            SQLITE_STATE.data[rp_off + 2], SQLITE_STATE.data[rp_off + 3],
+                        ]);
+                        if right_child == leaf_page {
+                            // Update right-pointer to new page
+                            let npn = new_page_num as u32;
+                            let npn_bytes = npn.to_be_bytes();
+                            SQLITE_STATE.data[rp_off] = npn_bytes[0];
+                            SQLITE_STATE.data[rp_off + 1] = npn_bytes[1];
+                            SQLITE_STATE.data[rp_off + 2] = npn_bytes[2];
+                            SQLITE_STATE.data[rp_off + 3] = npn_bytes[3];
+                            println!("[SYNAPSE] Updated parent right-pointer to page {}", new_page_num);
+                            break;
+                        }
+                        // Follow right-pointer deeper
+                        parent_page = right_child;
+                    } else {
+                        // Root is the leaf itself (single-level tree)
+                        // Can't easily add a page without restructuring
+                        println!("[SYNAPSE] Root is leaf — cannot split (need restructure)");
+                        break;
+                    }
+                }
+            }
+
+            // Expand SQLITE_STATE.size to include new page
+            SQLITE_STATE.size = (new_page_num) * page_size;
+
+            // Mark dirty: new leaf page + parent interior page + DB header (page 1)
+            mark_page_dirty(new_page_num - 1); // new leaf (0-indexed)
+            mark_page_dirty(0); // page 1 (header: page_count, change_counter)
+            // Parent interior pages were modified in the loop above
+            let mut pp = root_page;
+            for _ in 0..10 {
+                mark_page_dirty(pp as usize - 1);
+                let pp_off = (pp as usize - 1) * page_size;
+                let pp_hdr = if pp == 1 { 100 } else { 0 };
+                if SQLITE_STATE.data[pp_off + pp_hdr] != 0x05 { break; }
+                let rp = u32::from_be_bytes([
+                    SQLITE_STATE.data[pp_off + pp_hdr + 8],
+                    SQLITE_STATE.data[pp_off + pp_hdr + 9],
+                    SQLITE_STATE.data[pp_off + pp_hdr + 10],
+                    SQLITE_STATE.data[pp_off + pp_hdr + 11],
+                ]);
+                pp = rp;
+            }
+
+            println!("[SYNAPSE] New leaf page {} allocated", new_page_num);
+            return true;
         }
 
-        // Write cell at cell_content_start - cell_len
+        // Write cell at cell_content_start - cell_len (normal path)
         let new_cell_offset = cell_content_start - cell_len;
         SQLITE_STATE.data[page_offset + new_cell_offset..page_offset + new_cell_offset + cell_len]
             .copy_from_slice(&cell_buf[..cell_len]);
@@ -1531,22 +1815,475 @@ fn sqlite_insert_file(rowid: i64, name: &str, content: &[u8]) -> bool {
         SQLITE_STATE.data[26] = counter_bytes[2];
         SQLITE_STATE.data[27] = counter_bytes[3];
 
+        // Mark dirty: this leaf page + page 1 (header)
+        mark_page_dirty(leaf_page as usize - 1);
+        mark_page_dirty(0); // page 1: change counter
+
         true
     }
 }
 
-/// Read a file's BLOB data directly from SQLite into buf. Returns bytes read.
-fn read_sqlite_blob(name: &str, buf: &mut [u8]) -> usize {
+// ============================================================================
+// Semantic VFS — file_intents table operations
+// ============================================================================
+
+/// VADDR for intent shmem mapping
+const INTENT_SHMEM_VADDR: usize = 0x14000000;
+
+/// Insert an intent record into the file_intents B-tree
+/// Columns: file_id (INTEGER PK/rowid), mime_type (TEXT), intent_json (TEXT), schema_version (INT=1)
+fn sqlite_insert_intent(file_id: i64, mime_type: &str, intent_json: &str) -> bool {
+    unsafe {
+        if !SQLITE_STATE.valid { return false; }
+
+        let db_data = &SQLITE_STATE.data[..SQLITE_STATE.size];
+        let db = match SqliteDb::open(db_data) {
+            Ok(db) => db,
+            Err(_) => return false,
+        };
+
+        let root_page = match db.find_table_root("file_intents") {
+            Ok(p) => p,
+            Err(_) => {
+                println!("[SYNAPSE] insert_intent: file_intents table not found");
+                return false;
+            }
+        };
+
+        let page_size = db.page_size() as usize;
+
+        // Traverse B-tree to rightmost leaf
+        let mut current_page = root_page;
+        for _ in 0..10 {
+            let page_off = (current_page as usize - 1) * page_size;
+            let hdr_off = if current_page == 1 { 100 } else { 0 };
+            let page_type = SQLITE_STATE.data[page_off + hdr_off];
+            if page_type == 0x0d { break; }
+            else if page_type == 0x05 {
+                let rp_offset = page_off + hdr_off + 8;
+                let right_child = u32::from_be_bytes([
+                    SQLITE_STATE.data[rp_offset], SQLITE_STATE.data[rp_offset + 1],
+                    SQLITE_STATE.data[rp_offset + 2], SQLITE_STATE.data[rp_offset + 3],
+                ]);
+                current_page = right_child;
+            } else { return false; }
+        }
+
+        let leaf_page = current_page;
+        let page_offset = (leaf_page as usize - 1) * page_size;
+        let header_offset = if leaf_page == 1 { 100 } else { 0 };
+
+        if SQLITE_STATE.data[page_offset + header_offset] != 0x0d { return false; }
+
+        let hdr = page_offset + header_offset;
+        let cell_count = u16::from_be_bytes([
+            SQLITE_STATE.data[hdr + 3], SQLITE_STATE.data[hdr + 4],
+        ]) as usize;
+        let cell_content_start = {
+            let raw = u16::from_be_bytes([SQLITE_STATE.data[hdr + 5], SQLITE_STATE.data[hdr + 6]]);
+            if raw == 0 { page_size } else { raw as usize }
+        };
+
+        let mime_bytes = mime_type.as_bytes();
+        let json_bytes = intent_json.as_bytes();
+
+        // Type codes: file_id=NULL(0, stored as rowid), mime=TEXT, json=TEXT, version=INT(1)=type 9
+        let id_type: u64 = 0;
+        let mime_type_code = 13 + (mime_bytes.len() as u64) * 2;
+        let json_type_code = if json_bytes.is_empty() { 0 } else { 13 + (json_bytes.len() as u64) * 2 };
+        let version_type: u64 = 9; // constant 1
+
+        let mut hdr_buf = [0u8; 16];
+        let mut hdr_pos = 0usize;
+        hdr_pos += 1; // placeholder for header_size
+        hdr_pos += encode_varint(id_type, &mut hdr_buf[hdr_pos..]);
+        hdr_pos += encode_varint(mime_type_code, &mut hdr_buf[hdr_pos..]);
+        hdr_pos += encode_varint(json_type_code, &mut hdr_buf[hdr_pos..]);
+        hdr_pos += encode_varint(version_type, &mut hdr_buf[hdr_pos..]);
+
+        let header_size = hdr_pos;
+        if header_size > 127 { return false; }
+        hdr_buf[0] = header_size as u8;
+
+        // Record body = header + mime + json (id=0bytes, version=0bytes for type 9)
+        let record_body_size = header_size + mime_bytes.len() + json_bytes.len();
+
+        let mut cell_buf = [0u8; 2048];
+        let mut cell_pos = 0usize;
+        cell_pos += encode_varint(record_body_size as u64, &mut cell_buf[cell_pos..]);
+        cell_pos += encode_varint(file_id as u64, &mut cell_buf[cell_pos..]);
+
+        cell_buf[cell_pos..cell_pos + header_size].copy_from_slice(&hdr_buf[..header_size]);
+        cell_pos += header_size;
+
+        // Column values: id(NULL=0bytes), mime(TEXT), json(TEXT or NULL), version(type9=0bytes)
+        cell_buf[cell_pos..cell_pos + mime_bytes.len()].copy_from_slice(mime_bytes);
+        cell_pos += mime_bytes.len();
+        if !json_bytes.is_empty() {
+            cell_buf[cell_pos..cell_pos + json_bytes.len()].copy_from_slice(json_bytes);
+            cell_pos += json_bytes.len();
+        }
+
+        let cell_len = cell_pos;
+        let pointer_array_end = header_offset + 8 + cell_count * 2;
+        let free_space = cell_content_start - pointer_array_end;
+        if cell_len + 2 > free_space {
+            // Leaf full — allocate new page (same logic as sqlite_insert_file)
+            let page_count = u32::from_be_bytes([
+                SQLITE_STATE.data[28], SQLITE_STATE.data[29],
+                SQLITE_STATE.data[30], SQLITE_STATE.data[31],
+            ]) as usize;
+            let new_page_num = page_count + 1;
+            let new_page_offset = page_count * page_size;
+
+            if new_page_offset + page_size > MAX_DB_SIZE {
+                println!("[SYNAPSE] insert_intent: DB full");
+                return true;
+            }
+
+            // Initialize new leaf page
+            let np = new_page_offset;
+            SQLITE_STATE.data[np] = 0x0d;
+            SQLITE_STATE.data[np + 1] = 0; SQLITE_STATE.data[np + 2] = 0;
+            SQLITE_STATE.data[np + 3] = 0; SQLITE_STATE.data[np + 4] = 1;
+            let new_cell_start = page_size - cell_len;
+            let cs = (new_cell_start as u16).to_be_bytes();
+            SQLITE_STATE.data[np + 5] = cs[0];
+            SQLITE_STATE.data[np + 6] = cs[1];
+            SQLITE_STATE.data[np + 7] = 0;
+
+            // Write cell + pointer
+            SQLITE_STATE.data[np + new_cell_start..np + new_cell_start + cell_len]
+                .copy_from_slice(&cell_buf[..cell_len]);
+            let cp = (new_cell_start as u16).to_be_bytes();
+            SQLITE_STATE.data[np + 8] = cp[0];
+            SQLITE_STATE.data[np + 9] = cp[1];
+
+            // Update page_count in DB header
+            let nc = (new_page_num as u32).to_be_bytes();
+            SQLITE_STATE.data[28..32].copy_from_slice(&nc);
+            // Increment change counter
+            let cc = u32::from_be_bytes([
+                SQLITE_STATE.data[24], SQLITE_STATE.data[25],
+                SQLITE_STATE.data[26], SQLITE_STATE.data[27],
+            ]).wrapping_add(1).to_be_bytes();
+            SQLITE_STATE.data[24..28].copy_from_slice(&cc);
+
+            // Update parent interior page right-pointer
+            let mut pp = root_page;
+            for _ in 0..10 {
+                let pp_off = (pp as usize - 1) * page_size;
+                let pp_hdr = if pp == 1 { 100 } else { 0 };
+                if SQLITE_STATE.data[pp_off + pp_hdr] == 0x05 {
+                    let rp_off = pp_off + pp_hdr + 8;
+                    let rc = u32::from_be_bytes([
+                        SQLITE_STATE.data[rp_off], SQLITE_STATE.data[rp_off+1],
+                        SQLITE_STATE.data[rp_off+2], SQLITE_STATE.data[rp_off+3],
+                    ]);
+                    if rc == leaf_page {
+                        let npn = (new_page_num as u32).to_be_bytes();
+                        SQLITE_STATE.data[rp_off..rp_off+4].copy_from_slice(&npn);
+                        mark_page_dirty(pp as usize - 1);
+                        break;
+                    }
+                    pp = rc;
+                } else {
+                    // Root is leaf — need to convert to interior (not implemented)
+                    // For now, the new page is orphaned but data is in memory
+                    break;
+                }
+            }
+
+            SQLITE_STATE.size = new_page_num * page_size;
+            mark_page_dirty(new_page_num - 1);
+            mark_page_dirty(0);
+            println!("[SYNAPSE] Intent page {} allocated", new_page_num);
+            return true;
+        }
+
+        let new_cell_offset = cell_content_start - cell_len;
+        SQLITE_STATE.data[page_offset + new_cell_offset..page_offset + new_cell_offset + cell_len]
+            .copy_from_slice(&cell_buf[..cell_len]);
+
+        let ptr_offset = page_offset + header_offset + 8 + cell_count * 2;
+        let cell_ptr = (new_cell_offset as u16).to_be_bytes();
+        SQLITE_STATE.data[ptr_offset] = cell_ptr[0];
+        SQLITE_STATE.data[ptr_offset + 1] = cell_ptr[1];
+
+        let new_count = (cell_count + 1) as u16;
+        let count_bytes = new_count.to_be_bytes();
+        SQLITE_STATE.data[hdr + 3] = count_bytes[0];
+        SQLITE_STATE.data[hdr + 4] = count_bytes[1];
+
+        let start_bytes = (new_cell_offset as u16).to_be_bytes();
+        SQLITE_STATE.data[hdr + 5] = start_bytes[0];
+        SQLITE_STATE.data[hdr + 6] = start_bytes[1];
+
+        // Increment DB change counter
+        let change_counter = u32::from_be_bytes([
+            SQLITE_STATE.data[24], SQLITE_STATE.data[25],
+            SQLITE_STATE.data[26], SQLITE_STATE.data[27],
+        ]);
+        let new_counter = change_counter.wrapping_add(1);
+        let counter_bytes = new_counter.to_be_bytes();
+        SQLITE_STATE.data[24] = counter_bytes[0];
+        SQLITE_STATE.data[25] = counter_bytes[1];
+        SQLITE_STATE.data[26] = counter_bytes[2];
+        SQLITE_STATE.data[27] = counter_bytes[3];
+
+        mark_page_dirty(leaf_page as usize - 1);
+        mark_page_dirty(0);
+
+        true
+    }
+}
+
+/// Read intent for a file_id from file_intents table.
+/// Returns (mime_type, intent_json) as byte slices into a provided buffer.
+fn sqlite_read_intent(file_id: i64, out_buf: &mut [u8]) -> Option<(usize, usize)> {
+    let db = get_sqlite_db()?;
+    let scanner = db.table_scan("file_intents").ok()?;
+
+    for result in scanner {
+        if let Ok(record) = result {
+            if record.rowid == file_id {
+                let mut pos = 0usize;
+
+                // Column 1: mime_type (TEXT)
+                let mime_len = if let Some(Value::Text(s)) = record.get(1) {
+                    let b = s.as_bytes();
+                    let n = b.len().min(out_buf.len());
+                    out_buf[..n].copy_from_slice(&b[..n]);
+                    pos = n;
+                    n
+                } else { 0 };
+
+                // Column 2: intent_json (TEXT or NULL)
+                let json_len = if let Some(Value::Text(s)) = record.get(2) {
+                    let b = s.as_bytes();
+                    let n = b.len().min(out_buf.len() - pos);
+                    out_buf[pos..pos + n].copy_from_slice(&b[..n]);
+                    n
+                } else { 0 };
+
+                return Some((mime_len, json_len));
+            }
+        }
+    }
+    None
+}
+
+/// Handle WRITE_INTENT request
+/// Protocol: op | (shmem_handle << 16) | (total_size << 32)
+/// Shmem format: [file_id: u32 LE][mime_len: u16 LE][mime bytes][json bytes]
+fn handle_write_intent(msg: AsyncIpcMessage) {
+    if unsafe { BACKEND } != Backend::Sqlite {
+        let _ = reply(SYN_STATUS_ERROR, 0);
+        return;
+    }
+
+    let shmem_handle = ((msg.payload0 >> 16) & 0xFFFF) as u32;
+    let total_size = (msg.payload0 >> 32) as usize;
+
+    if shmem_handle == 0 || total_size < 7 {
+        let _ = reply(SYN_STATUS_ERROR, 0);
+        return;
+    }
+
+    if shmem_map(shmem_handle, INTENT_SHMEM_VADDR).is_err() {
+        let _ = reply(SYN_STATUS_ERROR, 0);
+        return;
+    }
+
+    let shmem_slice = unsafe {
+        core::slice::from_raw_parts(INTENT_SHMEM_VADDR as *const u8, total_size)
+    };
+
+    // Parse: [file_id: u32 LE][mime_len: u16 LE][mime][json]
+    let file_id = u32::from_le_bytes([shmem_slice[0], shmem_slice[1], shmem_slice[2], shmem_slice[3]]);
+    let mime_len = u16::from_le_bytes([shmem_slice[4], shmem_slice[5]]) as usize;
+
+    if 6 + mime_len > total_size {
+        let _ = shmem_unmap(shmem_handle, INTENT_SHMEM_VADDR);
+        let _ = reply(SYN_STATUS_ERROR, 0);
+        return;
+    }
+
+    // Copy to local buffers before unmapping
+    let mut mime_buf = [0u8; 128];
+    let ml = mime_len.min(128);
+    mime_buf[..ml].copy_from_slice(&shmem_slice[6..6 + ml]);
+
+    let json_start = 6 + mime_len;
+    let json_len = total_size - json_start;
+    let mut json_buf = [0u8; 1024];
+    let jl = json_len.min(1024);
+    if jl > 0 {
+        json_buf[..jl].copy_from_slice(&shmem_slice[json_start..json_start + jl]);
+    }
+
+    let _ = shmem_unmap(shmem_handle, INTENT_SHMEM_VADDR);
+
+    let mime_str = unsafe { core::str::from_utf8_unchecked(&mime_buf[..ml]) };
+    let json_str = unsafe { core::str::from_utf8_unchecked(&json_buf[..jl]) };
+
+    if sqlite_insert_intent(file_id as i64, mime_str, json_str) {
+        flush_sqlite_to_disk();
+        println!("[SYNAPSE] Intent stored for file_id={} mime={}", file_id, mime_str);
+        let _ = reply(0, 0);
+    } else {
+        println!("[SYNAPSE] Intent insert failed for file_id={}", file_id);
+        let _ = reply(SYN_STATUS_ERROR, 0);
+    }
+}
+
+/// Handle READ_INTENT request
+/// Request: op | (file_id << 16)
+/// Reply: (total_len << 32) | shmem_handle  (shmem contains: [mime_len: u16 LE][mime][json])
+fn handle_read_intent(msg: AsyncIpcMessage) {
+    let file_id = ((msg.payload0 >> 16) & 0xFFFF) as i64;
+
+    let mut buf = [0u8; 2048];
+    match sqlite_read_intent(file_id, &mut buf) {
+        Some((mime_len, json_len)) => {
+            let total = 2 + mime_len + json_len;
+            // Allocate shmem for response
+            let shmem_size = 4096;
+            match shmem_create(shmem_size) {
+                Ok(handle) => {
+                    let _ = shmem_grant(handle, msg.sender);
+                    if shmem_map(handle, INTENT_SHMEM_VADDR).is_ok() {
+                        unsafe {
+                            let ptr = INTENT_SHMEM_VADDR as *mut u8;
+                            let ml = (mime_len as u16).to_le_bytes();
+                            *ptr = ml[0];
+                            *ptr.add(1) = ml[1];
+                            core::ptr::copy_nonoverlapping(buf.as_ptr(), ptr.add(2), mime_len);
+                            core::ptr::copy_nonoverlapping(
+                                buf[mime_len..].as_ptr(), ptr.add(2 + mime_len), json_len
+                            );
+                        }
+                        let _ = shmem_unmap(handle, INTENT_SHMEM_VADDR);
+                        let _ = reply((total as u64) << 32 | handle as u64, 0);
+                    } else {
+                        let _ = reply(SYN_STATUS_ERROR, 0);
+                    }
+                }
+                Err(_) => { let _ = reply(SYN_STATUS_ERROR, 0); }
+            }
+        }
+        None => {
+            let _ = reply(SYN_STATUS_NOT_FOUND, 0);
+        }
+    }
+}
+
+/// Handle QUERY_MIME — scan file_intents for matching mime_type
+fn handle_query_mime(msg: AsyncIpcMessage) {
+    // For now, use the hash approach (same as read_file_by_name)
+    let mime_hash = ((msg.payload0 >> 32) & 0xFFFFFFFF) as u32;
+
     if let Some(db) = get_sqlite_db() {
-        if let Ok(scanner) = db.table_scan("files") {
+        if let Ok(scanner) = db.table_scan("file_intents") {
             for result in scanner {
                 if let Ok(record) = result {
-                    if let Some(Value::Text(rec_name)) = record.get(1) {
-                        if rec_name == name {
-                            if let Some(Value::Blob(data)) = record.get(4) {
-                                let copy_len = data.len().min(buf.len());
-                                buf[..copy_len].copy_from_slice(&data[..copy_len]);
-                                return copy_len;
+                    if let Some(Value::Text(mime)) = record.get(1) {
+                        if hash_name(mime) == mime_hash {
+                            // Found! Return the file_id and look up its size
+                            let file_id = record.rowid as u16;
+                            let size = get_file_size(file_id as i64);
+                            let _ = reply((size as u64) << 32 | file_id as u64, 0);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let _ = reply(SYN_STATUS_NOT_FOUND, 0);
+}
+
+/// Handle QUERY_INTENT — semantic file search by concept/purpose
+/// Scans file_intents.intent_json for substring match against query.
+/// Request: op | (shmem_handle << 16) | (query_len << 32)
+/// Reply: (size << 32) | file_id, or SYN_STATUS_NOT_FOUND
+fn handle_query_intent(msg: AsyncIpcMessage) {
+    let shmem_handle = ((msg.payload0 >> 16) & 0xFFFF) as u32;
+    let query_len = (msg.payload0 >> 32) as usize;
+
+    if shmem_handle == 0 || query_len == 0 || query_len > 256 {
+        let _ = reply(SYN_STATUS_NOT_FOUND, 0);
+        return;
+    }
+
+    // Map shmem to read query string
+    const QUERY_INTENT_VADDR: usize = 0x15000000;
+    if shmem_map(shmem_handle, QUERY_INTENT_VADDR).is_err() {
+        let _ = reply(SYN_STATUS_ERROR, 0);
+        return;
+    }
+
+    let query_slice = unsafe {
+        core::slice::from_raw_parts(QUERY_INTENT_VADDR as *const u8, query_len)
+    };
+    let mut query_buf = [0u8; 256];
+    let ql = query_len.min(256);
+    query_buf[..ql].copy_from_slice(&query_slice[..ql]);
+    let _ = shmem_unmap(shmem_handle, QUERY_INTENT_VADDR);
+
+    let query = match core::str::from_utf8(&query_buf[..ql]) {
+        Ok(s) => s,
+        Err(_) => {
+            let _ = reply(SYN_STATUS_ERROR, 0);
+            return;
+        }
+    };
+
+    // Lowercase query for case-insensitive matching
+    let mut query_lower = [0u8; 256];
+    for (i, b) in query.bytes().enumerate().take(256) {
+        query_lower[i] = if b >= b'A' && b <= b'Z' { b + 32 } else { b };
+    }
+    let query_lc = unsafe { core::str::from_utf8_unchecked(&query_lower[..ql]) };
+
+    // Scan file_intents for best match
+    let mut best_file_id: i64 = -1;
+    let mut best_score: usize = 0;
+
+    if let Some(db) = get_sqlite_db() {
+        if let Ok(scanner) = db.table_scan("file_intents") {
+            for result in scanner {
+                if let Ok(record) = result {
+                    let file_id = record.rowid;
+
+                    // Check intent_json (column 2) for substring match
+                    if let Some(Value::Text(json)) = record.get(2) {
+                        // Case-insensitive substring search
+                        let mut json_lower = [0u8; 1024];
+                        let jl = json.len().min(1024);
+                        for (i, b) in json.bytes().enumerate().take(jl) {
+                            json_lower[i] = if b >= b'A' && b <= b'Z' { b + 32 } else { b };
+                        }
+                        let json_lc = unsafe { core::str::from_utf8_unchecked(&json_lower[..jl]) };
+
+                        // Score: number of query words found in intent_json
+                        let mut score = 0;
+                        for word in query_lc.split_whitespace() {
+                            if json_lc.contains(word) { score += 1; }
+                        }
+
+                        if score > best_score {
+                            best_score = score;
+                            best_file_id = file_id;
+                        }
+                    }
+
+                    // Also check mime_type (column 1)
+                    if let Some(Value::Text(mime)) = record.get(1) {
+                        if mime.contains(query_lc) || query_lc.contains(mime) {
+                            if best_score == 0 {
+                                best_file_id = file_id;
+                                best_score = 1;
                             }
                         }
                     }
@@ -1554,6 +2291,286 @@ fn read_sqlite_blob(name: &str, buf: &mut [u8]) -> usize {
             }
         }
     }
+
+    if best_file_id >= 0 {
+        let size = get_file_size(best_file_id);
+        println!("[SYNAPSE] Intent query '{}' → file_id={} (score={})", query, best_file_id, best_score);
+        let _ = reply((size as u64) << 32 | best_file_id as u64, 0);
+    } else {
+        println!("[SYNAPSE] Intent query '{}' → not found", query);
+        let _ = reply(SYN_STATUS_NOT_FOUND, 0);
+    }
+}
+
+/// Read a file's BLOB data directly from SQLite into buf. Returns bytes read.
+fn read_sqlite_blob(name: &str, buf: &mut [u8]) -> usize {
+    if let Some(db) = get_sqlite_db() {
+        if let Ok(scanner) = db.table_scan("files") {
+            let mut row_count = 0u32;
+            for result in scanner {
+                row_count += 1;
+                if let Ok(record) = result {
+                    if let Some(Value::Text(rec_name)) = record.get(1) {
+                        if rec_name == name {
+                            if let Some(Value::Blob(data)) = record.get(4) {
+                                let copy_len = data.len().min(buf.len());
+                                buf[..copy_len].copy_from_slice(&data[..copy_len]);
+                                println!("[SYNAPSE] read_sqlite_blob: found '{}' blob={}B copy={}B",
+                                    name, data.len(), copy_len);
+                                return copy_len;
+                            } else {
+                                println!("[SYNAPSE] read_sqlite_blob: '{}' matched but col4 is not Blob", name);
+                            }
+                        }
+                    }
+                }
+            }
+            println!("[SYNAPSE] read_sqlite_blob: scanned {} rows, '{}' not found", row_count, name);
+        } else {
+            println!("[SYNAPSE] read_sqlite_blob: table_scan failed");
+        }
+    } else {
+        println!("[SYNAPSE] read_sqlite_blob: no sqlite db");
+    }
+    0
+}
+
+/// Decode a varint, returning Option<(u64, bytes_consumed)> for easy use with match
+fn dv(bytes: &[u8]) -> Option<(u64, usize)> {
+    decode_varint(bytes).ok().map(|(v, n)| (v as u64, n))
+}
+
+/// Read a file's BLOB data from SQLite with overflow page support.
+/// SQLite stores large BLOBs across multiple pages. The B-tree leaf cell
+/// contains the first N bytes inline, then a 4-byte overflow page number.
+/// Each overflow page: [4-byte next_page][content (page_size - 4 bytes)].
+fn read_sqlite_blob_large(name: &str, buf: &mut [u8]) -> usize {
+    let db = match get_sqlite_db() {
+        Some(d) => d,
+        None => return 0,
+    };
+
+    let page_size = db.page_size() as usize;
+    let usable_size = page_size - db.header().reserved_bytes as usize;
+
+    // Scan table to find the right row's cell raw data
+    // We need to find the cell ourselves to read overflow pages
+    let root_page = 2u32; // "files" table is typically on page 2
+
+    // Walk the B-tree to find the cell containing our file name
+    let mut pages_to_scan = [0u32; 64];
+    pages_to_scan[0] = root_page;
+    let mut scan_count = 1usize;
+    let mut total_written = 0usize;
+
+    while scan_count > 0 {
+        scan_count -= 1;
+        let page_num = pages_to_scan[scan_count];
+        let page_data = match db.page(page_num) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        // Parse page header
+        let hdr_offset = if page_num == 1 { 100 } else { 0 };
+        if hdr_offset + 8 > page_data.len() { continue; }
+        let page_type = page_data[hdr_offset];
+        let cell_count = u16::from_be_bytes([
+            page_data[hdr_offset + 3], page_data[hdr_offset + 4]
+        ]) as usize;
+
+        let is_leaf = page_type == 0x0D; // leaf table
+        let is_interior = page_type == 0x05; // interior table
+
+        if is_interior {
+            // Interior: follow child pointers (rightmost child + per-cell left children)
+            let right_child = u32::from_be_bytes([
+                page_data[hdr_offset + 8], page_data[hdr_offset + 9],
+                page_data[hdr_offset + 10], page_data[hdr_offset + 11],
+            ]);
+            if scan_count < 63 { pages_to_scan[scan_count] = right_child; scan_count += 1; }
+            let cell_ptr_start = hdr_offset + 12;
+            for i in 0..cell_count {
+                let ptr_off = cell_ptr_start + i * 2;
+                if ptr_off + 2 > page_data.len() { break; }
+                let cell_off = u16::from_be_bytes([page_data[ptr_off], page_data[ptr_off+1]]) as usize;
+                if cell_off + 4 > page_data.len() { continue; }
+                let left_child = u32::from_be_bytes([
+                    page_data[cell_off], page_data[cell_off+1],
+                    page_data[cell_off+2], page_data[cell_off+3],
+                ]);
+                if scan_count < 63 { pages_to_scan[scan_count] = left_child; scan_count += 1; }
+            }
+            continue;
+        }
+
+        if !is_leaf { continue; }
+
+        // Leaf: scan cells for matching file name
+        let cell_ptr_start = hdr_offset + 8;
+        for i in 0..cell_count {
+            let ptr_off = cell_ptr_start + i * 2;
+            if ptr_off + 2 > page_data.len() { break; }
+            let cell_off = u16::from_be_bytes([page_data[ptr_off], page_data[ptr_off+1]]) as usize;
+            if cell_off >= page_data.len() { continue; }
+            let cell = &page_data[cell_off..];
+
+            // Parse varint: payload_size, rowid
+            let (payload_size, ps_len) = match dv(cell) {
+                Some(v) => v,
+                None => continue,
+            };
+            let (_, rowid_len) = match dv(&cell[ps_len..]) {
+                Some(v) => v,
+                None => continue,
+            };
+
+            let hdr_start = ps_len + rowid_len;
+            let payload_size = payload_size as usize;
+
+            // Calculate local payload size (SQLite overflow formula)
+            let max_local = usable_size - 35;
+            let local_size = if payload_size <= max_local {
+                payload_size
+            } else {
+                let min_local = ((usable_size - 12) * 32 / 255) - 23;
+                let m = min_local + ((payload_size - min_local) % (usable_size - 4));
+                if m <= max_local { m } else { min_local }
+            };
+
+            // Read the inline portion of the record header to check file name
+            if hdr_start + 10 > cell.len() { continue; } // need at least header
+            let record_data = &cell[hdr_start..hdr_start + local_size.min(cell.len() - hdr_start)];
+
+            // Quick check: parse record header to find name column
+            let (hdr_size, hdr_size_len) = match dv(record_data) {
+                Some(v) => v,
+                None => continue,
+            };
+            let hdr_size = hdr_size as usize;
+            if hdr_size > record_data.len() { continue; }
+
+            // Parse column serial types from header
+            let mut col_types = [0u64; 6]; // id, name, kind, size, data
+            let mut pos = hdr_size_len;
+            let mut col_idx = 0;
+            while pos < hdr_size && col_idx < 6 {
+                let (st, st_len) = match dv(&record_data[pos..]) {
+                    Some(v) => v,
+                    None => break,
+                };
+                col_types[col_idx] = st;
+                pos += st_len;
+                col_idx += 1;
+            }
+
+            // Column 1 (name) serial type: >=13 and odd means TEXT, length=(st-13)/2
+            let name_st = col_types[1];
+            if name_st < 13 || name_st % 2 == 0 { continue; }
+            let name_len = ((name_st - 13) / 2) as usize;
+
+            // Calculate offset of name value: skip id column
+            let id_size = match col_types[0] {
+                0 => 0, 1 => 1, 2 => 2, 3 => 3, 4 => 4, 5 => 6, 6 => 8, 7 => 8,
+                8 | 9 => 0, _ => ((col_types[0] - 12) / 2) as usize,
+            };
+            let name_offset = hdr_size + id_size;
+            if name_offset + name_len > record_data.len() { continue; }
+            let rec_name = &record_data[name_offset..name_offset + name_len];
+
+            // Compare name
+            if rec_name != name.as_bytes() { continue; }
+
+            // Found it! Now read the full payload (inline + overflow)
+            // Calculate data (col4) offset by skipping cols 0-3
+            let kind_size = match col_types[2] {
+                0 => 0, 1 => 1, 2 => 2, 3 => 3, 4 => 4, 5 => 6, 6 => 8, 7 => 8,
+                8 | 9 => 0, _ => ((col_types[2] - 12) / 2) as usize,
+            };
+            let size_col_size = match col_types[3] {
+                0 => 0, 1 => 1, 2 => 2, 3 => 3, 4 => 4, 5 => 6, 6 => 8, 7 => 8,
+                8 | 9 => 0, _ => ((col_types[3] - 12) / 2) as usize,
+            };
+            let data_start = hdr_size + id_size + name_len + kind_size + size_col_size;
+            let blob_size = if col_types[4] >= 12 && col_types[4] % 2 == 0 {
+                ((col_types[4] - 12) / 2) as usize
+            } else {
+                // Not a blob
+                println!("[SYNAPSE] blob_large: col4 type={} is not BLOB", col_types[4]);
+                return 0;
+            };
+
+            // Copy inline portion of blob
+            let inline_blob_start = hdr_start + data_start;
+            let inline_blob_avail = local_size.saturating_sub(data_start);
+            let inline_copy = inline_blob_avail.min(blob_size).min(buf.len());
+            if inline_blob_start + inline_copy <= cell.len() {
+                buf[..inline_copy].copy_from_slice(
+                    &cell[inline_blob_start..inline_blob_start + inline_copy],
+                );
+                total_written = inline_copy;
+            }
+
+            // Follow overflow pages for the rest
+            if payload_size > local_size {
+                // Overflow page number is right after local payload
+                let ovfl_ptr_off = hdr_start + local_size;
+                if ovfl_ptr_off + 4 <= cell.len() {
+                    let mut ovfl_page = u32::from_be_bytes([
+                        cell[ovfl_ptr_off], cell[ovfl_ptr_off+1],
+                        cell[ovfl_ptr_off+2], cell[ovfl_ptr_off+3],
+                    ]);
+                    let content_per_page = usable_size - 4;
+                    let mut remaining = blob_size.saturating_sub(inline_copy);
+                    // But we also need to account for non-blob data in overflow
+                    let payload_in_overflow = payload_size - local_size;
+                    let blob_data_before_overflow = data_start + inline_copy;
+                    let non_blob_in_overflow = if payload_in_overflow > remaining {
+                        payload_in_overflow - remaining
+                    } else { 0 };
+                    // Skip non-blob overflow bytes
+                    let mut skip = if data_start > local_size {
+                        data_start - local_size // blob hasn't started yet in overflow
+                    } else { 0 };
+
+                    while ovfl_page != 0 && remaining > 0 && total_written < buf.len() {
+                        let ovfl_data = match db.page(ovfl_page) {
+                            Ok(p) => p,
+                            Err(_) => break,
+                        };
+                        if ovfl_data.len() < 4 { break; }
+                        let next_page = u32::from_be_bytes([
+                            ovfl_data[0], ovfl_data[1], ovfl_data[2], ovfl_data[3],
+                        ]);
+                        let content = &ovfl_data[4..usable_size.min(ovfl_data.len())];
+
+                        if skip > 0 {
+                            let skip_here = skip.min(content.len());
+                            let usable = &content[skip_here..];
+                            let copy = usable.len().min(remaining).min(buf.len() - total_written);
+                            buf[total_written..total_written + copy].copy_from_slice(&usable[..copy]);
+                            total_written += copy;
+                            remaining -= copy;
+                            skip -= skip_here;
+                        } else {
+                            let copy = content.len().min(remaining).min(buf.len() - total_written);
+                            buf[total_written..total_written + copy].copy_from_slice(&content[..copy]);
+                            total_written += copy;
+                            remaining -= copy;
+                        }
+
+                        ovfl_page = next_page;
+                    }
+                }
+            }
+
+            println!("[SYNAPSE] blob_large: '{}' read {} bytes (blob_size={})",
+                name, total_written, blob_size);
+            return total_written;
+        }
+    }
+
+    println!("[SYNAPSE] blob_large: '{}' not found in B-tree", name);
     0
 }
 
@@ -1599,24 +2616,51 @@ fn flush_sqlite_to_disk() -> bool {
     unsafe {
         let db_size = SQLITE_STATE.size;
         let total_sectors = (db_size + block::SECTOR_SIZE - 1) / block::SECTOR_SIZE;
-        let chunk_size = 64usize;
-        let mut sectors_remaining = total_sectors;
-        let mut current_sector = db_sector;
-        let mut buf_offset = 0usize;
+        let total_pages = (db_size + 4095) / 4096;
+        let mut written = 0usize;
+        let mut errors = 0usize;
 
-        while sectors_remaining > 0 {
-            let this_chunk = sectors_remaining.min(chunk_size);
-            let chunk_bytes = this_chunk * block::SECTOR_SIZE;
-            let buf = &SQLITE_STATE.data[buf_offset..buf_offset + chunk_bytes];
-
-            if block::block_write(current_sector, buf, this_chunk).is_err() {
-                println!("[SYNAPSE] flush: write failed at sector {}", current_sector);
-                return false;
+        // Dirty-page flush: only write pages that were modified since last flush.
+        // Each SQLite page = 4096 bytes = 8 sectors.
+        for page in 0..total_pages {
+            if !is_page_dirty(page) {
+                continue; // Skip clean pages
             }
+            let page_offset = page * 4096;
+            let sectors_in_page = if page_offset + 4096 <= db_size { 8 } else {
+                (db_size - page_offset + 511) / 512
+            };
+            for s in 0..sectors_in_page {
+                let byte_offset = page_offset + s * 512;
+                let sec = db_sector + (byte_offset / 512) as u64;
+                let sector_data: &[u8; 512] = SQLITE_STATE.data[byte_offset..byte_offset + 512]
+                    .try_into().unwrap();
+                if block::write_sector(sec, sector_data).is_ok() {
+                    written += 1;
+                } else {
+                    errors += 1;
+                }
+            }
+        }
 
-            current_sector += this_chunk as u64;
-            buf_offset += chunk_bytes;
-            sectors_remaining -= this_chunk;
+        // Clear dirty flags after flush
+        clear_dirty();
+
+        // Update FOLKDISK header with new DB size
+        let new_db_sectors = total_sectors as u64;
+        let old_db_sectors = u64::from_le_bytes([
+            header_buf[56], header_buf[57], header_buf[58], header_buf[59],
+            header_buf[60], header_buf[61], header_buf[62], header_buf[63],
+        ]);
+        if new_db_sectors != old_db_sectors {
+            header_buf[56..64].copy_from_slice(&new_db_sectors.to_le_bytes());
+            let _ = block::write_sector(0, &header_buf);
+            println!("[SYNAPSE] DB grown: {} -> {} sectors", old_db_sectors, new_db_sectors);
+        }
+
+        if written > 0 || errors > 0 {
+            println!("[SYNAPSE] flush: {} sectors written, {} errors ({} dirty pages)",
+                written, errors, written / 8 + if errors > 0 { 1 } else { 0 });
         }
     }
 

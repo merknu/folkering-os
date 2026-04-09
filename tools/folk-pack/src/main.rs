@@ -630,6 +630,22 @@ fn create_sqlite(output_path: String, add_entries: Vec<AddEntry>, generate_embed
         process::exit(1);
     });
 
+    // Create file_intents table for Semantic VFS (ECS component)
+    // Stores MIME type and intent JSON separately from raw file data
+    conn.execute(
+        "CREATE TABLE file_intents (
+            file_id INTEGER PRIMARY KEY,
+            mime_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+            intent_json TEXT,
+            schema_version INTEGER DEFAULT 1,
+            FOREIGN KEY (file_id) REFERENCES files(id)
+        )",
+        [],
+    ).unwrap_or_else(|e| {
+        eprintln!("Error creating file_intents table: {}", e);
+        process::exit(1);
+    });
+
     // Create index on embeddings for faster lookups
     conn.execute(
         "CREATE INDEX idx_embeddings_file_id ON embeddings(file_id)",
@@ -890,6 +906,27 @@ fn create_sqlite(output_path: String, add_entries: Vec<AddEntry>, generate_embed
     // Close connection
     drop(conn);
 
+    // CRITICAL: Verify and fix page_count in SQLite header.
+    // SQLite sometimes leaves page_count stale (e.g., after auto-vacuum or
+    // freelist operations). Synapse's B-tree traversal relies on page_count
+    // to bounds-check page references — a stale count causes "unexpected
+    // page type 0x00" errors.
+    {
+        let db_bytes = fs::read(&output_path).unwrap();
+        if db_bytes.len() >= 100 && &db_bytes[0..16] == b"SQLite format 3\0" {
+            let page_size = u16::from_be_bytes([db_bytes[16], db_bytes[17]]) as usize;
+            let header_page_count = u32::from_be_bytes([db_bytes[28], db_bytes[29], db_bytes[30], db_bytes[31]]) as usize;
+            let actual_pages = db_bytes.len() / page_size;
+            if header_page_count != actual_pages {
+                println!("folk-pack: WARNING: page_count mismatch! header={} actual={} — fixing", header_page_count, actual_pages);
+                let mut fixed = db_bytes;
+                let correct = (actual_pages as u32).to_be_bytes();
+                fixed[28..32].copy_from_slice(&correct);
+                fs::write(&output_path, &fixed).unwrap();
+            }
+        }
+    }
+
     // Get final file size
     let db_size = fs::metadata(&output_path)
         .map(|m| m.len())
@@ -915,6 +952,14 @@ fn create_sqlite(output_path: String, add_entries: Vec<AddEntry>, generate_embed
     println!("      kind INTEGER NOT NULL,  -- 0=ELF, 1=Data");
     println!("      size INTEGER NOT NULL,");
     println!("      data BLOB");
+    println!("  );");
+    println!();
+    println!("  CREATE TABLE file_intents (");
+    println!("      file_id INTEGER PRIMARY KEY,");
+    println!("      mime_type TEXT NOT NULL DEFAULT 'application/octet-stream',");
+    println!("      intent_json TEXT,");
+    println!("      schema_version INTEGER DEFAULT 1,");
+    println!("      FOREIGN KEY (file_id) REFERENCES files(id)");
     println!("  );");
     println!();
     println!("  CREATE TABLE embeddings (");

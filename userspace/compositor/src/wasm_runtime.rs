@@ -23,6 +23,8 @@
 //! - `folk_get_surface() -> i32` — returns offset in WASM memory for pixel buffer
 //! - `folk_surface_pitch() -> i32` — bytes per row (width * 4)
 //! - `folk_surface_present()` — marks surface dirty for blit to framebuffer
+//! ## Tensor Inspection (Phase 10)
+//! - `folk_tensor_read(buf_ptr, buf_len, sector_offset) -> i32` — read TDMP mailbox
 
 extern crate alloc;
 
@@ -31,7 +33,12 @@ use alloc::vec::Vec;
 use wasmi::*;
 
 /// Maximum fuel (instructions) per WASM execution tick
+/// Default fuel for WASM apps (1M instructions per frame)
 const FUEL_LIMIT: u64 = 1_000_000;
+/// Boosted fuel for the foreground/active app (5x more CPU time)
+pub const FUEL_FOREGROUND: u64 = 5_000_000;
+/// Reduced fuel for background windows (save CPU for foreground)
+pub const FUEL_BACKGROUND: u64 = 200_000;
 
 /// Maximum pending events per frame (prevent unbounded growth)
 const MAX_EVENTS: usize = 64;
@@ -98,6 +105,43 @@ pub struct WasmOutput {
     pub fill_screen: Option<u32>,
     pub surface_dirty: bool,
     pub asset_requests: Vec<PendingAssetRequest>,
+    /// Semantic Streams: data pushed by upstream via folk_stream_write()
+    pub stream_data: Vec<u8>,
+    /// Semantic Streams: upstream signals completion
+    pub stream_complete: bool,
+}
+
+/// Generate a text description of what a WASM app renders.
+/// Used by AutoDream Creative mode — sent to LLM instead of raw pixels.
+pub fn render_summary(output: &WasmOutput) -> String {
+    let mut s = String::new();
+    if let Some(color) = output.fill_screen {
+        s.push_str(&alloc::format!("Background: #{:06X}\n", color));
+    }
+    if !output.draw_commands.is_empty() {
+        s.push_str(&alloc::format!("{} rectangles:\n", output.draw_commands.len()));
+        for (i, cmd) in output.draw_commands.iter().take(5).enumerate() {
+            s.push_str(&alloc::format!("  [{}] {}x{} at ({},{}) color=#{:06X}\n", i, cmd.w, cmd.h, cmd.x, cmd.y, cmd.color));
+        }
+        if output.draw_commands.len() > 5 { s.push_str("  ...\n"); }
+    }
+    if !output.circle_commands.is_empty() {
+        s.push_str(&alloc::format!("{} circles:\n", output.circle_commands.len()));
+        for (i, cmd) in output.circle_commands.iter().take(3).enumerate() {
+            s.push_str(&alloc::format!("  [{}] r={} at ({},{}) color=#{:06X}\n", i, cmd.r, cmd.cx, cmd.cy, cmd.color));
+        }
+    }
+    if !output.line_commands.is_empty() {
+        s.push_str(&alloc::format!("{} lines\n", output.line_commands.len()));
+    }
+    if !output.text_commands.is_empty() {
+        s.push_str(&alloc::format!("{} text labels:\n", output.text_commands.len()));
+        for cmd in output.text_commands.iter().take(3) {
+            s.push_str(&alloc::format!("  \"{}\" at ({},{}) color=#{:06X}\n", &cmd.text[..cmd.text.len().min(30)], cmd.x, cmd.y, cmd.color));
+        }
+    }
+    if s.is_empty() { s.push_str("(empty output)"); }
+    s
 }
 
 // ── Internal State ───────────────────────────────────────────────────────
@@ -114,6 +158,10 @@ struct HostState {
     pending_asset_requests: Vec<PendingAssetRequest>,
     next_asset_handle: u32,
     config: WasmConfig,
+    // Semantic Streams
+    stream_write_buf: Vec<u8>,  // upstream writes here via folk_stream_write
+    stream_read_buf: Vec<u8>,   // downstream reads from here (set by compositor)
+    stream_complete: bool,
 }
 
 // ── Host Function Registration ───────────────────────────────────────────
@@ -201,6 +249,31 @@ fn register_host_functions(linker: &mut Linker<HostState>) {
     let _ = linker.func_wrap("env", "folk_random",
         |_caller: Caller<HostState>| -> i32 {
             libfolk::sys::random::random_u32() as i32
+        },
+    );
+
+    // OS Metrics: AI-generated apps can query live system state
+    // folk_os_metric(id) -> i32: 0=network, 1=firewall, 2=uptime, 3=suspicious
+    // Returns lower 32 bits of the metric (enough for most use cases)
+    let _ = linker.func_wrap("env", "folk_os_metric",
+        |_caller: Caller<HostState>, metric_id: i32| -> i32 {
+            (libfolk::sys::pci::os_metric(metric_id as u32) & 0xFFFFFFFF) as i32
+        },
+    );
+
+    // Convenience: folk_net_has_ip() -> i32 (1 if online, 0 if not)
+    let _ = linker.func_wrap("env", "folk_net_has_ip",
+        |_caller: Caller<HostState>| -> i32 {
+            let (has_ip, _, _, _, _) = libfolk::sys::pci::net_status();
+            if has_ip { 1 } else { 0 }
+        },
+    );
+
+    // Convenience: folk_fw_drops() -> i32 (firewall drop count)
+    let _ = linker.func_wrap("env", "folk_fw_drops",
+        |_caller: Caller<HostState>| -> i32 {
+            let (_, drops) = libfolk::sys::pci::firewall_stats();
+            drops as i32
         },
     );
 
@@ -335,6 +408,277 @@ fn register_host_functions(linker: &mut Linker<HostState>) {
             handle as i32
         },
     );
+
+    // Phase 5: Semantic file query — search files by concept/purpose
+    // folk_query_files(query_ptr, query_len, result_ptr, result_max_len) -> i32
+    // Writes the first matching filename to result_ptr.
+    // Returns filename length on success, 0 on not found, -1 on error.
+    let _ = linker.func_wrap("env", "folk_query_files",
+        |mut caller: Caller<HostState>, query_ptr: i32, query_len: i32, result_ptr: i32, result_max_len: i32| -> i32 {
+            if query_len <= 0 || query_len > 256 || result_max_len <= 0 { return -1; }
+
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+
+            // Read query string from WASM memory
+            let mut query_buf = alloc::vec![0u8; query_len as usize];
+            if mem.read(&caller, query_ptr as usize, &mut query_buf).is_err() { return -1; }
+            let query = match alloc::str::from_utf8(&query_buf) {
+                Ok(s) => String::from(s),
+                Err(_) => return -1,
+            };
+
+            // Call Synapse semantic query
+            match libfolk::sys::synapse::query_intent(&query) {
+                Ok(info) => {
+                    // Construct result filename from query
+                    let result_name = alloc::format!("{}.wasm", query);
+                    let result_bytes = result_name.as_bytes();
+                    let copy_len = result_bytes.len().min(result_max_len as usize);
+                    if mem.write(&mut caller, result_ptr as usize, &result_bytes[..copy_len]).is_ok() {
+                        copy_len as i32
+                    } else { -1 }
+                }
+                Err(_) => 0, // Not found
+            }
+        },
+    );
+
+    // Phase 6: VFS write + list — apps can save data and browse files
+    // folk_list_files(buf_ptr, max_len) -> i32
+    // Writes "name1\nname2\n..." to buf. Returns total bytes written.
+    let _ = linker.func_wrap("env", "folk_list_files",
+        |mut caller: Caller<HostState>, buf_ptr: i32, max_len: i32| -> i32 {
+            if max_len <= 0 { return 0; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+            // Read directory entries from ramdisk (kernel syscall)
+            let mut entries: [libfolk::sys::fs::DirEntry; 32] = unsafe { ::core::mem::zeroed() };
+            let count = libfolk::sys::fs::read_dir(&mut entries);
+            // Build newline-separated file list with size info
+            let mut result = String::new();
+            for i in 0..count {
+                let e = &entries[i];
+                let name = e.name_str();
+                result.push_str(name);
+                result.push('\t');
+                // Append size
+                let mut nbuf = [0u8; 12];
+                let mut n = e.size as usize;
+                let mut pos = nbuf.len();
+                if n == 0 { pos -= 1; nbuf[pos] = b'0'; }
+                while n > 0 && pos > 0 { pos -= 1; nbuf[pos] = b'0' + (n % 10) as u8; n /= 10; }
+                if let Ok(s) = ::core::str::from_utf8(&nbuf[pos..]) { result.push_str(s); }
+                result.push('\n');
+            }
+            let bytes = result.as_bytes();
+            let copy_len = bytes.len().min(max_len as usize);
+            if mem.write(&mut caller, buf_ptr as usize, &bytes[..copy_len]).is_ok() {
+                copy_len as i32
+            } else { -1 }
+        },
+    );
+
+    // folk_write_file(path_ptr, path_len, data_ptr, data_len) -> i32
+    // Saves data to Synapse VFS. Returns 0 on success, -1 on error.
+    let _ = linker.func_wrap("env", "folk_write_file",
+        |mut caller: Caller<HostState>, path_ptr: i32, path_len: i32, data_ptr: i32, data_len: i32| -> i32 {
+            if path_len <= 0 || path_len > 256 || data_len < 0 || data_len > 4096 { return -1; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+            let mut name_buf = alloc::vec![0u8; path_len as usize];
+            if mem.read(&caller, path_ptr as usize, &mut name_buf).is_err() { return -1; }
+            let name = match alloc::str::from_utf8(&name_buf) {
+                Ok(s) => s,
+                Err(_) => return -1,
+            };
+            let mut data_buf = alloc::vec![0u8; data_len as usize];
+            if data_len > 0 {
+                if mem.read(&caller, data_ptr as usize, &mut data_buf).is_err() { return -1; }
+            }
+            match libfolk::sys::synapse::write_file(name, &data_buf) {
+                Ok(_) => 0,
+                Err(_) => -1,
+            }
+        },
+    );
+
+    // Phase 7: Intent-IP — Semantic Network Requests
+    // folk_http_get(url_ptr, url_len, buf_ptr, max_len) -> i32
+    // Makes an HTTP GET request via kernel network stack.
+    // Returns bytes written to buf, or -1 on error.
+    let _ = linker.func_wrap("env", "folk_http_get",
+        |mut caller: Caller<HostState>, url_ptr: i32, url_len: i32, buf_ptr: i32, max_len: i32| -> i32 {
+            // folk_http_get: WASM app fetches data from internet via TCP proxy
+            if url_len <= 0 || url_len > 512 || max_len <= 0 { return -1; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+            // Read URL from WASM memory
+            let mut url_buf = alloc::vec![0u8; url_len as usize];
+            if mem.read(&caller, url_ptr as usize, &mut url_buf).is_err() { return -1; }
+            let url = match alloc::str::from_utf8(&url_buf) {
+                Ok(s) => s,
+                Err(_) => return -1,
+            };
+            // Use kernel ask_gemini syscall with __HTTP_GET__ prefix
+            // The proxy intercepts this and performs actual HTTP GET
+            let prompt = alloc::format!("__HTTP_GET__{}", url);
+            let mut response = alloc::vec![0u8; max_len as usize];
+            let bytes = libfolk::sys::ask_gemini(&prompt, &mut response);
+            if bytes == 0 { return -1; }
+            let copy_len = bytes.min(max_len as usize);
+            if mem.write(&mut caller, buf_ptr as usize, &response[..copy_len]).is_ok() {
+                copy_len as i32
+            } else { -1 }
+        },
+    );
+
+    // Phase 8: On-Device SLM — Local AI inference for WASM apps
+    // folk_slm_generate(prompt_ptr, prompt_len, buf_ptr, max_len) -> i32
+    // Tries LOCAL brain first (zero latency, zero network).
+    // Falls back to Ollama proxy for complex queries.
+    // "Spinal cord" = local, "Cerebral cortex" = cloud.
+    let _ = linker.func_wrap("env", "folk_slm_generate",
+        |mut caller: Caller<HostState>, prompt_ptr: i32, prompt_len: i32, buf_ptr: i32, max_len: i32| -> i32 {
+            if prompt_len <= 0 || prompt_len > 2048 || max_len <= 0 { return -1; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+            let mut prompt_buf = alloc::vec![0u8; prompt_len as usize];
+            if mem.read(&caller, prompt_ptr as usize, &mut prompt_buf).is_err() { return -1; }
+            let prompt = match alloc::str::from_utf8(&prompt_buf) {
+                Ok(s) => String::from(s),
+                Err(_) => return -1,
+            };
+
+            // Try LOCAL brain first (zero latency, zero network)
+            if let Some(local_response) = crate::slm_runtime::brain().generate(&prompt) {
+                let bytes = local_response.as_bytes();
+                let copy_len = bytes.len().min(max_len as usize);
+                if mem.write(&mut caller, buf_ptr as usize, &bytes[..copy_len]).is_ok() {
+                    return copy_len as i32;
+                }
+            }
+
+            // Fallback: route to proxy (Ollama FAST tier)
+            let full_prompt = alloc::format!("__SLM_GENERATE__{}", prompt);
+            let mut response = alloc::vec![0u8; max_len as usize];
+            let bytes = libfolk::sys::ask_gemini(&full_prompt, &mut response);
+            if bytes == 0 { return -1; }
+            let copy_len = bytes.min(max_len as usize);
+            if mem.write(&mut caller, buf_ptr as usize, &response[..copy_len]).is_ok() {
+                copy_len as i32
+            } else { -1 }
+        },
+    );
+
+    // folk_intent_fetch(query_ptr, query_len, buf_ptr, max_len) -> i32
+    // Semantic network request: "Get weather in Oslo" → OS translates to API call.
+    // The LLM proxy interprets the intent, calls the appropriate API, and returns
+    // structured data. The app never needs to know HTTP headers or JSON parsing.
+    let _ = linker.func_wrap("env", "folk_intent_fetch",
+        |mut caller: Caller<HostState>, query_ptr: i32, query_len: i32, buf_ptr: i32, max_len: i32| -> i32 {
+            if query_len <= 0 || query_len > 512 || max_len <= 0 { return -1; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+            let mut query_buf = alloc::vec![0u8; query_len as usize];
+            if mem.read(&caller, query_ptr as usize, &mut query_buf).is_err() { return -1; }
+            let query = match alloc::str::from_utf8(&query_buf) {
+                Ok(s) => s,
+                Err(_) => return -1,
+            };
+            // Send as MCP ChatRequest with __INTENT_FETCH__ prefix
+            // Proxy will: interpret intent → call API → return structured result
+            let prompt = alloc::format!("__INTENT_FETCH__{}", query);
+            let mut response = alloc::vec![0u8; max_len as usize];
+            let bytes = libfolk::sys::ask_gemini(&prompt, &mut response);
+            if bytes == 0 { return -1; }
+            let copy_len = bytes.min(max_len as usize);
+            if mem.write(&mut caller, buf_ptr as usize, &response[..copy_len]).is_ok() {
+                copy_len as i32
+            } else { -1 }
+        },
+    );
+
+    // Phase 10: Tensor Inspection — Read inference tensor mailbox from VirtIO-blk
+    // folk_tensor_read(buf_ptr, buf_len, sector_offset) -> i32
+    // Reads from the TDMP (Tensor DuMP) disk mailbox written by the inference server.
+    //   sector_offset=0: Header sector (512 bytes) — magic, stats, shape, 100 summary floats
+    //   sector_offset=1+: Data sectors with raw f32 values (up to 256 sectors, 128KB)
+    // Returns bytes read, or -1 on error.
+    let _ = linker.func_wrap("env", "folk_tensor_read",
+        |mut caller: Caller<HostState>, buf_ptr: i32, buf_len: i32, sector_offset: i32| -> i32 {
+            if buf_len <= 0 || sector_offset < 0 || sector_offset > 256 { return -1; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+            // TDMP header is at sector 1, data starts at sector 2
+            let disk_sector = 1u64 + sector_offset as u64;
+            let sectors_to_read = ((buf_len as usize) + 511) / 512;
+            let sectors_to_read = sectors_to_read.min(257 - sector_offset as usize);
+            let total_bytes = sectors_to_read * 512;
+            let mut read_buf = alloc::vec![0u8; total_bytes];
+            if libfolk::sys::block::block_read(disk_sector, &mut read_buf, sectors_to_read).is_err() {
+                return -1;
+            }
+            let copy_len = total_bytes.min(buf_len as usize);
+            if mem.write(&mut caller, buf_ptr as usize, &read_buf[..copy_len]).is_ok() {
+                copy_len as i32
+            } else { -1 }
+        },
+    );
+
+    // Phase 9: Semantic Streams — Tick-Tock Co-Scheduling
+    // folk_stream_write(ptr, len) — upstream pushes data to stream buffer
+    let _ = linker.func_wrap("env", "folk_stream_write",
+        |mut caller: Caller<HostState>, ptr: i32, len: i32| {
+            if len <= 0 || len > 4096 { return; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return,
+            };
+            let mut buf = alloc::vec![0u8; len as usize];
+            if mem.read(&caller, ptr as usize, &mut buf).is_ok() {
+                caller.data_mut().stream_write_buf.extend_from_slice(&buf);
+            }
+        },
+    );
+
+    // folk_stream_read(ptr, max_len) -> i32 — downstream pulls data from stream
+    let _ = linker.func_wrap("env", "folk_stream_read",
+        |mut caller: Caller<HostState>, ptr: i32, max_len: i32| -> i32 {
+            if max_len <= 0 { return 0; }
+            let data = caller.data().stream_read_buf.clone();
+            if data.is_empty() { return 0; }
+            let copy_len = data.len().min(max_len as usize);
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+            if mem.write(&mut caller, ptr as usize, &data[..copy_len]).is_ok() {
+                copy_len as i32
+            } else { -1 }
+        },
+    );
+
+    // folk_stream_done() — signal that streaming is complete
+    let _ = linker.func_wrap("env", "folk_stream_done",
+        |mut caller: Caller<HostState>| {
+            caller.data_mut().stream_complete = true;
+        },
+    );
 }
 
 // ── One-Shot Execution (tools/scripts) ───────────────────────────────────
@@ -360,11 +704,8 @@ pub fn execute_wasm(
     let mut linker = Linker::<HostState>::new(&engine);
     register_host_functions(&mut linker);
 
-    let instance = match linker.instantiate(&mut store, &module) {
-        Ok(inst) => match inst.ensure_no_start(&mut store) {
-            Ok(i) => i,
-            Err(e) => return (WasmResult::Trap(alloc::format!("Start trap: {:?}", e)), empty_output()),
-        },
+    let instance = match linker.instantiate_and_start(&mut store, &module) {
+        Ok(i) => i,
         Err(e) => return (WasmResult::LoadError(alloc::format!("Instantiation: {:?}", e)), empty_output()),
     };
 
@@ -400,6 +741,8 @@ pub struct PersistentWasmApp {
     instance: Instance,
     run_fn: TypedFunc<(), ()>,
     pub active: bool,
+    /// Dynamic fuel budget: foreground apps get more CPU time
+    pub fuel_budget: u64,
 }
 
 impl PersistentWasmApp {
@@ -416,18 +759,16 @@ impl PersistentWasmApp {
         let mut linker = Linker::<HostState>::new(&engine);
         register_host_functions(&mut linker);
 
-        let instance = linker.instantiate(&mut store, &module)
-            .map_err(|e| alloc::format!("Instantiation: {:?}", e))?
-            .ensure_no_start(&mut store)
-            .map_err(|e| alloc::format!("Start trap: {:?}", e))?;
+        let instance = linker.instantiate_and_start(&mut store, &module)
+            .map_err(|e| alloc::format!("Instantiation: {:?}", e))?;
 
         // Try to grow WASM memory for surface buffer support.
         // If allocation fails (heap too small), surface just won't be available
         // and folk_get_surface() will return 0 (apps use DrawCmd fallback).
         if let Some(Extern::Memory(mem)) = instance.get_export(&store, "memory") {
-            let current_pages = mem.size(&store);
+            let current_pages = mem.size(&store) as u32;
             if current_pages < MIN_SURFACE_PAGES {
-                match mem.grow(&mut store, MIN_SURFACE_PAGES - current_pages) {
+                match mem.grow(&mut store, (MIN_SURFACE_PAGES - current_pages) as u64) {
                     Ok(_) => {} // Surface buffer available
                     Err(_) => {} // Growth failed — surface won't work, but app runs fine with DrawCmd
                 }
@@ -437,7 +778,7 @@ impl PersistentWasmApp {
         let run_fn = instance.get_typed_func::<(), ()>(&store, "run")
             .map_err(|_| String::from("No 'run' exported"))?;
 
-        Ok(Self { store, instance, run_fn, active: true })
+        Ok(Self { store, instance, run_fn, active: true, fuel_budget: FUEL_LIMIT })
     }
 
     /// Push an input event into the app's queue (max 64 per frame).
@@ -463,8 +804,8 @@ impl PersistentWasmApp {
             state.config = config;
         }
 
-        // Reset fuel for this frame
-        self.store.set_fuel(FUEL_LIMIT).unwrap_or(());
+        // Reset fuel — use dynamic budget if set, otherwise default
+        self.store.set_fuel(self.fuel_budget).unwrap_or(());
 
         // Execute run()
         match self.run_fn.call(&mut self.store, ()) {
@@ -522,6 +863,9 @@ fn new_host_state(config: WasmConfig) -> HostState {
         pending_asset_requests: Vec::new(),
         next_asset_handle: 1,
         config,
+        stream_write_buf: Vec::new(),
+        stream_read_buf: Vec::new(),
+        stream_complete: false,
     }
 }
 
@@ -534,6 +878,8 @@ fn empty_output() -> WasmOutput {
         fill_screen: None,
         surface_dirty: false,
         asset_requests: Vec::new(),
+        stream_data: Vec::new(),
+        stream_complete: false,
     }
 }
 
@@ -546,6 +892,8 @@ fn state_to_output(state: HostState) -> WasmOutput {
         fill_screen: state.fill_screen,
         surface_dirty: state.surface_dirty,
         asset_requests: state.pending_asset_requests,
+        stream_data: state.stream_write_buf,
+        stream_complete: state.stream_complete,
     }
 }
 
@@ -556,8 +904,11 @@ fn take_output(state: &mut HostState) -> WasmOutput {
     let lines = ::core::mem::replace(&mut state.line_commands, Vec::new());
     let circles = ::core::mem::replace(&mut state.circle_commands, Vec::new());
     let assets = ::core::mem::replace(&mut state.pending_asset_requests, Vec::new());
+    let stream = ::core::mem::replace(&mut state.stream_write_buf, Vec::new());
     let dirty = state.surface_dirty;
+    let stream_done = state.stream_complete;
     state.surface_dirty = false;
+    state.stream_complete = false;
     WasmOutput {
         draw_commands: draws,
         text_commands: texts,
@@ -566,5 +917,128 @@ fn take_output(state: &mut HostState) -> WasmOutput {
         fill_screen: state.fill_screen.take(),
         surface_dirty: dirty,
         asset_requests: assets,
+        stream_data: stream,
+        stream_complete: stream_done,
     }
+}
+
+/// Inject stream data into a PersistentWasmApp's read buffer (for Tick-Tock).
+/// Called by compositor between upstream.run_frame() and downstream.run_frame().
+impl PersistentWasmApp {
+    pub fn inject_stream_data(&mut self, data: &[u8]) {
+        self.store.data_mut().stream_read_buf = Vec::from(data);
+    }
+}
+
+// ── View Adapter: Data Format Translation Engine ──────────────────────────
+
+/// Execute a View Adapter WASM module to transform data.
+///
+/// The adapter exports `transform()` which reads input via `folk_adapter_input`
+/// and writes output via `folk_adapter_output`.
+///
+/// Returns the transformed bytes, or None if the adapter fails.
+pub fn execute_adapter(adapter_wasm: &[u8], input_data: &[u8]) -> Option<Vec<u8>> {
+    let engine = Engine::default();
+
+    // Adapter host state: input/output buffers
+    struct AdapterState {
+        input: Vec<u8>,
+        output: Vec<u8>,
+        input_read: bool,
+    }
+
+    let mut store = Store::new(&engine, AdapterState {
+        input: Vec::from(input_data),
+        output: Vec::new(),
+        input_read: false,
+    });
+    store.set_fuel(500_000).unwrap_or(()); // Adapters get less fuel than apps
+
+    let module = match Module::new(&engine, adapter_wasm) {
+        Ok(m) => m,
+        Err(_) => return None,
+    };
+
+    let mut linker = <Linker<AdapterState>>::new(&engine);
+
+    // folk_adapter_input(ptr, max_len) -> i32: write input data to WASM memory
+    let _ = linker.func_wrap("env", "folk_adapter_input",
+        |mut caller: Caller<AdapterState>, ptr: i32, max_len: i32| -> i32 {
+            if caller.data().input_read { return 0; }
+            let input = &caller.data().input;
+            let copy_len = input.len().min(max_len as usize);
+            let data = input[..copy_len].to_vec();
+            if let Some(Extern::Memory(mem)) = caller.get_export("memory") {
+                if mem.write(&mut caller, ptr as usize, &data).is_ok() {
+                    caller.data_mut().input_read = true;
+                    return copy_len as i32;
+                }
+            }
+            0
+        },
+    );
+
+    // folk_adapter_output(ptr, len): read transformed data from WASM memory
+    let _ = linker.func_wrap("env", "folk_adapter_output",
+        |mut caller: Caller<AdapterState>, ptr: i32, len: i32| {
+            if len <= 0 || len > 8192 { return; }
+            let mut buf = alloc::vec![0u8; len as usize];
+            if let Some(Extern::Memory(mem)) = caller.get_export("memory") {
+                if mem.read(&caller, ptr as usize, &mut buf).is_ok() {
+                    caller.data_mut().output = buf;
+                }
+            }
+        },
+    );
+
+    // Also provide basic folk_* stubs so adapters can reuse the WASM template
+    let _ = linker.func_wrap("env", "folk_get_time", |_: Caller<AdapterState>| -> i32 { 0 });
+    let _ = linker.func_wrap("env", "folk_screen_width", |_: Caller<AdapterState>| -> i32 { 0 });
+    let _ = linker.func_wrap("env", "folk_screen_height", |_: Caller<AdapterState>| -> i32 { 0 });
+
+    let instance = match linker.instantiate_and_start(&mut store, &module) {
+        Ok(i) => i,
+        Err(_) => return None,
+    };
+
+    // Call transform() or run() — adapters may export either
+    let func_name = if instance.get_func(&store, "transform").is_some() {
+        "transform"
+    } else {
+        "run"
+    };
+
+    let func = match instance.get_typed_func::<(), ()>(&store, func_name) {
+        Ok(f) => f,
+        Err(_) => return None,
+    };
+
+    if func.call(&mut store, ()).is_err() {
+        return None;
+    }
+
+    let output = ::core::mem::replace(&mut store.data_mut().output, Vec::new());
+    if output.is_empty() { None } else { Some(output) }
+}
+
+/// Build the LLM prompt for generating a View Adapter.
+pub fn adapter_generation_prompt(source_mime: &str, target_format: &str, sample_data: &str) -> String {
+    alloc::format!(
+        "Generate a Rust no_std WASM module that transforms data.\n\n\
+         Source format: {}\n\
+         Target format: {}\n\n\
+         The module must:\n\
+         - #![no_std] #![no_main]\n\
+         - Import: extern \"C\" {{ fn folk_adapter_input(ptr: *mut u8, max_len: i32) -> i32; \
+           fn folk_adapter_output(ptr: *const u8, len: i32); }}\n\
+         - Export: #[no_mangle] pub extern \"C\" fn transform()\n\
+         - Read input via folk_adapter_input into a stack buffer\n\
+         - Transform the data from {} to {}\n\
+         - Write output via folk_adapter_output\n\n\
+         Sample input data (first 200 bytes):\n{}\n\n\
+         Return ONLY the Rust code, no explanation.",
+        source_mime, target_format, source_mime, target_format,
+        &sample_data[..sample_data.len().min(200)]
+    )
 }

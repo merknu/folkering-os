@@ -189,6 +189,9 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
         serial_strln!("[INIT] Enumerating PCI bus...");
         drivers::pci::init();
 
+        // Initialize IOMMU (Intel VT-d) if available
+        drivers::iommu::init();
+
         // Initialize VirtIO block device (if present)
         serial_strln!("[INIT] Looking for VirtIO block device...");
         match drivers::virtio_blk::init() {

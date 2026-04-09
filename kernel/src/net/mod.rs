@@ -1,9 +1,13 @@
-//! Network Stack — smoltcp integration over VirtIO-net
+//! Network Stack — smoltcp integration over VirtIO-net or WASM E1000 driver
 //!
-//! Provides DHCP-based IPv4 connectivity via smoltcp. The VirtIO-net driver
-//! supplies raw Ethernet frames; this module wraps it as a smoltcp Device
-//! and runs the TCP/IP stack. Supports ICMP echo (ping), DNS resolution, and TLS 1.3.
+//! Provides DHCP-based IPv4 connectivity via smoltcp. Supports two backends:
+//! 1. VirtIO-net (kernel-internal driver)
+//! 2. WASM E1000 driver (userspace, via packet ring IPC)
+//!
+//! The WASM backend uses shared memory ring buffers for zero-copy packet transfer
+//! between the compositor's E1000 driver and the kernel's smoltcp stack.
 
+pub mod firewall;
 pub mod gemini;
 pub mod github;
 pub mod json;
@@ -31,6 +35,153 @@ use crate::drivers::virtio_net;
 /// ICMP echo identifier — "Fo" for Folkering
 const PING_IDENT: u16 = 0x466F;
 
+/// Max packets in the WASM driver ring buffers
+const WASM_NET_RING_SIZE: usize = 8;
+/// Max Ethernet frame size
+const MAX_FRAME_SIZE: usize = 1514;
+
+// ── WASM Network Driver Packet Ring ─────────────────────────────────────────
+//
+// Shared between the compositor (via syscalls) and smoltcp (via Device trait).
+// The compositor's E1000 host functions call submit_rx/poll_tx syscalls.
+// The kernel's FolkeringDevice reads from rx_ring and writes to tx_ring.
+
+struct PacketSlot {
+    data: [u8; MAX_FRAME_SIZE],
+    len: usize,
+    used: bool,
+}
+
+impl PacketSlot {
+    const EMPTY: Self = Self { data: [0; MAX_FRAME_SIZE], len: 0, used: false };
+}
+
+/// Packet ring for WASM network driver ↔ kernel smoltcp bridge
+pub(crate) struct WasmNetRing {
+    /// Packets received by E1000 hardware, waiting for smoltcp to process
+    rx_ring: [PacketSlot; WASM_NET_RING_SIZE],
+    rx_head: usize,
+    rx_count: usize,
+    /// Packets from smoltcp waiting for E1000 to transmit
+    tx_ring: [PacketSlot; WASM_NET_RING_SIZE],
+    tx_head: usize,
+    tx_count: usize,
+    /// MAC address provided by the WASM driver
+    mac: [u8; 6],
+    /// Whether the WASM net backend is active
+    active: bool,
+}
+
+impl WasmNetRing {
+    const fn new() -> Self {
+        Self {
+            rx_ring: [PacketSlot::EMPTY; WASM_NET_RING_SIZE],
+            rx_head: 0, rx_count: 0,
+            tx_ring: [PacketSlot::EMPTY; WASM_NET_RING_SIZE],
+            tx_head: 0, tx_count: 0,
+            mac: [0; 6],
+            active: false,
+        }
+    }
+
+    /// Submit a received packet (from E1000 DMA → kernel)
+    fn submit_rx(&mut self, data: &[u8]) -> bool {
+        if self.rx_count >= WASM_NET_RING_SIZE || data.len() > MAX_FRAME_SIZE {
+            return false;
+        }
+        let idx = (self.rx_head + self.rx_count) % WASM_NET_RING_SIZE;
+        self.rx_ring[idx].data[..data.len()].copy_from_slice(data);
+        self.rx_ring[idx].len = data.len();
+        self.rx_ring[idx].used = true;
+        self.rx_count += 1;
+        true
+    }
+
+    /// Pop a received packet (kernel smoltcp reads it)
+    fn pop_rx(&mut self) -> Option<(&[u8], usize)> {
+        if self.rx_count == 0 { return None; }
+        let idx = self.rx_head;
+        if !self.rx_ring[idx].used { return None; }
+        let len = self.rx_ring[idx].len;
+        self.rx_ring[idx].used = false;
+        self.rx_head = (self.rx_head + 1) % WASM_NET_RING_SIZE;
+        self.rx_count -= 1;
+        Some((&self.rx_ring[idx].data[..len], len))
+    }
+
+    /// Queue a packet for transmission (kernel smoltcp → E1000)
+    fn submit_tx(&mut self, data: &[u8]) -> bool {
+        if self.tx_count >= WASM_NET_RING_SIZE || data.len() > MAX_FRAME_SIZE {
+            return false;
+        }
+        let idx = (self.tx_head + self.tx_count) % WASM_NET_RING_SIZE;
+        self.tx_ring[idx].data[..data.len()].copy_from_slice(data);
+        self.tx_ring[idx].len = data.len();
+        self.tx_ring[idx].used = true;
+        self.tx_count += 1;
+        true
+    }
+
+    /// Pop a packet to transmit (E1000 reads it)
+    fn pop_tx(&mut self) -> Option<(&[u8], usize)> {
+        if self.tx_count == 0 { return None; }
+        let idx = self.tx_head;
+        if !self.tx_ring[idx].used { return None; }
+        let len = self.tx_ring[idx].len;
+        self.tx_ring[idx].used = false;
+        self.tx_head = (self.tx_head + 1) % WASM_NET_RING_SIZE;
+        self.tx_count -= 1;
+        Some((&self.tx_ring[idx].data[..len], len))
+    }
+}
+
+/// Global WASM network ring — accessed by syscalls and smoltcp Device
+pub(crate) static WASM_NET: Mutex<WasmNetRing> = Mutex::new(WasmNetRing::new());
+
+// ── Public API for syscalls ─────────────────────────────────────────────────
+
+/// Called from SYS_NET_SUBMIT_RX syscall (compositor → kernel)
+pub fn wasm_net_submit_rx(data: &[u8]) -> bool {
+    WASM_NET.lock().submit_rx(data)
+}
+
+/// Called from SYS_NET_POLL_TX syscall (kernel → compositor)
+/// Returns (data_ptr, length) or None
+pub fn wasm_net_poll_tx(buf: &mut [u8]) -> Option<usize> {
+    let mut ring = WASM_NET.lock();
+    if let Some((data, len)) = ring.pop_tx() {
+        let copy_len = len.min(buf.len());
+        buf[..copy_len].copy_from_slice(&data[..copy_len]);
+        Some(copy_len)
+    } else {
+        None
+    }
+}
+
+/// Initialize the WASM network backend with the given MAC address.
+/// Called from SYS_NET_REGISTER syscall when E1000 driver starts.
+pub fn init_wasm_net(mac: [u8; 6]) {
+    let mut ring = WASM_NET.lock();
+    ring.mac = mac;
+    ring.active = true;
+    drop(ring);
+
+    crate::serial_str!("[NET] WASM E1000 registered, MAC=");
+    for i in 0..6 {
+        crate::drivers::serial::write_hex(mac[i] as u64);
+        if i < 5 { crate::serial_str!(":"); }
+    }
+    crate::serial_strln!("");
+
+    // Initialize smoltcp with this MAC (same as VirtIO path but using WASM backend)
+    init_with_mac(mac);
+}
+
+/// Check if WASM net backend is active
+pub fn wasm_net_active() -> bool {
+    WASM_NET.try_lock().map_or(false, |r| r.active)
+}
+
 // ── smoltcp Device wrapper ──────────────────────────────────────────────────
 
 struct FolkeringDevice;
@@ -57,7 +208,21 @@ impl phy::TxToken for FolkeringTxToken {
     {
         let mut buffer = vec![0u8; len];
         let result = f(&mut buffer);
-        let _ = virtio_net::transmit_packet(&buffer);
+        // Route to WASM driver if active, otherwise VirtIO
+        let sent = WASM_NET.try_lock().map_or(false, |mut ring| {
+            if ring.active { ring.submit_tx(&buffer) } else { false }
+        });
+        if sent {
+            static TX_LOG_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+            let c = TX_LOG_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if c < 5 { // Log first 5 TX packets
+                crate::serial_str!("[NET-TX] ");
+                crate::drivers::serial::write_dec(len as u32);
+                crate::serial_strln!("B queued for WASM driver");
+            }
+        } else {
+            let _ = virtio_net::transmit_packet(&buffer);
+        }
         result
     }
 }
@@ -67,12 +232,36 @@ impl Device for FolkeringDevice {
     type TxToken<'a> = FolkeringTxToken where Self: 'a;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        let (frame, len) = virtio_net::receive_raw()?;
-        let rx = FolkeringRxToken {
-            buffer: frame[..len].to_vec(),
-        };
-        let tx = FolkeringTxToken;
-        Some((rx, tx))
+        // Try WASM backend first (use try_lock to avoid deadlock with timer tick)
+        if let Some(mut ring) = WASM_NET.try_lock() {
+            if ring.active {
+                if let Some((data, len)) = ring.pop_rx() {
+                    // ── Firewall: inspect before passing to smoltcp ──
+                    if firewall::filter_packet(&data[..len]) == firewall::FirewallAction::Drop {
+                        drop(ring);
+                        return None; // Dropped by firewall
+                    }
+                    let rx = FolkeringRxToken { buffer: data[..len].to_vec() };
+                    drop(ring);
+                    return Some((rx, FolkeringTxToken));
+                }
+                drop(ring);
+                return None;
+            }
+        }
+        // Fallback to VirtIO — loop to skip dropped packets
+        loop {
+            let (frame, len) = match virtio_net::receive_raw() {
+                Some(f) => f,
+                None => return None,
+            };
+            // ── Firewall: inspect before passing to smoltcp ──
+            if firewall::filter_packet(&frame[..len]) == firewall::FirewallAction::Allow {
+                let rx = FolkeringRxToken { buffer: frame[..len].to_vec() };
+                return Some((rx, FolkeringTxToken));
+            }
+            // Packet dropped, try next from VirtIO queue
+        }
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
@@ -91,7 +280,7 @@ impl Device for FolkeringDevice {
 // ── Network State ───────────────────────────────────────────────────────────
 
 pub(crate) struct NetState {
-    iface: Interface,
+    pub(crate) iface: Interface,
     sockets: SocketSet<'static>,
     dhcp_handle: SocketHandle,
     icmp_handle: SocketHandle,
@@ -107,25 +296,35 @@ pub(crate) struct NetState {
     auto_https_done: bool,
 }
 
-static NET_STATE: Mutex<Option<NetState>> = Mutex::new(None);
+pub(crate) static NET_STATE: Mutex<Option<NetState>> = Mutex::new(None);
 
 // ── Initialization ──────────────────────────────────────────────────────────
 
+/// Initialize network stack from VirtIO-net (existing path)
 pub fn init() {
     let mac = match virtio_net::mac_address() {
         Some(m) => m,
         None => {
-            crate::serial_strln!("[NET] No MAC address — skipping network stack init");
+            crate::serial_strln!("[NET] No VirtIO MAC — will wait for WASM driver");
             return;
         }
     };
+    init_with_mac(mac);
+}
+
+/// Initialize smoltcp stack with a given MAC address.
+/// Called by both VirtIO init and WASM E1000 registration.
+fn init_with_mac(mac: [u8; 6]) {
+    // Don't re-initialize if already running
+    if NET_STATE.lock().is_some() {
+        crate::serial_strln!("[NET] Stack already initialized, skipping re-init");
+        return;
+    }
 
     crate::serial_str!("[NET] Initializing smoltcp stack, MAC=");
     for i in 0..6 {
         crate::drivers::serial::write_hex(mac[i] as u64);
-        if i < 5 {
-            crate::serial_str!(":");
-        }
+        if i < 5 { crate::serial_str!(":"); }
     }
     crate::drivers::serial::write_newline();
 
@@ -133,8 +332,6 @@ pub fn init() {
 
     let hw_addr = HardwareAddress::Ethernet(EthernetAddress(mac));
     let mut config = Config::new(hw_addr);
-    // Seed PRNG from TSC — needed for DNS transaction IDs and source ports.
-    // A zero seed causes xorshift to always return 0, breaking DNS.
     config.random_seed = {
         let lo: u32;
         let hi: u32;
@@ -145,21 +342,12 @@ pub fn init() {
     let now = Instant::from_millis(crate::timer::uptime_ms() as i64);
     let iface = Interface::new(config, &mut device, now);
 
-    // DHCP socket
     let dhcp_socket = dhcpv4::Socket::new();
-
-    // ICMP socket
     let icmp_rx_buf = icmp::PacketBuffer::new(
-        vec![icmp::PacketMetadata::EMPTY; 4],
-        vec![0; 1024],
-    );
+        vec![icmp::PacketMetadata::EMPTY; 4], vec![0; 1024]);
     let icmp_tx_buf = icmp::PacketBuffer::new(
-        vec![icmp::PacketMetadata::EMPTY; 4],
-        vec![0; 1024],
-    );
+        vec![icmp::PacketMetadata::EMPTY; 4], vec![0; 1024]);
     let icmp_socket = icmp::Socket::new(icmp_rx_buf, icmp_tx_buf);
-
-    // DNS socket — pre-allocate 1 query slot (servers set from DHCP)
     let dns_socket = dns::Socket::new(&[], vec![None]);
 
     let mut sockets = SocketSet::new(vec![]);
@@ -168,27 +356,45 @@ pub fn init() {
     let dns_handle = sockets.add(dns_socket);
 
     *NET_STATE.lock() = Some(NetState {
-        iface,
-        sockets,
-        dhcp_handle,
-        icmp_handle,
-        dns_handle,
-        has_ip: false,
-        ping_seq: 0,
-        ping_send_at: None,
-        auto_ping_done: false,
-        auto_dns_started: false,
-        auto_dns_query: None,
-        auto_https_done: false,
+        iface, sockets, dhcp_handle, icmp_handle, dns_handle,
+        has_ip: false, ping_seq: 0, ping_send_at: None,
+        auto_ping_done: false, auto_dns_started: false,
+        auto_dns_query: None, auto_https_done: false,
     });
 
     crate::serial_strln!("[NET] Stack initialized, DHCP discovery starting...");
+
+    // ── Blocking DHCP boot loop ──
+    // Drive the network stack until DHCP assigns an IP.
+    // This replaces timer-ISR polling (which caused #GP from stack misalignment).
+    // Reuses the poll() function which handles DHCP events properly.
+    let dhcp_start = crate::timer::uptime_ms();
+    loop {
+        poll(); // calls try_lock + iface.poll + DHCP event handling
+        {
+            let g = NET_STATE.lock();
+            if g.as_ref().map_or(false, |s| s.has_ip) {
+                break; // DHCP complete!
+            }
+        }
+        if crate::timer::uptime_ms() - dhcp_start > 10_000 {
+            crate::serial_strln!("[NET] DHCP: timeout (10s), continuing without IP");
+            break;
+        }
+        for _ in 0..10_000 { core::hint::spin_loop(); }
+    }
 }
 
 // ── Polling ─────────────────────────────────────────────────────────────────
 
 pub fn poll() {
-    let mut guard = NET_STATE.lock();
+    // Use try_lock: this is called from the timer ISR (tick()),
+    // so we MUST NOT spin if the lock is held by a syscall (e.g., TLS/Gemini).
+    // Spinning in ISR context would deadlock (ISR can't be preempted).
+    let mut guard = match NET_STATE.try_lock() {
+        Some(g) => g,
+        None => return, // Lock held — skip this poll, next tick will retry
+    };
     let state = match guard.as_mut() {
         Some(s) => s,
         None => return,
@@ -253,57 +459,18 @@ pub fn poll() {
         }
     }
 
-    // ── Auto-ping gateway after first DHCP ────────────────────────────────
-    if state.has_ip && !state.auto_ping_done {
-        state.auto_ping_done = true;
-        let gateway = Ipv4Address::new(10, 0, 2, 2);
-        send_ping_inner(state, gateway);
-    }
+    // ── Auto-ping after first DHCP ─────────────────────────────────────
+    // Disabled: hardcoded gateway doesn't work with bridge networking.
+    // Ping can be triggered manually via the `ping` omnibar command.
 
     // ── Check for ICMP echo replies ──────────────────────────────────────
     check_ping_reply(state);
 
-    // ── Auto-DNS test (async: start query in one tick, check in next) ────
-    if state.has_ip && !state.auto_dns_started && state.auto_ping_done {
-        if crate::timer::uptime_ms() > 8000 {
-            state.auto_dns_started = true;
-            crate::serial_strln!("[NET] DNS auto-test: resolving google.com...");
-            let dns_socket = state.sockets.get_mut::<dns::Socket>(state.dns_handle);
-            match dns_socket.start_query(state.iface.context(), "google.com", DnsQueryType::A) {
-                Ok(h) => {
-                    state.auto_dns_query = Some(h);
-                }
-                Err(_) => {
-                    crate::serial_strln!("[NET] DNS auto-test: failed to start query");
-                }
-            }
-        }
-    }
-
-    // Check auto-DNS result
-    if let Some(qh) = state.auto_dns_query {
-        let dns_socket = state.sockets.get_mut::<dns::Socket>(state.dns_handle);
-        match dns_socket.get_query_result(qh) {
-            Ok(addrs) => {
-                state.auto_dns_query = None;
-                for addr in addrs.iter() {
-                    if let IpAddress::Ipv4(v4) = addr {
-                        crate::serial_str!("[NET] DNS: google.com -> ");
-                        print_ipv4(v4);
-                        crate::drivers::serial::write_newline();
-                        break;
-                    }
-                }
-            }
-            Err(dns::GetQueryResultError::Pending) => {
-                // Still waiting — will check next poll tick
-            }
-            Err(dns::GetQueryResultError::Failed) => {
-                state.auto_dns_query = None;
-                crate::serial_strln!("[NET] DNS auto-test: failed (host DNS unreachable?)");
-            }
-        }
-    }
+    // DNS auto-test DISABLED — caused system deadlock after completion.
+    // The DNS query completes successfully but something in smoltcp's
+    // socket cleanup path causes the system to hang permanently.
+    // This prevented Draug from ever reaching 15min idle for AutoDream.
+    // (Disabled 2026-04-03, see commit history for original code)
 
 }
 
@@ -420,6 +587,10 @@ pub fn send_ping(a: u8, b: u8, c: u8, d: u8) {
     let target = Ipv4Address::new(a, b, c, d);
     send_ping_inner(state, target);
 }
+
+// ── Non-blocking HTTPS test ─────────────────────────────────────────────
+// Instead of blocking the compositor with dns_lookup + https_get,
+// we use a kernel-side flag that poll() processes incrementally.
 
 /// Resolve a domain name to an IPv4 address (blocking).
 /// MUST be called from userspace syscall context (interrupts enabled).

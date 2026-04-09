@@ -24,6 +24,19 @@ import os
 import base64
 import shutil
 
+# Add tools/ directory to path for module imports
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from context_manager import ContextManager
+from mcp_bridge import _retx_queue  # Retransmission queue (global, used in handle_serial timeout check)
+# Modular proxy components (extracted from this monolith)
+from proxy.llm_router import call_llm as _call_llm_modular, route_for_task as _route_modular, dispatch as _dispatch_modular
+from proxy.cache_manager import (cache_check as _cache_check_mod, cache_store as _cache_store_mod,
+    cache_get_meta as _cache_get_meta_mod, cache_rollback as _cache_rollback_mod,
+    list_all_apps as _list_all_apps_mod, dream_budget_check as _dream_budget_check_mod,
+    dream_budget_record as _dream_budget_record_mod, set_dream_max, cache_key as _cache_key_mod)
+from proxy.crypto import sign_wasm as _sign_wasm_mod
+_context_mgr = ContextManager(max_tokens=4096)  # Match LLM context window
+
 # ── Configuration (from .env or environment variables) ────────────────────
 
 def load_env():
@@ -44,39 +57,55 @@ def cfg(key, default=""):
     """Get config from env var or .env file."""
     return os.environ.get(key, _env.get(key, default))
 
-# Provider: "gemini", "openai", "claude", or "local" (LM Studio / llama.cpp / Ollama)
-LLM_PROVIDER = cfg("LLM_PROVIDER", "gemini")
-LLM_API_KEY = cfg("LLM_API_KEY", "") or cfg("GEMINI_API_KEY", "")
-LLM_MODEL = cfg("LLM_MODEL", "")
-LLM_BASE_URL = cfg("LLM_BASE_URL", "")
+# ── Hybrid Model Router ──────────────────────────────────────────────────
+# Three tiers: FAST (local, cheap), MEDIUM (cloud lite), HEAVY (cloud smart)
+# Each task is routed to the cheapest tier that can handle it.
 
-# "local" provider needs no API key (LM Studio, Ollama, llama.cpp --server)
-if not LLM_API_KEY and LLM_PROVIDER not in ("local",):
-    print("[PROXY] ERROR: Set LLM_API_KEY (or GEMINI_API_KEY) in .env or environment")
-    print("[PROXY] TIP: Use LLM_PROVIDER=local for LM Studio (no key needed)")
-    sys.exit(1)
+# FAST tier: local Ollama — free, GPU-accelerated
+FAST_PROVIDER = cfg("FAST_LLM_PROVIDER", "local")
+FAST_MODEL = cfg("FAST_LLM_MODEL", "gemma4:31b-cloud")
+FAST_URL = cfg("FAST_LLM_URL", "http://localhost:11434/v1")
 
-# Default models per provider
-DEFAULT_MODELS = {
-    "gemini": "gemini-3.1-flash-lite-preview",
-    "openai": "gpt-4o-mini",
-    "claude": "claude-sonnet-4-20250514",
-    "local": "default",  # LM Studio uses whichever model is loaded
-}
-if not LLM_MODEL:
-    LLM_MODEL = DEFAULT_MODELS.get(LLM_PROVIDER, "gemini-2.5-flash")
+# MEDIUM tier: cloud lite — cheap, good for code gen + simple tool calls
+MEDIUM_PROVIDER = cfg("MEDIUM_LLM_PROVIDER", "gemini")
+MEDIUM_MODEL = cfg("MEDIUM_LLM_MODEL", "gemini-3.1-flash-lite-preview")
+MEDIUM_URL = cfg("MEDIUM_LLM_URL", "https://generativelanguage.googleapis.com/v1beta")
 
-# Default base URLs per provider
+# HEAVY tier: cloud smart — expensive, for complex multi-step reasoning
+HEAVY_PROVIDER = cfg("HEAVY_LLM_PROVIDER", "gemini")
+HEAVY_MODEL = cfg("HEAVY_LLM_MODEL", "gemini-3-flash-preview")
+HEAVY_URL = cfg("HEAVY_LLM_URL", "https://generativelanguage.googleapis.com/v1beta")
+
+# ULTRA tier: last resort — only when all other tiers fail, very expensive
+ULTRA_PROVIDER = cfg("ULTRA_LLM_PROVIDER", "gemini")
+ULTRA_MODEL = cfg("ULTRA_LLM_MODEL", "gemini-3.1-pro-preview-customtools")
+ULTRA_URL = cfg("ULTRA_LLM_URL", "https://generativelanguage.googleapis.com/v1beta")
+
+# API key for cloud providers
+GOOGLE_API_KEY = cfg("GOOGLE_API_KEY", "") or cfg("GEMINI_API_KEY", "") or cfg("LLM_API_KEY", "")
+
+# Legacy compat
+LLM_PROVIDER = FAST_PROVIDER
+LLM_MODEL = FAST_MODEL
+LLM_BASE_URL = FAST_URL
+LLM_API_KEY = GOOGLE_API_KEY
+LLM_CODE_MODEL = cfg("LLM_CODE_MODEL", FAST_MODEL)
+
 DEFAULT_URLS = {
     "gemini": "https://generativelanguage.googleapis.com/v1beta",
     "openai": "https://api.openai.com/v1",
     "claude": "https://api.anthropic.com/v1",
-    "local": "http://localhost:1234/v1",  # LM Studio default port
+    "local": "http://localhost:11434/v1",
 }
-if not LLM_BASE_URL:
-    LLM_BASE_URL = DEFAULT_URLS.get(LLM_PROVIDER, DEFAULT_URLS["gemini"])
 
-print(f"[PROXY] Provider: {LLM_PROVIDER} | Model: {LLM_MODEL} | URL: {LLM_BASE_URL}")
+print(f"[PROXY] FAST:   {FAST_PROVIDER}/{FAST_MODEL}")
+print(f"[PROXY] MEDIUM: {MEDIUM_PROVIDER}/{MEDIUM_MODEL}")
+print(f"[PROXY] HEAVY:  {HEAVY_PROVIDER}/{HEAVY_MODEL}")
+print(f"[PROXY] ULTRA:  {ULTRA_PROVIDER}/{ULTRA_MODEL}")
+if GOOGLE_API_KEY:
+    print(f"[PROXY] Cloud API key: ...{GOOGLE_API_KEY[-8:]}")
+else:
+    print(f"[PROXY] No cloud API key — cloud tiers will fall back to FAST")
 
 COM2_HOST = "127.0.0.1"
 COM2_PORT = 4567
@@ -94,15 +123,272 @@ LOAD_WASM_PREFIX = "[LOAD_WASM:"  # [LOAD_WASM:/path/to/file.wasm]
 # Maximum compiled WASM size (64KB) — prevents COM2 buffer overflow
 MAX_WASM_SIZE = 64 * 1024
 
+# ── Dynamic RAG: Load folk_* host function signatures from source ────────
+# Parses wasm_runtime.rs to build the extern registry automatically.
+# Falls back to hardcoded list if source file not found.
+
+def _load_folk_externs_from_source() -> dict:
+    """Parse wasm_runtime.rs for linker.func_wrap calls and extract folk_* signatures."""
+    import re as _re
+    # Try multiple paths (dev machine vs Proxmox deploy)
+    candidates = [
+        os.path.join(os.path.dirname(__file__), "..", "userspace", "compositor", "src", "wasm_runtime.rs"),
+        "/var/lib/vz/images/900/wasm_runtime.rs",
+    ]
+    source = None
+    for path in candidates:
+        try:
+            with open(path, "r") as f:
+                source = f.read()
+            break
+        except FileNotFoundError:
+            continue
+
+    if not source:
+        print("[RAG] wasm_runtime.rs not found — using hardcoded externs")
+        return _HARDCODED_EXTERNS
+
+    # Extract: linker.func_wrap("env", "folk_xxx", |caller, arg1: i32, arg2: i32| -> i32 { ... })
+    externs = {}
+    for m in _re.finditer(
+        r'func_wrap\("env",\s*"(folk_\w+)",\s*\|[^|]*\|'
+        r'([^{]*?)(?:->|{)',
+        source
+    ):
+        name = m.group(1)
+        # Already have this one parsed? Skip duplicates
+        if name in externs:
+            continue
+
+    # More robust: parse the Caller<HostState> signature
+    for m in _re.finditer(
+        r'func_wrap\("env",\s*"(folk_\w+)",\s*\|(?:mut\s+)?caller:\s*Caller<HostState>'
+        r'(?:,\s*(\w+:\s*i32(?:,\s*\w+:\s*i32)*))?'
+        r'\|\s*(?:->\s*(i32))?\s*\{',
+        source
+    ):
+        name = m.group(1)
+        params_raw = m.group(2) or ""
+        ret = m.group(3)
+
+        # Build signature
+        params = params_raw.strip().rstrip(",") if params_raw else ""
+        sig = f"fn {name}({params})"
+        if ret:
+            sig += f" -> {ret}"
+        sig += ";"
+        externs[name] = sig
+
+    if externs:
+        print(f"[RAG] Loaded {len(externs)} folk_* signatures from wasm_runtime.rs")
+    else:
+        print("[RAG] Parse found 0 signatures — using hardcoded fallback")
+        return _HARDCODED_EXTERNS
+
+    # Merge with hardcoded (source of truth for docs/comments)
+    for k, v in _HARDCODED_EXTERNS.items():
+        if k not in externs:
+            externs[k] = v
+
+    return externs
+
+
+_HARDCODED_EXTERNS = {
+    # Drawing
+    "folk_draw_rect": "fn folk_draw_rect(x: i32, y: i32, w: i32, h: i32, color: i32);",
+    "folk_draw_line": "fn folk_draw_line(x1: i32, y1: i32, x2: i32, y2: i32, color: i32);",
+    "folk_draw_circle": "fn folk_draw_circle(cx: i32, cy: i32, r: i32, color: i32);",
+    "folk_draw_text": "fn folk_draw_text(x: i32, y: i32, ptr: i32, len: i32, color: i32);",
+    "folk_fill_screen": "fn folk_fill_screen(color: i32);",
+    # System
+    "folk_get_time": "fn folk_get_time() -> i32;",
+    "folk_screen_width": "fn folk_screen_width() -> i32;",
+    "folk_screen_height": "fn folk_screen_height() -> i32;",
+    "folk_random": "fn folk_random() -> i32;",
+    "folk_get_datetime": "fn folk_get_datetime(ptr: i32) -> i32;",
+    "folk_os_metric": "fn folk_os_metric(metric_id: i32) -> i32;",
+    "folk_net_has_ip": "fn folk_net_has_ip() -> i32;",
+    "folk_fw_drops": "fn folk_fw_drops() -> i32;",
+    # Input
+    "folk_poll_event": "fn folk_poll_event(event_ptr: i32) -> i32;",
+    # Surface
+    "folk_get_surface": "fn folk_get_surface() -> i32;",
+    "folk_surface_pitch": "fn folk_surface_pitch() -> i32;",
+    "folk_surface_present": "fn folk_surface_present();",
+    # Files
+    "folk_request_file": "fn folk_request_file(path_ptr: i32, path_len: i32, dest_ptr: i32, dest_len: i32) -> i32;",
+    "folk_list_files": "fn folk_list_files(buf_ptr: i32, max_len: i32) -> i32;",
+    "folk_write_file": "fn folk_write_file(path_ptr: i32, path_len: i32, data_ptr: i32, data_len: i32) -> i32;",
+    "folk_query_files": "fn folk_query_files(query_ptr: i32, query_len: i32, result_ptr: i32, result_max_len: i32) -> i32;",
+    # Network
+    "folk_http_get": "fn folk_http_get(url_ptr: i32, url_len: i32, buf_ptr: i32, max_len: i32) -> i32;",
+    "folk_intent_fetch": "fn folk_intent_fetch(query_ptr: i32, query_len: i32, buf_ptr: i32, max_len: i32) -> i32;",
+    # AI
+    "folk_slm_generate": "fn folk_slm_generate(prompt_ptr: i32, prompt_len: i32, buf_ptr: i32, max_len: i32) -> i32;",
+    # Streams
+    "folk_stream_write": "fn folk_stream_write(ptr: i32, len: i32);",
+    "folk_stream_read": "fn folk_stream_read(ptr: i32, max_len: i32) -> i32;",
+    "folk_stream_done": "fn folk_stream_done();",
+    # Adapter
+    "folk_adapter_input": "fn folk_adapter_input(ptr: i32, max_len: i32) -> i32;",
+    "folk_adapter_output": "fn folk_adapter_output(ptr: i32, len: i32);",
+}
+
+FOLK_EXTERNS = _load_folk_externs_from_source()
+
+
+# ── Mega-Context: Load full source files for 256K context models ─────────
+
+def _load_full_context() -> str:
+    """Load entire source files for deep OS understanding.
+    Gemma 4 (256K context) can absorb the full WASM runtime + libfolk API."""
+    sources = {}
+    file_map = {
+        "wasm_runtime.rs": [
+            os.path.join(os.path.dirname(__file__), "..", "userspace", "compositor", "src", "wasm_runtime.rs"),
+            "/var/lib/vz/images/900/wasm_runtime.rs",
+        ],
+        "folkering_context.py": [
+            os.path.join(os.path.dirname(__file__), "folkering_context.py"),
+            "/var/lib/vz/images/900/folkering_context.py",
+        ],
+    }
+    for name, paths in file_map.items():
+        for path in paths:
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+                sources[name] = content
+                break
+            except FileNotFoundError:
+                continue
+
+    if not sources:
+        return ""
+
+    ctx = "=== FOLKERING OS SOURCE CONTEXT ===\n\n"
+    for name, content in sources.items():
+        # Trim to 60K chars per file (leaves room for conversation)
+        trimmed = content[:60000]
+        ctx += f"--- {name} ({len(trimmed)} chars) ---\n{trimmed}\n\n"
+
+    total = len(ctx)
+    print(f"[CTX] Loaded {len(sources)} source files ({total} chars total)")
+    return ctx
+
+
+_FULL_SOURCE_CONTEXT = _load_full_context()
+
+import re
+
+def fix_missing_externs(source: str) -> str:
+    """Scan for folk_* calls not declared in extern blocks. Inject missing ones."""
+    # Find all folk_* function calls in the source
+    used = set(re.findall(r'\bfolk_\w+', source))
+
+    # Find which ones are already declared in an extern "C" block
+    declared = set()
+    for m in re.finditer(r'extern\s+"C"\s*\{([^}]*)\}', source, re.DOTALL):
+        block = m.group(1)
+        declared.update(re.findall(r'\bfolk_\w+', block))
+
+    # Find missing declarations
+    missing = []
+    for name in sorted(used - declared):
+        if name in FOLK_EXTERNS:
+            missing.append(f"    {FOLK_EXTERNS[name]}")
+
+    if not missing:
+        return source
+
+    print(f"[SERIAL-PROXY] Auto-injecting {len(missing)} missing extern(s): {', '.join(n for n in sorted(used - declared) if n in FOLK_EXTERNS)}")
+
+    # Strategy: append missing declarations into the FIRST extern "C" block
+    first_extern = re.search(r'(extern\s+"C"\s*\{)', source)
+    if first_extern:
+        insert_pos = first_extern.end()
+        injection = "\n" + "\n".join(missing) + "\n"
+        source = source[:insert_pos] + injection + source[insert_pos:]
+    else:
+        # No extern block exists — create one after #![no_main]
+        anchor = source.find("#![no_main]")
+        if anchor != -1:
+            insert_pos = source.index("\n", anchor) + 1
+        else:
+            insert_pos = 0
+        block = 'extern "C" {\n' + "\n".join(missing) + "\n}\n"
+        source = source[:insert_pos] + block + source[insert_pos:]
+
+    return source
+
+
+def fix_unsafe_calls(source: str) -> str:
+    """If run() body has bare extern calls (no unsafe block), wrap the body in unsafe { }."""
+    # Check if there's already an unsafe block inside run()
+    run_match = re.search(r'pub\s+extern\s+"C"\s+fn\s+run\s*\(\s*\)\s*\{', source)
+    if not run_match:
+        return source
+
+    # Check if unsafe already present after run() opening
+    after_run = source[run_match.end():]
+    stripped = after_run.lstrip()
+    if stripped.startswith("unsafe"):
+        return source  # Already has unsafe
+
+    # Check if any folk_ calls exist in the function (indicating extern calls)
+    if not re.search(r'\bfolk_\w+\s*\(', after_run.split("\n#")[0]):
+        return source  # No extern calls in run()
+
+    # Wrap the body: insert "unsafe {" after opening brace, and "}" before closing brace
+    # Find the matching closing brace by counting braces
+    depth = 1
+    pos = run_match.end()
+    while pos < len(source) and depth > 0:
+        if source[pos] == '{':
+            depth += 1
+        elif source[pos] == '}':
+            depth -= 1
+        pos += 1
+
+    if depth != 0:
+        return source  # Can't find matching brace
+
+    closing_pos = pos - 1  # Position of the closing '}'
+    insert_after = run_match.end()
+
+    source = (source[:insert_after] + "\n    unsafe {" +
+              source[insert_after:closing_pos] + "    }\n" +
+              source[closing_pos:])
+    print("[SERIAL-PROXY] Auto-wrapped run() body in unsafe { }")
+    return source
+
+
+def fix_infinite_loop(source: str) -> str:
+    """Remove infinite loops with spin_loop — WASM tools must be run-to-completion."""
+    # Remove `loop { ... core::hint::spin_loop(); }` at the end of run()
+    source = re.sub(r'\s*core::hint::spin_loop\(\);\s*', '\n', source)
+    # Replace bare `loop {` wrapping the entire run body with just the body
+    # This is a common LLM mistake — they use loop {} instead of relying on frame-based calls
+    return source
+
+
 # The Master Prompt — strict no_std WASM code generation
+from folkering_context import get_full_wasm_context, get_dream_context
+
+_WASM_CONTEXT = get_full_wasm_context()
+
 WASM_SYSTEM_PROMPT = """You are a code generator for Folkering OS (bare-metal Rust, no_std).
 Generate a SINGLE Rust file that compiles to wasm32-unknown-unknown.
+
+""" + _WASM_CONTEXT + """
 
 STRICT RULES:
 - #![no_std] and #![no_main] are REQUIRED
 - Export: #[no_mangle] pub extern "C" fn run()
 - Include: #[panic_handler] fn panic(_: &core::panic::PanicInfo) -> ! { loop {} }
-- NO infinite loops, NO yielding, NO sleeping — run-to-completion per frame
+- The ENTIRE body of run() MUST be wrapped in unsafe { } — ALL extern calls require it!
+- NO infinite loops (no `loop {}`), NO yielding, NO sleeping — run() is called every frame
+- Use `static mut` variables for state that persists between frames (position, velocity, etc)
 - Event polling loops (while folk_poll_event() != 0) are OK
 - NO println!, NO std, NO allocation, NO extern crate
 - Color format: 0x00RRGGBB (alpha channel is IGNORED, use solid colors only)
@@ -140,6 +426,16 @@ fn folk_request_file(path_ptr: i32, path_len: i32, dest_ptr: i32, dest_len: i32)
   // File data is written to dest_ptr in WASM memory when ready.
   // Check folk_poll_event for event_type=4 (AssetLoaded):
   //   x=handle, y=status (0=ok, 1=not_found), data=bytes_loaded
+
+OUTPUT FORMAT:
+Wrap your ENTIRE Rust source code in <TOOL_CODE> tags:
+<TOOL_CODE>
+#![no_std]
+#![no_main]
+// ... your code here ...
+</TOOL_CODE>
+
+You may think and explain OUTSIDE the tags, but the code MUST be inside <TOOL_CODE>...</TOOL_CODE>.
 
 TIPS:
 - Use folk_screen_width()/folk_screen_height() to make UIs that adapt to any resolution
@@ -226,159 +522,1262 @@ extern "C" {
 Output ONLY the Rust code. No explanation, no markdown fences."""
 
 
-def generate_and_compile_wasm(prompt: str, sock: socket.socket):
-    """Generate Rust code via Gemini, compile to WASM, send base64 binary back."""
-    print(f"[SERIAL-PROXY] Tool request: {prompt[:80]}...")
+import hashlib
 
-    # Step 1: Call Gemini with code-gen system prompt
-    full_prompt = f"{WASM_SYSTEM_PROMPT}\n\nGenerate: {prompt}"
-    print(f"[SERIAL-PROXY] Calling {LLM_PROVIDER} for code generation...")
-    source = call_llm(full_prompt)
+# WASM source cache directory
+_WASM_CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "wasm_cache")
+os.makedirs(_WASM_CACHE_DIR, exist_ok=True)
 
-    if source.startswith("Error:"):
-        error_resp = RESP_START + source.encode() + RESP_END + b"\n"
-        sock.sendall(error_resp)
-        print(f"[SERIAL-PROXY] Gemini error: {source}")
-        return
+def _cache_key(prompt: str) -> str:
+    """Generate a filesystem-safe cache key from a prompt."""
+    h = hashlib.sha256(prompt.strip().lower().encode()).hexdigest()[:16]
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in prompt.strip()[:40])
+    return f"{safe}_{h}"
 
-    # Step 2: Strip markdown fences if present
-    if "```rust" in source:
-        source = source.split("```rust")[1].split("```")[0]
-    elif "```" in source:
-        source = source.split("```")[1].split("```")[0]
-    source = source.strip()
-
-    print(f"[SERIAL-PROXY] Generated {len(source)} chars of Rust source")
-
-    # Step 3: Create temp Cargo project
-    tmp_dir = tempfile.mkdtemp(prefix="folkwasm_")
-    try:
-        # cargo new --lib
-        proj_dir = os.path.join(tmp_dir, "wasm_tool")
-        subprocess.run(["cargo", "new", "--lib", proj_dir], capture_output=True, timeout=10)
-
-        # Write Cargo.toml with aggressive optimization
-        cargo_toml = f"""[package]
-name = "wasm_tool"
-version = "0.1.0"
-edition = "2021"
-
-[lib]
-crate-type = ["cdylib"]
-
-[profile.release]
-opt-level = "z"
-lto = true
-strip = true
-codegen-units = 1
-panic = "abort"
-"""
-        with open(os.path.join(proj_dir, "Cargo.toml"), "w") as f:
-            f.write(cargo_toml)
-
-        # Write source
-        src_path = os.path.join(proj_dir, "src", "lib.rs")
-        with open(src_path, "w") as f:
-            f.write(source)
-
-        # Step 4: Compile
-        print("[SERIAL-PROXY] Compiling WASM...")
-        result = subprocess.run(
-            ["cargo", "build", "--target", "wasm32-unknown-unknown", "--release"],
-            capture_output=True, text=True, timeout=60,
-            cwd=proj_dir,
-        )
-
-        if result.returncode != 0:
-            error = f"Compile error: {result.stderr[:400]}"
-            print(f"[SERIAL-PROXY] {error}")
-            error_resp = RESP_START + error.encode() + RESP_END + b"\n"
-            sock.sendall(error_resp)
-            return
-
-        # Find compiled WASM
-        wasm_path = os.path.join(
-            proj_dir, "target", "wasm32-unknown-unknown", "release", "wasm_tool.wasm"
-        )
-        if not os.path.exists(wasm_path):
-            error_resp = RESP_START + b"Compile error: WASM output not found" + RESP_END + b"\n"
-            sock.sendall(error_resp)
-            return
-
+def _cache_check(prompt: str) -> tuple:
+    """Check if cached WASM + source exists. Returns (wasm_bytes, source_str) or (None, None)."""
+    key = _cache_key(prompt)
+    wasm_path = os.path.join(_WASM_CACHE_DIR, f"{key}.wasm")
+    src_path = os.path.join(_WASM_CACHE_DIR, f"{key}.rs")
+    if os.path.exists(wasm_path):
         with open(wasm_path, "rb") as f:
-            wasm_binary = f.read()
+            wasm = f.read()
+        src = ""
+        if os.path.exists(src_path):
+            with open(src_path, "r") as f:
+                src = f.read()
+        print(f"[CACHE] Hit: {key} ({len(wasm)} bytes)")
+        return wasm, src
+    return None, None
 
-        print(f"[SERIAL-PROXY] WASM compiled: {len(wasm_binary)} bytes")
 
-        # Step 5: Size check
-        if len(wasm_binary) > MAX_WASM_SIZE:
-            error = f"WASM too large: {len(wasm_binary)} bytes (max {MAX_WASM_SIZE})"
-            error_resp = RESP_START + error.encode() + RESP_END + b"\n"
-            sock.sendall(error_resp)
-            return
+def _cache_save_version(prompt: str, source: str, wasm_bytes: bytes):
+    """Save a numbered version snapshot (for rollback). Never deleted."""
+    key = _cache_key(prompt)
+    meta = _cache_get_meta(prompt)
+    ver = meta.get("version", 1)
+    versions_dir = os.path.join(_WASM_CACHE_DIR, "versions", key)
+    os.makedirs(versions_dir, exist_ok=True)
+    with open(os.path.join(versions_dir, f"v{ver}.rs"), "w") as f:
+        f.write(source)
+    with open(os.path.join(versions_dir, f"v{ver}.wasm"), "wb") as f:
+        f.write(wasm_bytes)
+    with open(os.path.join(versions_dir, f"v{ver}.meta.json"), "w") as f:
+        f.write(json.dumps(meta, indent=2))
+    print(f"[CACHE] Snapshot saved: {key}/v{ver}")
 
-        # Step 6: Base64 encode
-        b64_data = base64.b64encode(wasm_binary).decode("ascii")
 
-        # Step 7: Send response
-        resp_json = json.dumps({"action": "tool_ready", "binary": b64_data})
-        response = RESP_START + resp_json.encode() + RESP_END + b"\n"
-        sock.sendall(response)
-        print(f"[SERIAL-PROXY] Sent tool_ready: {len(wasm_binary)} bytes WASM, {len(b64_data)} chars base64")
+def _cache_list_versions(prompt: str) -> list:
+    """List all saved versions of an app."""
+    key = _cache_key(prompt)
+    versions_dir = os.path.join(_WASM_CACHE_DIR, "versions", key)
+    if not os.path.exists(versions_dir):
+        return []
+    versions = []
+    for f in sorted(os.listdir(versions_dir)):
+        if f.endswith(".meta.json"):
+            ver_num = f.replace(".meta.json", "").replace("v", "")
+            try:
+                with open(os.path.join(versions_dir, f), "r") as fh:
+                    meta = json.loads(fh.read())
+                wasm_path = os.path.join(versions_dir, f"v{ver_num}.wasm")
+                size = os.path.getsize(wasm_path) if os.path.exists(wasm_path) else 0
+                versions.append({
+                    "version": int(ver_num),
+                    "id": meta.get("id", "?"),
+                    "size": size,
+                    "description": meta.get("description", ""),
+                    "dream_history": meta.get("dream_history", []),
+                })
+            except Exception:
+                pass
+    return versions
 
-    except subprocess.TimeoutExpired:
-        error_resp = RESP_START + b"Compile timeout (60s)" + RESP_END + b"\n"
-        sock.sendall(error_resp)
-        print("[SERIAL-PROXY] Compile timeout")
-    except Exception as e:
-        error = f"Tool generation error: {e}"
-        print(f"[SERIAL-PROXY] {error}")
-        error_resp = RESP_START + error.encode() + RESP_END + b"\n"
-        sock.sendall(error_resp)
-    finally:
-        # Cleanup temp directory
+
+def _cache_rollback(prompt: str, target_version: int) -> tuple:
+    """Rollback to a specific version. Returns (wasm_bytes, source, error)."""
+    key = _cache_key(prompt)
+    versions_dir = os.path.join(_WASM_CACHE_DIR, "versions", key)
+    src_path = os.path.join(versions_dir, f"v{target_version}.rs")
+    wasm_path = os.path.join(versions_dir, f"v{target_version}.wasm")
+    meta_path = os.path.join(versions_dir, f"v{target_version}.meta.json")
+
+    if not os.path.exists(wasm_path):
+        return None, None, f"Version {target_version} not found"
+
+    with open(wasm_path, "rb") as f:
+        wasm = f.read()
+    src = ""
+    if os.path.exists(src_path):
+        with open(src_path, "r") as f:
+            src = f.read()
+
+    # Restore as current version
+    with open(os.path.join(_WASM_CACHE_DIR, f"{key}.wasm"), "wb") as f:
+        f.write(wasm)
+    if src:
+        with open(os.path.join(_WASM_CACHE_DIR, f"{key}.rs"), "w") as f:
+            f.write(src)
+    if os.path.exists(meta_path):
+        with open(meta_path, "r") as f:
+            old_meta = json.loads(f.read())
+        import datetime
+        old_meta["last_updated"] = datetime.datetime.now().isoformat()
+        old_meta["rollback_from"] = _cache_get_meta(prompt).get("version", 0)
+        _cache_set_meta(prompt, old_meta)
+
+    print(f"[CACHE] Rolled back {key} to v{target_version} ({len(wasm)} bytes)")
+    return wasm, src, None
+
+def _cache_meta_path(prompt: str) -> str:
+    return os.path.join(_WASM_CACHE_DIR, f"{_cache_key(prompt)}.meta.json")
+
+def _cache_get_meta(prompt: str) -> dict:
+    """Read cache metadata (lineage, strikes, version history)."""
+    path = _cache_meta_path(prompt)
+    if os.path.exists(path):
         try:
-            shutil.rmtree(tmp_dir)
+            with open(path, "r") as f:
+                return json.loads(f.read())
         except Exception:
             pass
+    return {
+        "id": "",              # Unique hash of this version's source code
+        "parent_id": "",       # ID of the version this was derived from
+        "root_id": "",         # ID of the original "genesis" version (shared by all branches)
+        "branch": "main",      # Branch name: "main", "fast", "beautiful", etc.
+        "strikes": 0,
+        "perfected": False,
+        "version": 1,
+        "description": "",
+        "created": "",
+        "last_updated": "",
+        "lineage": [],         # List of ancestor IDs: [root, ..., parent, self]
+        "dream_history": [],   # What dreams have been applied: ["refactor", "creative", ...]
+    }
+
+def _cache_set_meta(prompt: str, meta: dict):
+    """Write cache metadata."""
+    with open(_cache_meta_path(prompt), "w") as f:
+        f.write(json.dumps(meta, indent=2))
+
+def _cache_store(prompt: str, source: str, wasm_bytes: bytes, parent_prompt: str = "", dream_mode: str = ""):
+    """Store compiled WASM + source code + metadata with lineage tracking."""
+    key = _cache_key(prompt)
+    with open(os.path.join(_WASM_CACHE_DIR, f"{key}.rs"), "w") as f:
+        f.write(source)
+    with open(os.path.join(_WASM_CACHE_DIR, f"{key}.wasm"), "wb") as f:
+        f.write(wasm_bytes)
+
+    import datetime
+    # Unique ID for this version = hash of source code
+    source_id = hashlib.sha256(source.encode()).hexdigest()[:12]
+
+    meta = _cache_get_meta(prompt)
+    meta["version"] = meta.get("version", 0) + 1
+    meta["id"] = source_id
+
+    # Clean description
+    desc = prompt
+    for prefix in ["gemini generate ", "gemini gen ", "generate ", "agent generate "]:
+        if desc.lower().startswith(prefix):
+            desc = desc[len(prefix):]
+            break
+    meta["description"] = desc
+
+    # Lineage tracking
+    if parent_prompt:
+        parent_meta = _cache_get_meta(parent_prompt)
+        meta["parent_id"] = parent_meta.get("id", "")
+        meta["root_id"] = parent_meta.get("root_id", "") or parent_meta.get("id", "")
+        # Inherit branch name from parent (unless explicitly changed)
+        if not meta.get("branch") or meta["branch"] == "main":
+            meta["branch"] = parent_meta.get("branch", "main")
+        # Build lineage chain
+        parent_lineage = parent_meta.get("lineage", [])
+        meta["lineage"] = parent_lineage + [parent_meta.get("id", "")]
+    else:
+        # Genesis: first version of this app
+        meta["root_id"] = source_id
+        meta["parent_id"] = ""
+        meta["lineage"] = []
+
+    # Dream history
+    if dream_mode:
+        history = meta.get("dream_history", [])
+        history.append({"mode": dream_mode, "time": datetime.datetime.now().isoformat(), "version": meta["version"]})
+        # Keep last 20 entries
+        meta["dream_history"] = history[-20:]
+
+    if not meta.get("created"):
+        meta["created"] = datetime.datetime.now().isoformat()
+    meta["last_updated"] = datetime.datetime.now().isoformat()
+
+    # Semantic VFS: auto-generate intent metadata
+    intent = {
+        "purpose": desc,
+        "type": "interactive_app" if any(kw in source.lower() for kw in
+            ["folk_poll_event", "mouse", "click", "key_down"]) else "visual_widget",
+        "mime": "application/wasm",
+    }
+    # Detect capabilities from source
+    caps = []
+    if "folk_poll_event" in source: caps.append("input")
+    if "folk_draw_rect" in source or "folk_fill_screen" in source: caps.append("graphics")
+    if "folk_draw_text" in source: caps.append("text")
+    if "folk_get_time" in source or "folk_get_datetime" in source: caps.append("time")
+    if "folk_random" in source: caps.append("random")
+    if caps: intent["capabilities"] = caps
+    meta["intent"] = intent
+
+    _cache_set_meta(prompt, meta)
+
+    # Save version snapshot for rollback (never deleted)
+    _cache_save_version(prompt, source, wasm_bytes)
+
+    lineage_depth = len(meta.get("lineage", []))
+    print(f"[CACHE] Stored: {key} v{meta['version']} id={source_id} depth={lineage_depth} ({len(source)} chars, {len(wasm_bytes)} bytes)")
 
 
-def call_llm(prompt: str) -> str:
-    """Call the configured LLM provider and return response text."""
-    try:
-        if LLM_PROVIDER == "gemini":
-            return _call_gemini(prompt)
-        elif LLM_PROVIDER == "local":
-            return _call_local(prompt)
-        elif LLM_PROVIDER == "openai":
-            return _call_openai(prompt)
-        elif LLM_PROVIDER == "claude":
-            return _call_claude(prompt)
+# ── Lineage Query ────────────────────────────────────────────────────────
+
+def _list_all_apps() -> list:
+    """List all cached apps with their lineage metadata."""
+    apps = []
+    for f in os.listdir(_WASM_CACHE_DIR):
+        if f.endswith(".meta.json"):
+            try:
+                with open(os.path.join(_WASM_CACHE_DIR, f), "r") as fh:
+                    meta = json.loads(fh.read())
+                key = f.replace(".meta.json", "")
+                apps.append({
+                    "key": key,
+                    "id": meta.get("id", "?"),
+                    "parent_id": meta.get("parent_id", ""),
+                    "root_id": meta.get("root_id", ""),
+                    "branch": meta.get("branch", "main"),
+                    "version": meta.get("version", 1),
+                    "description": meta.get("description", key),
+                    "dreams": len(meta.get("dream_history", [])),
+                    "perfected": meta.get("perfected", False),
+                })
+            except Exception:
+                pass
+    return apps
+
+
+def _get_lineage_tree(prompt: str) -> str:
+    """Build a text representation of an app's family tree."""
+    meta = _cache_get_meta(prompt)
+    if not meta.get("id"):
+        return f"No lineage data for '{prompt}'"
+
+    root_id = meta.get("root_id", meta.get("id", ""))
+    # Find all apps with same root_id (all relatives)
+    family = []
+    for app in _list_all_apps():
+        if app["root_id"] == root_id or app["id"] == root_id:
+            family.append(app)
+
+    if not family:
+        return f"'{prompt}' has no known relatives"
+
+    # Sort by version
+    family.sort(key=lambda a: a["version"])
+
+    lines = [f"Lineage for '{meta.get('description', prompt)}' (root: {root_id[:8]}...)"]
+    lines.append("")
+    for app in family:
+        prefix = "  " if app["id"] != meta.get("id") else "→ "
+        perfected = " [PERFECTED]" if app.get("perfected") else ""
+        lines.append(f"{prefix}v{app['version']} [{app['branch']}] id={app['id'][:8]} "
+                     f"dreams={app['dreams']}{perfected} — {app['description'][:40]}")
+
+    return "\n".join(lines)
+
+
+# ── Daily Dream Budget ──────────────────────────────────────────────────
+# Prevents AutoDream from burning through API credits overnight.
+
+DREAM_MAX_PER_DAY = int(cfg("DREAM_MAX_CALLS_PER_DAY", "10"))
+_DREAM_BUDGET_PATH = os.path.join(_WASM_CACHE_DIR, "dream_budget.json")
+
+def _dream_budget_check() -> bool:
+    """Check if today's dream budget is available. Returns True if allowed."""
+    import datetime
+    today = datetime.date.today().isoformat()
+    budget = {"date": "", "calls": 0}
+    if os.path.exists(_DREAM_BUDGET_PATH):
+        try:
+            with open(_DREAM_BUDGET_PATH, "r") as f:
+                budget = json.loads(f.read())
+        except Exception:
+            pass
+    # Reset counter if new day
+    if budget.get("date") != today:
+        budget = {"date": today, "calls": 0}
+    if budget["calls"] >= DREAM_MAX_PER_DAY:
+        print(f"[DREAM-BUDGET] Blocked: {budget['calls']}/{DREAM_MAX_PER_DAY} calls used today")
+        return False
+    return True
+
+def _dream_budget_record():
+    """Record a dream API call."""
+    import datetime
+    today = datetime.date.today().isoformat()
+    budget = {"date": today, "calls": 0}
+    if os.path.exists(_DREAM_BUDGET_PATH):
+        try:
+            with open(_DREAM_BUDGET_PATH, "r") as f:
+                budget = json.loads(f.read())
+        except Exception:
+            pass
+    if budget.get("date") != today:
+        budget = {"date": today, "calls": 0}
+    budget["calls"] += 1
+    with open(_DREAM_BUDGET_PATH, "w") as f:
+        f.write(json.dumps(budget))
+    print(f"[DREAM-BUDGET] Used: {budget['calls']}/{DREAM_MAX_PER_DAY} today")
+
+
+def _clarify_request(prompt: str) -> tuple:
+    """Check if an ambiguous request needs clarification.
+    Returns (should_proceed: bool, message: str).
+    If should_proceed is False, message contains a question or suggestion.
+
+    PERFORMANCE: No LLM call. Uses fast heuristics only.
+    The old version called FAST tier for every request, adding 3-10s latency.
+    """
+
+    # Skip clarification for tweaks, dreams, force, and most prompts
+    if "--tweak" in prompt or "--force" in prompt or len(prompt.split()) > 5:
+        return True, ""
+
+    # Clean prompt for matching
+    clean = prompt.lower()
+    for pfx in ["gemini generate ", "generate ", "agent generate "]:
+        if clean.startswith(pfx):
+            clean = clean[len(pfx):]
+            break
+    clean = clean.strip()
+
+    # Reject only truly empty or single-char prompts
+    if len(clean) < 3:
+        return False, "QUESTION: What should the app do? Example: 'bouncing ball' or 'analog clock'"
+
+    # Check for EXACT cache match — offer to load instead of regenerating
+    all_apps = _list_all_apps()
+    exact = [a for a in all_apps if a["description"].lower() == clean]
+    if exact:
+        a = exact[0]
+        # Exact match exists — load from cache (fast path, no LLM call)
+        print(f"[CLARIFY] Exact cache hit: '{a['description']}' v{a['version']}")
+        # Don't block — let cache_check handle it in _llm_to_wasm
+        return True, ""
+
+    # Everything else: proceed directly. The LLM is better at handling
+    # ambiguity than a clarification round-trip that adds 5-10s latency.
+    return True, ""
+
+
+def _llm_to_wasm(prompt: str, force: bool = False, tweak: str = "") -> tuple:
+    """Agentic WASM pipeline: LLM plans and executes using tools.
+
+    The LLM has access to three tools:
+      - read_libfolk_docs(query): Search the Folk API for host function signatures
+      - write_file(filename, code): Write source code to the project
+      - cargo_compile(): Compile and return errors or WASM binary
+
+    The LLM iterates autonomously (up to 8 steps) until compilation succeeds.
+    Returns (bytes, None) on success, (None, str) on failure.
+    """
+
+    # Phase 0: Check cache
+    if not force and not tweak:
+        cached_wasm, _ = _cache_check(prompt)
+        if cached_wasm:
+            return cached_wasm, None
+    if not force and not tweak:
+        should_proceed, clarify_msg = _clarify_request(prompt)
+        if not should_proceed:
+            return None, f"CLARIFY:{clarify_msg}"
+
+    # ── Build the task description ──
+    if tweak:
+        _, existing_src = _cache_check(prompt)
+        meta = _cache_get_meta(prompt)
+        app_desc = meta.get("description", prompt)
+        for pfx in ["gemini generate ", "gemini gen ", "generate ", "agent generate ", "--tweak "]:
+            if app_desc.lower().startswith(pfx):
+                app_desc = app_desc[len(pfx):]
+        if existing_src:
+            task = (f"Modify an existing Folkering OS WASM app.\n"
+                    f"App: \"{app_desc}\"\n"
+                    f"Current source:\n```rust\n{existing_src}\n```\n"
+                    f"Change requested: {tweak}")
         else:
-            return f"Error: Unknown provider '{LLM_PROVIDER}'"
+            task = f"Generate a WASM app: {prompt}\nAlso apply: {tweak}"
+    else:
+        clean = prompt
+        for pfx in ["gemini generate ", "gemini gen ", "generate "]:
+            if clean.lower().startswith(pfx):
+                clean = clean[len(pfx):]
+                break
+        task = f"Generate a WASM app: {clean}"
+
+    # ── Run agentic ReAct loop ──
+    wasm_binary, source, error = _react_wasm_agent(task)
+
+    if wasm_binary:
+        dream_mode_tag = ""
+        parent = ""
+        if tweak:
+            parent = prompt
+            if "refactor" in tweak.lower(): dream_mode_tag = "refactor"
+            elif "visual" in tweak.lower() or "improvement" in tweak.lower(): dream_mode_tag = "creative"
+            elif "harden" in tweak.lower(): dream_mode_tag = "nightmare"
+            else: dream_mode_tag = "tweak"
+        _cache_store(prompt, source or "", wasm_binary, parent_prompt=parent, dream_mode=dream_mode_tag)
+        return wasm_binary, None
+    return None, error or "Agent failed to produce WASM"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Agentic ReAct WASM Generator
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ── Agent system prompt (injected as system message) ──
+_AGENT_SYSTEM = """You are the Folkering OS Toolsmith — an AI agent that builds WASM apps.
+
+You have three tools available via function calling. Use them to build, compile,
+and iterate on WASM applications for Folkering OS (bare-metal Rust, no_std).
+
+WORKFLOW:
+1. Optionally call read_libfolk_docs to find APIs you need
+2. Call write_file with your complete Rust source code
+3. Call cargo_compile to compile it
+4. If compilation fails, read the errors, fix the code, write_file again, recompile
+5. Repeat until cargo_compile returns success
+
+STRICT RULES for the Rust code:
+- #![no_std] #![no_main] are REQUIRED at the top
+- Export: #[no_mangle] pub extern "C" fn run()
+- Include: #[panic_handler] fn panic(_: &core::panic::PanicInfo) -> ! { loop {} }
+- The ENTIRE body of run() MUST be wrapped in unsafe { }
+- NO std, NO allocation (Vec/String/Box), NO extern crate
+- run() is called every frame — use static mut for persistent state
+- Colors: 0x00RRGGBB (e.g., 0xFF0000 = red, 0x00FF00 = green)
+- Declare all folk_* functions in: extern "C" { fn folk_...; }
+"""
+
+# ── Native tool definitions for Ollama function calling ──
+_AGENT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "read_libfolk_docs",
+            "description": "Search the Folkering OS host API documentation. Returns matching folk_* function signatures. Use queries like 'drawing', 'input', 'time', 'network', 'file', 'all'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query (e.g., 'drawing', 'input events', 'network http')"
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Write complete Rust source code to lib.rs. The code must be a full #![no_std] WASM module with run() exported. This overwrites any previous code.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "Complete Rust source code for the WASM app"
+                    }
+                },
+                "required": ["code"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cargo_compile",
+            "description": "Compile the current lib.rs to wasm32-unknown-unknown. Returns 'OK: N bytes' on success, or compiler error messages on failure. Always call this after write_file.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            }
+        }
+    },
+]
+
+_REACT_MAX_STEPS = 8
+
+
+def _react_wasm_agent(task: str) -> tuple:
+    """Run an agentic tool-calling loop. Returns (wasm_bytes, source, error).
+
+    Uses Ollama native function calling: the LLM returns structured tool_calls
+    instead of text-based <tool> tags. No regex parsing needed.
+    """
+
+    tmp_dir = tempfile.mkdtemp(prefix="folkwasm_")
+    proj_dir = os.path.join(tmp_dir, "wasm_tool")
+    subprocess.run(["cargo", "new", "--lib", proj_dir], capture_output=True, timeout=10)
+    with open(os.path.join(proj_dir, "Cargo.toml"), "w") as f:
+        f.write('[package]\nname = "wasm_tool"\nversion = "0.1.0"\nedition = "2021"\n'
+                '[lib]\ncrate-type = ["cdylib"]\n[profile.release]\n'
+                'opt-level = "z"\nlto = true\nstrip = true\npanic = "abort"\n')
+
+    # Build system prompt with full source context (256K models can handle it)
+    system_prompt = _AGENT_SYSTEM
+    if _FULL_SOURCE_CONTEXT:
+        system_prompt += "\n\n" + _FULL_SOURCE_CONTEXT
+
+    history = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": task},
+    ]
+
+    wasm_result = None
+    last_source = None
+    compile_failures = 0
+    current_tier = "fast"
+
+    try:
+        for step in range(1, _REACT_MAX_STEPS + 1):
+            print(f"[AGENT] Step {step}/{_REACT_MAX_STEPS} (tier={current_tier})")
+
+            # Call LLM with tools
+            response = _call_llm_with_tools(history, _AGENT_TOOLS, tier=current_tier)
+
+            if not response:
+                if current_tier == "fast" and GOOGLE_API_KEY:
+                    print(f"[AGENT] {current_tier} failed, escalating to medium")
+                    current_tier = "medium"
+                    response = _call_llm_with_tools(history, _AGENT_TOOLS, tier=current_tier)
+                if not response:
+                    print(f"[AGENT] LLM returned nothing")
+                    break
+
+            # Check if response has tool calls (native function calling)
+            tool_calls = response.get("tool_calls") if isinstance(response, dict) else None
+
+            if tool_calls:
+                # Native tool calling path
+                history.append({"role": "assistant", "content": "", "tool_calls": tool_calls})
+
+                for tc in tool_calls:
+                    fn = tc.get("function", {})
+                    name = fn.get("name", "")
+                    args = fn.get("arguments", {})
+                    if isinstance(args, str):
+                        try: args = json.loads(args)
+                        except: args = {}
+
+                    print(f"[AGENT] Tool: {name}({', '.join(f'{k}={str(v)[:40]}' for k,v in args.items())})")
+
+                    if name == "read_libfolk_docs":
+                        result = _tool_read_docs(args.get("query", "all"))
+                    elif name == "write_file":
+                        code = args.get("code", "")
+                        result = _tool_write_file(proj_dir, f"lib.rs, {code}")
+                        last_source = code
+                    elif name == "cargo_compile":
+                        result, wasm_result = _tool_cargo_compile(proj_dir)
+                        if wasm_result:
+                            print(f"[AGENT] Compiled in step {step} ({current_tier}): {len(wasm_result)} bytes")
+                            return wasm_result, last_source, None
+                        compile_failures += 1
+                        if compile_failures == 1 and current_tier == "fast" and GOOGLE_API_KEY:
+                            current_tier = "medium"
+                            print(f"[AGENT] Compile failed, escalating to Flash Lite")
+                        elif compile_failures == 2 and current_tier == "medium" and GOOGLE_API_KEY:
+                            current_tier = "heavy"
+                            print(f"[AGENT] 2nd fail, escalating to Flash")
+                    else:
+                        result = f"Unknown tool: {name}"
+
+                    print(f"[AGENT] Result: {result[:120]}")
+                    history.append({"role": "tool", "content": result})
+
+            else:
+                # Fallback: LLM returned text (no tool calls)
+                content = response.get("content", "") if isinstance(response, dict) else str(response)
+                history.append({"role": "assistant", "content": content})
+
+                # Try to extract code from text response
+                if "```rust" in content and "#![no_std]" in content:
+                    print(f"[AGENT] Text response with code — auto-extracting")
+                    code = content.split("```rust")[1].split("```")[0].strip()
+                    result = _tool_write_file(proj_dir, f"lib.rs, {code}")
+                    last_source = code
+                    history.append({"role": "tool", "content": result})
+                    # Auto-compile
+                    result2, wasm_result = _tool_cargo_compile(proj_dir)
+                    history.append({"role": "tool", "content": result2})
+                    if wasm_result:
+                        print(f"[AGENT] Auto-compiled in step {step}: {len(wasm_result)} bytes")
+                        return wasm_result, last_source, None
+                    compile_failures += 1
+                    if compile_failures == 1 and current_tier == "fast" and GOOGLE_API_KEY:
+                        current_tier = "medium"
+                        print(f"[AGENT] Compile failed, escalating to Flash Lite")
+                else:
+                    print(f"[AGENT] No tool calls in response, nudging")
+                    history.append({"role": "user", "content": "Please call the write_file tool with your Rust code, then call cargo_compile."})
+
+        print(f"[AGENT] Max steps ({_REACT_MAX_STEPS}) reached")
+        return None, last_source, f"Agent exhausted {_REACT_MAX_STEPS} steps"
+
     except Exception as e:
-        return f"Error: {e}"
+        print(f"[AGENT] Exception: {e}")
+        return None, last_source, f"Agent error: {e}"
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def _call_gemini(prompt: str) -> str:
+def _call_llm_with_tools(messages: list, tools: list = None, tier: str = "fast") -> dict:
+    """Call LLM with native tool/function calling support.
+
+    Returns a dict with either:
+      {"tool_calls": [...]}  — LLM wants to call tools
+      {"content": "..."}    — LLM returned text
+
+    Routes: fast → Ollama, medium → Gemini Flash Lite, heavy → Gemini Flash
+    """
+    tier_map = {
+        "fast":   (FAST_PROVIDER,   FAST_MODEL,   FAST_URL),
+        "medium": (MEDIUM_PROVIDER, MEDIUM_MODEL, MEDIUM_URL),
+        "heavy":  (HEAVY_PROVIDER,  HEAVY_MODEL,  HEAVY_URL),
+    }
+    provider, model, base_url = tier_map.get(tier, tier_map["fast"])
+
+    if provider != "local" and not GOOGLE_API_KEY:
+        provider, model, base_url = FAST_PROVIDER, FAST_MODEL, FAST_URL
+
+    # ── Ollama: native /api/chat with tools ──
+    if provider == "local":
+        try:
+            base = base_url.rstrip("/v1").rstrip("/")
+            url = f"{base}/api/chat"
+            payload = {"model": model, "messages": messages, "stream": False}
+            if tools:
+                payload["tools"] = tools
+            body = json.dumps(payload).encode()
+            req = urllib.request.Request(url, data=body,
+                headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                result = json.loads(resp.read())
+                msg = result.get("message", {})
+                tc = msg.get("tool_calls")
+                if tc:
+                    return {"tool_calls": tc}
+                content = msg.get("content", "")
+                return {"content": content}
+        except Exception as e:
+            if GOOGLE_API_KEY:
+                print(f"[AGENT] Ollama failed ({e}), escalating to Gemini")
+                return _call_gemini_with_tools(messages, tools, MEDIUM_MODEL, MEDIUM_URL)
+            return None
+
+    # ── Gemini: multi-turn with function calling ──
+    if provider == "gemini":
+        return _call_gemini_with_tools(messages, tools, model, base_url)
+
+    # ── Fallback: text-only ──
+    flat = "\n\n".join(f"[{m['role']}]: {m.get('content','')}" for m in messages)
+    text = call_llm(flat, tier=tier)
+    return {"content": text} if text else None
+
+
+def _call_llm_chat(messages: list, tier: str = "fast") -> str:
+    """Simple chat without tools (for non-agent use). Returns text."""
+    result = _call_llm_with_tools(messages, tools=None, tier=tier)
+    if not result:
+        return ""
+    return result.get("content", "")
+
+
+def _call_gemini_with_tools(messages: list, tools: list, model: str, base_url: str) -> dict:
+    """Gemini API with native function calling."""
+    contents = []
+    system_text = ""
+
+    for msg in messages:
+        role = msg["role"]
+        text = msg.get("content", "")
+        if role == "system":
+            system_text = text
+            continue
+        if role == "tool":
+            # Gemini expects tool results as "user" role with functionResponse
+            contents.append({"role": "user", "parts": [{"text": f"[Tool result]: {text}"}]})
+            continue
+        gemini_role = "model" if role == "assistant" else "user"
+        contents.append({"role": gemini_role, "parts": [{"text": text}]})
+
+    body = {"contents": contents}
+    if system_text:
+        body["systemInstruction"] = {"parts": [{"text": system_text}]}
+
+    # Convert tools to Gemini format
+    if tools:
+        gemini_tools = []
+        for t in tools:
+            fn = t.get("function", {})
+            gemini_tools.append({
+                "name": fn["name"],
+                "description": fn.get("description", ""),
+                "parameters": fn.get("parameters", {"type": "object", "properties": {}}),
+            })
+        body["tools"] = [{"functionDeclarations": gemini_tools}]
+
+    url = f"{base_url}/models/{model}:generateContent?key={GOOGLE_API_KEY}"
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(url, data=data,
+        headers={"Content-Type": "application/json"}, method="POST")
+    ctx = ssl.create_default_context()
+    try:
+        with urllib.request.urlopen(req, context=ctx, timeout=90) as resp:
+            result = json.loads(resp.read())
+            parts = result["candidates"][0]["content"]["parts"]
+
+            # Check for function calls
+            tool_calls = []
+            text_parts = []
+            for part in parts:
+                if "functionCall" in part:
+                    fc = part["functionCall"]
+                    tool_calls.append({
+                        "function": {
+                            "name": fc["name"],
+                            "arguments": fc.get("args", {}),
+                        }
+                    })
+                elif "text" in part:
+                    text_parts.append(part["text"])
+
+            if tool_calls:
+                return {"tool_calls": tool_calls}
+            return {"content": "\n".join(text_parts)}
+    except Exception as e:
+        print(f"[AGENT] Gemini error: {e}")
+        return None
+
+
+# ── Agent Tools ──────────────────────────────────────────────────────────
+
+def _tool_read_docs(query: str) -> str:
+    """Search Folk API docs. Returns matching function signatures."""
+    query_lower = query.lower().strip().strip('"').strip("'")
+    matches = []
+
+    # Category keywords for broader searches
+    categories = {
+        "draw": ["folk_draw_rect", "folk_draw_line", "folk_draw_circle", "folk_draw_text", "folk_fill_screen"],
+        "input": ["folk_poll_event"],
+        "time": ["folk_get_time", "folk_get_datetime"],
+        "screen": ["folk_screen_width", "folk_screen_height"],
+        "file": ["folk_request_file", "folk_list_files", "folk_write_file", "folk_query_files"],
+        "net": ["folk_http_get", "folk_net_has_ip", "folk_intent_fetch"],
+        "surface": ["folk_get_surface", "folk_surface_pitch", "folk_surface_present"],
+        "random": ["folk_random"],
+        "ai": ["folk_slm_generate"],
+        "stream": ["folk_stream_write", "folk_stream_read", "folk_stream_done"],
+        "metric": ["folk_os_metric", "folk_fw_drops"],
+    }
+
+    # Match by category
+    for cat, funcs in categories.items():
+        if cat in query_lower:
+            for name in funcs:
+                if name in FOLK_EXTERNS:
+                    matches.append(FOLK_EXTERNS[name])
+
+    # Match by function name substring
+    for name, sig in FOLK_EXTERNS.items():
+        if query_lower in name.lower() or query_lower in sig.lower():
+            if sig not in matches:
+                matches.append(sig)
+
+    # If no matches, return all
+    if not matches:
+        matches = list(FOLK_EXTERNS.values())
+        return "No exact match. Here are ALL available functions:\n" + "\n".join(f"  {s}" for s in matches)
+
+    return "Matching Folk API functions:\n" + "\n".join(f"  {s}" for s in matches)
+
+
+def _tool_write_file(proj_dir: str, args: str) -> str:
+    """Write source code to the project."""
+    comma = args.find(", ")
+    if comma < 0:
+        return "Error: format is write_file(filename, CODE). Example: write_file(lib.rs, #![no_std]...)"
+
+    filename = args[:comma].strip()
+    code = args[comma + 2:]
+
+    # Extract from code blocks if LLM wrapped it
+    if "```rust" in code:
+        code = code.split("```rust")[1].split("```")[0]
+    elif "```" in code:
+        parts = code.split("```")
+        if len(parts) >= 3:
+            code = parts[1]
+
+    code = code.strip()
+
+    # Apply automatic fixes
+    code = fix_missing_externs(code)
+    code = fix_unsafe_calls(code)
+    code = fix_infinite_loop(code)
+
+    # Write to src/lib.rs (only file we support)
+    target = os.path.join(proj_dir, "src", "lib.rs")
+    with open(target, "w") as f:
+        f.write(code)
+
+    lines = code.count("\n") + 1
+    return f"OK: wrote {len(code)} chars ({lines} lines) to src/lib.rs"
+
+
+def _tool_cargo_compile(proj_dir: str) -> tuple:
+    """Compile the project. Returns (observation_str, wasm_bytes_or_None)."""
+    try:
+        result = subprocess.run(
+            ["cargo", "build", "--target", "wasm32-unknown-unknown", "--release"],
+            capture_output=True, text=True, timeout=60, cwd=proj_dir)
+    except subprocess.TimeoutExpired:
+        return "Error: compilation timed out after 60s", None
+
+    if result.returncode != 0:
+        stderr = result.stderr
+        # Extract errors: prefer "error[E..." lines, fall back to last 600 chars
+        error_lines = [l for l in stderr.split("\n") if "error" in l.lower()]
+        if error_lines:
+            errors = "\n".join(error_lines[-10:])  # Last 10 error lines
+        else:
+            errors = stderr[-600:]
+        error_count = stderr.count("error[E") + stderr.count("error: ")
+        return f"COMPILE FAILED ({error_count} errors):\n{errors}", None
+
+    wasm_path = os.path.join(proj_dir, "target", "wasm32-unknown-unknown", "release", "wasm_tool.wasm")
+    if not os.path.exists(wasm_path):
+        return "Error: WASM output file not found", None
+
+    with open(wasm_path, "rb") as f:
+        wasm_binary = f.read()
+
+    if len(wasm_binary) > MAX_WASM_SIZE:
+        return f"Error: WASM too large ({len(wasm_binary)} bytes, max {MAX_WASM_SIZE})", None
+
+    return f"OK: {len(wasm_binary)} bytes compiled successfully!", wasm_binary
+
+
+def _generate_driver(vendor_id: str, device_id: str, class_name: str) -> tuple:
+    """Generate a WASM device driver for a specific PCI device.
+    Uses the driver-specific ABI prompt (folk_mmio_*, folk_in*, folk_wait_irq).
+    Returns (bytes, None) on success, (None, error_str) on failure."""
+
+    # Build the driver system prompt with full ABI definition
+    driver_prompt = f"""Generate a Rust no_std WASM device driver for Folkering OS.
+
+TARGET DEVICE:
+- PCI Vendor: {vendor_id}, Device: {device_id}
+- Class: {class_name}
+
+HARD CONSTRAINTS (violating these = compile failure):
+- #![no_std] #![no_main]
+- #![allow(unused)] at top
+- No allocation (no Vec, String, Box, format!, alloc)
+- No crate imports (no `use` for external crates, no std)
+- Export: #[no_mangle] pub extern "C" fn driver_main()
+- ALL host function calls must be inside unsafe {{ }}
+- Use `static mut` for any state that persists between IRQ cycles
+- Declare ALL used host functions with: extern "C" {{ fn name(args) -> ret; }}
+- Every constant must have a complete value (e.g., `const X: i32 = 0x1234;`)
+
+AVAILABLE HOST FUNCTIONS (declare as extern "C"):
+  // Port I/O (capability-checked by kernel against PCI BARs)
+  fn folk_inb(port: i32) -> i32;
+  fn folk_inw(port: i32) -> i32;
+  fn folk_inl(port: i32) -> i32;
+  fn folk_outb(port: i32, value: i32);
+  fn folk_outw(port: i32, value: i32);
+  fn folk_outl(port: i32, value: i32);
+
+  // MMIO (bar=BAR index 0-5, offset=byte offset in BAR)
+  fn folk_mmio_read_u8(bar: i32, offset: i32) -> i32;
+  fn folk_mmio_read_u16(bar: i32, offset: i32) -> i32;
+  fn folk_mmio_read_u32(bar: i32, offset: i32) -> i32;
+  fn folk_mmio_write_u8(bar: i32, offset: i32, value: i32);
+  fn folk_mmio_write_u16(bar: i32, offset: i32, value: i32);
+  fn folk_mmio_write_u32(bar: i32, offset: i32, value: i32);
+
+  // DMA allocation (returns physical address, max 1MB)
+  fn folk_dma_alloc(size: i32) -> i64;
+  fn folk_dma_free(phys_addr: i32);
+
+  // Interrupt lifecycle
+  fn folk_wait_irq();   // yields CPU until hardware interrupt fires
+  fn folk_ack_irq();    // acknowledge interrupt (unmask at APIC)
+
+  // Device identity query
+  fn folk_device_vendor_id() -> i32;
+  fn folk_device_id() -> i32;
+  fn folk_device_irq() -> i32;
+  fn folk_bar_size(bar: i32) -> i32;
+
+  // Debug logging (ptr = WASM memory address, len = byte count)
+  fn folk_log(ptr: i32, len: i32);
+
+COMPLETE WORKING EXAMPLE (minimal skeleton):
+```rust
+#![no_std]
+#![no_main]
+#![allow(unused)]
+
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo) -> ! {{ loop {{}} }}
+
+extern "C" {{
+    fn folk_device_vendor_id() -> i32;
+    fn folk_device_id() -> i32;
+    fn folk_bar_size(bar: i32) -> i32;
+    fn folk_mmio_read_u32(bar: i32, offset: i32) -> i32;
+    fn folk_mmio_write_u32(bar: i32, offset: i32, value: i32);
+    fn folk_wait_irq();
+    fn folk_ack_irq();
+    fn folk_log(ptr: i32, len: i32);
+}}
+
+static mut IRQ_COUNT: u32 = 0;
+
+#[no_mangle]
+pub extern "C" fn driver_main() {{
+    unsafe {{
+        let msg = b"Driver started";
+        folk_log(msg.as_ptr() as i32, msg.len() as i32);
+        let _vid = folk_device_vendor_id();
+        // Initialize device via BAR0 MMIO
+        folk_mmio_write_u32(0, 0x00, 0x01);
+        // Main IRQ loop
+        loop {{
+            folk_wait_irq();
+            let isr = folk_mmio_read_u32(0, 0x00C0);
+            IRQ_COUNT += 1;
+            folk_ack_irq();
+        }}
+    }}
+}}
+```
+
+IMPORTANT: Your code MUST compile with `cargo build --target wasm32-unknown-unknown`.
+Return ONLY the Rust source code. No markdown, no explanation, no backticks around the code."""
+
+    print(f"[DRIVER] Generating driver for {vendor_id}:{device_id} ({class_name})...")
+    source = call_llm(driver_prompt, tier="heavy")
+
+    if source.startswith("Error:"):
+        return None, source
+
+    # Extract code
+    if "<think>" in source and "</think>" in source:
+        source = source[source.index("</think>") + 8:]
+    extracted = None
+    if "```rust" in source:
+        extracted = source.split("```rust")[1].split("```")[0]
+    elif "```" in source:
+        parts = source.split("```")
+        if len(parts) >= 3: extracted = parts[1]
+    if extracted: source = extracted.strip()
+    elif "#![no_std]" in source: source = source[source.index("#![no_std]"):].strip()
+
+    # Fix common issues
+    source = fix_missing_externs(source)
+    source = fix_unsafe_calls(source)
+
+    # Ensure driver exports driver_main (not run)
+    if "fn driver_main" not in source and "fn run" in source:
+        source = source.replace("fn run()", "fn driver_main()")
+
+    print(f"[DRIVER] Source: {len(source)} chars")
+
+    # Compile
+    tmp_dir = tempfile.mkdtemp(prefix="folkdrv_")
+    try:
+        proj_dir = os.path.join(tmp_dir, "wasm_driver")
+        subprocess.run(["cargo", "new", "--lib", proj_dir], capture_output=True, timeout=10)
+        with open(os.path.join(proj_dir, "Cargo.toml"), "w") as f:
+            f.write('[package]\nname = "wasm_driver"\nversion = "0.1.0"\nedition = "2021"\n'
+                    '[lib]\ncrate-type = ["cdylib"]\n[profile.release]\n'
+                    'opt-level = "z"\nlto = true\nstrip = true\npanic = "abort"\n')
+        with open(os.path.join(proj_dir, "src", "lib.rs"), "w") as f:
+            f.write(source)
+        result = subprocess.run(
+            ["cargo", "build", "--target", "wasm32-unknown-unknown", "--release"],
+            capture_output=True, text=True, timeout=60, cwd=proj_dir)
+        if result.returncode != 0:
+            print(f"[DRIVER] Compile failed: {result.stderr[:500]}")
+            # Save source even on failure for debugging
+            fail_key = f"driver_{vendor_id}_{device_id}"
+            fail_path = os.path.join(_WASM_CACHE_DIR, f"{fail_key}_FAILED.rs")
+            with open(fail_path, "w") as ff:
+                ff.write(source)
+            err_path = os.path.join(_WASM_CACHE_DIR, f"{fail_key}_FAILED.err")
+            with open(err_path, "w") as ff:
+                ff.write(result.stderr)
+            print(f"[DRIVER] Saved failed source: {fail_path}")
+
+            # AUTO-FIX: retry with compile error feedback (one attempt)
+            fix_prompt = f"""The following Rust WASM driver code failed to compile.
+Fix ALL compilation errors and return the corrected code.
+
+ORIGINAL CODE:
+```rust
+{source}
+```
+
+COMPILER ERRORS:
+{result.stderr[:2000]}
+
+CONSTRAINTS (same as before):
+- #![no_std] #![no_main]
+- No allocation (no Vec, String, Box)
+- No crate imports
+- Export: #[no_mangle] pub extern "C" fn driver_main()
+- All host calls must be inside unsafe {{}}
+
+Return ONLY the corrected Rust code."""
+
+            print(f"[DRIVER] Attempting auto-fix...")
+            fix_source = call_llm(fix_prompt, tier="heavy")
+            if fix_source and not fix_source.startswith("Error:"):
+                # Extract code from response
+                if "```rust" in fix_source:
+                    fix_source = fix_source.split("```rust")[1].split("```")[0].strip()
+                elif "```" in fix_source:
+                    parts = fix_source.split("```")
+                    if len(parts) >= 3: fix_source = parts[1].strip()
+                fix_source = fix_missing_externs(fix_source)
+                fix_source = fix_unsafe_calls(fix_source)
+                if "fn driver_main" not in fix_source and "fn run" in fix_source:
+                    fix_source = fix_source.replace("fn run()", "fn driver_main()")
+                with open(os.path.join(proj_dir, "src", "lib.rs"), "w") as ff:
+                    ff.write(fix_source)
+                retry = subprocess.run(
+                    ["cargo", "build", "--target", "wasm32-unknown-unknown", "--release"],
+                    capture_output=True, text=True, timeout=60, cwd=proj_dir)
+                if retry.returncode == 0:
+                    wasm_path2 = os.path.join(proj_dir, "target", "wasm32-unknown-unknown", "release", "wasm_driver.wasm")
+                    if os.path.exists(wasm_path2):
+                        with open(wasm_path2, "rb") as ff:
+                            wasm_binary = ff.read()
+                        print(f"[DRIVER] Auto-fix SUCCESS: {len(wasm_binary)} bytes")
+                        source = fix_source  # Use fixed source for caching
+                        # Fall through to cache + return below
+                    else:
+                        return None, "Driver WASM not found after fix"
+                else:
+                    print(f"[DRIVER] Auto-fix compile also failed: {retry.stderr[:200]}")
+                    fix2_path = os.path.join(_WASM_CACHE_DIR, f"{fail_key}_FIX_FAILED.rs")
+                    with open(fix2_path, "w") as ff:
+                        ff.write(fix_source)
+                    return None, f"Driver compile error (even after auto-fix): {retry.stderr[:300]}"
+            else:
+                return None, f"Driver compile error: {result.stderr[:400]}"
+        wasm_path = os.path.join(proj_dir, "target", "wasm32-unknown-unknown", "release", "wasm_driver.wasm")
+        if not os.path.exists(wasm_path):
+            return None, "Driver WASM output not found"
+        with open(wasm_path, "rb") as f:
+            wasm_binary = f.read()
+        print(f"[DRIVER] Compiled: {len(wasm_binary)} bytes")
+
+        # Cache the driver source
+        cache_key = f"driver_{vendor_id}_{device_id}"
+        cache_path = os.path.join(_WASM_CACHE_DIR, f"{cache_key}.rs")
+        with open(cache_path, "w") as f:
+            f.write(source)
+        wasm_cache_path = os.path.join(_WASM_CACHE_DIR, f"{cache_key}.wasm")
+        with open(wasm_cache_path, "wb") as f:
+            f.write(wasm_binary)
+        print(f"[DRIVER] Cached: {cache_key}")
+
+        return wasm_binary, None
+    except subprocess.TimeoutExpired:
+        return None, "Driver compile timeout (60s)"
+    except Exception as e:
+        return None, f"Driver build error: {e}"
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def generate_and_compile_wasm(prompt: str, sock: socket.socket):
+    """Legacy path: Generate WASM and send via @@GEMINI_RESP@@ protocol."""
+    print(f"[SERIAL-PROXY] Tool request (legacy): {prompt[:80]}...")
+    wasm_binary, error = _llm_to_wasm(prompt)
+    if error:
+        error_resp = RESP_START + error.encode() + RESP_END + b"\n"
+        sock.sendall(error_resp)
+        print(f"[SERIAL-PROXY] Error: {error[:100]}")
+        return
+    b64_data = base64.b64encode(wasm_binary).decode("ascii")
+    resp_json = json.dumps({"action": "tool_ready", "binary": b64_data})
+    response = RESP_START + resp_json.encode() + RESP_END + b"\n"
+    sock.sendall(response)
+    print(f"[SERIAL-PROXY] Sent tool_ready: {len(wasm_binary)} bytes WASM")
+
+
+def _dispatch(provider: str, url: str, model: str, prompt: str) -> str:
+    """Route to the correct provider backend."""
+    if provider == "gemini":
+        return _call_gemini(prompt, model, url)
+    elif provider == "local":
+        return _call_local(prompt, model, url)
+    elif provider == "openai":
+        return _call_openai(prompt, model, url)
+    elif provider == "claude":
+        return _call_claude(prompt, model)
+    else:
+        return f"Error: Unknown provider '{provider}'"
+
+
+_TIER_CHAIN = [
+    ("fast",   lambda: (FAST_PROVIDER,   FAST_MODEL,   FAST_URL)),
+    ("medium", lambda: (MEDIUM_PROVIDER, MEDIUM_MODEL, MEDIUM_URL)),
+    ("heavy",  lambda: (HEAVY_PROVIDER,  HEAVY_MODEL,  HEAVY_URL)),
+    ("ultra",  lambda: (ULTRA_PROVIDER,  ULTRA_MODEL,  ULTRA_URL)),
+]
+
+# Ultra tier rate limiter — prevents runaway costs
+ULTRA_MAX_PER_SESSION = 3          # max ultra calls per proxy session
+ULTRA_COOLDOWN_S = 300             # 5 min cooldown between ultra calls
+_ultra_count = 0
+_ultra_last_ts = 0.0
+
+def _ultra_allowed() -> bool:
+    """Check if ultra tier is allowed right now."""
+    global _ultra_count, _ultra_last_ts
+    if _ultra_count >= ULTRA_MAX_PER_SESSION:
+        print(f"[ROUTER] ULTRA blocked: {_ultra_count}/{ULTRA_MAX_PER_SESSION} calls used this session")
+        return False
+    now = time.time()
+    if _ultra_last_ts > 0 and now - _ultra_last_ts < ULTRA_COOLDOWN_S:
+        remaining = int(ULTRA_COOLDOWN_S - (now - _ultra_last_ts))
+        print(f"[ROUTER] ULTRA blocked: cooldown ({remaining}s remaining)")
+        return False
+    return True
+
+def _ultra_record():
+    """Record an ultra tier call."""
+    global _ultra_count, _ultra_last_ts
+    _ultra_count += 1
+    _ultra_last_ts = time.time()
+    print(f"[ROUTER] ULTRA used: {_ultra_count}/{ULTRA_MAX_PER_SESSION} this session")
+
+
+def call_llm(prompt: str, model_override: str = "", tier: str = "fast") -> str:
+    """Call LLM using the hybrid router with auto-escalation on failure.
+
+    Tiers: fast → medium → heavy → ultra
+    On failure, escalates to the next tier automatically.
+    Ultra is rate-limited: max 3 calls per session, 5 min cooldown.
+    """
+    tier_names = [t[0] for t in _TIER_CHAIN]
+    start_idx = tier_names.index(tier) if tier in tier_names else 0
+
+    for i in range(start_idx, len(_TIER_CHAIN)):
+        tier_name, get_config = _TIER_CHAIN[i]
+
+        # Ultra rate limiter
+        if tier_name == "ultra" and not _ultra_allowed():
+            return "Error: ultra tier rate-limited (max 3/session, 5min cooldown)"
+
+        provider, model, url = get_config()
+
+        if model_override and i == start_idx:
+            model = model_override
+
+        # Skip cloud tiers without API key
+        if provider != "local" and not GOOGLE_API_KEY:
+            if i == start_idx:
+                print(f"[ROUTER] No API key for {tier_name}/{provider}, falling back to FAST")
+            provider, model, url = FAST_PROVIDER, FAST_MODEL, FAST_URL
+
+        print(f"[ROUTER] tier={tier_name} -> {provider}/{model}")
+        try:
+            result = _dispatch(provider, url, model, prompt)
+            if result and not result.startswith("Error:"):
+                if tier_name == "ultra":
+                    _ultra_record()
+                return result
+            raise ValueError(result)
+        except Exception as e:
+            if i < len(_TIER_CHAIN) - 1:
+                print(f"[ROUTER] {tier_name} failed ({e}), escalating...")
+            else:
+                return f"Error: all tiers exhausted ({e})"
+
+    return "Error: no tiers available"
+
+
+def route_for_task(msg_type: str, prompt: str = "") -> str:
+    """Decide which tier to use based on task type and prompt content.
+
+    Returns: 'fast', 'medium', or 'heavy'
+    """
+    # Draug background analysis — always fast (cheap, non-critical)
+    if "draug" in prompt.lower() or "background daemon" in prompt.lower():
+        return "fast"
+
+    # WASM code generation — medium (needs decent code output)
+    if msg_type == "wasm_gen_request" or "generate_wasm" in prompt.lower():
+        return "medium"
+
+    # Agent tool calls — medium (needs structured JSON output)
+    if msg_type == "chat_request" and ("tool" in prompt.lower() or "agent" in prompt.lower()):
+        return "medium"
+
+    # Complex multi-step reasoning (long prompts with history)
+    if len(prompt) > 4000:
+        return "medium"
+
+    # Default: fast
+    return "fast"
+
+
+def _call_gemini(prompt: str, model: str = "", base_url: str = "") -> str:
     """Google Gemini API."""
-    url = f"{LLM_BASE_URL}/models/{LLM_MODEL}:generateContent?key={LLM_API_KEY}"
+    m = model or MEDIUM_MODEL
+    base = base_url or MEDIUM_URL
+    url = f"{base}/models/{m}:generateContent?key={GOOGLE_API_KEY}"
     body = json.dumps({
         "contents": [{"parts": [{"text": prompt}]}]
     }).encode()
     req = urllib.request.Request(url, data=body,
         headers={"Content-Type": "application/json"}, method="POST")
     ctx = ssl.create_default_context()
-    with urllib.request.urlopen(req, context=ctx, timeout=60) as resp:
+    with urllib.request.urlopen(req, context=ctx, timeout=30) as resp:
         result = json.loads(resp.read())
         return result["candidates"][0]["content"]["parts"][0]["text"]
 
 
-def _call_openai(prompt: str) -> str:
+def _call_openai(prompt: str, model: str = "", base_url: str = "") -> str:
     """OpenAI-compatible API (OpenAI, LM Studio, Ollama, llama.cpp server)."""
-    url = f"{LLM_BASE_URL}/chat/completions"
+    m = model or FAST_MODEL
+    base = base_url or FAST_URL
+    url = f"{base}/chat/completions"
     body = json.dumps({
-        "model": LLM_MODEL,
+        "model": m,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": 4096,
         "temperature": 0.7,
@@ -388,7 +1787,7 @@ def _call_openai(prompt: str) -> str:
         headers["Authorization"] = f"Bearer {LLM_API_KEY}"
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
     # Use SSL only for HTTPS URLs
-    kwargs = {"timeout": 120}
+    kwargs = {"timeout": 45}
     if url.startswith("https"):
         kwargs["context"] = ssl.create_default_context()
     with urllib.request.urlopen(req, **kwargs) as resp:
@@ -396,36 +1795,39 @@ def _call_openai(prompt: str) -> str:
         return result["choices"][0]["message"]["content"]
 
 
-def _call_local(prompt: str) -> str:
+def _call_local(prompt: str, model: str = "", base_url: str = "") -> str:
     """Local Ollama API — uses native /api/chat to capture <think> reasoning."""
+    m = model or FAST_MODEL
     # Use Ollama native API (not OpenAI compat) to get 'thinking' field
-    base = LLM_BASE_URL.rstrip("/v1").rstrip("/")  # http://localhost:11434
+    raw_url = base_url or FAST_URL
+    base = raw_url.rstrip("/v1").rstrip("/")  # http://localhost:11434
     url = f"{base}/api/chat"
     body = json.dumps({
-        "model": LLM_MODEL,
+        "model": m,
         "messages": [{"role": "user", "content": prompt}],
         "stream": False,
     }).encode()
     req = urllib.request.Request(url, data=body,
         headers={"Content-Type": "application/json"}, method="POST")
-    with urllib.request.urlopen(req, timeout=120) as resp:
+    with urllib.request.urlopen(req, timeout=45) as resp:
         result = json.loads(resp.read())
         msg = result.get("message", {})
         content = msg.get("content", "")
         thinking = msg.get("thinking", "")
         # Debug: log thinking status
-        print(f"[PROXY] thinking: {len(thinking)} chars, content: {len(content)} chars")
+        print(f"[PROXY] model={m}, thinking: {len(thinking)} chars, content: {len(content)} chars")
         # Wrap thinking in <think> tags for Folkering OS FSA parser
         if thinking:
             return f"<think>\n{thinking}\n</think>\n{content}"
         return content
 
 
-def _call_claude(prompt: str) -> str:
+def _call_claude(prompt: str, model: str = "") -> str:
     """Anthropic Claude API."""
+    m = model or LLM_MODEL
     url = f"{LLM_BASE_URL}/messages"
     body = json.dumps({
-        "model": LLM_MODEL,
+        "model": m,
         "max_tokens": 4096,
         "messages": [{"role": "user", "content": prompt}],
     }).encode()
@@ -435,15 +1837,213 @@ def _call_claude(prompt: str) -> str:
         "anthropic-version": "2023-06-01",
     }, method="POST")
     ctx = ssl.create_default_context()
-    with urllib.request.urlopen(req, context=ctx, timeout=60) as resp:
+    with urllib.request.urlopen(req, context=ctx, timeout=30) as resp:
         result = json.loads(resp.read())
         return result["content"][0]["text"]
 
 
+def sign_wasm(wasm_bytes: bytes, prompt: str) -> bytes:
+    """Sign WASM binary with cryptographic intention signature.
+    Prepends a 37-byte header: FOLK\\x00 (5 bytes) + SHA256 signature (32 bytes).
+    The OS strips and verifies this header before execution."""
+    import hashlib, time
+    wasm_hash = hashlib.sha256(wasm_bytes).digest()
+    timestamp = int(time.time()).to_bytes(8, 'little')
+    prompt_bytes = prompt.encode('utf-8')[:4096]
+    sig_input = prompt_bytes + wasm_hash + timestamp
+    signature = hashlib.sha256(sig_input).digest()
+    # Header: magic(5) + signature(32) = 37 bytes
+    header = b'FOLK\x00' + signature
+    print(f"[CRYPTO] Signed: {hashlib.sha256(wasm_bytes).hexdigest()[:16]}... sig={signature.hex()[:16]}...")
+    return header + wasm_bytes
+
+
+def handle_mcp_frame(frame_bytes: bytes, sock: socket.socket):
+    """Process a complete MCP frame (COBS-encoded, CRC-verified, Postcard-serialized)."""
+    from mcp_bridge import (parse_frame, decode_mcp_response, make_frame, send_reliable,
+        encode_chat_response, encode_time_sync, encode_wasm_chunk, encode_ping,
+        _retx_queue, _session, send_wasm_chunked)
+
+    try:
+        sid, seq, payload = parse_frame(frame_bytes)
+        msg = decode_mcp_response(payload)
+    except Exception:
+        # Silently drop unparseable frames (ACK/NACK are tiny, may fragment)
+        return
+
+    # Session lock: first frame locks the session, subsequent frames are validated
+    if not _session.locked:
+        _session.lock_to(sid)
+        print(f"[MCP] Session locked to 0x{sid:08X}")
+    elif not _session.validate(sid):
+        print(f"[MCP] DROPPED: wrong session 0x{sid:08X} (expected 0x{_session.session_id:08X})")
+        return
+
+    msg_type = msg.get('type', 'unknown')
+    print(f"[MCP] Received: {msg_type} (seq={seq})")
+
+    if msg_type == 'chat_request':
+        prompt = msg['prompt']
+
+        # Handle internal commands (not LLM calls)
+        if prompt.startswith("__ROLLBACK__"):
+            parts = prompt.split()
+            if len(parts) >= 3:
+                app_name = parts[1]
+                try:
+                    ver = int(parts[2])
+                    wasm, src, err = _cache_rollback(app_name, ver)
+                    if err:
+                        response_frame = make_frame(encode_chat_response(f"Rollback failed: {err}"))
+                    else:
+                        response_frame = make_frame(encode_chat_response(
+                            f"Rolled back '{app_name}' to v{ver} ({len(wasm)} bytes). Restart app to see changes."))
+                        # Also send the WASM binary so OS can update its cache
+                        signed = sign_wasm(wasm, f"rollback:{app_name}:v{ver}")
+                        send_wasm_chunked(signed, sock, session_id=_session.session_id)
+                except Exception as e:
+                    response_frame = make_frame(encode_chat_response(f"Rollback error: {e}"))
+            else:
+                response_frame = make_frame(encode_chat_response("Usage: __ROLLBACK__ <app_name> <version>"))
+            sock.sendall(response_frame)
+            return
+
+        # Normal LLM routing
+        tier = route_for_task(msg_type, prompt)
+        print(f"[MCP] Chat ({tier}): {prompt[:80]}...")
+
+        # Context management: check compaction thresholds
+        if _context_mgr.needs_full_compact():
+            print(f"[CTX] FULL COMPACT ({_context_mgr.usage_pct():.0f}%)")
+            _context_mgr.full_compact()
+        elif _context_mgr.needs_auto_compact():
+            print(f"[CTX] AUTO COMPACT ({_context_mgr.usage_pct():.0f}%)")
+            _context_mgr.auto_compact(lambda text: call_llm(text, tier="fast"))
+
+        _context_mgr.add_message("user", prompt)
+        full_context = _context_mgr.get_prompt_text()
+        response_text = call_llm(full_context, tier=tier)
+
+        # Strip <think>...</think> tags to reduce wire size
+        clean_text = response_text
+        if "<think>" in clean_text and "</think>" in clean_text:
+            think_end = clean_text.index("</think>") + len("</think>")
+            clean_text = clean_text[think_end:].strip()
+            print(f"[MCP] Think stripped: {len(response_text)} -> {len(clean_text)} chars")
+        _context_mgr.add_message("assistant", clean_text)
+
+        # Send MCP ChatResponse reliably (enqueued for retransmission)
+        payload = encode_chat_response(clean_text)
+        seq = send_reliable(payload, sock, session_id=_session.session_id)
+        print(f"[MCP] Sent ChatResponse seq={seq}: {len(clean_text)} chars (ctx: {_context_mgr.usage_pct():.0f}%)")
+
+    elif msg_type == 'time_sync_request':
+        import datetime
+        now_local = datetime.datetime.now()
+        utc_offset = datetime.datetime.now(datetime.timezone.utc).astimezone().utcoffset()
+        offset_minutes = int(utc_offset.total_seconds() / 60) if utc_offset else 0
+        offset_minutes = round(offset_minutes / 15) * 15
+        payload = encode_time_sync(
+            now_local.year, now_local.month, now_local.day,
+            now_local.hour, now_local.minute, now_local.second,
+            offset_minutes
+        )
+        seq = send_reliable(payload, sock, session_id=_session.session_id)
+        print(f"[MCP] Sent TimeSync seq={seq}: {now_local.hour}:{now_local.minute:02d} UTC+{offset_minutes//60}")
+
+    elif msg_type == 'wasm_gen_request':
+        desc = msg.get('description', '')
+
+        # ── Autonomous Driver Generation ──────────────────────────
+        # Format: __DRIVER_GEN__<vendor_id>:<device_id>:<class_name>
+        if desc.startswith("__DRIVER_GEN__"):
+            parts = desc[14:].split(":", 2)
+            if len(parts) >= 3:
+                vendor_id = parts[0]
+                device_id = parts[1]
+                class_name = parts[2]
+                print(f"[MCP] DRIVER GEN: {vendor_id}:{device_id} ({class_name})")
+                wasm_binary, error = _generate_driver(vendor_id, device_id, class_name)
+                if error:
+                    error_frame = make_frame(encode_chat_response(f"Error: {error}"))
+                    sock.sendall(error_frame)
+                else:
+                    signed = sign_wasm(wasm_binary, desc)
+                    send_wasm_chunked(signed, sock, session_id=_session.session_id)
+            else:
+                error_frame = make_frame(encode_chat_response("Error: bad driver gen format"))
+                sock.sendall(error_frame)
+        else:
+        # ── Normal WASM App Generation ────────────────────────────
+
+            is_dream = "--tweak" in desc and ("refactor" in desc.lower() or "optimize" in desc.lower() or "visual" in desc.lower())
+            print(f"[MCP] WASM gen{'(dream)' if is_dream else ''}: {desc[:60]}...")
+
+            # Dream budget check — reject if daily quota exhausted
+            if is_dream and not _dream_budget_check():
+                error_frame = make_frame(encode_chat_response("Error: dream budget exhausted for today"))
+                sock.sendall(error_frame)
+            else:
+                # Check if app is "perfected" (three strikes) — skip refactor dreams
+                base_key = desc.rsplit(' ', 1)[-1] if ' ' in desc else desc
+                meta = _cache_get_meta(base_key)
+                if is_dream and meta.get("perfected") and "refactor" in desc.lower():
+                    error_frame = make_frame(encode_chat_response("Error: app perfected — skipping refactor"))
+                    sock.sendall(error_frame)
+                    print(f"[CACHE] Skipped perfected app: {base_key}")
+                else:
+                    wasm_binary, error = _llm_to_wasm(desc)
+                    if error and error.startswith("CLARIFY:"):
+                        clarify_msg = error[8:]
+                        print(f"[MCP] Clarification needed: {clarify_msg[:60]}")
+                        response_frame = make_frame(encode_chat_response(clarify_msg))
+                        sock.sendall(response_frame)
+                    elif error:
+                        error_frame = make_frame(encode_chat_response(f"Error: {error}"))
+                        sock.sendall(error_frame)
+                    else:
+                        if is_dream:
+                            _dream_budget_record()
+                        signed = sign_wasm(wasm_binary, desc)
+                        send_wasm_chunked(signed, sock, session_id=_session.session_id)
+
+    elif msg_type == 'pong':
+        print(f"[MCP] Pong seq={msg.get('seq', 0)}")
+
+    elif msg_type == 'ack':
+        # OS acknowledged our frame — clear from retransmission queue
+        _retx_queue.on_ack(seq)
+        # Don't print for every ACK (too noisy)
+
+    elif msg_type == 'nack':
+        reason = msg.get('reason', 0)
+        reasons = {1: 'CRC', 2: 'PARSE', 3: 'SESSION', 4: 'CHUNK_ORDER'}
+        print(f"[MCP] NACK seq={seq} reason={reasons.get(reason, reason)}")
+        _retx_queue.on_nack(seq, sock)
+
+    elif msg_type == 'sampling_request':
+        prompt = msg['prompt']
+        max_tokens = msg.get('max_tokens', 4096)
+        print(f"[MCP] Sampling: {prompt[:60]}... (max {max_tokens})")
+        response_text = call_llm(prompt)
+        response_frame = make_frame(encode_chat_response(response_text))
+        sock.sendall(response_frame)
+
+    else:
+        print(f"[MCP] Unknown message type: {msg}")
+
+
 def handle_serial(sock: socket.socket):
-    """Read from COM2, process requests, write responses."""
+    """Read from COM2, process requests, write responses.
+    Dual-mode: supports both MCP (COBS frames with 0x00 sentinel) and
+    legacy (@@GEMINI_REQ@@...@@END@@) protocols simultaneously."""
     buf = b""
-    print("[SERIAL-PROXY] Connected to COM2, listening for requests...")
+    # Reset session on new connection (OS may have rebooted)
+    from mcp_bridge import _session as bridge_session
+    bridge_session.locked = False
+    bridge_session.session_id = 0
+    bridge_session.seq_counter = 0
+    print("[SERIAL-PROXY] Connected to COM2 (dual-mode: MCP + legacy, session reset)...")
 
     while True:
         try:
@@ -454,7 +2054,24 @@ def handle_serial(sock: socket.socket):
 
             buf += data
 
-            # Look for complete request: @@GEMINI_REQ@@{...}@@END@@
+            # === MCP Protocol: check for COBS frames (0x00 sentinel) ===
+            while b'\x00' in buf:
+                sentinel_pos = buf.index(b'\x00')
+                if sentinel_pos > 0:
+                    frame = buf[:sentinel_pos]
+                    buf = buf[sentinel_pos + 1:]
+                    # Verify this looks like a COBS frame (no 0x00 inside)
+                    if b'\x00' not in frame and len(frame) >= 3:
+                        try:
+                            handle_mcp_frame(frame, sock)
+                        except Exception as e:
+                            # Silently drop malformed frames (ACKs, partial data)
+                            pass
+                else:
+                    # Leading 0x00 — skip it
+                    buf = buf[1:]
+
+            # === Legacy Protocol: @@GEMINI_REQ@@...@@END@@ ===
             while REQ_START in buf and REQ_END in buf:
                 start = buf.index(REQ_START) + len(REQ_START)
                 end = buf.index(REQ_END)
@@ -520,6 +2137,66 @@ def handle_serial(sock: socket.socket):
                         sock.sendall(RESP_START + f"Load error: {e}".encode() + RESP_END + b"\n")
                     continue
 
+                # ── On-Device SLM: Local AI inference via Ollama ──
+                if prompt.startswith("__SLM_GENERATE__"):
+                    slm_prompt = prompt[16:].strip()
+                    print(f"[SLM] Local inference: {slm_prompt[:60]}...")
+                    try:
+                        # Force FAST tier (local Ollama, free, instant)
+                        result = call_llm(slm_prompt, tier="fast")
+                        # Strip thinking tags if present
+                        if "<think>" in result and "</think>" in result:
+                            result = result[result.index("</think>") + 8:].strip()
+                        print(f"[SLM] Response: {len(result)} chars")
+                        sock.sendall(RESP_START + result.encode("utf-8", errors="replace")[:4096] + RESP_END + b"\n")
+                    except Exception as e:
+                        err = f"SLM error: {e}"
+                        sock.sendall(RESP_START + err.encode()[:256] + RESP_END + b"\n")
+                    continue
+
+                # ── Intent-IP: HTTP GET via host network ──
+                if prompt.startswith("__HTTP_GET__"):
+                    url = prompt[12:].strip()
+                    print(f"[INTENT-IP] HTTP GET: {url[:80]}")
+                    try:
+                        import urllib.request, ssl
+                        ctx = ssl.create_default_context()
+                        req = urllib.request.Request(url, headers={"User-Agent": "FolkeringOS/1.0"})
+                        with urllib.request.urlopen(req, context=ctx, timeout=15) as resp:
+                            body = resp.read(4096).decode("utf-8", errors="replace")
+                        print(f"[INTENT-IP] Got {len(body)} chars")
+                        sock.sendall(RESP_START + body.encode("utf-8", errors="replace")[:4096] + RESP_END + b"\n")
+                    except Exception as e:
+                        err = f"HTTP error: {e}"
+                        print(f"[INTENT-IP] {err}")
+                        sock.sendall(RESP_START + err.encode()[:256] + RESP_END + b"\n")
+                    continue
+
+                # ── Intent-IP: Semantic fetch via LLM ──
+                if prompt.startswith("__INTENT_FETCH__"):
+                    query = prompt[16:].strip()
+                    print(f"[INTENT-IP] Semantic fetch: {query[:80]}")
+                    # Ask LLM to translate intent to structured data
+                    intent_prompt = (
+                        f"The user wants: \"{query}\"\n\n"
+                        f"You are an API translation layer. Return ONLY a structured JSON response "
+                        f"with the requested data. If you need to call an API, describe what the "
+                        f"response would be. Keep it under 500 chars. No explanation, just data."
+                    )
+                    try:
+                        result = call_llm(intent_prompt, tier="fast")
+                        # Strip markdown code fences if present
+                        if "```json" in result:
+                            result = result.split("```json")[1].split("```")[0].strip()
+                        elif "```" in result:
+                            result = result.split("```")[1].split("```")[0].strip()
+                        print(f"[INTENT-IP] Result: {len(result)} chars")
+                        sock.sendall(RESP_START + result.encode("utf-8", errors="replace")[:4096] + RESP_END + b"\n")
+                    except Exception as e:
+                        err = f"Intent error: {e}"
+                        sock.sendall(RESP_START + err.encode()[:256] + RESP_END + b"\n")
+                    continue
+
                 # Check for [GENERATE_TOOL] prefix → WASM pipeline
                 if prompt.startswith(TOOL_GENERATE_PREFIX):
                     tool_prompt = prompt[len(TOOL_GENERATE_PREFIX):].strip()
@@ -537,13 +2214,128 @@ def handle_serial(sock: socket.socket):
                 print(f"[SERIAL-PROXY] Sent {len(response)} bytes back to OS")
 
         except socket.timeout:
+            # Check retransmission timeouts on every socket timeout (1s)
+            if not _retx_queue.is_empty():
+                _retx_queue.check_timeouts(sock)
             continue
         except Exception as e:
             print(f"[SERIAL-PROXY] Error: {e}")
             break
 
 
+def handle_tcp_client(conn, addr):
+    """Handle a single TCP client connection (from kernel's ask_gemini via TCP)."""
+    print(f"[TCP-PROXY] Connection from {addr}")
+    try:
+        conn.settimeout(60)
+        data = b""
+        while b"@@END@@" not in data:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+
+        if REQ_START not in data or REQ_END not in data:
+            print(f"[TCP-PROXY] Malformed request ({len(data)} bytes)")
+            conn.close()
+            return
+
+        start = data.index(REQ_START) + len(REQ_START)
+        end = data.index(REQ_END)
+        payload = data[start:end]
+
+        print(f"[TCP-PROXY] Request: {payload[:100]}...")
+
+        try:
+            req = json.loads(payload)
+            prompt = req.get("prompt", payload.decode("utf-8", errors="replace"))
+        except json.JSONDecodeError:
+            prompt = payload.decode("utf-8", errors="replace")
+
+        # ── Load WASM from host filesystem ──
+        if prompt.startswith(LOAD_WASM_PREFIX):
+            wasm_path = prompt[len(LOAD_WASM_PREFIX):].rstrip("]").strip()
+            print(f"[TCP-PROXY] Loading WASM from: {wasm_path}")
+            try:
+                with open(wasm_path, "rb") as wf:
+                    wasm_binary = wf.read()
+                if len(wasm_binary) > MAX_WASM_SIZE:
+                    response = RESP_START + f"WASM too large: {len(wasm_binary)}".encode() + RESP_END + b"\n"
+                else:
+                    b64_data = base64.b64encode(wasm_binary).decode("ascii")
+                    resp_json = json.dumps({"action": "tool_ready", "binary": b64_data})
+                    response = RESP_START + resp_json.encode() + RESP_END + b"\n"
+                    print(f"[TCP-PROXY] WASM loaded: {len(wasm_binary)} bytes -> {len(b64_data)} b64")
+            except Exception as e:
+                response = RESP_START + f"Load error: {e}".encode()[:256] + RESP_END + b"\n"
+        # ── Intent-IP: HTTP GET via host network ──
+        elif prompt.startswith("__HTTP_GET__"):
+            url = prompt[12:].strip()
+            print(f"[TCP-PROXY] HTTP GET: {url[:80]}")
+            try:
+                import urllib.request, ssl
+                ctx = ssl.create_default_context()
+                req_obj = urllib.request.Request(url, headers={"User-Agent": "FolkeringOS/1.0"})
+                with urllib.request.urlopen(req_obj, context=ctx, timeout=15) as resp:
+                    body = resp.read(8192).decode("utf-8", errors="replace")
+                print(f"[TCP-PROXY] HTTP GET got {len(body)} chars")
+                response = RESP_START + body.encode("utf-8", errors="replace")[:8192] + RESP_END + b"\n"
+            except Exception as e:
+                err = f"HTTP error: {e}"
+                print(f"[TCP-PROXY] {err}")
+                response = RESP_START + err.encode()[:256] + RESP_END + b"\n"
+        # ── WASM generation ──
+        elif prompt.startswith("gemini generate ") or prompt.startswith("Generate a Rust"):
+            wasm_binary, error = _llm_to_wasm(prompt)
+            if error:
+                response = RESP_START + error.encode() + RESP_END + b"\n"
+            else:
+                b64_data = base64.b64encode(wasm_binary).decode("ascii")
+                resp_json = json.dumps({"action": "tool_ready", "binary": b64_data})
+                response = RESP_START + resp_json.encode() + RESP_END + b"\n"
+        # ── Default: LLM chat ──
+        else:
+            result = call_llm(prompt, tier="fast")
+            if result.startswith("Error:"):
+                result = call_llm(prompt, tier="medium")
+            response = RESP_START + result.encode("utf-8", errors="replace") + RESP_END + b"\n"
+
+        conn.sendall(response)
+        print(f"[TCP-PROXY] Sent {len(response)} bytes")
+
+    except Exception as e:
+        print(f"[TCP-PROXY] Error: {e}")
+    finally:
+        conn.close()
+
+
+def tcp_listener_thread():
+    """Background thread that listens for TCP connections from the kernel."""
+    TCP_PORT = 8080
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("0.0.0.0", TCP_PORT))
+    srv.listen(4)
+    print(f"[TCP-PROXY] Listening on 0.0.0.0:{TCP_PORT} (kernel AI proxy)")
+
+    while True:
+        try:
+            conn, addr = srv.accept()
+            # Handle each connection in a thread to avoid blocking
+            import threading
+            t = threading.Thread(target=handle_tcp_client, args=(conn, addr), daemon=True)
+            t.start()
+        except Exception as e:
+            print(f"[TCP-PROXY] Accept error: {e}")
+            time.sleep(1)
+
+
 def main():
+    # Start TCP listener for kernel AI proxy (in background thread)
+    import threading
+    tcp_thread = threading.Thread(target=tcp_listener_thread, daemon=True)
+    tcp_thread.start()
+
     print(f"[SERIAL-PROXY] Connecting to QEMU COM2 at {COM2_HOST}:{COM2_PORT}...")
 
     while True:

@@ -118,6 +118,12 @@ impl FramebufferView {
         }
     }
 
+    /// Get raw shadow buffer base pointer (for VGA mirror bulk copy).
+    #[inline]
+    pub fn shadow_ptr_raw(&self) -> *const u8 {
+        self.shadow as *const u8
+    }
+
     /// Get shadow buffer pixel pointer (normal RAM — reliable reads)
     #[inline]
     fn shadow_ptr(&self, x: usize, y: usize) -> *mut u32 {
@@ -127,15 +133,16 @@ impl FramebufferView {
         }
     }
 
-    /// Set a single pixel. Writes to BOTH framebuffer (WC) and shadow buffer (RAM).
-    /// Use for all scene content (background, windows, UI).
+    /// Set a single pixel. Writes to shadow buffer (cached RAM) only.
+    /// Call present_region() after rendering to copy shadow→FB in bulk.
     #[inline]
     pub fn set_pixel(&mut self, x: usize, y: usize, color: u32) {
         if x < self.width && y < self.height {
             unsafe {
-                core::ptr::write_volatile(self.pixel_ptr(x, y), color);
                 if !self.shadow.is_null() {
                     core::ptr::write(self.shadow_ptr(x, y), color);
+                } else {
+                    core::ptr::write_volatile(self.pixel_ptr(x, y), color);
                 }
             }
         }
@@ -153,31 +160,31 @@ impl FramebufferView {
     }
 
     /// Fill a rectangle with a solid color.
-    ///
-    /// Optimized for Write-Combining: writes in row order.
+    /// Writes to shadow buffer only. Call present_region() to copy to FB.
     pub fn fill_rect(&mut self, x: usize, y: usize, w: usize, h: usize, color: u32) {
         let end_x = (x + w).min(self.width);
         let end_y = (y + h).min(self.height);
         let start_x = x.min(self.width);
         let start_y = y.min(self.height);
+        let pixels = end_x - start_x;
 
-        for row in start_y..end_y {
-            let offset = row * self.pitch + start_x * self.bpp;
-            let row_start = unsafe { self.buffer.add(offset) };
-            let pixels = (end_x - start_x) as isize;
-
-            for i in 0..pixels {
-                unsafe {
-                    core::ptr::write_volatile(row_start.add(i as usize * self.bpp) as *mut u32, color);
-                }
-            }
-
-            // Mirror to shadow buffer
-            if !self.shadow.is_null() {
+        if !self.shadow.is_null() {
+            for row in start_y..end_y {
+                let offset = row * self.pitch + start_x * self.bpp;
                 let shadow_row = unsafe { self.shadow.add(offset) };
                 for i in 0..pixels {
                     unsafe {
-                        core::ptr::write(shadow_row.add(i as usize * self.bpp) as *mut u32, color);
+                        core::ptr::write(shadow_row.add(i * self.bpp) as *mut u32, color);
+                    }
+                }
+            }
+        } else {
+            for row in start_y..end_y {
+                let offset = row * self.pitch + start_x * self.bpp;
+                let row_start = unsafe { self.buffer.add(offset) };
+                for i in 0..pixels {
+                    unsafe {
+                        core::ptr::write_volatile(row_start.add(i * self.bpp) as *mut u32, color);
                     }
                 }
             }
@@ -187,6 +194,38 @@ impl FramebufferView {
     /// Fill the entire screen with a color.
     pub fn clear(&mut self, color: u32) {
         self.fill_rect(0, 0, self.width, self.height, color);
+    }
+
+    /// Copy a region from shadow buffer to device framebuffer in bulk.
+    /// Call this AFTER all rendering is done, BEFORE gpu_flush.
+    /// Uses row-wise memcpy — much faster than per-pixel write_volatile.
+    pub fn present_region(&mut self, x: u32, y: u32, w: u32, h: u32) {
+        if self.shadow.is_null() { return; }
+        let x = (x as usize).min(self.width);
+        let y = (y as usize).min(self.height);
+        let w = (w as usize).min(self.width - x);
+        let h = (h as usize).min(self.height - y);
+        let bytes_per_row = w * self.bpp;
+
+        for row in y..y + h {
+            let offset = row * self.pitch + x * self.bpp;
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    self.shadow.add(offset),
+                    self.buffer.add(offset),
+                    bytes_per_row,
+                );
+            }
+        }
+    }
+
+    /// Copy entire shadow buffer to device framebuffer.
+    pub fn present_full(&mut self) {
+        if self.shadow.is_null() { return; }
+        let total = self.pitch * self.height;
+        unsafe {
+            core::ptr::copy_nonoverlapping(self.shadow, self.buffer, total);
+        }
     }
 
     /// Draw a horizontal line.

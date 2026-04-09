@@ -168,6 +168,13 @@ pub struct Window {
     pub dirty: bool,
     /// True while AI is streaming tokens to this window (shows typing cursor)
     pub typing: bool,
+    // Spatial Pipelining: node I/O ports
+    /// This window has an output port (right edge) for streaming data out
+    pub output_port: bool,
+    /// This window has an input port (left edge) for receiving stream data
+    pub input_port: bool,
+    /// WASM bytes for this node (compositor instantiates PersistentWasmApp from these)
+    pub node_wasm: Option<alloc::vec::Vec<u8>>,
 }
 
 impl Window {
@@ -287,6 +294,9 @@ impl WindowManager {
             focused_widget: None,
             dirty: true,
             typing: false,
+            output_port: false,
+            input_port: false,
+            node_wasm: None,
         };
         self.windows.push(win);
         self.focused_id = Some(id);
@@ -323,6 +333,31 @@ impl WindowManager {
             // Inside this window — check sub-zones
             let rel_x = cx - wx;
             let rel_y = cy - wy;
+            let mid_y = wh / 2;
+
+            // Spatial Pipelining: check I/O port hits (small circles on edges)
+            const PORT_RADIUS: i32 = 10;
+            if win.output_port {
+                // Output port: right edge, vertically centered
+                let port_x = ww;
+                let port_y = mid_y;
+                let dx = rel_x - port_x;
+                let dy = rel_y - port_y;
+                if dx * dx + dy * dy <= PORT_RADIUS * PORT_RADIUS {
+                    return Some((win.id, HitZone::OutputPort));
+                }
+            }
+            if win.input_port {
+                // Input port: left edge, vertically centered
+                let port_x = 0;
+                let port_y = mid_y;
+                let dx = rel_x - port_x;
+                let dy = rel_y - port_y;
+                if dx * dx + dy * dy <= PORT_RADIUS * PORT_RADIUS {
+                    return Some((win.id, HitZone::InputPort));
+                }
+            }
+
             // Close button (top-right corner of title bar)
             let close_x = ww - (CLOSE_BTN_W + CLOSE_BTN_MARGIN) as i32;
             if rel_y >= BORDER_W as i32 && rel_y < (BORDER_W + TITLE_BAR_H) as i32
@@ -391,6 +426,10 @@ pub enum HitZone {
     TitleBar,
     CloseButton,
     Content,
+    /// Spatial Pipelining: output port (right edge, mid-height)
+    OutputPort,
+    /// Spatial Pipelining: input port (left edge, mid-height)
+    InputPort,
 }
 
 // ===== Drawing helpers =====
