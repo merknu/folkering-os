@@ -27,6 +27,8 @@ extern "C" {
     fn folk_http_get(url_ptr: i32, url_len: i32, buf_ptr: i32, max_len: i32) -> i32;
     fn folk_slm_generate(prompt_ptr: i32, prompt_len: i32, buf_ptr: i32, max_len: i32) -> i32;
     fn folk_submit_display_list(ptr: i32, len: i32) -> i32;
+    fn folk_draw_pixels(x: i32, y: i32, w: i32, h: i32, pixel_ptr: i32, pixel_len: i32) -> i32;
+    fn folk_http_get_large(url_ptr: i32, url_len: i32, buf_ptr: i32, max_len: i32) -> i32;
     fn folk_log_telemetry(action: i32, target: i32, duration: i32);
 }
 
@@ -84,7 +86,8 @@ enum ElemType {
     B = 11,       // bold (inline)
     I = 12,       // italic (inline)
     Title = 13,
-    Unknown = 14,
+    Img = 14,    // image — text field stores src URL
+    Unknown = 15,
 }
 
 #[derive(Clone, Copy)]
@@ -233,12 +236,27 @@ unsafe fn parse_html() {
                 }
             }
 
-            // Self-closing tags
-            if elem_type == ElemType::Br || elem_type == ElemType::Hr {
-                let e = &mut *elems.add(count);
-                *e = HtmlElement::empty();
-                e.elem_type = elem_type;
-                count += 1;
+            // Self-closing tags (including img)
+            if elem_type == ElemType::Br || elem_type == ElemType::Hr || elem_type == ElemType::Img {
+                if elem_type == ElemType::Img && count < MAX_ELEMENTS {
+                    // Extract src attribute from the tag area we already skipped past
+                    // Rescan the tag for src="..."
+                    let tag_area = &html[tag_start..i.min(html.len())];
+                    if let Some(src) = extract_attr(tag_area, b"src") {
+                        let e = &mut *elems.add(count);
+                        *e = HtmlElement::empty();
+                        e.elem_type = ElemType::Img;
+                        let copy = src.len().min(MAX_TEXT_PER_ELEM);
+                        for j in 0..copy { e.text[j] = src[j]; }
+                        e.text_len = copy;
+                        count += 1;
+                    }
+                } else {
+                    let e = &mut *elems.add(count);
+                    *e = HtmlElement::empty();
+                    e.elem_type = elem_type;
+                    count += 1;
+                }
                 continue;
             }
 
@@ -311,6 +329,7 @@ fn match_tag(name: &[u8]) -> ElemType {
     else if s == b"b" || s == b"strong" { ElemType::B }
     else if s == b"i" || s == b"em" { ElemType::I }
     else if s == b"title" { ElemType::Title }
+    else if s == b"img" { ElemType::Img }
     else { ElemType::Unknown }
 }
 
@@ -320,6 +339,38 @@ fn trim_bytes(s: &[u8]) -> &[u8] {
     while start < end && (s[start] == b' ' || s[start] == b'\n' || s[start] == b'\r' || s[start] == b'\t') { start += 1; }
     while end > start && (s[end-1] == b' ' || s[end-1] == b'\n' || s[end-1] == b'\r' || s[end-1] == b'\t') { end -= 1; }
     &s[start..end]
+}
+
+/// Extract an attribute value from a tag string (e.g., src="..." from img tag)
+fn extract_attr<'a>(tag: &'a [u8], attr_name: &[u8]) -> Option<&'a [u8]> {
+    // Search for attr_name= or attr_name="
+    let name_len = attr_name.len();
+    for i in 0..tag.len().saturating_sub(name_len + 2) {
+        let mut matches = true;
+        for j in 0..name_len {
+            let a = if tag[i+j] >= b'A' && tag[i+j] <= b'Z' { tag[i+j] + 32 } else { tag[i+j] };
+            let b = if attr_name[j] >= b'A' && attr_name[j] <= b'Z' { attr_name[j] + 32 } else { attr_name[j] };
+            if a != b { matches = false; break; }
+        }
+        if matches && i + name_len < tag.len() && tag[i + name_len] == b'=' {
+            let start = i + name_len + 1;
+            if start >= tag.len() { return None; }
+            // Handle quoted and unquoted values
+            if tag[start] == b'"' || tag[start] == b'\'' {
+                let quote = tag[start];
+                let val_start = start + 1;
+                let mut val_end = val_start;
+                while val_end < tag.len() && tag[val_end] != quote { val_end += 1; }
+                return Some(&tag[val_start..val_end]);
+            } else {
+                let val_start = start;
+                let mut val_end = val_start;
+                while val_end < tag.len() && tag[val_end] != b' ' && tag[val_end] != b'>' { val_end += 1; }
+                return Some(&tag[val_start..val_end]);
+            }
+        }
+    }
+    None
 }
 
 // ── Layout Engine ───────────────────────────────────────────────────────
@@ -403,6 +454,14 @@ unsafe fn layout_elements(viewport_w: i32) {
                 e.w = content_w;
                 y += e.h + 2;
             }
+            ElemType::Img => {
+                // Reserve space for image (placeholder 200x150, actual size after load)
+                e.x = MARGIN;
+                e.y = y;
+                e.w = 200; // default placeholder width
+                e.h = 150; // default placeholder height
+                y += e.h + PARA_GAP;
+            }
             ElemType::Title => {
                 e.x = 0; e.y = 0; e.w = 0; e.h = 0; // invisible
             }
@@ -435,7 +494,7 @@ unsafe fn build_display_list(viewport_w: i32, viewport_h: i32) {
 
         // Culling: skip elements outside viewport
         if ey + e.h < 0 || ey > viewport_h { continue; }
-        if e.text_len == 0 && e.elem_type != ElemType::Hr && e.elem_type != ElemType::Br { continue; }
+        if e.text_len == 0 && e.elem_type != ElemType::Hr && e.elem_type != ElemType::Br && e.elem_type != ElemType::Img { continue; }
 
         match e.elem_type {
             ElemType::Hr => {
@@ -476,6 +535,20 @@ unsafe fn build_display_list(viewport_w: i32, viewport_h: i32) {
             }
             ElemType::H2 | ElemType::H3 => {
                 pos = emit_text(dl, pos, e, ey, H2_COLOR);
+            }
+            ElemType::Img => {
+                // Draw placeholder rect for image
+                if pos + 13 <= MAX_DISPLAY_LIST {
+                    *dl.add(pos) = 0x01; pos += 1;
+                    let vals: [u16; 4] = [e.x as u16, ey as u16, e.w as u16, e.h as u16];
+                    for v in &vals { let b = v.to_le_bytes(); *dl.add(pos) = b[0]; *dl.add(pos+1) = b[1]; pos += 2; }
+                    let cb = (0x1A2332u32).to_le_bytes(); // dark placeholder bg
+                    for j in 0..4 { *dl.add(pos+j) = cb[j]; } pos += 4;
+                }
+                // Show "[IMG]" label + truncated URL
+                if e.text_len > 0 {
+                    pos = emit_text(dl, pos, e, ey + 4, 0x484F58);
+                }
             }
             ElemType::A => {
                 pos = emit_text(dl, pos, e, ey, LINK_COLOR);

@@ -100,6 +100,8 @@ pub enum WasmResult {
 #[derive(Clone)]
 pub struct DrawCmd { pub x: u32, pub y: u32, pub w: u32, pub h: u32, pub color: u32 }
 #[derive(Clone)]
+pub struct PixelBlit { pub x: u32, pub y: u32, pub w: u32, pub h: u32, pub data: Vec<u8> }
+#[derive(Clone)]
 pub struct TextCmd { pub x: u32, pub y: u32, pub text: String, pub color: u32 }
 #[derive(Clone)]
 pub struct LineCmd { pub x1: i32, pub y1: i32, pub x2: i32, pub y2: i32, pub color: u32 }
@@ -115,6 +117,8 @@ pub struct WasmOutput {
     pub fill_screen: Option<u32>,
     pub surface_dirty: bool,
     pub asset_requests: Vec<PendingAssetRequest>,
+    /// Pixel blits from folk_draw_pixels (image rendering)
+    pub pixel_blits: Vec<PixelBlit>,
     /// Semantic Streams: data pushed by upstream via folk_stream_write()
     pub stream_data: Vec<u8>,
     /// Semantic Streams: upstream signals completion
@@ -168,6 +172,8 @@ struct HostState {
     pending_asset_requests: Vec<PendingAssetRequest>,
     next_asset_handle: u32,
     config: WasmConfig,
+    // Pixel blit queue (for image rendering)
+    pending_pixel_blits: Vec<PixelBlit>,
     // Semantic Streams
     stream_write_buf: Vec<u8>,  // upstream writes here via folk_stream_write
     stream_read_buf: Vec<u8>,   // downstream reads from here (set by compositor)
@@ -767,6 +773,75 @@ fn register_host_functions(linker: &mut Linker<HostState>) {
             // Write to WASM memory
             if mem.write(&mut caller, out_ptr as usize, &out).is_ok() {
                 total_size as i32
+            } else { -1 }
+        },
+    );
+
+    // Phase 24: Pixel Blit — Draw raw RGBA pixels to framebuffer (for images)
+    // folk_draw_pixels(x, y, w, h, pixel_ptr, pixel_len) -> i32
+    // Reads RGBA pixel data from WASM memory and stores as a DrawPixels command.
+    // Compositor blits it to the framebuffer during output rendering.
+    // Returns 0 on success, -1 on error.
+    let _ = linker.func_wrap("env", "folk_draw_pixels",
+        |mut caller: Caller<HostState>, x: i32, y: i32, w: i32, h: i32, pixel_ptr: i32, pixel_len: i32| -> i32 {
+            if w <= 0 || h <= 0 || w > 2048 || h > 2048 || pixel_len <= 0 { return -1; }
+            let expected = (w * h * 4) as usize; // RGBA = 4 bytes/pixel
+            if (pixel_len as usize) < expected { return -1; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+
+            // Read pixel data from WASM memory
+            let mut pixels = alloc::vec![0u8; expected];
+            if mem.read(&caller, pixel_ptr as usize, &mut pixels).is_err() { return -1; }
+
+            // Store as a special draw command for the compositor to blit
+            caller.data_mut().draw_commands.push(DrawCmd {
+                x: x as u32, y: y as u32, w: w as u32, h: h as u32,
+                // Use a sentinel color value to mark this as a pixel blit
+                // The pixel data is stored separately
+                color: 0xFFFF_FFFF, // sentinel: compositor checks this
+            });
+
+            // Store pixel data in a new field (extend HostState)
+            caller.data_mut().pending_pixel_blits.push(PixelBlit {
+                x: x as u32, y: y as u32, w: w as u32, h: h as u32,
+                data: pixels,
+            });
+
+            0
+        },
+    );
+
+    // Phase 25: Large HTTP GET — Fetch files >8KB directly via kernel TCP
+    // folk_http_get_large(url_ptr, url_len, buf_ptr, max_len) -> i32
+    // Same as folk_http_get but uses a larger buffer (up to 256KB).
+    // Returns bytes loaded, or -1 on error.
+    let _ = linker.func_wrap("env", "folk_http_get_large",
+        |mut caller: Caller<HostState>, url_ptr: i32, url_len: i32, buf_ptr: i32, max_len: i32| -> i32 {
+            if url_len <= 0 || url_len > 512 || max_len <= 0 || max_len > 262144 { return -1; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+
+            let mut url_buf = alloc::vec![0u8; url_len as usize];
+            if mem.read(&caller, url_ptr as usize, &mut url_buf).is_err() { return -1; }
+            let url = match alloc::str::from_utf8(&url_buf) {
+                Ok(s) => String::from(s),
+                Err(_) => return -1,
+            };
+
+            // Route via proxy with __HTTP_GET__ prefix (proxy now returns up to 8KB)
+            // For truly large files, we'd need direct kernel TCP — for now, use proxy
+            let full_prompt = alloc::format!("__HTTP_GET__{}", url);
+            let mut response = alloc::vec![0u8; max_len as usize];
+            let bytes = libfolk::sys::ask_gemini(&full_prompt, &mut response);
+            if bytes == 0 { return -1; }
+            let copy_len = bytes.min(max_len as usize);
+            if mem.write(&mut caller, buf_ptr as usize, &response[..copy_len]).is_ok() {
+                copy_len as i32
             } else { -1 }
         },
     );
@@ -1696,6 +1771,7 @@ fn new_host_state(config: WasmConfig) -> HostState {
         pending_asset_requests: Vec::new(),
         next_asset_handle: 1,
         config,
+        pending_pixel_blits: Vec::new(),
         stream_write_buf: Vec::new(),
         stream_read_buf: Vec::new(),
         stream_complete: false,
@@ -1711,6 +1787,7 @@ fn empty_output() -> WasmOutput {
         fill_screen: None,
         surface_dirty: false,
         asset_requests: Vec::new(),
+        pixel_blits: Vec::new(),
         stream_data: Vec::new(),
         stream_complete: false,
     }
@@ -1725,6 +1802,7 @@ fn state_to_output(state: HostState) -> WasmOutput {
         fill_screen: state.fill_screen,
         surface_dirty: state.surface_dirty,
         asset_requests: state.pending_asset_requests,
+        pixel_blits: state.pending_pixel_blits,
         stream_data: state.stream_write_buf,
         stream_complete: state.stream_complete,
     }
@@ -1737,6 +1815,7 @@ fn take_output(state: &mut HostState) -> WasmOutput {
     let lines = ::core::mem::replace(&mut state.line_commands, Vec::new());
     let circles = ::core::mem::replace(&mut state.circle_commands, Vec::new());
     let assets = ::core::mem::replace(&mut state.pending_asset_requests, Vec::new());
+    let pixels = ::core::mem::replace(&mut state.pending_pixel_blits, Vec::new());
     let stream = ::core::mem::replace(&mut state.stream_write_buf, Vec::new());
     let dirty = state.surface_dirty;
     let stream_done = state.stream_complete;
@@ -1750,6 +1829,7 @@ fn take_output(state: &mut HostState) -> WasmOutput {
         fill_screen: state.fill_screen.take(),
         surface_dirty: dirty,
         asset_requests: assets,
+        pixel_blits: pixels,
         stream_data: stream,
         stream_complete: stream_done,
     }
@@ -2095,6 +2175,15 @@ fn register_shadow_functions(linker: &mut Linker<ShadowState>) {
     );
     let _ = linker.func_wrap("env", "folk_surface_present",
         |_: Caller<ShadowState>| {},
+    );
+
+    // Pixel blit — no-op in shadow
+    let _ = linker.func_wrap("env", "folk_draw_pixels",
+        |_: Caller<ShadowState>, _x: i32, _y: i32, _w: i32, _h: i32, _p: i32, _l: i32| -> i32 { 0 },
+    );
+    // Large HTTP — no network in shadow
+    let _ = linker.func_wrap("env", "folk_http_get_large",
+        |_: Caller<ShadowState>, _u: i32, _ul: i32, _b: i32, _bl: i32| -> i32 { -1 },
     );
 
     // Display list — count commands in shadow (no rendering)

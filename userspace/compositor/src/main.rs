@@ -6001,6 +6001,31 @@ fn main() -> ! {
                             fb.draw_string(cmd.x as usize, cmd.y as usize, &cmd.text, fb.color_from_rgb24(cmd.color), fb.color_from_rgb24(0));
                         }
 
+                        // Phase 24: Pixel blits (images from folk_draw_pixels)
+                        for blit in &output.pixel_blits {
+                            let bw = blit.w as usize;
+                            let bh = blit.h as usize;
+                            let bx = blit.x as usize;
+                            let by = blit.y as usize;
+                            if blit.data.len() >= bw * bh * 4 {
+                                for row in 0..bh {
+                                    let py = by + row;
+                                    if py >= fb.height { break; }
+                                    for col in 0..bw {
+                                        let px = bx + col;
+                                        if px >= fb.width { break; }
+                                        let off = (row * bw + col) * 4;
+                                        let r = blit.data[off] as u32;
+                                        let g = blit.data[off + 1] as u32;
+                                        let b = blit.data[off + 2] as u32;
+                                        // RGBA → 0x00RRGGBB
+                                        let color = (r << 16) | (g << 8) | b;
+                                        fb.set_pixel(px, py, color);
+                                    }
+                                }
+                            }
+                        }
+
                         // Phase 3: Surface blit
                         if output.surface_dirty {
                             if let Some(mem_data) = app.get_memory_slice() {
