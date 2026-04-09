@@ -23,6 +23,8 @@ pub struct InputState {
     pub clipboard_len: usize,
     pub caret_visible: bool,
     pub last_caret_flip_ms: u64,
+    pub show_ram_graph: bool,
+    pub prev_left_button: bool,
 }
 
 impl InputState {
@@ -38,6 +40,8 @@ impl InputState {
             clipboard_len: 0,
             caret_visible: true,
             last_caret_flip_ms: 0,
+            show_ram_graph: false,
+            prev_left_button: false,
         }
     }
 
@@ -67,6 +71,12 @@ pub struct WasmState {
     pub last_interactive: bool,
     pub cache: BTreeMap<String, Vec<u8>>,
     pub state_snapshot: Option<Vec<u8>>,
+    pub active_drivers: Vec<crate::driver_runtime::WasmDriver>,
+    pub streaming_upstream: Option<crate::wasm_runtime::PersistentWasmApp>,
+    pub streaming_downstream: Option<crate::wasm_runtime::PersistentWasmApp>,
+    pub node_connections: Vec<crate::spatial::NodeConnection>,
+    pub connection_drag: Option<crate::spatial::ConnectionDrag>,
+    pub window_apps: BTreeMap<u32, crate::wasm_runtime::PersistentWasmApp>,
 }
 
 impl WasmState {
@@ -80,6 +90,12 @@ impl WasmState {
             last_interactive: false,
             cache: BTreeMap::new(),
             state_snapshot: None,
+            active_drivers: Vec::new(),
+            streaming_upstream: None,
+            streaming_downstream: None,
+            node_connections: Vec::new(),
+            connection_drag: None,
+            window_apps: BTreeMap::new(),
         }
     }
 }
@@ -99,6 +115,7 @@ pub struct McpState {
     pub pending_shell_jit: Option<String>,
     pub shell_jit_pipeline: Option<(Vec<crate::folkshell::Command>, usize, String)>,
     pub adapter_cache: BTreeMap<String, Vec<u8>>,
+    pub mcp_time_sent: bool,
 }
 
 impl McpState {
@@ -115,6 +132,7 @@ impl McpState {
             pending_shell_jit: None,
             shell_jit_pipeline: None,
             adapter_cache: BTreeMap::new(),
+            mcp_time_sent: false,
         }
     }
 
@@ -282,6 +300,84 @@ impl IqeState {
             ewma_mou_wake: 0,
             ewma_mou_rend: 0,
             buf: [0; 288],
+        }
+    }
+}
+
+// ── God Mode Pipe (COM3) ───────────────────────────────────────────
+
+pub struct Com3State {
+    pub buf: [u8; 512],
+    pub len: usize,
+    pub queue: Vec<String>,
+}
+
+impl Com3State {
+    pub fn new() -> Self {
+        Self { buf: [0; 512], len: 0, queue: Vec::new() }
+    }
+}
+
+// ── RAM History Graph ──────────────────────────────────────────────
+
+pub const RAM_HISTORY_LEN: usize = 120;
+
+pub struct RamHistory {
+    pub data: [u8; RAM_HISTORY_LEN],
+    pub idx: usize,
+    pub count: usize,
+}
+
+impl RamHistory {
+    pub const fn new() -> Self {
+        Self { data: [0; RAM_HISTORY_LEN], idx: 0, count: 0 }
+    }
+
+    pub fn push(&mut self, pct: u8) {
+        self.data[self.idx] = pct;
+        self.idx = (self.idx + 1) % RAM_HISTORY_LEN;
+        if self.count < RAM_HISTORY_LEN { self.count += 1; }
+    }
+}
+
+// ── App Launcher ───────────────────────────────────────────────────
+
+pub const MAX_CATEGORIES: usize = 6;
+pub const MAX_APPS_PER_CAT: usize = 20;
+
+pub struct AppEntry {
+    pub name: [u8; 24],
+    pub name_len: usize,
+}
+
+pub struct Category {
+    pub label: &'static [u8],
+    pub color: u32,
+    pub apps: [AppEntry; MAX_APPS_PER_CAT],
+    pub count: usize,
+}
+
+// ── GPU / VGA Mirror State ─────────────────────────────────────────
+
+pub struct GpuState {
+    pub use_gpu: bool,
+    pub vga_mirror_ptr: *mut u8,
+    pub vga_mirror_pitch: usize,
+    pub vga_mirror_w: usize,
+    pub vga_mirror_h: usize,
+}
+
+unsafe impl Send for GpuState {}
+unsafe impl Sync for GpuState {}
+
+impl GpuState {
+    pub const fn new() -> Self {
+        Self {
+            use_gpu: false,
+            vga_mirror_ptr: core::ptr::null_mut(),
+            vga_mirror_pitch: 0,
+            vga_mirror_w: 0,
+            vga_mirror_h: 0,
         }
     }
 }
