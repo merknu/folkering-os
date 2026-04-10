@@ -229,6 +229,9 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
             }
         }
 
+        // AC97 audio (optional — only present if QEMU started with -device AC97)
+        drivers::ac97::init();
+
         // Initialize keyboard driver (uses IRQ1 via IOAPIC)
         // NOTE: keyboard::init() will try to enable PIC IRQ1, but it's masked
         serial_strln!("[INIT] Initializing PS/2 keyboard driver...");

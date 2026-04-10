@@ -970,6 +970,10 @@ extern "C" fn syscall_handler(
         0x58 => syscall_udp_send(arg1, arg2, arg3, arg4),
         // UDP send + recv (target_ip:port, data, response_buf, timeout_ms)
         0x59 => syscall_udp_send_recv(arg1, arg2, arg3, arg4, arg5, arg6),
+        // Audio: play raw PCM samples (16-bit signed stereo @ 44100Hz)
+        0x5A => syscall_audio_play(arg1, arg2),
+        // Audio: beep (440Hz sine wave for duration_ms)
+        0x5B => syscall_audio_beep(arg1),
         // SMP: Parallel GEMM
         0x60 => syscall_parallel_gemm(arg1, arg2, arg3, arg4, arg5, arg6),
         // Hybrid AI: Ask Gemini cloud API
@@ -2144,6 +2148,20 @@ fn syscall_http_fetch(url_ptr: u64, url_len: u64, buf_ptr: u64, buf_len: u64) ->
     crate::serial_str!(" bytes body\n");
 
     copy_len as u64
+}
+
+/// Audio: play raw PCM samples (16-bit signed stereo @ 44100Hz)
+fn syscall_audio_play(samples_ptr: u64, samples_count: u64) -> u64 {
+    if samples_count == 0 || samples_count > 1_000_000 { return u64::MAX; }
+    let samples = unsafe {
+        core::slice::from_raw_parts(samples_ptr as *const i16, samples_count as usize)
+    };
+    if crate::drivers::ac97::play_pcm(samples) { 0 } else { u64::MAX }
+}
+
+/// Audio: beep — generate 440Hz tone for duration_ms milliseconds
+fn syscall_audio_beep(duration_ms: u64) -> u64 {
+    if crate::drivers::ac97::beep(duration_ms as u32) { 0 } else { u64::MAX }
 }
 
 /// UDP send: target packed as ip|port (32+16 bits), data_ptr, data_len

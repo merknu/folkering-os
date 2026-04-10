@@ -85,6 +85,27 @@ pub fn ask_gemini(prompt: &str, response_buf: &mut [u8]) -> usize {
     if ret == u64::MAX { 0 } else { ret as usize }
 }
 
+/// Play raw PCM audio (16-bit signed stereo @ 44100Hz).
+/// Returns true on success.
+pub fn audio_play(samples: &[i16]) -> bool {
+    let ret = unsafe {
+        syscall2(
+            0x5A, // SYS_AUDIO_PLAY
+            samples.as_ptr() as u64,
+            samples.len() as u64,
+        )
+    };
+    ret == 0
+}
+
+/// Beep — generate a 440Hz tone for the given duration (ms).
+pub fn audio_beep(duration_ms: u32) -> bool {
+    let ret = unsafe {
+        syscall1(0x5B, duration_ms as u64)
+    };
+    ret == 0
+}
+
 /// Send a UDP packet to target IP:port. Returns true on success.
 /// Max payload: 1472 bytes (MTU - IP - UDP headers).
 pub fn udp_send(target_ip: [u8; 4], target_port: u16, data: &[u8]) -> bool {

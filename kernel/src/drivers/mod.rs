@@ -13,3 +13,4 @@ pub mod rng;
 pub mod iqe;
 pub mod telemetry;
 pub mod iommu;
+pub mod ac97;
