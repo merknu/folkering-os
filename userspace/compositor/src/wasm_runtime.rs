@@ -774,6 +774,17 @@ fn register_shadow_functions(linker: &mut Linker<ShadowState>) {
         |_: Caller<ShadowState>| {},
     );
 
+    // Clipboard — return empty in shadow
+    let _ = linker.func_wrap("env", "folk_clipboard_set",
+        |_: Caller<ShadowState>, _p: i32, _l: i32| -> i32 { 0 },
+    );
+    let _ = linker.func_wrap("env", "folk_clipboard_get",
+        |_: Caller<ShadowState>, _p: i32, _l: i32| -> i32 { 0 },
+    );
+    let _ = linker.func_wrap("env", "folk_clipboard_len",
+        |_: Caller<ShadowState>| -> i32 { 0 },
+    );
+
     // Surface — return 0 (no surface in shadow)
     let _ = linker.func_wrap("env", "folk_get_surface",
         |_: Caller<ShadowState>| -> i32 { 0 },

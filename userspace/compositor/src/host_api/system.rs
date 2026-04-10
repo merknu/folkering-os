@@ -371,4 +371,62 @@ pub fn register(linker: &mut Linker<HostState>) {
             caller.data_mut().stream_complete = true;
         },
     );
+
+    // ── Clipboard ──────────────────────────────────────────────────────
+    // Global clipboard shared between all WASM apps. Backed by a static
+    // buffer in the compositor process. Max 4KB content.
+
+    // folk_clipboard_set(ptr, len) -> i32
+    // Copy data from WASM memory into the global clipboard.
+    // Returns 0 on success, -1 on error.
+    let _ = linker.func_wrap("env", "folk_clipboard_set",
+        |caller: Caller<HostState>, ptr: i32, len: i32| -> i32 {
+            if len < 0 || len > 4096 { return -1; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+            let mut buf = alloc::vec![0u8; len as usize];
+            if mem.read(&caller, ptr as usize, &mut buf).is_err() { return -1; }
+            unsafe {
+                let n = (len as usize).min(CLIPBOARD_BUF.len());
+                CLIPBOARD_BUF[..n].copy_from_slice(&buf[..n]);
+                CLIPBOARD_LEN = n;
+            }
+            0
+        },
+    );
+
+    // folk_clipboard_get(ptr, max_len) -> i32
+    // Copy clipboard contents into WASM memory.
+    // Returns bytes written, or -1 on error.
+    let _ = linker.func_wrap("env", "folk_clipboard_get",
+        |mut caller: Caller<HostState>, ptr: i32, max_len: i32| -> i32 {
+            if max_len <= 0 { return -1; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+            let (data, len) = unsafe {
+                let n = CLIPBOARD_LEN.min(max_len as usize);
+                (CLIPBOARD_BUF[..n].to_vec(), n)
+            };
+            if len == 0 { return 0; }
+            if mem.write(&mut caller, ptr as usize, &data[..len]).is_ok() {
+                len as i32
+            } else { -1 }
+        },
+    );
+
+    // folk_clipboard_len() -> i32
+    // Returns current clipboard size in bytes (0 if empty).
+    let _ = linker.func_wrap("env", "folk_clipboard_len",
+        |_caller: Caller<HostState>| -> i32 {
+            unsafe { CLIPBOARD_LEN as i32 }
+        },
+    );
 }
+
+// Global clipboard buffer (compositor-process scope)
+static mut CLIPBOARD_BUF: [u8; 4096] = [0u8; 4096];
+static mut CLIPBOARD_LEN: usize = 0;

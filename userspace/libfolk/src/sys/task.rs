@@ -85,6 +85,54 @@ pub fn ask_gemini(prompt: &str, response_buf: &mut [u8]) -> usize {
     if ret == u64::MAX { 0 } else { ret as usize }
 }
 
+/// Send a UDP packet to target IP:port. Returns true on success.
+/// Max payload: 1472 bytes (MTU - IP - UDP headers).
+pub fn udp_send(target_ip: [u8; 4], target_port: u16, data: &[u8]) -> bool {
+    let packed = ((target_ip[0] as u64) << 24)
+        | ((target_ip[1] as u64) << 16)
+        | ((target_ip[2] as u64) << 8)
+        | (target_ip[3] as u64);
+    let ret = unsafe {
+        syscall4(
+            0x58, // SYS_UDP_SEND
+            packed,
+            target_port as u64,
+            data.as_ptr() as u64,
+            data.len() as u64,
+        )
+    };
+    ret == 0
+}
+
+/// Send a UDP packet and wait for one response. Returns bytes received.
+/// Max payload: 1472 bytes. Max response: 4096 bytes.
+pub fn udp_send_recv(
+    target_ip: [u8; 4],
+    target_port: u16,
+    data: &[u8],
+    response: &mut [u8],
+    timeout_ms: u32,
+) -> usize {
+    let packed = ((target_ip[0] as u64) << 24)
+        | ((target_ip[1] as u64) << 16)
+        | ((target_ip[2] as u64) << 8)
+        | (target_ip[3] as u64);
+    // Pack response_len (low 32) and timeout_ms (high 32) into one u64
+    let resp_arg = (response.len() as u64) | ((timeout_ms as u64) << 32);
+    let ret = unsafe {
+        syscall6(
+            0x59, // SYS_UDP_SEND_RECV
+            packed,
+            target_port as u64,
+            data.as_ptr() as u64,
+            data.len() as u64,
+            response.as_mut_ptr() as u64,
+            resp_arg,
+        )
+    };
+    if ret == u64::MAX { 0 } else { ret as usize }
+}
+
 /// Direct HTTP(S) fetch via kernel TLS stack. No proxy needed.
 /// Returns bytes written to response_buf, or 0 on error.
 pub fn http_fetch(url: &str, response_buf: &mut [u8]) -> usize {

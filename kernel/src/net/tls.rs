@@ -1,7 +1,21 @@
 //! TLS 1.3 client — embedded-tls integration over smoltcp TCP
 //!
 //! Provides `https_get(host, path, ip)` for making HTTPS requests.
-//! Uses UnsecureProvider (no certificate verification) for v1.
+//!
+//! # SECURITY WARNING
+//! Currently uses `UnsecureProvider` which performs NO certificate validation.
+//! This means we are vulnerable to MITM attacks. A proper fix requires:
+//!   1. Bundling Mozilla CA root certificates (~140 certs, ~80KB)
+//!   2. Implementing X.509 chain verification
+//!   3. Hostname matching against SAN extension
+//!
+//! embedded-tls 0.18's built-in webpki feature only supports a SINGLE trust
+//! anchor without intermediate cert handling, which is insufficient for
+//! general internet HTTPS. A custom verifier or alternative crate (rustls
+//! with no_std support) is needed.
+//!
+//! Until then, every TLS connection logs a `[TLS WARN]` message and the
+//! browser shows a "unverified" indicator.
 
 extern crate alloc;
 
@@ -238,6 +252,7 @@ pub fn https_get_raw(ip: [u8; 4], host: &str, request: &[u8]) -> Result<alloc::v
 
     let rng = KernelRng;
     let provider = UnsecureProvider::new::<Aes128GcmSha256>(rng);
+    crate::serial_str!("[TLS WARN] cert validation DISABLED — vulnerable to MITM\n");
     tls.open(TlsContext::new(&config, provider))
         .map_err(|_| {
             crate::serial_str!("[TLS] TLS handshake FAILED\n");

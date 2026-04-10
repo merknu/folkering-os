@@ -966,6 +966,10 @@ extern "C" fn syscall_handler(
         0x56 => syscall_github_clone(arg1, arg2, arg3, arg4),
         // Direct HTTP fetch (URL → DNS → TLS → body)
         0x57 => syscall_http_fetch(arg1, arg2, arg3, arg4),
+        // UDP send (target_ip:port, data)
+        0x58 => syscall_udp_send(arg1, arg2, arg3, arg4),
+        // UDP send + recv (target_ip:port, data, response_buf, timeout_ms)
+        0x59 => syscall_udp_send_recv(arg1, arg2, arg3, arg4, arg5, arg6),
         // SMP: Parallel GEMM
         0x60 => syscall_parallel_gemm(arg1, arg2, arg3, arg4, arg5, arg6),
         // Hybrid AI: Ask Gemini cloud API
@@ -2140,6 +2144,48 @@ fn syscall_http_fetch(url_ptr: u64, url_len: u64, buf_ptr: u64, buf_len: u64) ->
     crate::serial_str!(" bytes body\n");
 
     copy_len as u64
+}
+
+/// UDP send: target packed as ip|port (32+16 bits), data_ptr, data_len
+/// arg1 = (a<<24)|(b<<16)|(c<<8)|d, arg2 = port, arg3 = data_ptr, arg4 = data_len
+fn syscall_udp_send(target_packed: u64, port: u64, data_ptr: u64, data_len: u64) -> u64 {
+    if data_len == 0 || data_len > 1472 { return u64::MAX; }
+    let ip = [
+        ((target_packed >> 24) & 0xFF) as u8,
+        ((target_packed >> 16) & 0xFF) as u8,
+        ((target_packed >> 8) & 0xFF) as u8,
+        (target_packed & 0xFF) as u8,
+    ];
+    let data = unsafe {
+        core::slice::from_raw_parts(data_ptr as *const u8, data_len as usize)
+    };
+    if crate::net::udp_send(ip, port as u16, data) { 0 } else { u64::MAX }
+}
+
+/// UDP send + receive: returns bytes received
+fn syscall_udp_send_recv(
+    target_packed: u64, port: u64,
+    data_ptr: u64, data_len: u64,
+    resp_ptr: u64, resp_len_and_timeout: u64,
+) -> u64 {
+    let resp_len = (resp_len_and_timeout & 0xFFFF_FFFF) as usize;
+    let timeout_ms = (resp_len_and_timeout >> 32) as u32;
+    if data_len == 0 || data_len > 1472 || resp_len == 0 || resp_len > 4096 {
+        return u64::MAX;
+    }
+    let ip = [
+        ((target_packed >> 24) & 0xFF) as u8,
+        ((target_packed >> 16) & 0xFF) as u8,
+        ((target_packed >> 8) & 0xFF) as u8,
+        (target_packed & 0xFF) as u8,
+    ];
+    let data = unsafe {
+        core::slice::from_raw_parts(data_ptr as *const u8, data_len as usize)
+    };
+    let response = unsafe {
+        core::slice::from_raw_parts_mut(resp_ptr as *mut u8, resp_len)
+    };
+    crate::net::udp_send_recv(ip, port as u16, data, response, timeout_ms) as u64
 }
 
 fn syscall_spawn(binary_ptr: u64, binary_len: u64) -> u64 {
