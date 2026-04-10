@@ -949,13 +949,25 @@ fn main() -> ! {
         if kr.did_work { did_work = true; }
         if kr.need_redraw { need_redraw = true; }
 
-        // ===== Command dispatch (moved to command_dispatch.rs) =====
-        let dr = command_dispatch::dispatch_omnibar(
-            &mut input, &mut wasm, &mut wm, &mut mcp,
-            &mut stream, &mut draug, &mut fb, &mut damage,
-            &mut com3_queue, &mut active_agent, &mut drivers_seeded,
-            execute_command, &mut cursor,
-        );
+        // ===== Command dispatch (moved to command_dispatch/) =====
+        // Phase C1: 13 parameters → 1 DispatchContext.
+        let dr = {
+            let mut ctx = command_dispatch::DispatchContext {
+                input: &mut input,
+                wasm: &mut wasm,
+                wm: &mut wm,
+                mcp: &mut mcp,
+                stream: &mut stream,
+                draug: &mut draug,
+                fb: &mut fb,
+                damage: &mut damage,
+                com3_queue: &mut com3_queue,
+                active_agent: &mut active_agent,
+                drivers_seeded: &mut drivers_seeded,
+                cursor: &mut cursor,
+            };
+            command_dispatch::dispatch_omnibar(&mut ctx, execute_command)
+        };
         let mut deferred_app_handle = dr.deferred_app_handle;
         if dr.did_work { did_work = true; }
         if dr.need_redraw { need_redraw = true; }
