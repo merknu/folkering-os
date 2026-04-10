@@ -227,26 +227,30 @@ pub fn ws_connect(ip: [u8; 4], port: u16, host: &str, path: &str) -> Option<u8> 
     let packed_ip = ip[0] as u64 | ((ip[1] as u64) << 8) | ((ip[2] as u64) << 16) | ((ip[3] as u64) << 24);
     let packed_port = port as u64 | ((total as u64) << 16);
 
-    let ret = unsafe { syscall3(0xA0, packed_ip, packed_port, buf.as_ptr() as u64) };
+    // Phase B4: moved from 0xA0 (collided with SYS_PCI_ENUMERATE) to 0xC0
+    let ret = unsafe { syscall3(0xC0, packed_ip, packed_port, buf.as_ptr() as u64) };
     if ret == u64::MAX { None } else { Some(ret as u8) }
 }
 
 /// WebSocket: Send text data on a connection.
 pub fn ws_send(slot_id: u8, data: &[u8]) -> bool {
-    let ret = unsafe { syscall3(0xA1, slot_id as u64, data.as_ptr() as u64, data.len() as u64) };
+    // Phase B4: moved from 0xA1 (collided with SYS_PORT_INB) to 0xC1
+    let ret = unsafe { syscall3(0xC1, slot_id as u64, data.as_ptr() as u64, data.len() as u64) };
     ret == 0
 }
 
 /// WebSocket: Non-blocking receive poll. Returns bytes read (0 = nothing yet).
 /// Returns None on connection closed/error.
 pub fn ws_poll_recv(slot_id: u8, buf: &mut [u8]) -> Option<usize> {
-    let ret = unsafe { syscall3(0xA2, slot_id as u64, buf.as_mut_ptr() as u64, buf.len() as u64) };
+    // Phase B4: moved from 0xA2 (collided with SYS_PORT_INW) to 0xC2
+    let ret = unsafe { syscall3(0xC2, slot_id as u64, buf.as_mut_ptr() as u64, buf.len() as u64) };
     if ret == u64::MAX { None } else { Some(ret as usize) }
 }
 
 /// WebSocket: Close a connection.
 pub fn ws_close(slot_id: u8) {
-    unsafe { syscall1(0xA3, slot_id as u64); }
+    // Phase B4: moved from 0xA3 (collided with SYS_PORT_INL) to 0xC3
+    unsafe { syscall1(0xC3, slot_id as u64); }
 }
 
 /// Telemetry: Record an app-level event for AutoDream pattern mining.

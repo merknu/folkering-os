@@ -242,14 +242,16 @@ pub(super) extern "C" fn syscall_handler(
         0xB0 => syscall_net_dma_rx(arg1, arg2),     // Kernel-assisted RX: read DMA + deliver to smoltcp
         0xB1 => syscall_dma_sync_write(arg1, arg2), // Write to physical memory via HHDM
         0xB2 => syscall_net_metrics(arg1, arg2),    // OS metrics for AI introspection
-        // NOTE: Cases 0xA0–0xA3 below are UNREACHABLE — they collide with the
-        // PCI enumerate / port_in_* numbers above. Preserved verbatim from the
-        // pre-refactor file; cleaning up the conflict is a separate task.
+        // ── WebSocket (0xC0-0xC3) ───────────────────────────────────────
+        // NOTE: These were originally at 0xA0-0xA3 but collided with PCI
+        // enumerate / port I/O. Moved to 0xC0-0xC3 in Phase B4. libfolk's
+        // ws_connect/send/poll_recv/close were updated to match.
+        //
         // WebSocket: connect to server
         // arg1 = packed IP (a | b<<8 | c<<16 | d<<24), arg2 = port | (path_len << 16)
         // arg3 = ptr to "host\0path" string
         // Returns: slot_id (0-3) or u64::MAX on error
-        0xA0 => {
+        0xC0 => {
             let ip = [arg1 as u8, (arg1 >> 8) as u8, (arg1 >> 16) as u8, (arg1 >> 24) as u8];
             let port = (arg2 & 0xFFFF) as u16;
             let path_len = ((arg2 >> 16) & 0xFFFF) as usize;
@@ -271,7 +273,7 @@ pub(super) extern "C" fn syscall_handler(
         // WebSocket: send text data
         // arg1 = slot_id, arg2 = data_ptr, arg3 = data_len
         // Returns: 0 on success, u64::MAX on error
-        0xA1 => {
+        0xC1 => {
             let ptr = arg2 as *const u8;
             let len = (arg3 as usize).min(8192);
             if ptr.is_null() || arg2 < 0x200000 || len == 0 { u64::MAX } else {
@@ -285,7 +287,7 @@ pub(super) extern "C" fn syscall_handler(
         // WebSocket: non-blocking receive poll
         // arg1 = slot_id, arg2 = buf_ptr, arg3 = max_len
         // Returns: bytes read (0 = nothing yet, u64::MAX-1 = closed/error)
-        0xA2 => {
+        0xC2 => {
             let ptr = arg2 as *mut u8;
             let max = (arg3 as usize).min(8192);
             if ptr.is_null() || arg2 < 0x200000 { u64::MAX } else {
@@ -296,7 +298,7 @@ pub(super) extern "C" fn syscall_handler(
         },
         // WebSocket: close connection
         // arg1 = slot_id
-        0xA3 => {
+        0xC3 => {
             crate::net::websocket::ws_close(arg1 as u8);
             0
         },

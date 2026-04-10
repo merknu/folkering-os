@@ -9,7 +9,8 @@
 //! - `entry.rs` — naked syscall_entry / int_syscall_entry asm + their helpers
 //! - `init.rs` — init() (configures EFER, MSRs, kernel stack, guard page)
 //! - `dispatch.rs` — syscall_handler match-statement (routes by syscall #)
-//! - `handlers.rs` — handler implementations (one per syscall number)
+//! - `handlers/` — per-domain handler modules (ipc, memory, task, io, fs,
+//!   net, audio, compute, gpu, pci, dma); flattened via `pub use ipc::*` etc.
 
 mod state;
 mod debug;
