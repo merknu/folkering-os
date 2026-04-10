@@ -37,6 +37,7 @@ use alloc::vec;
 use embedded_io::{ErrorType, Read, Write};
 use embedded_tls::blocking::{Aes128GcmSha256, TlsConfig, TlsConnection, TlsContext};
 use embedded_tls::UnsecureProvider;
+use super::tls_verify::VerifyingProvider;
 use rand_core::{CryptoRng, RngCore};
 
 use smoltcp::socket::tcp;
@@ -265,8 +266,8 @@ pub fn https_get_raw(ip: [u8; 4], host: &str, request: &[u8]) -> Result<alloc::v
         TlsConnection::new(stream, &mut tls_read_buf, &mut tls_write_buf);
 
     let rng = KernelRng;
-    let provider = UnsecureProvider::new::<Aes128GcmSha256>(rng);
-    crate::serial_str!("[TLS WARN] cert validation DISABLED — vulnerable to MITM\n");
+    let provider = VerifyingProvider::new::<Aes128GcmSha256>(rng);
+    crate::serial_str!("[TLS] using MinimalVerifier (hostname + expiration check)\n");
     tls.open(TlsContext::new(&config, provider))
         .map_err(|_| {
             crate::serial_str!("[TLS] TLS handshake FAILED\n");
@@ -435,9 +436,9 @@ pub fn https_get(ip: [u8; 4], host: &str, path: &str) -> Result<(), &'static str
     let mut tls: TlsConnection<'_, TcpStream<'_>, Aes128GcmSha256> =
         TlsConnection::new(stream, &mut tls_read_buf, &mut tls_write_buf);
 
-    // Perform TLS handshake
+    // Perform TLS handshake with MinimalVerifier (hostname + expiration check)
     let rng = KernelRng;
-    let provider = UnsecureProvider::new::<Aes128GcmSha256>(rng);
+    let provider = VerifyingProvider::new::<Aes128GcmSha256>(rng);
     match tls.open(TlsContext::new(&config, provider)) {
         Ok(()) => {
             crate::serial_strln!("[TLS] Handshake complete! Connection encrypted.");

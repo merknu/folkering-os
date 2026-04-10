@@ -12,6 +12,7 @@ pub mod gemini;
 pub mod github;
 pub mod json;
 pub mod tls;
+pub mod tls_verify;
 pub mod websocket;
 
 extern crate alloc;

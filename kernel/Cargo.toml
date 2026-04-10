@@ -32,6 +32,7 @@ features = [
     "alloc",
     "medium-ethernet",
     "proto-ipv4",
+    "proto-ipv6",
     "proto-dhcpv4",
     "proto-dns",
     "socket-dhcpv4",
@@ -41,9 +42,19 @@ features = [
     "socket-udp",
 ]
 
-# TLS 1.3 (no_std, blocking mode)
+# TLS 1.3 (no_std, blocking mode) — vendored with pub handshake module for cert validation
 [dependencies.embedded-tls]
-version = "0.18"
+path = "vendor/embedded-tls"
+default-features = false
+
+# TLS verification transitive deps (needed for custom CryptoProvider)
+[dependencies.p256]
+version = "0.13"
+default-features = false
+features = ["ecdsa"]
+
+[dependencies.signature]
+version = "2.2"
 default-features = false
 
 [dependencies.embedded-io]
