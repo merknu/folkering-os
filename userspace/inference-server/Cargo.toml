@@ -4,9 +4,12 @@ version = "0.1.0"
 edition = "2021"
 description = "AI Inference Server for Folkering OS (Task 6)"
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "inference"
-path = "src/main.rs"
+path = "src/bin/main.rs"
 
 [dependencies]
 libfolk = { path = "../libfolk" }
