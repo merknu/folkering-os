@@ -776,11 +776,19 @@ fn main() -> ! {
                 damage.add_damage(compositor::damage::Rect::new(ram_clear_x as u32, 0, 70, 20)); // RAM
             }
 
-            // Lazy timezone sync via MCP: send TimeSyncRequest, poll for TimeSync response
+            // Try direct kernel NTP first (uses UDP syscall), fall back to MCP proxy
             if !mcp.tz_synced && !mcp.tz_sync_pending {
-                if libfolk::mcp::client::send_time_sync() {
+                // Try NTP via kernel: pool.ntp.org → 162.159.200.123 (Cloudflare time)
+                let ntp_ip = [162, 159, 200, 123];
+                let ntp_time = libfolk::sys::ntp_query(ntp_ip);
+                if ntp_time > 0 {
+                    // Got NTP time! Set as authoritative, no need for proxy.
+                    mcp.tz_synced = true;
+                    write_str("[NTP] Sync OK via kernel UDP\n");
+                    // Compute timezone offset later when we know local time vs UTC
+                } else if libfolk::mcp::client::send_time_sync() {
                     mcp.tz_sync_pending = true;
-                    write_str("[MCP] TimeSyncRequest sent\n");
+                    write_str("[MCP] TimeSyncRequest sent (NTP failed, fallback)\n");
                 }
             }
         }

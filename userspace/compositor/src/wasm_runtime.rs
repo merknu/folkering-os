@@ -790,6 +790,9 @@ fn register_shadow_functions(linker: &mut Linker<ShadowState>) {
     let _ = linker.func_wrap("env", "folk_audio_play",
         |_: Caller<ShadowState>, _p: i32, _l: i32| -> i32 { 0 },
     );
+    let _ = linker.func_wrap("env", "folk_ntp_query",
+        |_: Caller<ShadowState>, _a: i32, _b: i32, _c: i32, _d: i32| -> i64 { 0 },
+    );
 
     // Surface — return 0 (no surface in shadow)
     let _ = linker.func_wrap("env", "folk_get_surface",

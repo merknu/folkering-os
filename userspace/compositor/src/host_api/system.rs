@@ -426,6 +426,18 @@ pub fn register(linker: &mut Linker<HostState>) {
         },
     );
 
+    // ── NTP / Network time ─────────────────────────────────────────────
+
+    // folk_ntp_query_packed_ip(ip_packed) -> (high32 << 32 | low32)
+    // Returns Unix timestamp (seconds since 1970) or 0 on failure.
+    // Uses kernel UDP stack, no proxy needed.
+    let _ = linker.func_wrap("env", "folk_ntp_query",
+        |_caller: Caller<HostState>, ip_a: i32, ip_b: i32, ip_c: i32, ip_d: i32| -> i64 {
+            let ip = [ip_a as u8, ip_b as u8, ip_c as u8, ip_d as u8];
+            libfolk::sys::ntp_query(ip) as i64
+        },
+    );
+
     // ── Audio ──────────────────────────────────────────────────────────
 
     // folk_audio_beep(duration_ms) -> i32
