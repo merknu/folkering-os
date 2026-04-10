@@ -4,18 +4,32 @@
 //!
 //! # SECURITY WARNING
 //! Currently uses `UnsecureProvider` which performs NO certificate validation.
-//! This means we are vulnerable to MITM attacks. A proper fix requires:
-//!   1. Bundling Mozilla CA root certificates (~140 certs, ~80KB)
-//!   2. Implementing X.509 chain verification
-//!   3. Hostname matching against SAN extension
+//! This means we are vulnerable to MITM attacks.
 //!
-//! embedded-tls 0.18's built-in webpki feature only supports a SINGLE trust
-//! anchor without intermediate cert handling, which is insufficient for
-//! general internet HTTPS. A custom verifier or alternative crate (rustls
-//! with no_std support) is needed.
+//! ## Why we can't easily fix this in embedded-tls 0.18:
 //!
-//! Until then, every TLS connection logs a `[TLS WARN]` message and the
-//! browser shows a "unverified" indicator.
+//! 1. The `TlsVerifier` trait method takes `CertificateRef` which is in a
+//!    private module — we cannot implement custom verifiers from outside
+//!    the crate without forking it.
+//!
+//! 2. The built-in `webpki` feature only supports a SINGLE trust anchor
+//!    without intermediate cert handling, which is insufficient for
+//!    general internet HTTPS where chains are typically 3+ certs deep.
+//!
+//! 3. The `rustpki` feature requires the `rsa` crate which depends on
+//!    `std` features incompatible with our no_std build.
+//!
+//! ## Path forward (future work):
+//!
+//! - Fork embedded-tls and re-export `CertificateRef` publicly
+//! - Bundle Mozilla CA roots (~140 certs, ~80KB)
+//! - Implement custom X.509 chain verifier
+//! - OR migrate to a different TLS library when one with proper no_std
+//!   chain validation becomes available
+//!
+//! Until then, every TLS connection logs a `[TLS WARN]` message.
+//! Folkering OS is a research/development OS, not a production system —
+//! do not use it for sensitive logins or financial transactions.
 
 extern crate alloc;
 

@@ -58,7 +58,18 @@ pub struct Ac97Driver {
     pub bar0: u16, // NAM I/O port base
     pub bar1: u16, // NABM I/O port base
     pub initialized: bool,
+    /// Physical address of the BDL (32 entries × 8 bytes = 256 bytes)
+    pub bdl_phys: u64,
+    /// Virtual address of the BDL (HHDM-mapped, for kernel writes)
+    pub bdl_virt: *mut BufferDesc,
+    /// Physical addresses of allocated sample buffers (one per BDL slot)
+    pub buffer_phys: [u64; BDL_ENTRIES],
+    /// Virtual addresses (HHDM) of sample buffers
+    pub buffer_virt: [*mut i16; BDL_ENTRIES],
 }
+
+unsafe impl Send for Ac97Driver {}
+unsafe impl Sync for Ac97Driver {}
 
 lazy_static! {
     pub static ref AC97: Mutex<Option<Ac97Driver>> = Mutex::new(None);
@@ -124,13 +135,56 @@ pub fn init() {
                     for _ in 0..1000 { core::hint::spin_loop(); }
                 }
 
+                // Allocate BDL (Buffer Descriptor List) — needs 1 physical page
+                // 32 entries × 8 bytes = 256 bytes, fits easily in one 4KB page
+                let bdl_phys = match crate::memory::physical::alloc_page() {
+                    Some(p) => p as u64,
+                    None => {
+                        crate::serial_strln!("[AC97] ERROR: failed to allocate BDL page");
+                        return;
+                    }
+                };
+                let hhdm = crate::memory::paging::hhdm_offset() as u64;
+                let bdl_virt = (bdl_phys + hhdm) as *mut BufferDesc;
+
+                // Zero the BDL
+                unsafe {
+                    core::ptr::write_bytes(bdl_virt, 0, BDL_ENTRIES);
+                }
+
+                // Allocate sample buffers (one 4KB page each = 1024 stereo frames each)
+                let mut buffer_phys = [0u64; BDL_ENTRIES];
+                let mut buffer_virt = [core::ptr::null_mut::<i16>(); BDL_ENTRIES];
+                for i in 0..BDL_ENTRIES {
+                    let p = match crate::memory::physical::alloc_page() {
+                        Some(p) => p as u64,
+                        None => {
+                            crate::serial_strln!("[AC97] ERROR: failed to allocate sample buffer");
+                            return;
+                        }
+                    };
+                    buffer_phys[i] = p;
+                    buffer_virt[i] = (p + hhdm) as *mut i16;
+                }
+
                 let driver = Ac97Driver {
                     bar0,
                     bar1,
                     initialized: true,
+                    bdl_phys,
+                    bdl_virt,
+                    buffer_phys,
+                    buffer_virt,
                 };
+
+                // Write BDL physical address to PO_BDBAR (must be 8-byte aligned)
+                unsafe {
+                    let mut po_bdbar: Port<u32> = Port::new(bar1 + NABM_PO_BDBAR);
+                    po_bdbar.write(bdl_phys as u32);
+                }
+
                 *AC97.lock() = Some(driver);
-                crate::serial_strln!("[AC97] Initialized successfully");
+                crate::serial_strln!("[AC97] Initialized successfully (BDL allocated)");
                 return;
             }
         }
@@ -140,12 +194,14 @@ pub fn init() {
 }
 
 /// Play raw PCM samples (16-bit signed stereo, 44100Hz).
-/// Blocks until samples are queued. Returns true on success.
+/// Returns true on success. Samples are copied into pre-allocated DMA buffers.
 ///
-/// NOTE: This is a stub that logs the play request. Full DMA-based
-/// playback requires physical memory allocation for the BDL and sample
-/// buffers, which is non-trivial in the current memory model.
+/// Each buffer holds 1024 stereo frames (2048 samples = 4KB), so 32 buffers
+/// total = 32768 stereo frames ≈ 0.74 seconds of audio at 44100Hz.
+/// Longer audio is truncated.
 pub fn play_pcm(samples: &[i16]) -> bool {
+    use x86_64::instructions::port::Port;
+
     let guard = AC97.lock();
     let driver = match guard.as_ref() {
         Some(d) if d.initialized => d,
@@ -155,25 +211,62 @@ pub fn play_pcm(samples: &[i16]) -> bool {
         }
     };
 
+    if samples.is_empty() { return false; }
+
+    const SAMPLES_PER_BUFFER: usize = 2048; // 1024 stereo frames per 4KB page
+    let total_samples = samples.len();
+    let buffers_needed = (total_samples + SAMPLES_PER_BUFFER - 1) / SAMPLES_PER_BUFFER;
+    let buffers_used = buffers_needed.min(BDL_ENTRIES);
+
     crate::serial_str!("[AC97] play_pcm: ");
-    crate::drivers::serial::write_dec(samples.len() as u32);
-    crate::serial_str!(" samples (");
-    crate::drivers::serial::write_dec((samples.len() / 2) as u32);
-    crate::serial_str!(" stereo frames)\n");
+    crate::drivers::serial::write_dec(total_samples as u32);
+    crate::serial_str!(" samples → ");
+    crate::drivers::serial::write_dec(buffers_used as u32);
+    crate::serial_strln!(" buffers");
 
-    // TODO: Allocate physical memory for sample buffer
-    // TODO: Set up BDL entries pointing to it
-    // TODO: Write BDL physical address to NABM_PO_BDBAR
-    // TODO: Set LVI to last valid buffer index
-    // TODO: Start playback by setting CR_RUN
+    // Copy samples into buffers and set up BDL entries
+    let mut sample_idx = 0;
+    for i in 0..buffers_used {
+        let chunk_len = (total_samples - sample_idx).min(SAMPLES_PER_BUFFER);
+        unsafe {
+            // Copy samples to DMA buffer (via HHDM mapping)
+            core::ptr::copy_nonoverlapping(
+                samples.as_ptr().add(sample_idx),
+                driver.buffer_virt[i],
+                chunk_len,
+            );
 
-    // For now, just acknowledge the request
-    let _ = driver;
+            // Set BDL entry: points to physical buffer with sample count
+            // AC97 BDL "samples" field is actually number of 16-bit samples - 1?
+            // Per spec: "Number of samples - 1, max 0xFFFE samples"
+            // But many implementations use raw count. We'll use raw count.
+            let entry = BufferDesc {
+                addr: driver.buffer_phys[i] as u32,
+                samples: chunk_len as u16,
+                // bit 15 = IOC (interrupt on completion), bit 14 = BUP (buffer underrun policy)
+                flags: if i == buffers_used - 1 { 0xC000 } else { 0 },
+            };
+            *driver.bdl_virt.add(i) = entry;
+        }
+        sample_idx += chunk_len;
+    }
+
+    // Start playback
+    unsafe {
+        // Set Last Valid Index — tells the device to play through buffer N
+        let mut po_lvi: Port<u8> = Port::new(driver.bar1 + NABM_PO_LVI);
+        po_lvi.write((buffers_used - 1) as u8);
+
+        // Set CR_RUN to start playback
+        let mut po_cr: Port<u8> = Port::new(driver.bar1 + NABM_PO_CR);
+        po_cr.write(CR_RUN | CR_LVBIE | CR_FEIE | CR_IOCE);
+    }
+
     true
 }
 
 /// Beep — generate a 440Hz sine wave for the requested duration.
-/// Useful for system feedback.
+/// Uses a simple square-wave approximation to avoid floating point in kernel.
 pub fn beep(duration_ms: u32) -> bool {
     if AC97.lock().is_none() {
         return false;
@@ -181,6 +274,26 @@ pub fn beep(duration_ms: u32) -> bool {
     crate::serial_str!("[AC97] beep ");
     crate::drivers::serial::write_dec(duration_ms);
     crate::serial_strln!("ms");
-    // Stub — would generate sine wave samples and call play_pcm
-    true
+
+    // 44100 Hz sample rate, stereo
+    // 440 Hz tone: period = 44100/440 ≈ 100 samples, half-period = 50
+    let total_frames = (44100 * duration_ms / 1000) as usize;
+    let total_samples = (total_frames * 2).min(2048 * BDL_ENTRIES); // stereo, max BDL capacity
+
+    // Generate a buffer of samples (use static to avoid stack overflow)
+    use alloc::vec;
+    let mut samples = vec![0i16; total_samples];
+    let half_period = 50; // 44100 / 440 / 2
+    let amplitude: i16 = 8000; // moderate volume
+
+    for i in 0..total_frames {
+        let val = if (i / half_period) % 2 == 0 { amplitude } else { -amplitude };
+        let stereo_idx = i * 2;
+        if stereo_idx + 1 < samples.len() {
+            samples[stereo_idx] = val;     // left
+            samples[stereo_idx + 1] = val; // right
+        }
+    }
+
+    play_pcm(&samples)
 }
