@@ -1027,12 +1027,29 @@ fn main() -> ! {
                 app_tile_w: APP_TILE_W, app_tile_h: APP_TILE_H, app_tile_gap: APP_TILE_GAP, app_tile_cols: APP_TILE_COLS,
                 cursor_w: CURSOR_W, cursor_h: CURSOR_H,
             };
-            let rr = rendering::render_frame(
-                &mut fb, &mut wm, &mut wasm, &input, &mut render, &mut mcp,
-                &iqe, &mut damage, &mut draug, &categories[..], &rl,
-                &cursor, cursor_drawn, &mut cursor_bg.0,
-                &ram_history.data, ram_history.idx, ram_history.count,
-            );
+            // Phase C2: 17 parameters → 1 RenderContext.
+            let rr = {
+                let mut rctx = rendering::RenderContext {
+                    fb: &mut fb,
+                    wm: &mut wm,
+                    wasm: &mut wasm,
+                    input: &input,
+                    render: &mut render,
+                    mcp: &mut mcp,
+                    iqe: &iqe,
+                    damage: &mut damage,
+                    draug: &mut draug,
+                    categories: &categories[..],
+                    layout: &rl,
+                    cursor: &cursor,
+                    cursor_drawn,
+                    cursor_bg: &mut cursor_bg.0,
+                    ram_history: &ram_history.data,
+                    ram_history_idx: ram_history.idx,
+                    ram_history_count: ram_history.count,
+                };
+                rendering::render_frame(&mut rctx)
+            };
             if rr.did_work { did_work = true; }
         }
 
