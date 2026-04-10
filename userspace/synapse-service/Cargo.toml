@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 description = "Synapse - The Data Kernel for Folkering OS"
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "synapse"
 path = "src/main.rs"
