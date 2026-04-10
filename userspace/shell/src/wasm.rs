@@ -6,7 +6,7 @@
 //! Safety: All memory/stack access is bounds-checked. Instruction limit
 //! prevents infinite loops. Any trap falls back to hardcoded logic.
 
-use crate::AppState;
+use crate::state::AppState;
 
 // === Constants ===
 const WASM_MAX_CODE: usize = 4096;
