@@ -784,6 +784,12 @@ fn register_shadow_functions(linker: &mut Linker<ShadowState>) {
     let _ = linker.func_wrap("env", "folk_clipboard_len",
         |_: Caller<ShadowState>| -> i32 { 0 },
     );
+    let _ = linker.func_wrap("env", "folk_audio_beep",
+        |_: Caller<ShadowState>, _d: i32| -> i32 { 0 },
+    );
+    let _ = linker.func_wrap("env", "folk_audio_play",
+        |_: Caller<ShadowState>, _p: i32, _l: i32| -> i32 { 0 },
+    );
 
     // Surface — return 0 (no surface in shadow)
     let _ = linker.func_wrap("env", "folk_get_surface",

@@ -85,6 +85,17 @@ pub fn ask_gemini(prompt: &str, response_buf: &mut [u8]) -> usize {
     if ret == u64::MAX { 0 } else { ret as usize }
 }
 
+/// Query an NTP server for current Unix time.
+/// server_ip is the resolved IP (use dns_lookup first).
+/// Returns Unix timestamp (seconds since 1970-01-01 UTC) or 0 on failure.
+pub fn ntp_query(server_ip: [u8; 4]) -> u64 {
+    let packed = ((server_ip[0] as u64) << 24)
+        | ((server_ip[1] as u64) << 16)
+        | ((server_ip[2] as u64) << 8)
+        | (server_ip[3] as u64);
+    unsafe { syscall1(0x5C, packed) }
+}
+
 /// Play raw PCM audio (16-bit signed stereo @ 44100Hz).
 /// Returns true on success.
 pub fn audio_play(samples: &[i16]) -> bool {

@@ -425,6 +425,39 @@ pub fn register(linker: &mut Linker<HostState>) {
             unsafe { CLIPBOARD_LEN as i32 }
         },
     );
+
+    // ── Audio ──────────────────────────────────────────────────────────
+
+    // folk_audio_beep(duration_ms) -> i32
+    // Play a 440Hz tone for the given duration. Returns 0 on success.
+    let _ = linker.func_wrap("env", "folk_audio_beep",
+        |_caller: Caller<HostState>, duration_ms: i32| -> i32 {
+            if duration_ms <= 0 || duration_ms > 10000 { return -1; }
+            if libfolk::sys::audio_beep(duration_ms as u32) { 0 } else { -1 }
+        },
+    );
+
+    // folk_audio_play(ptr, sample_count) -> i32
+    // Play raw 16-bit signed stereo PCM samples at 44100Hz.
+    // ptr points to i16 array in WASM memory, sample_count is number of i16 values.
+    // Max 65536 samples (~0.74 sec stereo).
+    let _ = linker.func_wrap("env", "folk_audio_play",
+        |caller: Caller<HostState>, ptr: i32, sample_count: i32| -> i32 {
+            if sample_count <= 0 || sample_count > 65536 { return -1; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+            let byte_len = sample_count as usize * 2;
+            let mut buf = alloc::vec![0u8; byte_len];
+            if mem.read(&caller, ptr as usize, &mut buf).is_err() { return -1; }
+            // Reinterpret bytes as i16 slice
+            let samples: &[i16] = unsafe {
+                core::slice::from_raw_parts(buf.as_ptr() as *const i16, sample_count as usize)
+            };
+            if libfolk::sys::audio_play(samples) { 0 } else { -1 }
+        },
+    );
 }
 
 // Global clipboard buffer (compositor-process scope)

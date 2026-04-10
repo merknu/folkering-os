@@ -974,6 +974,8 @@ extern "C" fn syscall_handler(
         0x5A => syscall_audio_play(arg1, arg2),
         // Audio: beep (440Hz sine wave for duration_ms)
         0x5B => syscall_audio_beep(arg1),
+        // NTP query: returns Unix timestamp from NTP server
+        0x5C => syscall_ntp_query(arg1),
         // SMP: Parallel GEMM
         0x60 => syscall_parallel_gemm(arg1, arg2, arg3, arg4, arg5, arg6),
         // Hybrid AI: Ask Gemini cloud API
@@ -2148,6 +2150,18 @@ fn syscall_http_fetch(url_ptr: u64, url_len: u64, buf_ptr: u64, buf_len: u64) ->
     crate::serial_str!(" bytes body\n");
 
     copy_len as u64
+}
+
+/// NTP query: resolve server via DNS, query it, return Unix timestamp.
+/// arg1 = server IP packed as (a<<24)|(b<<16)|(c<<8)|d
+fn syscall_ntp_query(server_ip_packed: u64) -> u64 {
+    let ip = [
+        ((server_ip_packed >> 24) & 0xFF) as u8,
+        ((server_ip_packed >> 16) & 0xFF) as u8,
+        ((server_ip_packed >> 8) & 0xFF) as u8,
+        (server_ip_packed & 0xFF) as u8,
+    ];
+    crate::net::ntp_query(ip)
 }
 
 /// Audio: play raw PCM samples (16-bit signed stereo @ 44100Hz)
