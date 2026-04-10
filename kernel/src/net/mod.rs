@@ -841,5 +841,14 @@ pub fn ntp_query(server_ip: [u8; 4]) -> u64 {
 
     // NTP epoch (1900-01-01) → Unix epoch (1970-01-01) = 2208988800 seconds
     if ntp_seconds < 2208988800 { return 0; }
-    ntp_seconds - 2208988800
+    let unix = ntp_seconds - 2208988800;
+
+    // Sync RTC if NTP time is significantly different (avoid jitter on every call)
+    let current_rtc = crate::drivers::cmos::unix_timestamp();
+    let diff = if unix > current_rtc { unix - current_rtc } else { current_rtc - unix };
+    if diff > 5 {
+        crate::drivers::cmos::set_unix_time(unix);
+    }
+
+    unix
 }

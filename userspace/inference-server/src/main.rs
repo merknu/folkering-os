@@ -179,8 +179,9 @@ pub const INFER_OP_ASK_ASYNC: u64 = 4;
 /// Bump arena size: 16MB for tokenizer tables (152K vocab) + inference buffers
 const ARENA_SIZE: usize = 16 * 1024 * 1024;
 
-/// Maximum GGUF model size we'll attempt to load (512MB for SmolLM2-360M+)
-const MAX_MODEL_SIZE: usize = 512 * 1024 * 1024;
+/// Maximum GGUF model size we'll attempt to load.
+/// 4GB supports up to 7B Q4 quantized models (e.g., Llama-2-7B-Q4, Mistral-7B-Q4).
+const MAX_MODEL_SIZE: usize = 4 * 1024 * 1024 * 1024;
 
 /// Virtual address for model mmap region
 const MODEL_MMAP_BASE: usize = 0x1_0000_0000;
