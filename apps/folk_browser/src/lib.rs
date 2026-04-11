@@ -72,6 +72,9 @@ const MAX_ELEMENTS: usize = 256;
 const MAX_TEXT_PER_ELEM: usize = 200;
 const MAX_DISPLAY_LIST: usize = 16384;
 const MAX_SEMANTIC: usize = 2048;
+const MAX_LINKS: usize = 48;
+const MAX_HREF: usize = 200;
+const HISTORY_SIZE: usize = 10;
 
 // ── HTML Element types ──────────────────────────────────────────────────
 
@@ -117,6 +120,21 @@ impl HtmlElement {
     }
 }
 
+/// Sparse link table: maps an element index to its href.
+/// Populated during HTML parsing for every <a href="..."> encountered.
+#[derive(Clone, Copy)]
+struct LinkRect {
+    elem_idx: u16,
+    href_len: u16,
+    href: [u8; MAX_HREF],
+}
+
+impl LinkRect {
+    const fn empty() -> Self {
+        Self { elem_idx: 0, href_len: 0, href: [0u8; MAX_HREF] }
+    }
+}
+
 // ── View mode ───────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq)]
@@ -157,6 +175,16 @@ static mut TITLE_LEN: usize = 0;
 static mut LINK_COUNT: u16 = 0;
 static mut EDITING_URL: bool = true;
 
+// Clickable link rectangles (sparse, indexed by parse order)
+static mut LINKS: [LinkRect; MAX_LINKS] = [LinkRect::empty(); MAX_LINKS];
+static mut LINK_RECT_COUNT: usize = 0;
+
+// History stack — last N visited URLs (oldest at index 0).
+// On Back, we pop the most recent and navigate to it.
+static mut HISTORY: [[u8; MAX_URL]; HISTORY_SIZE] = [[0u8; MAX_URL]; HISTORY_SIZE];
+static mut HISTORY_LENS: [usize; HISTORY_SIZE] = [0; HISTORY_SIZE];
+static mut HISTORY_COUNT: usize = 0;
+
 static mut EVT: [i32; 4] = [0i32; 4];
 static mut INITIALIZED: bool = false;
 
@@ -187,6 +215,7 @@ unsafe fn parse_html() {
     let mut count = 0usize;
     let mut i = 0usize;
     LINK_COUNT = 0;
+    LINK_RECT_COUNT = 0;
     TITLE_LEN = 0;
 
     while i < html.len() && count < MAX_ELEMENTS {
@@ -206,10 +235,16 @@ unsafe fn parse_html() {
             let tag_start = i;
             while i < html.len() && html[i] != b'>' && html[i] != b' ' { i += 1; }
             let tag_name = &html[tag_start..i];
+            let attrs_start = i;
 
             // Skip attributes + closing >
             while i < html.len() && html[i] != b'>' { i += 1; }
+            let attrs_end = i;
             if i < html.len() { i += 1; }
+
+            // Attribute area (between tag name and closing '>'). Used for
+            // extracting href on <a> tags and src on <img> tags.
+            let attrs = &html[attrs_start..attrs_end];
 
             if closing { continue; }
 
@@ -253,10 +288,7 @@ unsafe fn parse_html() {
             // Self-closing tags (including img)
             if elem_type == ElemType::Br || elem_type == ElemType::Hr || elem_type == ElemType::Img {
                 if elem_type == ElemType::Img && count < MAX_ELEMENTS {
-                    // Extract src attribute from the tag area we already skipped past
-                    // Rescan the tag for src="..."
-                    let tag_area = &html[tag_start..i.min(html.len())];
-                    if let Some(src) = extract_attr(tag_area, b"src") {
+                    if let Some(src) = extract_attr(attrs, b"src") {
                         let e = &mut *elems.add(count);
                         *e = HtmlElement::empty();
                         e.elem_type = ElemType::Img;
@@ -289,7 +321,21 @@ unsafe fn parse_html() {
                 for j in 0..copy { e.text[j] = trimmed[j]; }
                 e.text_len = copy;
 
-                if elem_type == ElemType::A { LINK_COUNT += 1; }
+                if elem_type == ElemType::A {
+                    LINK_COUNT += 1;
+                    // Record clickable link with its href URL
+                    if LINK_RECT_COUNT < MAX_LINKS {
+                        if let Some(href) = extract_attr(attrs, b"href") {
+                            let lr_ptr = core::ptr::addr_of_mut!(LINKS) as *mut LinkRect;
+                            let lr = &mut *lr_ptr.add(LINK_RECT_COUNT);
+                            lr.elem_idx = count as u16;
+                            let copy = href.len().min(MAX_HREF);
+                            for j in 0..copy { lr.href[j] = href[j]; }
+                            lr.href_len = copy as u16;
+                            LINK_RECT_COUNT += 1;
+                        }
+                    }
+                }
                 if elem_type == ElemType::Title {
                     let tc = copy.min(64);
                     let title = core::ptr::addr_of_mut!(PAGE_TITLE) as *mut u8;
@@ -725,6 +771,142 @@ unsafe fn generate_semantic_view() {
     }
 }
 
+// ── History & URL resolution ────────────────────────────────────────────
+
+/// Push the current URL onto the back stack. If the stack is full, drop the
+/// oldest entry to make room (FIFO eviction).
+unsafe fn history_push(url: &[u8]) {
+    if HISTORY_COUNT == HISTORY_SIZE {
+        // Shift everything down by one — drop oldest
+        for i in 0..HISTORY_SIZE - 1 {
+            let h = core::ptr::addr_of_mut!(HISTORY) as *mut [u8; MAX_URL];
+            let src = &*h.add(i + 1);
+            let dst = &mut *h.add(i);
+            *dst = *src;
+            HISTORY_LENS[i] = HISTORY_LENS[i + 1];
+        }
+        HISTORY_COUNT = HISTORY_SIZE - 1;
+    }
+    let len = url.len().min(MAX_URL);
+    let h = core::ptr::addr_of_mut!(HISTORY) as *mut [u8; MAX_URL];
+    let entry = &mut *h.add(HISTORY_COUNT);
+    for i in 0..len { entry[i] = url[i]; }
+    HISTORY_LENS[HISTORY_COUNT] = len;
+    HISTORY_COUNT += 1;
+}
+
+/// Pop the most recent entry from the back stack into URL. Returns true on
+/// success, false if the stack was empty.
+unsafe fn history_back() -> bool {
+    if HISTORY_COUNT == 0 { return false; }
+    HISTORY_COUNT -= 1;
+    let h = core::ptr::addr_of!(HISTORY) as *const [u8; MAX_URL];
+    let entry = &*h.add(HISTORY_COUNT);
+    let len = HISTORY_LENS[HISTORY_COUNT];
+    let u = core::ptr::addr_of_mut!(URL) as *mut u8;
+    for i in 0..len { *u.add(i) = entry[i]; }
+    URL_LEN = len;
+    CURSOR_POS = len;
+    true
+}
+
+/// Resolve a possibly-relative href against the current URL and write the
+/// result into the URL buffer. Handles four common cases:
+///   - "https://...", "http://..."  → use as-is
+///   - "//host/..."                  → prepend "https:"
+///   - "/path"                       → prepend scheme://host of current URL
+///   - "relative"                    → take current URL up to last '/' and append
+unsafe fn resolve_url(href: &[u8]) {
+    let u = core::ptr::addr_of_mut!(URL) as *mut u8;
+
+    // Already absolute?
+    if href.len() >= 7 && &href[..7] == b"http://" {
+        let len = href.len().min(MAX_URL);
+        for i in 0..len { *u.add(i) = href[i]; }
+        URL_LEN = len; CURSOR_POS = len;
+        return;
+    }
+    if href.len() >= 8 && &href[..8] == b"https://" {
+        let len = href.len().min(MAX_URL);
+        for i in 0..len { *u.add(i) = href[i]; }
+        URL_LEN = len; CURSOR_POS = len;
+        return;
+    }
+
+    // Protocol-relative ("//host/...") — assume https
+    if href.len() >= 2 && href[0] == b'/' && href[1] == b'/' {
+        let prefix = b"https:";
+        let mut pos = 0;
+        for &b in prefix { if pos < MAX_URL { *u.add(pos) = b; pos += 1; } }
+        for &b in href { if pos < MAX_URL { *u.add(pos) = b; pos += 1; } }
+        URL_LEN = pos; CURSOR_POS = pos;
+        return;
+    }
+
+    // Snapshot the current URL — we mutate URL in-place below
+    let mut cur = [0u8; MAX_URL];
+    let cur_len = URL_LEN;
+    for i in 0..cur_len { cur[i] = *u.add(i); }
+
+    // Find end of "scheme://"
+    let mut scheme_end = 0usize;
+    let mut k = 0usize;
+    while k + 2 < cur_len {
+        if cur[k] == b':' && cur[k+1] == b'/' && cur[k+2] == b'/' {
+            scheme_end = k + 3;
+            break;
+        }
+        k += 1;
+    }
+
+    // Find end of host (first '/' or '?' or '#' after scheme)
+    let mut host_end = scheme_end;
+    while host_end < cur_len {
+        let c = cur[host_end];
+        if c == b'/' || c == b'?' || c == b'#' { break; }
+        host_end += 1;
+    }
+
+    // Absolute path: "/foo" → scheme://host + href
+    if !href.is_empty() && href[0] == b'/' {
+        let mut pos = 0;
+        for i in 0..host_end {
+            if pos < MAX_URL { *u.add(pos) = cur[i]; pos += 1; }
+        }
+        for &b in href {
+            if pos < MAX_URL { *u.add(pos) = b; pos += 1; }
+        }
+        URL_LEN = pos; CURSOR_POS = pos;
+        return;
+    }
+
+    // Pure relative: take everything up to (and including) the last '/'
+    // in the path portion of the current URL.
+    let mut last_slash = host_end;
+    let mut k2 = host_end;
+    while k2 < cur_len {
+        let c = cur[k2];
+        if c == b'?' || c == b'#' { break; }
+        if c == b'/' { last_slash = k2; }
+        k2 += 1;
+    }
+    let base_end = if last_slash > host_end { last_slash + 1 } else { host_end };
+
+    let mut pos = 0;
+    for i in 0..base_end {
+        if pos < MAX_URL { *u.add(pos) = cur[i]; pos += 1; }
+    }
+    // If the current URL had no slash after the host (e.g. https://example.com),
+    // synthesize one before appending the relative href.
+    if base_end == host_end && pos < MAX_URL {
+        *u.add(pos) = b'/'; pos += 1;
+    }
+    for &b in href {
+        if pos < MAX_URL { *u.add(pos) = b; pos += 1; }
+    }
+    URL_LEN = pos; CURSOR_POS = pos;
+}
+
 // ── Input ───────────────────────────────────────────────────────────────
 
 unsafe fn handle_input() {
@@ -733,17 +915,60 @@ unsafe fn handle_input() {
         if folk_poll_event(e as i32) == 0 { break; }
         let event_type = *e.add(0);
 
-        // Mouse click on SEMANTIC button (top-left corner, 32x16 area)
+        // Mouse click handling
         if event_type == 2 {
             let mx = *e.add(1);
             let my = *e.add(2);
+
+            // STD/SEM mode toggle button
             if mx >= 4 && mx < 36 && my >= 4 && my < 20 {
-                // Toggle semantic mode
                 if MODE == ViewMode::Standard {
                     MODE = ViewMode::Semantic;
                     if SEMANTIC_LEN == 0 { generate_semantic_view(); }
                 } else {
                     MODE = ViewMode::Standard;
+                }
+                continue;
+            }
+
+            // BACK button (24×16 to the right of STD/SEM)
+            if mx >= 40 && mx < 64 && my >= 4 && my < 20 {
+                if history_back() {
+                    fetch_page();
+                    return;
+                }
+                continue;
+            }
+
+            // Link hit detection — only in standard mode and inside content area
+            let sh = folk_screen_height();
+            if MODE == ViewMode::Standard
+                && my >= URLBAR_H
+                && my < sh - STATUS_H
+            {
+                let elems_p = core::ptr::addr_of!(ELEMENTS) as *const HtmlElement;
+                let lr_ptr = core::ptr::addr_of!(LINKS) as *const LinkRect;
+                for li in 0..LINK_RECT_COUNT {
+                    let lr = &*lr_ptr.add(li);
+                    let idx = lr.elem_idx as usize;
+                    if idx >= ELEM_COUNT { continue; }
+                    let el = &*elems_p.add(idx);
+                    let sx = el.x;
+                    let sy = el.y - SCROLL_Y;
+                    if mx >= sx && mx < sx + el.w && my >= sy && my < sy + el.h {
+                        // Hit! Push current URL onto history, navigate
+                        let cur_url = core::slice::from_raw_parts(
+                            core::ptr::addr_of!(URL) as *const u8, URL_LEN);
+                        history_push(cur_url);
+
+                        let href_len = lr.href_len as usize;
+                        let mut href_local = [0u8; MAX_HREF];
+                        for j in 0..href_len { href_local[j] = lr.href[j]; }
+                        resolve_url(&href_local[..href_len]);
+
+                        fetch_page();
+                        return;
+                    }
                 }
             }
             continue;
@@ -775,6 +1000,9 @@ unsafe fn handle_input() {
                     let mut i = CURSOR_POS - 1;
                     while i < URL_LEN - 1 { *u.add(i) = *u.add(i+1); i += 1; }
                     URL_LEN -= 1; CURSOR_POS -= 1;
+                } else if !EDITING_URL && history_back() {
+                    fetch_page();
+                    return;
                 }
             }
             0x82 => { // Left
@@ -841,18 +1069,28 @@ unsafe fn render() {
     folk_draw_rect(4, 4, 32, 16, mode_bg);
     draw(8, 8, mode_text, mode_fg);
 
-    // URL text
+    // BACK button — dimmed when history is empty
+    let back_active = HISTORY_COUNT > 0;
+    let (back_bg, back_fg) = if back_active {
+        (0x1B2838_i32, 0xC9D1D9_i32)
+    } else {
+        (0x161B22_i32, 0x484F58_i32)
+    };
+    folk_draw_rect(40, 4, 24, 16, back_bg);
+    draw(48, 8, b"<", back_fg);
+
+    // URL text (shifted right to make room for BACK button)
     if URL_LEN > 0 {
         let url = core::slice::from_raw_parts(core::ptr::addr_of!(URL) as *const u8, URL_LEN);
-        let show = URL_LEN.min(((usable_w - 100) / FONT_W) as usize);
-        folk_draw_text(40, 8, url.as_ptr() as i32, show as i32, URLBAR_TEXT);
+        let show = URL_LEN.min(((usable_w - 132) / FONT_W) as usize);
+        folk_draw_text(72, 8, url.as_ptr() as i32, show as i32, URLBAR_TEXT);
     } else {
-        draw(40, 8, b"Type URL and press Enter...", 0x484F58);
+        draw(72, 8, b"Type URL and press Enter...", 0x484F58);
     }
 
     // Cursor in URL bar
     if EDITING_URL {
-        let cx = 40 + (CURSOR_POS as i32) * FONT_W;
+        let cx = 72 + (CURSOR_POS as i32) * FONT_W;
         folk_draw_rect(cx, 6, 2, FONT_H, CURSOR_COLOR);
     }
 
