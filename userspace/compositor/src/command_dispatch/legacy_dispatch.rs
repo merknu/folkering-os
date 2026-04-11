@@ -86,7 +86,7 @@ pub(super) fn dispatch_legacy_command(
                                     Err(e) => {
                                         write_str("[WM] WASM compile failed: ");
                                         let err_bytes = e.as_bytes();
-                                        let show = err_bytes.len().min(80);
+                                        let show = err_bytes.len().min(512);
                                         for &b in &err_bytes[..show] { write_char(b); }
                                         write_str("\n");
                                     }
