@@ -80,6 +80,54 @@ pub fn register(linker: &mut Linker<HostState>) {
         },
     );
 
+    // folk_http_post(url_ptr, url_len, body_ptr, body_len, buf_ptr, max_len) -> i32
+    // Submits a form via HTTP POST. Body is sent with
+    // Content-Type: application/x-www-form-urlencoded.
+    // Returns bytes written to buf, or -1 on error.
+    let _ = linker.func_wrap("env", "folk_http_post",
+        |mut caller: Caller<HostState>,
+         url_ptr: i32, url_len: i32,
+         body_ptr: i32, body_len: i32,
+         buf_ptr: i32, max_len: i32| -> i32 {
+            if url_len <= 0 || url_len > 512 || max_len <= 0 || max_len > 65536 {
+                return -1;
+            }
+            if body_len < 0 || body_len > 4096 { return -1; }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+
+            // Snapshot the URL
+            let mut url_buf = alloc::vec![0u8; url_len as usize];
+            if mem.read(&caller, url_ptr as usize, &mut url_buf).is_err() { return -1; }
+            let url = match alloc::str::from_utf8(&url_buf) {
+                Ok(s) => String::from(s),
+                Err(_) => return -1,
+            };
+
+            // Snapshot the body
+            let mut body_buf: Vec<u8> = if body_len > 0 {
+                let mut b = alloc::vec![0u8; body_len as usize];
+                if mem.read(&caller, body_ptr as usize, &mut b).is_err() { return -1; }
+                b
+            } else {
+                Vec::new()
+            };
+
+            // Direct kernel POST
+            let mut resp = alloc::vec![0u8; max_len as usize];
+            let n = libfolk::sys::http_post(&url, &body_buf, &mut resp);
+            // Drop the body buffer once the syscall is done
+            body_buf.clear();
+            if n == 0 { return -1; }
+            let copy_len = n.min(max_len as usize);
+            if mem.write(&mut caller, buf_ptr as usize, &resp[..copy_len]).is_ok() {
+                copy_len as i32
+            } else { -1 }
+        },
+    );
+
     // Phase 14: WebSocket — Persistent streaming connections
     // folk_ws_connect(url_ptr, url_len) -> i32 (slot_id or -1)
     // URL format: "ws://host:port/path"

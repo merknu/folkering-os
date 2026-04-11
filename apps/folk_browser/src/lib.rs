@@ -34,6 +34,7 @@ extern "C" {
     fn folk_submit_display_list(ptr: i32, len: i32) -> i32;
     fn folk_draw_pixels(x: i32, y: i32, w: i32, h: i32, pixel_ptr: i32, pixel_len: i32) -> i32;
     fn folk_http_get_large(url_ptr: i32, url_len: i32, buf_ptr: i32, max_len: i32) -> i32;
+    fn folk_http_post(url_ptr: i32, url_len: i32, body_ptr: i32, body_len: i32, buf_ptr: i32, max_len: i32) -> i32;
     fn folk_log_telemetry(action: i32, target: i32, duration: i32);
     fn folk_semantic_extract(html_ptr: i32, html_len: i32, buf_ptr: i32, max_len: i32) -> i32;
 }
@@ -1260,36 +1261,74 @@ unsafe fn build_query_string(form_idx: u16, out: &mut [u8]) -> usize {
     qpos
 }
 
-/// Submit a form by index. Currently handles GET only — POST is a no-op
-/// stub until `folk_http_post` is wired up.
+/// Submit a form by index. Handles both GET (`method=0`) and POST
+/// (`method=1`). For POST we route through the new `folk_http_post`
+/// host function and then re-feed the response into the renderer
+/// just like `fetch_page` does.
 unsafe fn submit_form(form_idx: u16) {
     if form_idx == NO_FORM || (form_idx as usize) >= FORM_COUNT { return; }
     let form_p = core::ptr::addr_of!(FORMS) as *const FormInfo;
     let form = &*form_p.add(form_idx as usize);
 
-    if form.method == 1 {
-        // POST not yet implemented
-        return;
-    }
-
-    // Snapshot current URL for history
+    // Snapshot current URL for history before we mutate it
     let url_p = core::ptr::addr_of!(URL) as *const u8;
     let mut saved_url = [0u8; MAX_URL];
     let saved_len = URL_LEN;
     for i in 0..saved_len { saved_url[i] = *url_p.add(i); }
 
-    // Resolve action against current URL (empty action → keep current URL)
+    // Resolve the action against the current URL (empty action = current)
     if form.action_len > 0 {
         let action_slice = &form.action[..form.action_len as usize];
         resolve_url(action_slice);
     }
 
-    // Build query string
+    // Build the URL-encoded query string from this form's inputs
     let mut query = [0u8; 1024];
     let qlen = build_query_string(form_idx, &mut query);
 
-    // Append "?query" or "&query" depending on whether the URL already
-    // contains a query separator.
+    if form.method == 1 {
+        // ── POST: keep URL clean, body carries the query string ─────
+        history_push(&saved_url[..saved_len]);
+
+        LOADING = true;
+        SCROLL_Y = 0;
+        ELEM_COUNT = 0;
+        SEMANTIC_LEN = 0;
+
+        let url_bytes = core::slice::from_raw_parts(
+            core::ptr::addr_of!(URL) as *const u8, URL_LEN);
+        let html_ptr = core::ptr::addr_of_mut!(HTML_BUF) as *mut u8;
+
+        let bytes = folk_http_post(
+            url_bytes.as_ptr() as i32, url_bytes.len() as i32,
+            query.as_ptr() as i32,    qlen as i32,
+            html_ptr as i32,          MAX_HTML as i32,
+        );
+
+        if bytes > 0 {
+            HTML_LEN = bytes as usize;
+            parse_html();
+            let sw = folk_screen_width();
+            layout_elements(sw.min(1024));
+            folk_log_telemetry(11, bytes as i32, 0); // POST telemetry tag
+            IMG_LOADED = false;
+            try_load_first_image();
+        } else {
+            let err = b"<h1>POST Failed</h1><p>The form submission did not return a response.</p>";
+            let copy = err.len().min(MAX_HTML);
+            for j in 0..copy { *html_ptr.add(j) = err[j]; }
+            HTML_LEN = copy;
+            parse_html();
+            let sw = folk_screen_width();
+            layout_elements(sw.min(1024));
+        }
+
+        LOADING = false;
+        EDITING_URL = false;
+        return;
+    }
+
+    // ── GET: append "?query" / "&query" to the resolved URL ─────────
     if qlen > 0 {
         let u = core::ptr::addr_of_mut!(URL) as *mut u8;
         let mut has_query = false;
@@ -1309,7 +1348,6 @@ unsafe fn submit_form(form_idx: u16) {
         CURSOR_POS = URL_LEN;
     }
 
-    // Push old URL onto history and navigate
     history_push(&saved_url[..saved_len]);
     fetch_page();
 }

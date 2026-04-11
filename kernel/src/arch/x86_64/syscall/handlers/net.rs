@@ -228,6 +228,132 @@ pub fn syscall_http_fetch(url_ptr: u64, url_len: u64, buf_ptr: u64, buf_len: u64
     copy_len as u64
 }
 
+/// HTTP POST: take a URL + form-encoded body, build a POST request,
+/// fire it through the existing `https_get_raw` TLS pipeline, and copy
+/// the response body back into a userspace buffer.
+///
+/// Args (6):
+///   url_ptr/url_len   — UTF-8 URL (https:// is stripped if present)
+///   body_ptr/body_len — request body bytes (typically `key=value&...`)
+///   resp_ptr/resp_max — output buffer for the response body
+/// Returns: number of body bytes copied, or `u64::MAX` on failure.
+pub fn syscall_http_post(
+    url_ptr: u64,
+    url_len: u64,
+    body_ptr: u64,
+    body_len: u64,
+    resp_ptr: u64,
+    resp_max: u64,
+) -> u64 {
+    if url_len == 0 || url_len > 512 || resp_max == 0 || resp_max > 65536 {
+        return u64::MAX;
+    }
+    if body_len > 4096 {
+        return u64::MAX;
+    }
+
+    let url = unsafe {
+        let slice = core::slice::from_raw_parts(url_ptr as *const u8, url_len as usize);
+        match core::str::from_utf8(slice) {
+            Ok(s) => s,
+            Err(_) => return u64::MAX,
+        }
+    };
+    let body: &[u8] = if body_len == 0 {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(body_ptr as *const u8, body_len as usize) }
+    };
+
+    let stripped = url
+        .strip_prefix("https://")
+        .unwrap_or(url.strip_prefix("http://").unwrap_or(url));
+    let (host, path) = match stripped.find('/') {
+        Some(i) => (&stripped[..i], &stripped[i..]),
+        None => (stripped, "/"),
+    };
+
+    crate::serial_str!("[HTTP_POST] ");
+    crate::serial_str!(host);
+    crate::serial_str!(path);
+    crate::serial_str!(" body=");
+    crate::drivers::serial::write_dec(body.len() as u32);
+    crate::serial_str!("B\n");
+
+    let ip_packed = crate::net::dns_lookup(host);
+    if ip_packed == 0 || ip_packed == u64::MAX {
+        crate::serial_strln!("[HTTP_POST] DNS failed");
+        return u64::MAX;
+    }
+    let ip = [
+        (ip_packed >> 24) as u8,
+        (ip_packed >> 16) as u8,
+        (ip_packed >> 8) as u8,
+        ip_packed as u8,
+    ];
+
+    // Format Content-Length as ASCII so we can stream it directly into
+    // the request without alloc::format!.
+    let mut clen_buf = [0u8; 12];
+    let clen_str = {
+        let mut n = body.len();
+        let mut tmp = [0u8; 12];
+        let mut idx = 0;
+        if n == 0 {
+            tmp[0] = b'0';
+            idx = 1;
+        } else {
+            while n > 0 {
+                tmp[idx] = b'0' + (n % 10) as u8;
+                n /= 10;
+                idx += 1;
+            }
+        }
+        for i in 0..idx { clen_buf[i] = tmp[idx - 1 - i]; }
+        &clen_buf[..idx]
+    };
+
+    let mut request = alloc::vec::Vec::with_capacity(
+        256 + host.len() + path.len() + body.len()
+    );
+    request.extend_from_slice(b"POST ");
+    request.extend_from_slice(path.as_bytes());
+    request.extend_from_slice(b" HTTP/1.1\r\nHost: ");
+    request.extend_from_slice(host.as_bytes());
+    request.extend_from_slice(b"\r\nUser-Agent: FolkeringOS/1.0\r\nAccept: text/html,*/*\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: ");
+    request.extend_from_slice(clen_str);
+    request.extend_from_slice(b"\r\nConnection: close\r\n\r\n");
+    request.extend_from_slice(body);
+
+    let response = match crate::net::tls::https_get_raw(ip, host, &request) {
+        Ok(data) => data,
+        Err(e) => {
+            crate::serial_str!("[HTTP_POST] TLS failed: ");
+            crate::serial_strln!(e);
+            return u64::MAX;
+        }
+    };
+
+    let body_start = response.windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|p| p + 4)
+        .unwrap_or(0);
+
+    let resp_body = &response[body_start..];
+    let copy_len = resp_body.len().min(resp_max as usize);
+
+    unsafe {
+        let dst = core::slice::from_raw_parts_mut(resp_ptr as *mut u8, copy_len);
+        dst.copy_from_slice(&resp_body[..copy_len]);
+    }
+
+    crate::serial_str!("[HTTP_POST] OK, ");
+    crate::drivers::serial::write_dec(copy_len as u32);
+    crate::serial_str!(" bytes body\n");
+
+    copy_len as u64
+}
+
 pub fn syscall_ntp_query(server_ip_packed: u64) -> u64 {
     let ip = [
         ((server_ip_packed >> 24) & 0xFF) as u8,

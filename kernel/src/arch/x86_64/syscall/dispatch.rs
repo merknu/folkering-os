@@ -79,6 +79,8 @@ pub(super) extern "C" fn syscall_handler(
         0x5B => syscall_audio_beep(arg1),
         // NTP query: returns Unix timestamp from NTP server
         0x5C => syscall_ntp_query(arg1),
+        // HTTP POST: url, body, response buffer (form submission)
+        0x5D => syscall_http_post(arg1, arg2, arg3, arg4, arg5, arg6),
         // SMP: Parallel GEMM
         0x60 => syscall_parallel_gemm(arg1, arg2, arg3, arg4, arg5, arg6),
         // Hybrid AI: Ask Gemini cloud API

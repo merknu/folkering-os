@@ -180,6 +180,24 @@ pub fn http_fetch(url: &str, response_buf: &mut [u8]) -> usize {
     if ret == u64::MAX { 0 } else { ret as usize }
 }
 
+/// HTTP(S) POST via kernel TLS stack. Sends `body` as the request body
+/// with `Content-Type: application/x-www-form-urlencoded`. Returns the
+/// number of response-body bytes written to `response_buf`, or 0 on error.
+pub fn http_post(url: &str, body: &[u8], response_buf: &mut [u8]) -> usize {
+    let ret = unsafe {
+        crate::syscall::syscall6(
+            0x5D, // SYS_HTTP_POST
+            url.as_ptr() as u64,
+            url.len() as u64,
+            body.as_ptr() as u64,
+            body.len() as u64,
+            response_buf.as_mut_ptr() as u64,
+            response_buf.len() as u64,
+        )
+    };
+    if ret == u64::MAX { 0 } else { ret as usize }
+}
+
 /// Flush GPU framebuffer dirty rectangle to display (fire-and-forget).
 pub fn gpu_flush(x: u32, y: u32, w: u32, h: u32) {
     unsafe { syscall4(SYS_GPU_FLUSH, x as u64, y as u64, w as u64, h as u64); }
