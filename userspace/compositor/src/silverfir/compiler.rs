@@ -39,9 +39,19 @@ impl CodeBuffer {
         self.code.len()
     }
 
-    /// Get the emitted code.
+    /// Get the emitted code (immutable).
     pub fn code(&self) -> &[u8] {
         &self.code
+    }
+
+    /// Get the emitted code (mutable, for jump patching).
+    pub fn code_mut(&mut self) -> &mut [u8] {
+        &mut self.code
+    }
+
+    /// Consume the buffer and return the code bytes.
+    pub fn into_code(self) -> Vec<u8> {
+        self.code
     }
 
     // ── x86_64 instruction helpers ──────────────────────────────────
