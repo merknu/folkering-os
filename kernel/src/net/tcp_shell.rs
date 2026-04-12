@@ -274,40 +274,13 @@ fn cmd_ping(args: &str, state: &mut super::state::NetState) -> String {
     let target = Ipv4Address::new(octets[0], octets[1], octets[2], octets[3]);
     super::icmp::send_ping_inner(state, target);
 
-    // Poll for reply (up to ~3s)
-    let start = crate::timer::uptime_ms();
-    loop {
-        let now = smoltcp::time::Instant::from_millis(crate::timer::uptime_ms() as i64);
-        let mut device = super::device::FolkeringDevice;
-        state.iface.poll(now, &mut device, &mut state.sockets);
-
-        // Check ICMP reply
-        let icmp_socket = state.sockets.get_mut::<smoltcp::socket::icmp::Socket>(state.icmp_handle);
-        if icmp_socket.can_recv() {
-            if let Ok((data, _from)) = icmp_socket.recv() {
-                if let Ok(pkt) = smoltcp::wire::Icmpv4Packet::new_checked(data) {
-                    if let Ok(smoltcp::wire::Icmpv4Repr::EchoReply { seq_no, .. }) =
-                        smoltcp::wire::Icmpv4Repr::parse(&pkt, &smoltcp::phy::ChecksumCapabilities::default())
-                    {
-                        let rtt = crate::timer::uptime_ms().saturating_sub(start);
-                        let mut out = String::with_capacity(64);
-                        out.push_str("reply from ");
-                        out.push_str(args);
-                        out.push_str(" seq=");
-                        push_dec(&mut out, seq_no as u32);
-                        out.push_str(" time=");
-                        push_dec(&mut out, rtt as u32);
-                        out.push_str("ms");
-                        return out;
-                    }
-                }
-            }
-        }
-
-        if crate::timer::uptime_ms() - start > 3000 { break; }
-        for _ in 0..1000 { core::hint::spin_loop(); }
-    }
-    String::from("request timed out (3s)")
+    // Non-blocking: just report that ping was sent.
+    // Reply will appear in serial log via check_ping_reply.
+    let mut out = String::with_capacity(64);
+    out.push_str("ping sent to ");
+    out.push_str(args);
+    out.push_str(" (reply in serial log)");
+    out
 }
 
 fn cmd_traceroute(args: &str, state: &mut super::state::NetState) -> String {

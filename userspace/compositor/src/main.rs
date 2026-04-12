@@ -636,6 +636,16 @@ fn main() -> ! {
             libfolk::sys::io::write_str(crate::util::format_usize(draug.task_levels[i] as usize, &mut nb));
         }
         libfolk::sys::io::write_str("]\n");
+
+        // Push restored state to kernel bridge so TCP shell shows correct values
+        libfolk::sys::draug_bridge_update(
+            draug.refactor_iter, draug.refactor_passed, draug.refactor_failed,
+            draug.refactor_retries,
+            draug.tasks_at_level(1) as u8, draug.tasks_at_level(2) as u8,
+            draug.tasks_at_level(3) as u8,
+            if draug.plan_mode_active { 1 } else { 0 },
+            draug.complex_task_idx as u8, 0, 0,
+        );
     }
 
     // Pillar 4: WASM warm cache — pre-compiled modules for instant response

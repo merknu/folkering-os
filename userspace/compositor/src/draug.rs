@@ -650,6 +650,12 @@ impl DraugDaemon {
         self.plan_mode_active = data[25] != 0;
         let _ = libfolk::sys::shmem_unmap(resp.shmem_handle, VADDR);
         let _ = libfolk::sys::shmem_destroy(resp.shmem_handle);
+
+        // If we restored state, skip the one-shot KHunt + KGraph test
+        // (they already ran in the session that saved this state).
+        // This saves 30-60s of boot time.
+        self.knowledge_hunted = true;
+
         true
     }
 
