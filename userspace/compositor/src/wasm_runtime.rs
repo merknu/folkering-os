@@ -45,6 +45,9 @@ use wasmi::*;
 #[path = "host_api/mod.rs"]
 mod host_api;
 
+#[path = "silverfir/mod.rs"]
+mod silverfir;
+
 /// Maximum fuel (instructions) per WASM execution tick
 /// Default fuel for WASM apps (1M instructions per frame)
 const FUEL_LIMIT: u64 = 1_000_000;
@@ -239,10 +242,25 @@ pub fn execute_wasm_with_backend(
     match backend {
         WasmBackend::Sandboxed => execute_wasm_sandboxed(wasm_bytes, config),
         WasmBackend::Trusted => {
-            // Silverfir-nano JIT: placeholder until the engine is integrated.
-            // For now, fall back to wasmi with a log message.
-            libfolk::sys::io::write_str("[WASM] Trusted backend requested — falling back to wasmi (silverfir-nano not yet active)\n");
-            execute_wasm_sandboxed(wasm_bytes, config)
+            // Attempt silverfir-nano JIT compilation.
+            // Falls back to wasmi if JIT is not yet implemented or fails.
+            match silverfir::JitModule::compile(wasm_bytes) {
+                Ok(mut module) => {
+                    libfolk::sys::io::write_str("[WASM] silverfir-nano: JIT compiled OK\n");
+                    match module.call_void("run") {
+                        Ok(()) => (WasmResult::Ok, empty_output()),
+                        Err(_) => (WasmResult::Trap(String::from("silverfir JIT trap")), empty_output()),
+                    }
+                }
+                Err(silverfir::JitError::NotYetImplemented) => {
+                    // Expected: JIT scaffold, fall back to wasmi
+                    execute_wasm_sandboxed(wasm_bytes, config)
+                }
+                Err(_) => {
+                    libfolk::sys::io::write_str("[WASM] silverfir-nano: compilation failed, falling back to wasmi\n");
+                    execute_wasm_sandboxed(wasm_bytes, config)
+                }
+            }
         }
     }
 }
