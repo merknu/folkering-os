@@ -270,10 +270,13 @@ pub(super) fn run_refactor_step(draug: &mut compositor::draug::DraugDaemon, now_
     let iter = draug.advance_refactor(now_ms);
 
     // ── Stability Fix 7: proxy health check (cached 60s) ─────────────
-    // Only re-ping if last ping was >60s ago or last ping failed.
+    // Re-ping if: never pinged (last_ping_ms==0), >60s stale, or last failed.
     {
         let now = libfolk::sys::uptime();
-        if now.saturating_sub(draug.last_ping_ms) > 60_000 || draug.last_ping_ok == false {
+        let needs_ping = draug.last_ping_ms == 0
+            || !draug.last_ping_ok
+            || now.saturating_sub(draug.last_ping_ms) > 60_000;
+        if needs_ping {
             let ok = libfolk::sys::proxy_ping();
             draug.last_ping_ms = now;
             draug.last_ping_ok = ok;

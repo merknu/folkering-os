@@ -158,26 +158,32 @@ pub(super) fn tick(
     }
 
     // ===== Draug Bridge: push status to kernel for TCP shell =====
+    // Rate-limited: every 60 ticks (~1/sec at 60Hz) to avoid
+    // unnecessary syscall overhead.
     {
-        let paused = libfolk::sys::draug_bridge_update(
-            draug.refactor_iter,
-            draug.refactor_passed,
-            draug.refactor_failed,
-            draug.refactor_retries,
-            draug.tasks_at_level(1) as u8,
-            draug.tasks_at_level(2) as u8,
-            draug.tasks_at_level(3) as u8,
-            if draug.plan_mode_active { 1 } else { 0 },
-            draug.complex_task_idx as u8,
-            if draug.refactor_hibernating { 1 } else { 0 },
-            draug.consecutive_skips.min(255) as u8,
-        );
-        if paused && draug.is_active() {
-            draug.set_active(false);
-            write_str("[Draug] PAUSED via remote shell\n");
-        } else if !paused && !draug.is_active() {
-            draug.set_active(true);
-            write_str("[Draug] RESUMED via remote shell\n");
+        static BRIDGE_COUNTER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+        let count = BRIDGE_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if count % 60 == 0 {
+            let paused = libfolk::sys::draug_bridge_update(
+                draug.refactor_iter,
+                draug.refactor_passed,
+                draug.refactor_failed,
+                draug.refactor_retries,
+                draug.tasks_at_level(1) as u8,
+                draug.tasks_at_level(2) as u8,
+                draug.tasks_at_level(3) as u8,
+                if draug.plan_mode_active { 1 } else { 0 },
+                draug.complex_task_idx as u8,
+                if draug.refactor_hibernating { 1 } else { 0 },
+                draug.consecutive_skips.min(255) as u8,
+            );
+            if paused && draug.is_active() {
+                draug.set_active(false);
+                write_str("[Draug] PAUSED via remote shell\n");
+            } else if !paused && !draug.is_active() {
+                draug.set_active(true);
+                write_str("[Draug] RESUMED via remote shell\n");
+            }
         }
     }
 

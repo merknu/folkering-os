@@ -66,7 +66,11 @@ pub fn init(state: &mut super::state::NetState) {
 
 /// Poll the TCP shell. Called from `net::poll()` with NET_STATE held.
 pub fn poll(state: &mut super::state::NetState) {
-    let mut guard = SHELL.lock();
+    // try_lock: avoid spinning if held (e.g. recursive call from tcp_plain)
+    let mut guard = match SHELL.try_lock() {
+        Some(g) => g,
+        None => return,
+    };
     let shell = match guard.as_mut() {
         Some(s) => s,
         None => return,
