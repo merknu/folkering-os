@@ -48,6 +48,10 @@ mod op {
     pub const I32_GT_S: u8 = 0x4A;
     pub const I32_LE_S: u8 = 0x4C;
     pub const I32_GE_S: u8 = 0x4E;
+    pub const I32_LT_U: u8 = 0x49;
+    pub const I32_GT_U: u8 = 0x4B;
+    pub const I32_LE_U: u8 = 0x4D;
+    pub const I32_GE_U: u8 = 0x4F;
     pub const I32_ADD: u8 = 0x6A;
     pub const I32_SUB: u8 = 0x6B;
     pub const I32_MUL: u8 = 0x6C;
@@ -57,6 +61,8 @@ mod op {
     pub const I32_SHL: u8 = 0x74;
     pub const I32_SHR_S: u8 = 0x75;
     pub const I32_SHR_U: u8 = 0x76;
+    pub const I32_STORE: u8 = 0x36;
+    pub const I32_LOAD: u8 = 0x28;
     pub const I64_ADD: u8 = 0x7C;
     pub const I64_SUB: u8 = 0x7D;
     pub const I64_MUL: u8 = 0x7E;
@@ -226,6 +232,37 @@ pub fn translate_function(
             op::I32_GT_S => { emit_cmp_i32(&mut buf, 0x9F); } // setg
             op::I32_LE_S => { emit_cmp_i32(&mut buf, 0x9E); } // setle
             op::I32_GE_S => { emit_cmp_i32(&mut buf, 0x9D); } // setge
+            op::I32_LT_U => { emit_cmp_i32(&mut buf, 0x92); } // setb (unsigned)
+            op::I32_GT_U => { emit_cmp_i32(&mut buf, 0x97); } // seta
+            op::I32_LE_U => { emit_cmp_i32(&mut buf, 0x96); } // setbe
+            op::I32_GE_U => { emit_cmp_i32(&mut buf, 0x93); } // setae
+
+            // ── i32 memory operations ────────────────────────────────
+            // Note: these are simplified — no memory base pointer yet.
+            // For silverfir v1, memory operations are NOPs (just consume args).
+            op::I32_STORE => {
+                // memarg: alignment (LEB128) + offset (LEB128)
+                let (_, n1) = read_leb128_i32(&bc[pc..])
+                    .map_err(|_| super::JitError::ParseError(alloc::string::String::from("bad align")))?;
+                pc += n1;
+                let (_, n2) = read_leb128_i32(&bc[pc..])
+                    .map_err(|_| super::JitError::ParseError(alloc::string::String::from("bad offset")))?;
+                pc += n2;
+                // pop value, pop addr — discard both (no memory impl yet)
+                buf.emit(&[0x5B]); // pop rbx (value)
+                buf.emit(&[0x58]); // pop rax (addr)
+            }
+            op::I32_LOAD => {
+                let (_, n1) = read_leb128_i32(&bc[pc..])
+                    .map_err(|_| super::JitError::ParseError(alloc::string::String::from("bad align")))?;
+                pc += n1;
+                let (_, n2) = read_leb128_i32(&bc[pc..])
+                    .map_err(|_| super::JitError::ParseError(alloc::string::String::from("bad offset")))?;
+                pc += n2;
+                // pop addr, push 0 (no memory impl yet)
+                buf.emit(&[0x58]); // pop rax (addr)
+                buf.emit(&[0x6A, 0x00]); // push 0
+            }
 
             // ── Control flow ────────────────────────────────────────
             op::BLOCK => {
