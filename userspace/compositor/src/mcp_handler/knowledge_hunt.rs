@@ -267,10 +267,12 @@ pub(super) fn run_refactor_step(draug: &mut compositor::draug::DraugDaemon, now_
     use libfolk::sys::{fbp_patch, llm_generate};
     use super::agent_planner;
 
-    let iter = draug.advance_refactor(now_ms);
+    // NOTE: advance_refactor() is called AFTER proxy check to avoid
+    // counting skips toward REFACTOR_MAX_ITER. Without this, ~4-16
+    // hours of Ollama downtime would permanently kill the loop.
+    draug.last_refactor_ms = now_ms;
 
     // ── Stability Fix 7: proxy health check (cached 60s) ─────────────
-    // Re-ping if: never pinged (last_ping_ms==0), >60s stale, or last failed.
     {
         let now = libfolk::sys::uptime();
         let needs_ping = draug.last_ping_ms == 0
@@ -283,10 +285,13 @@ pub(super) fn run_refactor_step(draug: &mut compositor::draug::DraugDaemon, now_
             if !ok {
                 write_str("[Draug] SKIP: proxy unreachable\n");
                 draug.record_skip();
-                return;
+                return; // iter NOT incremented
             }
         }
     }
+
+    // Increment iter only when we actually attempt work
+    let iter = draug.advance_refactor(now_ms);
 
     // ── Phase 15: Plan-and-Solve mode ────────────────────────────────
     // Once the L1-L3 skill tree completes, Draug transitions to
@@ -436,9 +441,10 @@ pub(super) fn run_refactor_step(draug: &mut compositor::draug::DraugDaemon, now_
             draug.clear_task_error(task_idx);
             draug.save_state();
 
-            // Store L1 code in memory for L2/L3 prompts
+            // Store L1 code in memory for L2/L3 prompts + persist to Synapse
             if level == 1 {
                 draug.store_task_code(task_idx, code);
+                draug.save_task_code(task_idx);
             }
 
             write_str("[Draug] ");

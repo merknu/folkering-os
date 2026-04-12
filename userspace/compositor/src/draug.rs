@@ -634,7 +634,7 @@ impl DraugDaemon {
         self.refactor_hibernating = false;
     }
 
-    /// Fix 1: Save critical state to Synapse (26 bytes).
+    /// Save critical state to Synapse.
     pub fn save_state(&self) {
         let mut buf = [0u8; 26];
         buf[0..20].copy_from_slice(&self.task_levels);
@@ -642,6 +642,21 @@ impl DraugDaemon {
         buf[24] = self.complex_task_idx as u8;
         buf[25] = if self.plan_mode_active { 1 } else { 0 };
         let _ = libfolk::sys::synapse::write_file("draug_state.bin", &buf);
+    }
+
+    /// Save L1 code for a specific task (called after L1 PASS).
+    /// Stored separately from the 26-byte state to keep save_state fast.
+    pub fn save_task_code(&self, idx: usize) {
+        if idx >= TASK_COUNT { return; }
+        if let Some(ref code) = self.task_code[idx] {
+            let mut name = alloc::string::String::with_capacity(24);
+            name.push_str("draug_code_");
+            // Simple decimal index
+            if idx >= 10 { name.push((b'0' + (idx / 10) as u8) as char); }
+            name.push((b'0' + (idx % 10) as u8) as char);
+            name.push_str(".rs");
+            let _ = libfolk::sys::synapse::write_file(&name, code.as_bytes());
+        }
     }
 
     /// Fix 1: Restore state from Synapse on boot.
@@ -663,10 +678,35 @@ impl DraugDaemon {
         let _ = libfolk::sys::shmem_unmap(resp.shmem_handle, VADDR);
         let _ = libfolk::sys::shmem_destroy(resp.shmem_handle);
 
-        // If we restored state, skip the one-shot KHunt + KGraph test
-        // (they already ran in the session that saved this state).
-        // This saves 30-60s of boot time.
+        // Skip the one-shot KHunt + KGraph test (saves 30-60s boot time)
         self.knowledge_hunted = true;
+
+        // Restore L1 code for L3 prompts
+        for i in 0..TASK_COUNT {
+            if self.task_levels[i] >= 1 {
+                let mut name = alloc::string::String::with_capacity(24);
+                name.push_str("draug_code_");
+                if i >= 10 { name.push((b'0' + (i / 10) as u8) as char); }
+                name.push((b'0' + (i % 10) as u8) as char);
+                name.push_str(".rs");
+                if let Ok(resp) = libfolk::sys::synapse::read_file_shmem(&name) {
+                    let sz = resp.size as usize;
+                    if sz > 0 && sz < 4096 {
+                        const CODE_VADDR: usize = 0x30004000;
+                        if libfolk::sys::shmem_map(resp.shmem_handle, CODE_VADDR).is_ok() {
+                            let bytes = unsafe {
+                                core::slice::from_raw_parts(CODE_VADDR as *const u8, sz)
+                            };
+                            if let Ok(s) = core::str::from_utf8(bytes) {
+                                self.task_code[i] = Some(alloc::string::String::from(s));
+                            }
+                            let _ = libfolk::sys::shmem_unmap(resp.shmem_handle, CODE_VADDR);
+                        }
+                        let _ = libfolk::sys::shmem_destroy(resp.shmem_handle);
+                    }
+                }
+            }
+        }
 
         true
     }

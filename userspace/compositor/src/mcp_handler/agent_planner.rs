@@ -160,6 +160,9 @@ pub fn plan_task(task_id: &str, task_desc: &str) -> Option<TaskPlan> {
 /// Execute the next pending step in a plan.
 /// Returns true if a step was attempted (pass or fail).
 pub fn execute_next_step(plan: &mut TaskPlan) -> bool {
+    // Guard: don't execute steps on completed/abandoned plans
+    if plan.completed { return false; }
+
     // Find first pending step
     let step_idx = match plan.steps.iter().position(|s| !s.done) {
         Some(i) => i,
