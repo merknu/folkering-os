@@ -25,7 +25,9 @@ use compositor::state::{McpState, StreamState, WasmState};
 use compositor::window_manager::WindowManager;
 
 mod agent_logic;
+pub(crate) mod agent_planner;
 mod autodream;
+pub(crate) mod knowledge_hunt;
 mod token_stream;
 
 // ── Constants (shared between submodules) ─────────────────────────────

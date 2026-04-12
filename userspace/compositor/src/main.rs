@@ -624,7 +624,19 @@ fn main() -> ! {
     // last_clock_second now in render (RenderState)
     // tz_offset_minutes, tz_synced, tz_sync_pending now in mcp
     let mut active_agent: Option<compositor::agent::AgentSession> = None; // ReAct agentic loop
-    let mut draug = compositor::draug::DraugDaemon::new(); // Background AI daemon
+    let mut draug = compositor::draug::DraugDaemon::new();
+    // Stability Fix 1: restore state from previous session
+    if draug.restore_state() {
+        libfolk::sys::io::write_str("[Draug] Restored state: iter=");
+        let mut nb = [0u8; 16];
+        libfolk::sys::io::write_str(crate::util::format_usize(draug.refactor_iter as usize, &mut nb));
+        libfolk::sys::io::write_str(" levels=[");
+        for i in 0..20 {
+            if i > 0 { libfolk::sys::io::write_str(","); }
+            libfolk::sys::io::write_str(crate::util::format_usize(draug.task_levels[i] as usize, &mut nb));
+        }
+        libfolk::sys::io::write_str("]\n");
+    }
 
     // Pillar 4: WASM warm cache — pre-compiled modules for instant response
     // wasm.cache initialized by WasmState::new()

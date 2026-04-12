@@ -161,7 +161,7 @@ pub fn filter_packet(frame: &[u8]) -> FirewallAction {
         return FirewallAction::Drop; // Silently drop all traffic from blocked IPs
     }
 
-    // Rule 5: TCP — block unsolicited inbound SYN
+    // Rule 5: TCP — block unsolicited inbound SYN (except whitelisted ports)
     if proto == PROTO_TCP {
         // TCP flags at offset 13 within TCP header
         if frame.len() < transport_offset + 14 {
@@ -171,6 +171,12 @@ pub fn filter_packet(frame: &[u8]) -> FirewallAction {
 
         // SYN set, ACK not set → unsolicited connection attempt
         if (tcp_flags & TCP_SYN) != 0 && (tcp_flags & TCP_ACK) == 0 {
+            // Allow SYN to whitelisted local server ports
+            if dst_port == 2222 {
+                // TCP remote shell — allow inbound connections
+                ALLOWS.fetch_add(1, Ordering::Relaxed);
+                return FirewallAction::Allow;
+            }
             // Track for anomaly detection (auto-block after 3 attempts)
             record_syn_attempt(src_ip);
             log_drop(src_ip, src_port, dst_port);

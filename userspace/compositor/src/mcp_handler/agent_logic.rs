@@ -19,7 +19,7 @@ use compositor::window_manager::WindowManager;
 
 use crate::util::format_usize;
 
-use super::{autodream, rdtsc, AiTickResult};
+use super::{autodream, knowledge_hunt, rdtsc, AiTickResult};
 
 pub(super) fn tick(
     mcp: &mut McpState,
@@ -123,10 +123,73 @@ pub(super) fn tick(
         }
     }
 
+    // ===== Phase 7 — Knowledge Hunt =====
+    //
+    // Fires once per boot when the user has been idle for ~15 s.
+    // Gated before AutoDream because it's a single cheap fetch, and
+    // we want it to land BEFORE the 45-minute AutoDream threshold so
+    // the demo is visible without a long wait.
+    {
+        let hunt_ms = if tsc_per_us > 0 { rdtsc() / tsc_per_us / 1000 } else { libfolk::sys::uptime() };
+        if draug.should_hunt_knowledge(hunt_ms)
+            && active_agent.is_none()
+            && mcp.async_tool_gen.is_none()
+        {
+            knowledge_hunt::run(draug);
+            did_work = true;
+        }
+    }
+
+    // ===== Phase 13 — Overnight refactor loop =====
+    //
+    // After the Knowledge Hunt has fired (Phase 7) and the system is
+    // idle, Draug rotates through a list of programming tasks, one
+    // per minute, prompting Gemma4 and sandboxing the result. The
+    // gate is self-rate-limiting; no extra scheduling needed.
+    {
+        let refactor_ms = if tsc_per_us > 0 { rdtsc() / tsc_per_us / 1000 } else { libfolk::sys::uptime() };
+        if draug.should_run_refactor_step(refactor_ms)
+            && active_agent.is_none()
+            && mcp.async_tool_gen.is_none()
+        {
+            knowledge_hunt::run_refactor_step(draug, refactor_ms);
+            did_work = true;
+        }
+    }
+
+    // ===== Draug Bridge: push status to kernel for TCP shell =====
+    {
+        let paused = libfolk::sys::draug_bridge_update(
+            draug.refactor_iter,
+            draug.refactor_passed,
+            draug.refactor_failed,
+            draug.refactor_retries,
+            draug.tasks_at_level(1) as u8,
+            draug.tasks_at_level(2) as u8,
+            draug.tasks_at_level(3) as u8,
+            if draug.plan_mode_active { 1 } else { 0 },
+            draug.complex_task_idx as u8,
+            if draug.refactor_hibernating { 1 } else { 0 },
+            draug.consecutive_skips.min(255) as u8,
+        );
+        if paused && draug.is_active() {
+            draug.set_active(false);
+            write_str("[Draug] PAUSED via remote shell\n");
+        } else if !paused && !draug.is_active() {
+            draug.set_active(true);
+            write_str("[Draug] RESUMED via remote shell\n");
+        }
+    }
+
     // ===== AutoDream cycle start (delegates to autodream module) =====
+    // Phase 14: don't dream if the skill tree still has work to do —
+    // the refactor loop takes priority over AutoDream.
     let dream_ms = if tsc_per_us > 0 { rdtsc() / tsc_per_us / 1000 } else { 0 };
     if draug.should_dream(dream_ms) && active_agent.is_none() && mcp.async_tool_gen.is_none()
         && !draug.should_yield_tokens(active_agent.is_some(), dream_ms)
+        && draug.next_task_and_level().is_none()
+        && !draug.plan_mode_active
+        && draug.complex_task_idx >= compositor::draug::COMPLEX_TASK_COUNT
     {
         autodream::start_dream_cycle(mcp, wasm, draug, fb, dream_ms);
     }

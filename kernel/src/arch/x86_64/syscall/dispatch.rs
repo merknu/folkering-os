@@ -81,6 +81,40 @@ pub(super) extern "C" fn syscall_handler(
         0x5C => syscall_ntp_query(arg1),
         // HTTP POST: url, body, response buffer (form submission)
         0x5D => syscall_http_post(arg1, arg2, arg3, arg4, arg5, arg6),
+        // FBP request: fetch DOM snapshot from host-side proxy
+        0x5E => syscall_fbp_request(arg1, arg2, arg3, arg4),
+        // FBP interact: send an INTERACTION_EVENT and read the post-
+        // click DOM snapshot on a single persistent TCP session.
+        0x5F => syscall_fbp_interact(arg1, arg2, arg3, arg4, arg5),
+        // FBP patch (Phase 11): ship a .rs file to the proxy's
+        // draug-sandbox crate and run cargo check on it.
+        // 4 args — lengths packed into arg4 to dodge the pre-existing
+        // 6-arg ABI gap in the syscall entry asm.
+        0x61 => syscall_fbp_patch(arg1, arg2, arg3, arg4),
+        // LLM gateway (Phase 12): Ollama bridge via proxy.
+        // Same 4-arg packed-lengths pattern as fbp_patch.
+        0x62 => syscall_llm_generate(arg1, arg2, arg3, arg4),
+        // WASM compilation (Phase 16): compile sandbox to wasm32
+        0x63 => syscall_wasm_compile(arg1, arg2),
+        // Proxy health check (Stability Fix 7)
+        0x64 => syscall_proxy_ping(),
+        // Draug bridge: push status to tcp_shell atomics, return pause flag
+        0xD0 => {
+            use crate::net::tcp_shell::*;
+            use core::sync::atomic::Ordering::Relaxed;
+            DRAUG_ITER.store((arg1 >> 32) as u32, Relaxed);
+            DRAUG_PASSED.store(arg1 as u32, Relaxed);
+            DRAUG_FAILED.store((arg2 >> 32) as u32, Relaxed);
+            DRAUG_RETRIES.store(arg2 as u32, Relaxed);
+            DRAUG_STATE[0].store((arg3 >> 24) as u8, Relaxed); // L1
+            DRAUG_STATE[1].store((arg3 >> 16) as u8, Relaxed); // L2
+            DRAUG_STATE[2].store((arg3 >> 8) as u8, Relaxed);  // L3
+            DRAUG_STATE[3].store(arg3 as u8, Relaxed);          // plan_mode
+            DRAUG_STATE[4].store((arg4 >> 16) as u8, Relaxed); // complex_idx
+            DRAUG_STATE[5].store((arg4 >> 8) as u8, Relaxed);  // hibernating
+            DRAUG_STATE[6].store(arg4 as u8, Relaxed);          // consec_skips
+            DRAUG_PAUSE_FLAG.load(Relaxed) as u64
+        },
         // SMP: Parallel GEMM
         0x60 => syscall_parallel_gemm(arg1, arg2, arg3, arg4, arg5, arg6),
         // Hybrid AI: Ask Gemini cloud API

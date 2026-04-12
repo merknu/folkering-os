@@ -16,6 +16,7 @@ pub mod github;
 pub mod json;
 pub mod tls;
 pub mod tls_verify;
+pub mod tcp_plain;
 pub mod websocket;
 
 // Internal submodules (refactored from former mod.rs body)
@@ -26,6 +27,7 @@ pub mod icmp;
 pub mod dns;
 pub mod udp;
 pub mod ntp;
+pub mod tcp_shell;
 
 // ── Re-exports for the public API ──────────────────────────────────────
 //
@@ -202,6 +204,9 @@ pub fn poll() {
                 .update_servers(&dns_servers);
 
             state.has_ip = true;
+
+            // Start TCP shell server once we have an IP
+            tcp_shell::init(state);
         }
         Some(dhcpv4::Event::Deconfigured) => {
             crate::serial_strln!("[NET] DHCP: lost configuration");
@@ -213,6 +218,9 @@ pub fn poll() {
 
     // Check for ICMP echo replies
     icmp::check_ping_reply(state);
+
+    // TCP remote shell
+    tcp_shell::poll(state);
 }
 
 // ── Public API ─────────────────────────────────────────────────────────
