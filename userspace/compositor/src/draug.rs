@@ -408,6 +408,9 @@ pub struct DraugDaemon {
     pub consecutive_skips: u32,
     /// Fix 8: Hibernation mode — set after 30 consecutive skips.
     pub refactor_hibernating: bool,
+    /// Cached proxy ping result (avoid 2s TCP per iteration).
+    pub last_ping_ms: u64,
+    pub last_ping_ok: bool,
 }
 
 // ── Phase 15 types (must live in lib crate so draug.rs can own them) ──
@@ -483,6 +486,8 @@ impl DraugDaemon {
             task_errors: [const { None }; TASK_COUNT],
             consecutive_skips: 0,
             refactor_hibernating: false,
+            last_ping_ms: 0,
+            last_ping_ok: false,
         }
     }
 
@@ -518,14 +523,21 @@ impl DraugDaemon {
         if self.last_refactor_ms == 0 {
             return true;
         }
-        // Fix 5: adaptive backoff when Ollama is struggling
-        let effective_interval = if self.consecutive_skips > 5 {
+        // Adaptive interval: L1 with fast 7b model needs less wait,
+        // L2+ with 31b needs full 60s. Backoff on skips.
+        let base_interval = if self.consecutive_skips > 5 {
             let multiplier = 1u64 << ((self.consecutive_skips.saturating_sub(5)).min(3) as u64);
-            (REFACTOR_INTERVAL_MS * multiplier).min(300_000) // cap at 5 min
+            (REFACTOR_INTERVAL_MS * multiplier).min(300_000)
+        } else if !self.plan_mode_active {
+            // Skill tree mode: check current level
+            match self.next_task_and_level() {
+                Some((_, 1)) => 15_000,  // L1: 15s (7b model responds in ~3s)
+                _ => REFACTOR_INTERVAL_MS, // L2+: 60s
+            }
         } else {
-            REFACTOR_INTERVAL_MS
+            REFACTOR_INTERVAL_MS // Plan mode: 60s (31b model)
         };
-        now_ms.saturating_sub(self.last_refactor_ms) >= effective_interval
+        now_ms.saturating_sub(self.last_refactor_ms) >= base_interval
     }
 
     /// Advance the refactor counter. Called BEFORE the actual work so

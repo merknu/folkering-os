@@ -269,13 +269,20 @@ pub(super) fn run_refactor_step(draug: &mut compositor::draug::DraugDaemon, now_
 
     let iter = draug.advance_refactor(now_ms);
 
-    // ── Stability Fix 7: proxy health check ─────────────────────────
-    // Fast-fail if proxy is down (~2s) instead of waiting 5+ minutes
-    // for the LLM TCP timeout.
-    if !libfolk::sys::proxy_ping() {
-        write_str("[Draug] SKIP: proxy unreachable\n");
-        draug.record_skip();
-        return;
+    // ── Stability Fix 7: proxy health check (cached 60s) ─────────────
+    // Only re-ping if last ping was >60s ago or last ping failed.
+    {
+        let now = libfolk::sys::uptime();
+        if now.saturating_sub(draug.last_ping_ms) > 60_000 || draug.last_ping_ok == false {
+            let ok = libfolk::sys::proxy_ping();
+            draug.last_ping_ms = now;
+            draug.last_ping_ok = ok;
+            if !ok {
+                write_str("[Draug] SKIP: proxy unreachable\n");
+                draug.record_skip();
+                return;
+            }
+        }
     }
 
     // ── Phase 15: Plan-and-Solve mode ────────────────────────────────
