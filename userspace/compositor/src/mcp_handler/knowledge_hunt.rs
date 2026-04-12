@@ -303,6 +303,15 @@ pub(super) fn run_refactor_step(draug: &mut compositor::draug::DraugDaemon, now_
     let (task_idx, level) = draug.next_task_and_level().unwrap();
     let (task_id, task_desc) = REFACTOR_TASKS[task_idx];
 
+    // Update bridge with current task for TCP shell
+    {
+        let mut label = alloc::string::String::with_capacity(32);
+        label.push_str(task_id);
+        label.push_str(" L");
+        push_decimal(&mut label, level as u32);
+        libfolk::sys::draug_bridge_set_task(&label);
+    }
+
     write_str("\n[Draug] ============================================\n");
     write_str("[Draug] iter=");
     write_dec(iter);

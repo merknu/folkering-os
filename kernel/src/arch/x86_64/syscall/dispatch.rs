@@ -115,6 +115,18 @@ pub(super) extern "C" fn syscall_handler(
             DRAUG_STATE[6].store(arg4 as u8, Relaxed);          // consec_skips
             DRAUG_PAUSE_FLAG.load(Relaxed) as u64
         },
+        // Draug bridge: set current task name string
+        0xD1 => {
+            let ptr = arg1 as *const u8;
+            let len = (arg2 as usize).min(31);
+            let mut buf = crate::net::tcp_shell::DRAUG_CURRENT_TASK.lock();
+            if len > 0 {
+                let src = unsafe { core::slice::from_raw_parts(ptr, len) };
+                buf[..len].copy_from_slice(src);
+            }
+            buf[len] = 0; // NUL terminate
+            0
+        },
         // SMP: Parallel GEMM
         0x60 => syscall_parallel_gemm(arg1, arg2, arg3, arg4, arg5, arg6),
         // Hybrid AI: Ask Gemini cloud API

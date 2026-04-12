@@ -26,8 +26,10 @@ pub static DRAUG_PASSED: AtomicU32 = AtomicU32::new(0);
 pub static DRAUG_FAILED: AtomicU32 = AtomicU32::new(0);
 pub static DRAUG_SKIPS: AtomicU32 = AtomicU32::new(0);
 pub static DRAUG_RETRIES: AtomicU32 = AtomicU32::new(0);
-/// Packed: [L1_count, L2_count, L3_count, plan_mode, complex_idx, hibernating, consecutive_skips, 0]
+/// [L1_count, L2_count, L3_count, plan_mode, complex_idx, hibernating, consecutive_skips, 0]
 pub static DRAUG_STATE: [AtomicU8; 8] = [const { AtomicU8::new(0) }; 8];
+/// Current task name (written by compositor, 31 bytes + NUL)
+pub static DRAUG_CURRENT_TASK: spin::Mutex<[u8; 32]> = spin::Mutex::new([0u8; 32]);
 
 // ── Shell State ─────────────────────────────────────────────────────────
 
@@ -162,8 +164,8 @@ fn dispatch_command(line: &[u8], state: &mut super::state::NetState) -> String {
         "net" => cmd_net(state),
         "df" => cmd_df(),
         "ping" => cmd_ping(args, state),
-        "traceroute" | "tracert" => cmd_traceroute(args, state),
         "draug" => cmd_draug(args),
+        "clear" => String::from("\x1b[2J\x1b[H"),
         "" => String::new(),
         _ => {
             let mut r = String::from("unknown command: ");
@@ -182,10 +184,10 @@ fn cmd_help() -> String {
          \x20 uptime           system uptime\r\n\
          \x20 mem              memory statistics\r\n\
          \x20 net              network configuration\r\n\
-         \x20 df               disk / database usage\r\n\
+         \x20 df               disk usage\r\n\
          \x20 ping <ip>        send ICMP echo\r\n\
-         \x20 traceroute <ip>  trace route (max 16 hops)\r\n\
-         \x20 draug status     Draug AI daemon status\r\n\
+         \x20 clear            clear screen\r\n\
+         \x20 draug status     AI daemon status + current task\r\n\
          \x20 draug pause      pause the refactor loop\r\n\
          \x20 draug resume     resume the refactor loop"
     )
@@ -299,19 +301,13 @@ fn cmd_net(state: &mut super::state::NetState) -> String {
 }
 
 fn cmd_df() -> String {
-    // Report Synapse DB usage via the kernel's block device stats
-    let mut out = String::with_capacity(128);
-    out.push_str("Filesystem       Size   Used\r\n");
-    out.push_str("virtio-data.img  4 MB   ");
-
-    // We can't query Synapse directly from kernel, but we know
-    // the DB starts at sector 2048 and the disk is ~365 MB.
-    // Report what we know statically.
-    out.push_str("(query via TCP shell not available)\r\n");
-    out.push_str("draug-sandbox/   archive has ");
-
-    // Count archived files is host-side, not accessible from kernel.
-    out.push_str("N files (check host)");
+    let mut out = String::with_capacity(256);
+    out.push_str("Filesystem          Size     Notes\r\n");
+    out.push_str("---                 ----     -----\r\n");
+    out.push_str("virtio-data.img     365 MB   model(364MB) + synapse DB(4MB)\r\n");
+    out.push_str("synapse (SQLite)    4 MB     files + knowledge graph\r\n");
+    out.push_str("kernel heap         16 MB    (see 'mem' for details)\r\n");
+    out.push_str("draug archives      host     ~/folkering/draug-sandbox/archive/");
     out
 }
 
@@ -333,96 +329,6 @@ fn cmd_ping(args: &str, state: &mut super::state::NetState) -> String {
     out
 }
 
-fn cmd_traceroute(args: &str, state: &mut super::state::NetState) -> String {
-    let octets = match parse_ip(args) {
-        Some(o) => o,
-        None => return String::from("usage: traceroute <x.x.x.x>"),
-    };
-
-    let target = Ipv4Address::new(octets[0], octets[1], octets[2], octets[3]);
-    let mut out = String::with_capacity(512);
-    out.push_str("traceroute to ");
-    out.push_str(args);
-    out.push_str(", max 16 hops\r\n");
-
-    for ttl in 1..=16u8 {
-        push_decimal_padded(&mut out, ttl as u32, 2);
-        out.push_str("  ");
-
-        // Send ICMP echo with this TTL
-        state.ping_seq = state.ping_seq.wrapping_add(1);
-        let seq = state.ping_seq;
-
-        let icmp_socket = state.sockets.get_mut::<smoltcp::socket::icmp::Socket>(state.icmp_handle);
-        if !icmp_socket.is_open() {
-            let _ = icmp_socket.bind(smoltcp::socket::icmp::Endpoint::Ident(super::icmp::PING_IDENT));
-        }
-        let echo = smoltcp::wire::Icmpv4Repr::EchoRequest {
-            ident: super::icmp::PING_IDENT,
-            seq_no: seq,
-            data: b"folk",
-        };
-        if icmp_socket.can_send() {
-            let tx = icmp_socket.send(echo.buffer_len(), smoltcp::wire::IpAddress::Ipv4(target)).unwrap();
-            let mut pkt = smoltcp::wire::Icmpv4Packet::new_unchecked(tx);
-            echo.emit(&mut pkt, &smoltcp::phy::ChecksumCapabilities::default());
-        }
-
-        // Set TTL on the interface's IP hop limit
-        // smoltcp doesn't expose per-socket TTL easily. For SLIRP,
-        // the gateway at 10.0.2.2 always responds so traceroute will
-        // show 1 hop. Log this limitation.
-        let start = crate::timer::uptime_ms();
-
-        // Poll for ICMP response
-        let mut got_reply = false;
-        loop {
-            let now = smoltcp::time::Instant::from_millis(crate::timer::uptime_ms() as i64);
-            let mut device = super::device::FolkeringDevice;
-            state.iface.poll(now, &mut device, &mut state.sockets);
-
-            let icmp_socket = state.sockets.get_mut::<smoltcp::socket::icmp::Socket>(state.icmp_handle);
-            if icmp_socket.can_recv() {
-                if let Ok((data, from)) = icmp_socket.recv() {
-                    let rtt = crate::timer::uptime_ms().saturating_sub(start);
-                    // Show source IP
-                    if let smoltcp::wire::IpAddress::Ipv4(v4) = from {
-                        let o = v4.octets();
-                        push_dec(&mut out, o[0] as u32); out.push('.');
-                        push_dec(&mut out, o[1] as u32); out.push('.');
-                        push_dec(&mut out, o[2] as u32); out.push('.');
-                        push_dec(&mut out, o[3] as u32);
-                    }
-                    out.push_str("  ");
-                    push_dec(&mut out, rtt as u32);
-                    out.push_str("ms");
-
-                    // Check if it's echo reply (reached destination)
-                    if let Ok(pkt) = smoltcp::wire::Icmpv4Packet::new_checked(data) {
-                        if let Ok(smoltcp::wire::Icmpv4Repr::EchoReply { .. }) =
-                            smoltcp::wire::Icmpv4Repr::parse(&pkt, &smoltcp::phy::ChecksumCapabilities::default())
-                        {
-                            out.push_str("  <-- destination reached");
-                            out.push_str("\r\n");
-                            return out;
-                        }
-                    }
-                    got_reply = true;
-                    break;
-                }
-            }
-            if crate::timer::uptime_ms() - start > 2000 { break; }
-            for _ in 0..500 { core::hint::spin_loop(); }
-        }
-
-        if !got_reply {
-            out.push_str("*  (timeout)");
-        }
-        out.push_str("\r\n");
-    }
-    out
-}
-
 fn cmd_draug(args: &str) -> String {
     match args {
         "status" => {
@@ -440,37 +346,67 @@ fn cmd_draug(args: &str) -> String {
             let consec_skips = DRAUG_STATE[6].load(Ordering::Relaxed);
             let paused = DRAUG_PAUSE_FLAG.load(Ordering::Relaxed);
 
-            let mut out = String::with_capacity(256);
-            out.push_str("Draug AI Daemon Status\r\n");
-            out.push_str("  Skill tree: L1=");
+            let mut out = String::with_capacity(512);
+            out.push_str("Draug AI Daemon\r\n");
+
+            // State line
+            out.push_str("  State: ");
+            if paused != 0 {
+                out.push_str("\x1b[33mPAUSED\x1b[0m");
+            } else if hibernating != 0 {
+                out.push_str("\x1b[31mHIBERNATING\x1b[0m (");
+                push_dec(&mut out, consec_skips as u32);
+                out.push_str(" skips)");
+            } else {
+                out.push_str("\x1b[32mRUNNING\x1b[0m");
+            }
+
+            // Current task
+            out.push_str("\r\n  Current: ");
+            {
+                let task_buf = DRAUG_CURRENT_TASK.lock();
+                let len = task_buf.iter().position(|&b| b == 0).unwrap_or(32);
+                if len > 0 {
+                    if let Ok(s) = core::str::from_utf8(&task_buf[..len]) {
+                        out.push_str(s);
+                    }
+                } else {
+                    out.push_str("(idle)");
+                }
+            }
+
+            out.push_str("\r\n  Skill tree: L1=");
             push_dec(&mut out, l1 as u32);
             out.push_str("/20 L2=");
             push_dec(&mut out, l2 as u32);
             out.push_str("/20 L3=");
             push_dec(&mut out, l3 as u32);
-            out.push_str("/20\r\n  Iteration: ");
+            out.push_str("/20");
+
+            if plan_mode != 0 {
+                out.push_str("\r\n  Plan mode: task ");
+                push_dec(&mut out, complex_idx as u32);
+                out.push_str("/8");
+            }
+
+            out.push_str("\r\n  Stats: iter=");
             push_dec(&mut out, iter);
-            out.push_str("  passed=");
+            out.push_str(" pass=");
             push_dec(&mut out, passed);
-            out.push_str(" failed=");
+            out.push_str(" fail=");
             push_dec(&mut out, failed);
-            out.push_str(" skips=");
+            out.push_str(" skip=");
             push_dec(&mut out, skips);
-            out.push_str(" retries=");
+            out.push_str(" retry=");
             push_dec(&mut out, retries);
-            out.push_str("\r\n  Plan mode: ");
-            out.push_str(if plan_mode != 0 { "active" } else { "inactive" });
-            out.push_str(" (task ");
-            push_dec(&mut out, complex_idx as u32);
-            out.push_str("/8)\r\n  State: ");
-            if paused != 0 {
-                out.push_str("PAUSED");
-            } else if hibernating != 0 {
-                out.push_str("HIBERNATING (");
-                push_dec(&mut out, consec_skips as u32);
-                out.push_str(" consecutive skips)");
-            } else {
-                out.push_str("RUNNING");
+
+            // Success rate
+            let total = passed + failed;
+            if total > 0 {
+                let rate = passed * 100 / total;
+                out.push_str("\r\n  Success rate: ");
+                push_dec(&mut out, rate);
+                out.push_str("%");
             }
             out
         }

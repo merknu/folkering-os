@@ -334,6 +334,12 @@ pub fn draug_bridge_update(
     ret != 0 // 1 = paused
 }
 
+/// Draug Bridge — set current task name for TCP shell display.
+pub fn draug_bridge_set_task(name: &str) {
+    let len = name.len().min(31);
+    unsafe { crate::syscall::syscall2(0xD1, name.as_ptr() as u64, len as u64); }
+}
+
 /// Stability Fix 7 — Proxy health check.
 /// Returns true if the proxy is reachable (~2s timeout).
 pub fn proxy_ping() -> bool {
