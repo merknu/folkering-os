@@ -204,7 +204,8 @@ pub struct PendingCreative {
 }
 
 /// Maximum pending creative changes
-pub const MAX_PENDING_CREATIVE: usize = 8;
+/// Cap pending creative items to limit heap use (~50KB WASM each).
+pub const MAX_PENDING_CREATIVE: usize = 3;
 
 /// System observation snapshot
 pub struct Observation {

@@ -357,17 +357,22 @@ pub(super) fn run_refactor_step(draug: &mut compositor::draug::DraugDaemon, now_
     }
 
     // ── 3-5. GENERATE → COMPILE → EVALUATE (with retry loop) ────────
+    // Pre-allocate retry buffers to avoid fragmentation from variable
+    // String allocations in the hot loop. Fixed 1KB error + reuse
+    // base_prompt reference on first attempt (no clone).
     let max_retries = compositor::draug::MAX_RETRIES;
     let mut attempt = 0u8;
-    let mut last_error = alloc::string::String::new();
+    let mut last_error_buf = [0u8; 1024];
+    let mut last_error_len = 0usize;
     let mut last_code = alloc::string::String::new();
 
     loop {
-        // Build effective prompt: original or retry with error context
         let prompt = if attempt == 0 {
-            base_prompt.clone()
+            // First attempt: use base_prompt directly (no clone)
+            core::mem::take(&mut base_prompt)
         } else {
-            build_retry_prompt(&last_code, &last_error)
+            let err_str = core::str::from_utf8(&last_error_buf[..last_error_len]).unwrap_or("");
+            build_retry_prompt(&last_code, err_str)
         };
 
         if attempt > 0 {
@@ -474,16 +479,17 @@ pub(super) fn run_refactor_step(draug: &mut compositor::draug::DraugDaemon, now_
 
         } else if patch.status == 1 && attempt < max_retries {
             // ── BUILD FAILED — retry with error feedback ─────────────
-            let out_len = patch.output_len.min(result_buf.len());
-            last_error = match core::str::from_utf8(&result_buf[..out_len]) {
-                Ok(s) => alloc::string::String::from(&s[..s.len().min(1024)]),
-                Err(_) => alloc::string::String::from("(non-UTF8 compiler output)"),
-            };
+            // Copy error into fixed buffer (no heap alloc)
+            let out_len = patch.output_len.min(result_buf.len()).min(1024);
+            last_error_len = out_len;
+            last_error_buf[..out_len].copy_from_slice(&result_buf[..out_len]);
             last_code = code;
 
             write_str("[Draug] cargo check FAILED — will retry with error\n");
             write_str("[Draug] error preview: ");
-            write_str(&last_error[..last_error.len().min(120)]);
+            if let Ok(s) = core::str::from_utf8(&last_error_buf[..last_error_len.min(120)]) {
+                write_str(s);
+            }
             write_str("\n");
 
             attempt += 1;
@@ -571,6 +577,9 @@ fn run_plan_step(draug: &mut compositor::draug::DraugDaemon, iter: u32) {
 
     match agent_planner::plan_task(task_id, task_desc) {
         Some(plan) => {
+            // Explicit drop: free old plan's Vec<PlanStep> + code Strings
+            // before allocating the new one (reduces peak fragmentation).
+            drop(draug.active_plan.take());
             draug.active_plan = Some(plan);
             draug.complex_task_idx += 1;
             // Don't execute yet — next tick will pick up the first step

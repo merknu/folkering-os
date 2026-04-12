@@ -185,13 +185,13 @@ pub fn execute_next_step(plan: &mut TaskPlan) -> bool {
     write_str(&plan.steps[step_idx].description[..plan.steps[step_idx].description.len().min(60)]);
     write_str("\n");
 
-    // Gather code from all completed prior steps
+    // Gather code from completed prior steps (capped at 8KB to
+    // prevent unbounded heap growth over many steps).
     let mut prior_code = String::with_capacity(4096);
     for prev in &plan.steps[..step_idx] {
         if let Some(ref code) = prev.code {
-            if !prior_code.is_empty() {
-                prior_code.push('\n');
-            }
+            if prior_code.len() + code.len() > 8192 { break; } // cap
+            if !prior_code.is_empty() { prior_code.push('\n'); }
             prior_code.push_str(code);
         }
     }
@@ -221,20 +221,23 @@ pub fn execute_next_step(plan: &mut TaskPlan) -> bool {
     prompt.push_str("No explanation.");
 
     // Retry loop with error feedback
+    // Pre-allocate error buffer to avoid fragmentation from variable Strings
     let mut attempt = 0u8;
-    let mut last_error = String::new();
+    let mut last_error_buf = [0u8; 1024];
+    let mut last_error_len = 0usize;
     let mut last_code = String::new();
 
     loop {
         let effective_prompt = if attempt == 0 {
-            prompt.clone()
+            core::mem::take(&mut prompt)
         } else {
-            let mut retry = String::with_capacity(prompt.len() + last_error.len() + 300);
+            let err_str = core::str::from_utf8(&last_error_buf[..last_error_len]).unwrap_or("");
+            let mut retry = String::with_capacity(last_code.len() + err_str.len() + 300);
             retry.push_str("Your previous code failed compilation.\n\n");
             retry.push_str("[YOUR CODE]\n```rust\n");
             retry.push_str(&last_code);
             retry.push_str("\n```\n\n[COMPILER ERROR]\n```\n");
-            retry.push_str(&last_error[..last_error.len().min(1024)]);
+            retry.push_str(err_str);
             retry.push_str("\n```\n\nFix the errors. Respond with the FIXED code in a ```rust block.");
             retry
         };
@@ -341,12 +344,10 @@ pub fn execute_next_step(plan: &mut TaskPlan) -> bool {
 
             return true;
         } else if patch.status == 1 && attempt < MAX_STEP_RETRIES {
-            // BUILD FAILED — retry
-            let out_len = patch.output_len.min(result_buf.len());
-            last_error = match core::str::from_utf8(&result_buf[..out_len]) {
-                Ok(s) => String::from(&s[..s.len().min(1024)]),
-                Err(_) => String::from("(non-UTF8 output)"),
-            };
+            // BUILD FAILED — copy error to fixed buffer (no heap alloc)
+            let out_len = patch.output_len.min(result_buf.len()).min(1024);
+            last_error_len = out_len;
+            last_error_buf[..out_len].copy_from_slice(&result_buf[..out_len]);
             last_code = code;
 
             write_str("[Executor] cargo check FAILED\n");
