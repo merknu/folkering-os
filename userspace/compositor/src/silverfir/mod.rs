@@ -27,6 +27,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 pub mod compiler;
+pub mod jit_memory;
 
 /// A compiled WASM module ready for native execution.
 pub struct JitModule {

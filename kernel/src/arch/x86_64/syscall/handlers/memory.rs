@@ -201,6 +201,59 @@ pub fn syscall_munmap(virt_addr: u64, size: u64) -> u64 {
     0
 }
 
+// ── Memory Protection Change (W^X for JIT) ──────────────────────────────
+
+/// Change page permissions on an existing mapping.
+///
+/// Enables the W^X (Write XOR Execute) pattern:
+///   1. mmap(size, PROT_READ | PROT_WRITE) → allocate RW pages
+///   2. Write JIT machine code
+///   3. mprotect(addr, size, PROT_READ | PROT_EXEC) → flip to RX
+///   4. Execute the JIT code
+///   5. mprotect(addr, size, PROT_READ | PROT_WRITE) → flip back for update
+///
+/// Security: rejects PROT_WRITE | PROT_EXEC simultaneously (enforces W^X).
+pub fn syscall_mprotect(virt_addr: u64, size: u64, flags: u64) -> u64 {
+    use x86_64::structures::paging::PageTableFlags as PTF;
+
+    const PAGE_SIZE: u64 = 4096;
+    const MMAP_BASE: u64 = 0x4000_0000;
+
+    // Validate inputs
+    if size == 0 || virt_addr % PAGE_SIZE != 0 || virt_addr < MMAP_BASE {
+        return u64::MAX;
+    }
+
+    // W^X enforcement: reject WRITE+EXEC
+    let prot_write = flags & 0x2 != 0;
+    let prot_exec = flags & 0x4 != 0;
+    if prot_write && prot_exec {
+        crate::serial_strln!("[MPROTECT] REJECTED: W^X violation (WRITE+EXEC)");
+        return u64::MAX;
+    }
+
+    // Build page table flags
+    let mut pt_flags = PTF::PRESENT | PTF::USER_ACCESSIBLE;
+    if prot_write {
+        pt_flags |= PTF::WRITABLE;
+    }
+    if !prot_exec {
+        pt_flags |= PTF::NO_EXECUTE;
+    }
+
+    let num_pages = ((size + PAGE_SIZE - 1) / PAGE_SIZE) as usize;
+
+    for i in 0..num_pages {
+        let virt = (virt_addr + (i as u64 * PAGE_SIZE)) as usize;
+        if let Err(_) = crate::memory::paging::protect(virt, pt_flags) {
+            crate::serial_strln!("[MPROTECT] Failed to update page flags");
+            return u64::MAX;
+        }
+    }
+
+    0 // success
+}
+
 // ── Physical Memory Mapping (Phase 6.2) ────────────────────────────────
 
 pub fn syscall_map_physical(phys_addr: u64, virt_addr: u64, size: u64, flags: u64, _reserved: u64) -> u64 {

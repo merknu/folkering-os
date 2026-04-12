@@ -190,3 +190,27 @@ pub fn munmap(ptr: *mut u8, size: usize) -> Result<(), MmapError> {
         Ok(())
     }
 }
+
+/// Change memory protection on a mapped region.
+///
+/// Enables W^X (Write XOR Execute) for JIT:
+/// 1. `mmap(size, PROT_READ | PROT_WRITE)` → allocate RW
+/// 2. Write JIT code
+/// 3. `mprotect(ptr, size, PROT_READ | PROT_EXEC)` → flip to RX
+/// 4. Execute
+/// 5. `mprotect(ptr, size, PROT_READ | PROT_WRITE)` → flip back
+///
+/// REJECTS `PROT_WRITE | PROT_EXEC` (W^X enforcement).
+const SYS_MPROTECT: u64 = 0x32;
+
+pub fn mprotect(ptr: *mut u8, size: usize, prot: u64) -> Result<(), MmapError> {
+    if ptr.is_null() || size == 0 {
+        return Err(MmapError::InvalidParam);
+    }
+    let ret = unsafe { syscall3(SYS_MPROTECT, ptr as u64, size as u64, prot) };
+    if ret == u64::MAX {
+        Err(MmapError::InvalidParam)
+    } else {
+        Ok(())
+    }
+}
