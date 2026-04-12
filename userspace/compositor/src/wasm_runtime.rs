@@ -64,6 +64,31 @@ const SURFACE_OFFSET: usize = 0x100000;
 /// But only grow if heap can afford it (check before growing)
 const MIN_SURFACE_PAGES: u32 = 64;
 
+// ── Dual-Runtime Backend ──────────────────────────────────────────────────
+
+/// WASM execution backend selection.
+///
+/// Folkering OS supports two WASM runtimes:
+///
+/// - **Sandboxed** (wasmi): Interpreter with fuel metering, memory bounds,
+///   and capability checking. Used for untrusted code (user apps, AI-generated
+///   tools, AutoDream evaluations). ~20-100x slower than native.
+///
+/// - **Trusted** (silverfir-nano): JIT compiler targeting native x86_64.
+///   Used for verified internal modules (hardware drivers, Draug-compiled
+///   modules after 3-layer validation, inference kernels). ~2-5x native.
+///
+/// Selection rule: if the code has passed ground-truth testing, mutation
+/// testing, and tautology detection — it earns Trusted. Everything else
+/// is Sandboxed by default.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum WasmBackend {
+    /// wasmi interpreter — safe, slow, fuel-metered
+    Sandboxed,
+    /// silverfir-nano JIT — fast, trusted code only
+    Trusted,
+}
+
 // ── Public Types ─────────────────────────────────────────────────────────
 
 /// Configuration passed into WASM execution from compositor
@@ -202,6 +227,31 @@ pub fn execute_wasm(
     wasm_bytes: &[u8],
     config: WasmConfig,
 ) -> (WasmResult, WasmOutput) {
+    execute_wasm_with_backend(wasm_bytes, config, WasmBackend::Sandboxed)
+}
+
+/// Execute with explicit backend selection.
+pub fn execute_wasm_with_backend(
+    wasm_bytes: &[u8],
+    config: WasmConfig,
+    backend: WasmBackend,
+) -> (WasmResult, WasmOutput) {
+    match backend {
+        WasmBackend::Sandboxed => execute_wasm_sandboxed(wasm_bytes, config),
+        WasmBackend::Trusted => {
+            // Silverfir-nano JIT: placeholder until the engine is integrated.
+            // For now, fall back to wasmi with a log message.
+            libfolk::sys::io::write_str("[WASM] Trusted backend requested — falling back to wasmi (silverfir-nano not yet active)\n");
+            execute_wasm_sandboxed(wasm_bytes, config)
+        }
+    }
+}
+
+/// Sandboxed execution via wasmi interpreter with fuel metering.
+fn execute_wasm_sandboxed(
+    wasm_bytes: &[u8],
+    config: WasmConfig,
+) -> (WasmResult, WasmOutput) {
     let engine = Engine::default();
 
     let module = match Module::new(&engine, wasm_bytes) {
@@ -260,7 +310,28 @@ pub struct PersistentWasmApp {
 
 impl PersistentWasmApp {
     /// Compile and instantiate a WASM module for persistent execution.
+    /// Uses Sandboxed (wasmi) backend by default.
     pub fn new(wasm_bytes: &[u8], config: WasmConfig) -> Result<Self, String> {
+        Self::new_with_backend(wasm_bytes, config, WasmBackend::Sandboxed)
+    }
+
+    /// Compile with explicit backend selection.
+    pub fn new_with_backend(
+        wasm_bytes: &[u8],
+        config: WasmConfig,
+        backend: WasmBackend,
+    ) -> Result<Self, String> {
+        match backend {
+            WasmBackend::Sandboxed => Self::new_sandboxed(wasm_bytes, config),
+            WasmBackend::Trusted => {
+                // Silverfir-nano: placeholder — fall back to wasmi
+                Self::new_sandboxed(wasm_bytes, config)
+            }
+        }
+    }
+
+    /// Internal: wasmi-based sandboxed instantiation.
+    fn new_sandboxed(wasm_bytes: &[u8], config: WasmConfig) -> Result<Self, String> {
         let engine = Engine::default();
 
         let module = Module::new(&engine, wasm_bytes)
