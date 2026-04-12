@@ -336,19 +336,20 @@ fn cmd_ping(args: &str, state: &mut super::state::NetState) -> String {
 fn cmd_draug(args: &str) -> String {
     match args {
         "status" => {
-            let iter = DRAUG_ITER.load(Ordering::Relaxed);
-            let passed = DRAUG_PASSED.load(Ordering::Relaxed);
-            let failed = DRAUG_FAILED.load(Ordering::Relaxed);
-            let skips = DRAUG_SKIPS.load(Ordering::Relaxed);
-            let retries = DRAUG_RETRIES.load(Ordering::Relaxed);
-            let l1 = DRAUG_STATE[0].load(Ordering::Relaxed);
-            let l2 = DRAUG_STATE[1].load(Ordering::Relaxed);
-            let l3 = DRAUG_STATE[2].load(Ordering::Relaxed);
-            let plan_mode = DRAUG_STATE[3].load(Ordering::Relaxed);
-            let complex_idx = DRAUG_STATE[4].load(Ordering::Relaxed);
-            let hibernating = DRAUG_STATE[5].load(Ordering::Relaxed);
-            let consec_skips = DRAUG_STATE[6].load(Ordering::Relaxed);
-            let paused = DRAUG_PAUSE_FLAG.load(Ordering::Relaxed);
+            // Acquire: synchronize with compositor's Release stores
+            let iter = DRAUG_ITER.load(Ordering::Acquire);
+            let passed = DRAUG_PASSED.load(Ordering::Acquire);
+            let failed = DRAUG_FAILED.load(Ordering::Acquire);
+            let skips = DRAUG_SKIPS.load(Ordering::Acquire);
+            let retries = DRAUG_RETRIES.load(Ordering::Acquire);
+            let l1 = DRAUG_STATE[0].load(Ordering::Acquire);
+            let l2 = DRAUG_STATE[1].load(Ordering::Acquire);
+            let l3 = DRAUG_STATE[2].load(Ordering::Acquire);
+            let plan_mode = DRAUG_STATE[3].load(Ordering::Acquire);
+            let complex_idx = DRAUG_STATE[4].load(Ordering::Acquire);
+            let hibernating = DRAUG_STATE[5].load(Ordering::Acquire);
+            let consec_skips = DRAUG_STATE[6].load(Ordering::Acquire);
+            let paused = DRAUG_PAUSE_FLAG.load(Ordering::Acquire);
 
             let mut out = String::with_capacity(512);
             out.push_str("Draug AI Daemon\r\n");
@@ -415,11 +416,11 @@ fn cmd_draug(args: &str) -> String {
             out
         }
         "pause" => {
-            DRAUG_PAUSE_FLAG.store(1, Ordering::Relaxed);
+            DRAUG_PAUSE_FLAG.store(1, Ordering::Release);
             String::from("Draug paused. Use 'draug resume' to continue.")
         }
         "resume" => {
-            DRAUG_PAUSE_FLAG.store(0, Ordering::Relaxed);
+            DRAUG_PAUSE_FLAG.store(0, Ordering::Release);
             String::from("Draug resumed.")
         }
         _ => String::from("usage: draug status|pause|resume"),

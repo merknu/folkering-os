@@ -99,21 +99,25 @@ pub(super) extern "C" fn syscall_handler(
         // Proxy health check (Stability Fix 7)
         0x64 => syscall_proxy_ping(),
         // Draug bridge: push status to tcp_shell atomics, return pause flag
+        // Draug bridge: producer writes status for TCP shell consumer.
+        // Release ordering ensures all stores are visible before the
+        // consumer's Acquire loads. Critical for aarch64 (weak ordering).
         0xD0 => {
             use crate::net::tcp_shell::*;
-            use core::sync::atomic::Ordering::Relaxed;
-            DRAUG_ITER.store((arg1 >> 32) as u32, Relaxed);
-            DRAUG_PASSED.store(arg1 as u32, Relaxed);
-            DRAUG_FAILED.store((arg2 >> 32) as u32, Relaxed);
-            DRAUG_RETRIES.store(arg2 as u32, Relaxed);
-            DRAUG_STATE[0].store((arg3 >> 24) as u8, Relaxed); // L1
-            DRAUG_STATE[1].store((arg3 >> 16) as u8, Relaxed); // L2
-            DRAUG_STATE[2].store((arg3 >> 8) as u8, Relaxed);  // L3
-            DRAUG_STATE[3].store(arg3 as u8, Relaxed);          // plan_mode
-            DRAUG_STATE[4].store((arg4 >> 16) as u8, Relaxed); // complex_idx
-            DRAUG_STATE[5].store((arg4 >> 8) as u8, Relaxed);  // hibernating
-            DRAUG_STATE[6].store(arg4 as u8, Relaxed);          // consec_skips
-            DRAUG_PAUSE_FLAG.load(Relaxed) as u64
+            use core::sync::atomic::Ordering::{Release, Acquire};
+            DRAUG_ITER.store((arg1 >> 32) as u32, Release);
+            DRAUG_PASSED.store(arg1 as u32, Release);
+            DRAUG_FAILED.store((arg2 >> 32) as u32, Release);
+            DRAUG_RETRIES.store(arg2 as u32, Release);
+            DRAUG_STATE[0].store((arg3 >> 24) as u8, Release);
+            DRAUG_STATE[1].store((arg3 >> 16) as u8, Release);
+            DRAUG_STATE[2].store((arg3 >> 8) as u8, Release);
+            DRAUG_STATE[3].store(arg3 as u8, Release);
+            DRAUG_STATE[4].store((arg4 >> 16) as u8, Release);
+            DRAUG_STATE[5].store((arg4 >> 8) as u8, Release);
+            DRAUG_STATE[6].store(arg4 as u8, Release);
+            // Read pause flag with Acquire (shell is producer for this)
+            DRAUG_PAUSE_FLAG.load(Acquire) as u64
         },
         // Draug bridge: set current task name string
         0xD1 => {
