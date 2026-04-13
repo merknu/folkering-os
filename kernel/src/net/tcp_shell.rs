@@ -38,7 +38,16 @@ struct ShellState {
     line_buf: [u8; 256],
     line_len: usize,
     connected: bool,
+    /// Uptime (ms) when client connected — for idle timeout.
+    connected_at_ms: u64,
+    /// Uptime (ms) of last received byte — for idle timeout.
+    last_recv_ms: u64,
+    /// True if line_buf is full (bytes being dropped).
+    overflow: bool,
 }
+
+/// Idle client timeout: 5 minutes. Frees socket for other users.
+const CLIENT_IDLE_TIMEOUT_MS: u64 = 300_000;
 
 static SHELL: Mutex<Option<ShellState>> = Mutex::new(None);
 
@@ -59,6 +68,9 @@ pub fn init(state: &mut super::state::NetState) {
         line_buf: [0u8; 256],
         line_len: 0,
         connected: false,
+        connected_at_ms: 0,
+        last_recv_ms: 0,
+        overflow: false,
     });
 
     crate::serial_strln!("[SHELL-TCP] Listening on port 2222");
@@ -89,9 +101,26 @@ pub fn poll(state: &mut super::state::NetState) {
     if !shell.connected && socket.is_active() && socket.may_send() {
         shell.connected = true;
         shell.line_len = 0;
+        shell.overflow = false;
+        let now = crate::timer::uptime_ms();
+        shell.connected_at_ms = now;
+        shell.last_recv_ms = now;
         let _ = socket.send_slice(BANNER);
         crate::serial_strln!("[SHELL-TCP] Client connected");
         return;
+    }
+
+    // Idle timeout: disconnect clients that send nothing for 5 minutes
+    if shell.connected {
+        let now = crate::timer::uptime_ms();
+        if now.saturating_sub(shell.last_recv_ms) > CLIENT_IDLE_TIMEOUT_MS {
+            crate::serial_strln!("[SHELL-TCP] Client idle timeout — disconnecting");
+            shell.connected = false;
+            shell.line_len = 0;
+            socket.abort();
+            let _ = socket.listen(SHELL_PORT);
+            return;
+        }
     }
 
     // Client disconnected
@@ -107,7 +136,22 @@ pub fn poll(state: &mut super::state::NetState) {
     // Read incoming data
     if shell.connected && socket.can_recv() {
         let mut tmp = [0u8; 256];
-        let n = socket.recv_slice(&mut tmp).unwrap_or(0);
+        let n = match socket.recv_slice(&mut tmp) {
+            Ok(n) => n,
+            Err(_) => {
+                // Recv error — disconnect client cleanly
+                crate::serial_strln!("[SHELL-TCP] recv error — disconnecting");
+                shell.connected = false;
+                shell.line_len = 0;
+                socket.abort();
+                let _ = socket.listen(SHELL_PORT);
+                return;
+            }
+        };
+
+        if n > 0 {
+            shell.last_recv_ms = crate::timer::uptime_ms();
+        }
 
         for i in 0..n {
             let byte = tmp[i];
@@ -115,9 +159,15 @@ pub fn poll(state: &mut super::state::NetState) {
             if byte == b'\r' { continue; }
 
             if byte == b'\n' {
-                // Echo newline
                 let socket = state.sockets.get_mut::<tcp::Socket>(shell.tcp_handle);
                 let _ = socket.send_slice(b"\r\n");
+
+                if shell.overflow {
+                    // Line was truncated — warn user
+                    let socket = state.sockets.get_mut::<tcp::Socket>(shell.tcp_handle);
+                    let _ = socket.send_slice(b"(line truncated at 255 bytes)\r\n");
+                    shell.overflow = false;
+                }
 
                 if shell.line_len > 0 {
                     let line = &shell.line_buf[..shell.line_len];
@@ -130,18 +180,20 @@ pub fn poll(state: &mut super::state::NetState) {
                 let _ = socket.send_slice(b"> ");
                 shell.line_len = 0;
             } else if byte == 0x7F || byte == 0x08 {
-                // Backspace
                 if shell.line_len > 0 {
                     shell.line_len -= 1;
+                    shell.overflow = false;
                     let socket = state.sockets.get_mut::<tcp::Socket>(shell.tcp_handle);
-                    let _ = socket.send_slice(b"\x08 \x08"); // erase char
+                    let _ = socket.send_slice(b"\x08 \x08");
                 }
             } else if shell.line_len < 255 {
-                // Echo character
                 shell.line_buf[shell.line_len] = byte;
                 shell.line_len += 1;
                 let socket = state.sockets.get_mut::<tcp::Socket>(shell.tcp_handle);
                 let _ = socket.send_slice(&[byte]);
+            } else {
+                // Buffer full — silently drop but mark overflow
+                shell.overflow = true;
             }
         }
     }
