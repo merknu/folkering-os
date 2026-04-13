@@ -213,8 +213,11 @@ Output gikk fra komplett gibberish til sammenhengende fraser.
 - Proxy `WASM_COMPILE` command: compiles Rust to .wasm binary
 - Kernel syscall 0x63 `sys_wasm_compile`: returns .wasm bytes to OS
 - Verified: 79-byte fib.wasm compiled end-to-end
+- **THE LOOP IS CLOSED**: deploy_wasm now executes code via silverfir JIT
+  - Draug writes code → cargo test → WASM compile → silverfir JIT → RUNS IN OS
+  - First time autonomously generated code executes inside the running OS
 
-### Silverfir-nano JIT (branch: silverfir-nano-wasm-hybrid)
+### Silverfir-nano JIT (merged into ai-native-os)
 - `WasmBackend` enum: `Sandboxed` (wasmi) vs `Trusted` (silverfir JIT)
 - WASM parser: type, import, function, export, code sections
 - x86_64 translator: i32 arithmetic, comparisons, locals, control flow
