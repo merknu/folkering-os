@@ -28,6 +28,7 @@ pub mod dns;
 pub mod udp;
 pub mod ntp;
 pub mod tcp_shell;
+pub mod tcp_async;
 
 // ── Re-exports for the public API ──────────────────────────────────────
 //

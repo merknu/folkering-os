@@ -319,6 +319,33 @@ pub fn fbp_patch(
     Some(PatchStatus { status, output_len })
 }
 
+// ── Async TCP (non-blocking, for Draug state machine) ────────────
+
+/// EAGAIN sentinel — means "not ready, try next frame"
+pub const TCP_EAGAIN: u64 = 0xFFFF_FFFE;
+
+/// Start a non-blocking TCP connection. Returns slot_id, EAGAIN, or MAX.
+pub fn tcp_connect_async(ip: [u8; 4], port: u16) -> u64 {
+    let packed = ((ip[0] as u64) << 24) | ((ip[1] as u64) << 16)
+        | ((ip[2] as u64) << 8) | (ip[3] as u64);
+    unsafe { crate::syscall::syscall2(0xE0, packed, port as u64) }
+}
+
+/// Non-blocking send. Returns bytes_sent, EAGAIN, or MAX.
+pub fn tcp_send_async(slot: u64, data: &[u8]) -> u64 {
+    unsafe { crate::syscall::syscall3(0xE1, slot, data.as_ptr() as u64, data.len() as u64) }
+}
+
+/// Non-blocking receive. Returns bytes_read, EAGAIN, 0 (peer closed), or MAX.
+pub fn tcp_poll_recv(slot: u64, buf: &mut [u8]) -> u64 {
+    unsafe { crate::syscall::syscall3(0xE2, slot, buf.as_mut_ptr() as u64, buf.len() as u64) }
+}
+
+/// Close async TCP connection.
+pub fn tcp_close_async(slot: u64) {
+    unsafe { crate::syscall::syscall1(0xE3, slot); }
+}
+
 /// Draug Bridge — push status to kernel tcp_shell atomics.
 /// Returns true if the remote shell has set the pause flag.
 pub fn draug_bridge_update(

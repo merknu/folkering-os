@@ -131,6 +131,11 @@ pub(super) extern "C" fn syscall_handler(
             buf[len] = 0; // NUL terminate
             0
         },
+        // Async TCP (non-blocking, returns EAGAIN)
+        0xE0 => crate::net::tcp_async::syscall_tcp_connect(arg1, arg2),
+        0xE1 => crate::net::tcp_async::syscall_tcp_send(arg1, arg2, arg3),
+        0xE2 => crate::net::tcp_async::syscall_tcp_poll_recv(arg1, arg2, arg3),
+        0xE3 => crate::net::tcp_async::syscall_tcp_close(arg1),
         // SMP: Parallel GEMM
         0x60 => syscall_parallel_gemm(arg1, arg2, arg3, arg4, arg5, arg6),
         // Hybrid AI: Ask Gemini cloud API
