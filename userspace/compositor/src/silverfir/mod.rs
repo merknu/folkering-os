@@ -111,6 +111,25 @@ impl JitModule {
         })
     }
 
+    /// Call an exported function that returns u32.
+    pub fn call_u32(&mut self, name: &str) -> Result<u32, JitError> {
+        let func_idx = self.exports.iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, idx)| *idx)
+            .ok_or(JitError::ExportNotFound)?;
+
+        let offset = *self.func_offsets.get(func_idx)
+            .ok_or(JitError::ExportNotFound)?;
+
+        let block = self.code_block.as_ref()
+            .ok_or(JitError::MemoryError)?;
+
+        unsafe {
+            block.call_u32(offset)
+                .map_err(|_| JitError::ExecutionFault)
+        }
+    }
+
     /// Call an exported void→void function by name.
     pub fn call_void(&mut self, name: &str) -> Result<(), JitError> {
         // Find export

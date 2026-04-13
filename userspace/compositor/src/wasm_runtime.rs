@@ -288,15 +288,48 @@ pub fn test_silverfir_jit() {
     ];
 
     match silverfir::JitModule::compile(wasm) {
-        Ok(module) => {
+        Ok(mut module) => {
             libfolk::sys::io::write_str("[silverfir] Compile OK: ");
             let mut nb = [0u8; 16];
             libfolk::sys::io::write_str(format_usize(module.functions.len(), &mut nb));
-            libfolk::sys::io::write_str(" function(s) JIT-compiled\n");
+            libfolk::sys::io::write_str(" function(s), ");
 
-            // Don't call yet — W^X mprotect needs to work first.
-            // Just verify that compilation succeeds.
-            libfolk::sys::io::write_str("[silverfir] SELF-TEST PASS: WASM→x86_64 compilation succeeded\n");
+            // Show emitted x86_64 bytes
+            if let Some(code) = module.functions.first() {
+                libfolk::sys::io::write_str(format_usize(code.len(), &mut nb));
+                libfolk::sys::io::write_str(" bytes of x86_64\n");
+
+                // Log the actual machine code for debugging
+                libfolk::sys::io::write_str("[silverfir] x86_64:");
+                for (i, byte) in code.iter().enumerate().take(32) {
+                    if i % 16 == 0 { libfolk::sys::io::write_str("\n  "); }
+                    let hi = b"0123456789abcdef"[(byte >> 4) as usize];
+                    let lo = b"0123456789abcdef"[(byte & 0xf) as usize];
+                    libfolk::sys::io::write_str(" ");
+                    let hex = [hi, lo];
+                    if let Ok(s) = core::str::from_utf8(&hex) {
+                        libfolk::sys::io::write_str(s);
+                    }
+                }
+                libfolk::sys::io::write_str("\n");
+            }
+
+            // Actually EXECUTE the JIT-compiled code and verify return value
+            libfolk::sys::io::write_str("[silverfir] Executing JIT code natively...\n");
+            match module.call_u32("run") {
+                Ok(result) => {
+                    libfolk::sys::io::write_str("[silverfir] Return value: ");
+                    libfolk::sys::io::write_str(format_usize(result as usize, &mut nb));
+                    if result == 42 {
+                        libfolk::sys::io::write_str(" === SELF-TEST PASS: native x86_64 execution returned 42!\n");
+                    } else {
+                        libfolk::sys::io::write_str(" !== 42 — SELF-TEST FAIL: wrong return value\n");
+                    }
+                }
+                Err(_) => {
+                    libfolk::sys::io::write_str("[silverfir] SELF-TEST FAIL: execution fault\n");
+                }
+            }
         }
         Err(silverfir::JitError::NotYetImplemented) => {
             libfolk::sys::io::write_str("[silverfir] SELF-TEST SKIP: JIT not yet implemented\n");

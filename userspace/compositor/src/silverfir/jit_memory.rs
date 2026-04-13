@@ -87,6 +87,22 @@ impl JitMemoryBlock {
         Ok(())
     }
 
+    /// Execute a void→u32 function at the given byte offset.
+    /// Return value comes from RAX (System V / Win64 ABI).
+    pub unsafe fn call_u32(&self, offset: usize) -> Result<u32, JitMemError> {
+        if !self.executable {
+            return Err(JitMemError::NotExecutable);
+        }
+        if offset >= self.size {
+            return Err(JitMemError::ProtectFailed);
+        }
+
+        let fn_ptr: unsafe extern "C" fn() -> u32 = core::mem::transmute(
+            self.ptr.add(offset)
+        );
+        Ok(fn_ptr())
+    }
+
     /// Base pointer (for calculating offsets into emitted code).
     pub fn base_ptr(&self) -> *const u8 {
         self.ptr as *const u8
