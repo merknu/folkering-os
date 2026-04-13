@@ -416,6 +416,39 @@ pub fn map_page_in_table(
     Ok(())
 }
 
+/// Change protection flags for a page in a specific task's page table.
+/// Used by sys_mprotect for W^X JIT memory management.
+pub fn protect_in_table(
+    pml4_phys: u64,
+    virt_addr: usize,
+    flags: PageTableFlags,
+) -> Result<(), MapError> {
+    let pml4_virt = crate::phys_to_virt(pml4_phys as usize);
+    let hhdm = crate::HHDM_OFFSET.load(core::sync::atomic::Ordering::Relaxed);
+    let phys_mem_offset = VirtAddr::new(hhdm as u64);
+
+    let pml4 = unsafe { &mut *(pml4_virt as *mut PageTable) };
+    let mut mapper = unsafe { OffsetPageTable::new(pml4, phys_mem_offset) };
+
+    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(virt_addr as u64));
+
+    let frame = mapper.translate_page(page)
+        .map_err(|_| MapError::PageNotMapped)?;
+
+    let (_, flush) = mapper.unmap(page).map_err(|_| MapError::UnmapFailed)?;
+    flush.flush();
+
+    let mut frame_allocator = BootFrameAllocator;
+    unsafe {
+        mapper
+            .map_to(page, frame, flags, &mut frame_allocator)
+            .map_err(|_| MapError::MapFailed)?
+            .flush();
+    }
+
+    Ok(())
+}
+
 /// Switch to a task's page table
 ///
 /// Loads the specified PML4 into CR3.

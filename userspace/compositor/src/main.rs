@@ -345,6 +345,9 @@ fn main() -> ! {
 
     write_str("[COMPOSITOR] *** NEURAL DESKTOP ***\n");
 
+    // ===== Silverfir-nano JIT self-test =====
+    compositor::wasm_runtime::test_silverfir_jit();
+
     // ===== Continue with normal operation =====
     let mut compositor = Compositor::new();
 

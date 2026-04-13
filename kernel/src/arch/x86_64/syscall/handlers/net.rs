@@ -534,11 +534,12 @@ pub fn syscall_fbp_interact(
     // We care about (b). Reserve enough headroom to hold both.
     let max_total = ((buf_max as usize) * 2 + 16).min(524288);
 
-    let response = match crate::net::tcp_plain::tcp_request(
+    let response = match crate::net::tcp_plain::tcp_request_with_timeout(
         PROXY_IP,
         PROXY_PORT,
         &req,
         max_total,
+        120_000,
     ) {
         Ok(data) => data,
         Err(e) => {
@@ -692,11 +693,14 @@ pub fn syscall_fbp_patch(
     // Reserve room for the 8-byte reply header + user buffer.
     let max_total = (result_max as usize).saturating_add(8).min(262_144);
 
-    let response = match crate::net::tcp_plain::tcp_request(
+    // Reduced timeout: cargo test typically 0.5-2s. 120K tsc_ms ≈ 40-80s
+    // wall — prevents 8-minute compositor freeze on timeout.
+    let response = match crate::net::tcp_plain::tcp_request_with_timeout(
         PROXY_IP,
         PROXY_PORT,
         &req,
         max_total,
+        120_000,
     ) {
         Ok(data) => data,
         Err(e) => {
@@ -913,11 +917,12 @@ pub fn syscall_wasm_compile(buf_ptr: u64, buf_max: u64) -> u64 {
     let req = b"WASM_COMPILE\n";
     let max_total = (buf_max as usize).saturating_add(8).min(262_144);
 
-    let response = match crate::net::tcp_plain::tcp_request(
+    let response = match crate::net::tcp_plain::tcp_request_with_timeout(
         PROXY_IP,
         PROXY_PORT,
         req,
         max_total,
+        120_000, // same reduced timeout as LLM/PATCH
     ) {
         Ok(data) => data,
         Err(e) => {

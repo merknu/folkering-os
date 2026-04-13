@@ -54,6 +54,8 @@ pub(super) extern "C" fn syscall_handler(
         // Phase 9: Anonymous memory mapping
         0x30 => syscall_mmap(arg1, arg2, arg3),
         0x31 => syscall_munmap(arg1, arg2),
+        // mprotect: change page permissions (W^X for silverfir JIT)
+        0x32 => syscall_mprotect(arg1, arg2, arg3),
         // Milestone 5: Block device I/O
         0x40 => syscall_block_read(arg1, arg2, arg3),
         0x41 => syscall_block_write(arg1, arg2, arg3),
