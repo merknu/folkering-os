@@ -204,6 +204,10 @@ fn start_llm_request(draug: &mut DraugDaemon, model: &str, prompt: &str) -> bool
 
     draug.async_request = req;
     draug.async_sent = 0;
+    // Pre-allocate 8KB to avoid repeated realloc during reads
+    if draug.async_response.capacity() < 8192 {
+        draug.async_response.reserve(8192);
+    }
     draug.async_response.clear();
     // Timestamp set by caller (tick_idle passes now_ms from compositor clock)
 
@@ -228,6 +232,10 @@ fn start_patch_request(draug: &mut DraugDaemon, code: &str) -> bool {
 
     draug.async_request = req;
     draug.async_sent = 0;
+    // Pre-allocate 8KB to avoid repeated realloc during reads
+    if draug.async_response.capacity() < 8192 {
+        draug.async_response.reserve(8192);
+    }
     draug.async_response.clear();
     draug.async_operation = AsyncOp::FbpPatch;
     // Timestamp set by caller (tick_idle passes now_ms from compositor clock)
@@ -267,7 +275,11 @@ fn tick_sending(draug: &mut DraugDaemon) -> bool {
     let remaining = &draug.async_request[draug.async_sent..];
     if remaining.is_empty() {
         draug.async_phase = AsyncPhase::Reading;
-        draug.async_response.clear();
+        // Pre-allocate 8KB to avoid repeated realloc during reads
+    if draug.async_response.capacity() < 8192 {
+        draug.async_response.reserve(8192);
+    }
+    draug.async_response.clear();
         return true;
     }
     let result = tcp_send_async(draug.async_tcp_slot, remaining);

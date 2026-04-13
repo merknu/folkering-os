@@ -3,10 +3,42 @@
 
 extern crate alloc;
 
-/// Freelist for recycling virtual address ranges from munmap.
-/// Prevents virtual address space exhaustion from JIT mmap/munmap churn.
-static MMAP_FREELIST: spin::Mutex<alloc::vec::Vec<(u64, usize)>> =
-    spin::Mutex::new(alloc::vec::Vec::new());
+/// Fixed-size freelist for recycling virtual address ranges from munmap.
+/// 64 entries max — avoids unbounded Vec growth in kernel heap.
+const MMAP_FREELIST_CAP: usize = 64;
+static MMAP_FREELIST: spin::Mutex<MmapFreelist> = spin::Mutex::new(MmapFreelist::new());
+
+struct MmapFreelist {
+    entries: [(u64, usize); MMAP_FREELIST_CAP],
+    count: usize,
+}
+
+impl MmapFreelist {
+    const fn new() -> Self {
+        Self { entries: [(0, 0); MMAP_FREELIST_CAP], count: 0 }
+    }
+    fn push(&mut self, addr: u64, pages: usize) {
+        if self.count < MMAP_FREELIST_CAP {
+            self.entries[self.count] = (addr, pages);
+            self.count += 1;
+        }
+        // If full, drop the entry (acceptable — bump allocator still works)
+    }
+    fn pop_fit(&mut self, needed: usize) -> Option<u64> {
+        for i in 0..self.count {
+            if self.entries[i].1 >= needed {
+                let addr = self.entries[i].0;
+                // Remove by swapping with last
+                self.count -= 1;
+                if i < self.count {
+                    self.entries[i] = self.entries[self.count];
+                }
+                return Some(addr);
+            }
+        }
+        None
+    }
+}
 
 /// Map physical memory flags
 pub mod map_flags {
@@ -138,10 +170,7 @@ pub fn syscall_mmap(hint_addr: u64, size: u64, flags: u64) -> u64 {
         hint_addr
     } else {
         // Freelist: reuse addresses from munmap before bumping.
-        let mut free = MMAP_FREELIST.lock();
-        let reused = free.iter().position(|&(_, pages)| pages >= num_pages)
-            .map(|i| free.remove(i).0);
-        drop(free);
+        let reused = MMAP_FREELIST.lock().pop_fit(num_pages);
 
         if let Some(addr) = reused {
             addr
@@ -212,8 +241,7 @@ pub fn syscall_munmap(virt_addr: u64, size: u64) -> u64 {
     }
 
     if freed > 0 {
-        // Return freed virtual address range to mmap freelist for reuse
-        MMAP_FREELIST.lock().push((virt_addr, freed));
+        MMAP_FREELIST.lock().push(virt_addr, freed);
     }
 
     0
