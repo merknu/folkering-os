@@ -62,6 +62,34 @@ pub const DREAM_MAX_PER_SESSION: u32 = 10;
 /// AutoDream: max refactoring failures before marking as "perfected"
 pub const DREAM_STRIKE_LIMIT: u8 = 3;
 
+// ── Async TCP State Machine ────────────────────────────────────────
+
+/// Non-blocking phase of a Draug iteration.
+/// Each phase takes <1ms. Compositor renders between phases.
+#[derive(Clone, PartialEq)]
+pub enum AsyncPhase {
+    /// Ready for next iteration (gate check).
+    Idle,
+    /// TCP connect in progress (EAGAIN polling).
+    Connecting,
+    /// Sending request bytes (EAGAIN polling).
+    Sending,
+    /// Reading response (EAGAIN polling).
+    Reading,
+    /// Response complete — process result.
+    Processing,
+}
+
+/// What operation the async TCP is serving.
+#[derive(Clone, PartialEq)]
+pub enum AsyncOp {
+    None,
+    LlmGenerate,
+    FbpPatch,
+    WasmCompile,
+    ProxyPing,
+}
+
 // ── Knowledge Hunt (Phase 7) ────────────────────────────────────────
 //
 // When the system idles, Draug fires a one-shot "Knowledge Hunt" that
@@ -412,6 +440,24 @@ pub struct DraugDaemon {
     /// Cached proxy ping result (avoid 2s TCP per iteration).
     pub last_ping_ms: u64,
     pub last_ping_ok: bool,
+
+    // ── Async TCP state machine ──────────────────────────────────
+    /// Current async phase (non-blocking Draug iteration).
+    pub async_phase: AsyncPhase,
+    /// TCP slot ID for the current async connection (0xFFFF = none).
+    pub async_tcp_slot: u64,
+    /// Buffer for accumulating async TCP response.
+    pub async_response: alloc::vec::Vec<u8>,
+    /// What we're waiting for (LLM or PATCH).
+    pub async_operation: AsyncOp,
+    /// The prompt/request bytes to send.
+    pub async_request: alloc::vec::Vec<u8>,
+    /// Bytes sent so far.
+    pub async_sent: usize,
+    /// Task context preserved across async calls.
+    pub async_task_idx: usize,
+    pub async_level: u8,
+    pub async_attempt: u8,
 }
 
 // ── Phase 15 types (must live in lib crate so draug.rs can own them) ──
@@ -489,6 +535,15 @@ impl DraugDaemon {
             refactor_hibernating: false,
             last_ping_ms: 0,
             last_ping_ok: false,
+            async_phase: AsyncPhase::Idle,
+            async_tcp_slot: 0xFFFF,
+            async_response: alloc::vec::Vec::new(),
+            async_operation: AsyncOp::None,
+            async_request: alloc::vec::Vec::new(),
+            async_sent: 0,
+            async_task_idx: 0,
+            async_level: 0,
+            async_attempt: 0,
         }
     }
 
