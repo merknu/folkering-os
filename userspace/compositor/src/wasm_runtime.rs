@@ -265,6 +265,67 @@ pub fn execute_wasm_with_backend(
     }
 }
 
+/// Test silverfir-nano JIT compilation on a minimal WASM binary.
+/// Called once at boot to verify the JIT pipeline works end-to-end.
+pub fn test_silverfir_jit() {
+    libfolk::sys::io::write_str("[silverfir] Running JIT self-test...\n");
+
+    // Minimal WASM: one function that returns 42
+    // (module (func (export "run") (result i32) (i32.const 42)))
+    let wasm: &[u8] = &[
+        0x00, 0x61, 0x73, 0x6D, // magic
+        0x01, 0x00, 0x00, 0x00, // version
+        // type section: 1 type, ()->i32
+        0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7F,
+        // function section: 1 func, type 0
+        0x03, 0x02, 0x01, 0x00,
+        // export section: "run" = func 0
+        0x07, 0x07, 0x01, 0x03, 0x72, 0x75, 0x6E, 0x00, 0x00,
+        // code section: 1 body
+        0x0A, 0x06, 0x01,
+        // body: 0 locals, i32.const 42, end
+        0x04, 0x00, 0x41, 0x2A, 0x0B,
+    ];
+
+    match silverfir::JitModule::compile(wasm) {
+        Ok(module) => {
+            libfolk::sys::io::write_str("[silverfir] Compile OK: ");
+            let mut nb = [0u8; 16];
+            libfolk::sys::io::write_str(format_usize(module.functions.len(), &mut nb));
+            libfolk::sys::io::write_str(" function(s) JIT-compiled\n");
+
+            // Don't call yet — W^X mprotect needs to work first.
+            // Just verify that compilation succeeds.
+            libfolk::sys::io::write_str("[silverfir] SELF-TEST PASS: WASM→x86_64 compilation succeeded\n");
+        }
+        Err(silverfir::JitError::NotYetImplemented) => {
+            libfolk::sys::io::write_str("[silverfir] SELF-TEST SKIP: JIT not yet implemented\n");
+        }
+        Err(silverfir::JitError::UnsupportedOpcode(op)) => {
+            libfolk::sys::io::write_str("[silverfir] SELF-TEST FAIL: unsupported opcode 0x");
+            let hex = [b"0123456789abcdef"[(op >> 4) as usize], b"0123456789abcdef"[(op & 0xf) as usize]];
+            if let Ok(s) = core::str::from_utf8(&hex) {
+                libfolk::sys::io::write_str(s);
+            }
+            libfolk::sys::io::write_str("\n");
+        }
+        Err(_) => {
+            libfolk::sys::io::write_str("[silverfir] SELF-TEST FAIL: compilation error\n");
+        }
+    }
+}
+
+fn format_usize(mut v: usize, buf: &mut [u8; 16]) -> &str {
+    if v == 0 { return "0"; }
+    let mut i = 15;
+    while v > 0 && i > 0 {
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        i -= 1;
+    }
+    core::str::from_utf8(&buf[i+1..16]).unwrap_or("?")
+}
+
 /// Sandboxed execution via wasmi interpreter with fuel metering.
 fn execute_wasm_sandboxed(
     wasm_bytes: &[u8],

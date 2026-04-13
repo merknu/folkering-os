@@ -243,9 +243,17 @@ pub fn syscall_mprotect(virt_addr: u64, size: u64, flags: u64) -> u64 {
 
     let num_pages = ((size + PAGE_SIZE - 1) / PAGE_SIZE) as usize;
 
+    // Must use the TASK's page table, not the kernel mapper
+    let task_pml4 = crate::task::task::current_task().lock().page_table_phys;
+    if task_pml4 == 0 {
+        crate::serial_strln!("[MPROTECT] No task page table");
+        return u64::MAX;
+    }
+
     for i in 0..num_pages {
-        let virt = (virt_addr + (i as u64 * PAGE_SIZE)) as usize;
-        if let Err(_) = crate::memory::paging::protect(virt, pt_flags) {
+        let virt = virt_addr + (i as u64 * PAGE_SIZE);
+        // Unmap + remap with new flags in the task's page table
+        if let Err(_) = crate::memory::paging::protect_in_table(task_pml4, virt as usize, pt_flags) {
             crate::serial_strln!("[MPROTECT] Failed to update page flags");
             return u64::MAX;
         }

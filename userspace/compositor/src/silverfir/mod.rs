@@ -19,7 +19,7 @@ pub mod translate;
 /// A compiled WASM module ready for native execution.
 pub struct JitModule {
     /// Compiled function code blocks (one per function)
-    functions: Vec<Vec<u8>>,
+    pub functions: Vec<Vec<u8>>,
     /// Export name → function index
     exports: Vec<(String, usize)>,
     /// W^X memory block holding executable code
