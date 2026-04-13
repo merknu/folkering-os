@@ -466,7 +466,15 @@ pub struct DraugDaemon {
     pub async_task_idx: usize,
     pub async_level: u8,
     pub async_attempt: u8,
+    /// Uptime (ms) when current async phase started — for timeout.
+    /// If now - async_phase_started_ms > ASYNC_TIMEOUT_MS, force abort.
+    pub async_phase_started_ms: u64,
 }
+
+/// Timeout for any single async TCP phase (connect/send/read).
+/// 90 seconds wall clock — enough for cold Ollama + cargo test,
+/// but prevents permanent hang if proxy stops responding.
+pub const ASYNC_TIMEOUT_MS: u64 = 90_000;
 
 // ── Phase 15 types (must live in lib crate so draug.rs can own them) ──
 
@@ -552,6 +560,7 @@ impl DraugDaemon {
             async_task_idx: 0,
             async_level: 0,
             async_attempt: 0,
+            async_phase_started_ms: 0,
         }
     }
 

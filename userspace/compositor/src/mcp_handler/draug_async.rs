@@ -19,6 +19,35 @@ const PROXY_PORT: u16 = 14711;
 
 /// Non-blocking Draug tick. Called every compositor frame (~60Hz).
 pub(super) fn tick_async(draug: &mut DraugDaemon, now_ms: u64) -> bool {
+    // Timeout check: if any non-Idle phase exceeds 90s, force abort.
+    // Prevents permanent hang when proxy stops responding mid-transfer.
+    if draug.async_phase != AsyncPhase::Idle && draug.async_phase != AsyncPhase::Processing {
+        let elapsed = now_ms.saturating_sub(draug.async_phase_started_ms);
+        if elapsed > compositor::draug::ASYNC_TIMEOUT_MS {
+            write_str("[Draug-async] TIMEOUT after ");
+            write_dec((elapsed / 1000) as u32);
+            write_str("s in ");
+            let phase_name = match &draug.async_phase {
+                AsyncPhase::Connecting => "Connecting",
+                AsyncPhase::Sending => "Sending",
+                AsyncPhase::Reading => "Reading",
+                _ => "?",
+            };
+            write_str(phase_name);
+            write_str(" — aborting\n");
+
+            // Clean up TCP slot
+            if draug.async_tcp_slot != 0xFFFF {
+                tcp_close_async(draug.async_tcp_slot);
+                draug.async_tcp_slot = 0xFFFF;
+            }
+            draug.async_phase = AsyncPhase::Idle;
+            draug.async_operation = AsyncOp::None;
+            draug.record_skip();
+            return true;
+        }
+    }
+
     match draug.async_phase.clone() {
         AsyncPhase::Idle => tick_idle(draug, now_ms),
         AsyncPhase::Connecting => tick_connecting(draug),
@@ -173,6 +202,7 @@ fn start_llm_request(draug: &mut DraugDaemon, model: &str, prompt: &str) -> bool
     draug.async_request = req;
     draug.async_sent = 0;
     draug.async_response.clear();
+    draug.async_phase_started_ms = libfolk::sys::uptime();
 
     let result = tcp_connect_async(PROXY_IP, PROXY_PORT);
     draug.async_tcp_slot = if result == TCP_EAGAIN { 0xFFFF } else { result };
@@ -191,6 +221,7 @@ fn start_patch_request(draug: &mut DraugDaemon, code: &str) -> bool {
     draug.async_sent = 0;
     draug.async_response.clear();
     draug.async_operation = AsyncOp::FbpPatch;
+    draug.async_phase_started_ms = libfolk::sys::uptime();
 
     let result = tcp_connect_async(PROXY_IP, PROXY_PORT);
     draug.async_tcp_slot = if result == TCP_EAGAIN { 0xFFFF } else { result };
