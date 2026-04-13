@@ -303,6 +303,9 @@ fn process_skill_llm(draug: &mut DraugDaemon, response: &[u8], _now_ms: u64) -> 
 /// Skill tree / Phase 15: PATCH result → advance or fail.
 fn process_patch_result(draug: &mut DraugDaemon, response: &[u8], now_ms: u64) -> bool {
     if response.len() < 8 {
+        write_str("[Draug-async] PATCH: short/empty response\n");
+        // Treat as transient failure — don't penalize task
+        draug.record_skip();
         draug.async_phase = AsyncPhase::Idle;
         return true;
     }
@@ -370,7 +373,8 @@ fn process_patch_result(draug: &mut DraugDaemon, response: &[u8], now_ms: u64) -
         }
     } else {
         if is_phase15 {
-            write_str("[Draug-async] Phase 15 step FAIL\n");
+            write_str("[Draug-async] Phase 15 step FAIL (cargo)\n");
+            increment_step_fail(draug);
         } else {
             draug.record_refactor_fail();
             let (task_id, _) = REFACTOR_TASKS[draug.async_task_idx];
@@ -452,6 +456,8 @@ fn process_executor_llm(draug: &mut DraugDaemon, response: &[u8]) -> bool {
         }
         None => {
             write_str("[Draug-async] Executor LLM failed\n");
+            // Increment fail_count so we eventually abandon the step
+            increment_step_fail(draug);
             draug.async_phase = AsyncPhase::Idle;
             return true;
         }
@@ -468,12 +474,14 @@ fn process_executor_llm(draug: &mut DraugDaemon, response: &[u8]) -> bool {
 // ── Helpers ─────────────────────────────────────────────────────────
 
 /// Parse [u32 status][u32 len][text] from LLM response.
+/// Returns None on any parse failure — never panics.
 fn parse_llm_response(response: &[u8]) -> Option<String> {
     if response.len() < 8 { return None; }
     let status = u32::from_le_bytes([response[0], response[1], response[2], response[3]]);
     if status != 0 { return None; }
     let output_len = u32::from_le_bytes([response[4], response[5], response[6], response[7]]) as usize;
-    let text_end = (8 + output_len).min(response.len());
+    // Guard: cap at actual response length (prevents overflow if output_len is corrupt)
+    let text_end = 8usize.saturating_add(output_len).min(response.len());
     let raw = core::str::from_utf8(&response[8..text_end]).ok()?;
     let code = extract_rust_code_block(raw);
     if code.is_empty() && raw.contains("STEP|") {
@@ -501,6 +509,26 @@ fn extract_code_from_patch_request(request: &[u8]) -> String {
         }
     }
     String::new()
+}
+
+/// Increment fail_count on the current Phase 15 step.
+/// After 3 fails, abandon the entire task (prevent infinite loop).
+fn increment_step_fail(draug: &mut DraugDaemon) {
+    let step_idx = draug.async_task_idx;
+    if let Some(ref mut plan) = draug.active_plan {
+        if step_idx < plan.steps.len() {
+            plan.steps[step_idx].fail_count += 1;
+            write_str("[Draug-async] step fail_count=");
+            write_dec(plan.steps[step_idx].fail_count as u32);
+            write_str("/3\n");
+            if plan.steps[step_idx].fail_count >= 3 {
+                plan.completed = true;
+                write_str("[Draug-async] === ");
+                write_str(&plan.task_id);
+                write_str(" ABANDONED ===\n");
+            }
+        }
+    }
 }
 
 /// Encode a usize as decimal ASCII into a Vec.
