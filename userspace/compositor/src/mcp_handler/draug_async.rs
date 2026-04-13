@@ -419,15 +419,62 @@ fn process_patch_result(draug: &mut DraugDaemon, response: &[u8], now_ms: u64) -
             write_str("/20\n");
         }
     } else {
+        // FAIL — attempt error-driven retry (max 2)
+        if draug.async_attempt < 2 {
+            draug.async_attempt += 1;
+
+            // Extract error from PATCH response
+            let err_len = response.len().saturating_sub(8).min(1024);
+            let error_text = if err_len > 0 {
+                core::str::from_utf8(&response[8..8 + err_len]).unwrap_or("(parse error)")
+            } else {
+                "(no error text)"
+            };
+
+            write_str("[Draug-async] FAIL → retry #");
+            write_dec(draug.async_attempt as u32);
+            write_str(" with compiler feedback\n");
+
+            // Extract the code we sent (from the PATCH request)
+            let failed_code = extract_code_from_patch_request(&draug.async_request);
+
+            // Build retry prompt
+            let mut retry_prompt = String::with_capacity(failed_code.len() + 512);
+            retry_prompt.push_str("Your previous code failed compilation.\n\n[YOUR CODE]\n```rust\n");
+            retry_prompt.push_str(&failed_code);
+            retry_prompt.push_str("\n```\n\n[COMPILER ERROR]\n```\n");
+            retry_prompt.push_str(&error_text[..error_text.len().min(1024)]);
+            retry_prompt.push_str("\n```\n\nFix the errors. Respond with the FIXED code in a ```rust block.");
+
+            let model = if is_phase15 {
+                compositor::draug::EXECUTOR_MODEL
+            } else {
+                compositor::draug::model_for_level(draug.async_level)
+            };
+
+            draug.async_phase_started_ms = now_ms;
+            start_llm_request(draug, model, &retry_prompt);
+            // Keep the same async_operation (LlmGenerate or ExecutorLlm)
+            if is_phase15 {
+                draug.async_operation = AsyncOp::ExecutorLlm;
+            } else {
+                draug.async_operation = AsyncOp::LlmGenerate;
+            }
+            return true;
+        }
+
+        // Final fail after retries
         if is_phase15 {
-            write_str("[Draug-async] Phase 15 step FAIL (cargo)\n");
+            write_str("[Draug-async] Phase 15 step FAIL (after retries)\n");
             increment_step_fail(draug);
         } else {
             draug.record_refactor_fail();
             let (task_id, _) = REFACTOR_TASKS[draug.async_task_idx];
             write_str("[Draug-async] ");
             write_str(task_id);
-            write_str(" FAIL\n");
+            write_str(" FAIL (after ");
+            write_dec(draug.async_attempt as u32);
+            write_str(" retries)\n");
         }
     }
 
