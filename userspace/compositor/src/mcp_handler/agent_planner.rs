@@ -370,30 +370,61 @@ fn deploy_wasm(task_id: &str) {
     };
 
     if result.status == 0 {
+        let wasm_len = result.output_len;
         write_str("[Deploy] ");
         write_str(task_id);
         write_str(".wasm = ");
-        write_dec(result.output_len as u32);
-        write_str(" bytes — LIVE IN OS\n");
+        write_dec(wasm_len as u32);
+        write_str(" bytes\n");
 
-        // Store the WASM binary in Synapse so the compositor can
-        // load it on demand via the existing WASM cache mechanism.
+        // Store in Synapse for persistence across boots
         let mut wasm_name = String::with_capacity(32);
         wasm_name.push_str("draug_");
         wasm_name.push_str(task_id);
         wasm_name.push_str(".wasm");
 
-        match libfolk::sys::synapse::write_file(
+        let _ = libfolk::sys::synapse::write_file(
             &wasm_name,
-            &wasm_buf[..result.output_len],
-        ) {
-            Ok(_) => {
-                write_str("[Deploy] Stored as ");
-                write_str(&wasm_name);
-                write_str(" in Synapse VFS\n");
+            &wasm_buf[..wasm_len],
+        );
+
+        // ── THE MISSING STEP: actually RUN the code in the OS ────
+        //
+        // Try silverfir-nano JIT (Trusted backend) first for
+        // near-native speed. Falls back to wasmi if JIT can't
+        // handle the opcodes.
+        write_str("[Deploy] Loading into OS runtime...\n");
+
+        let config = compositor::wasm_runtime::WasmConfig {
+            screen_width: 0,
+            screen_height: 0,
+            uptime_ms: 0,
+        };
+
+        let (result, _output) = compositor::wasm_runtime::execute_wasm_with_backend(
+            &wasm_buf[..wasm_len],
+            config,
+            compositor::wasm_runtime::WasmBackend::Trusted,
+        );
+
+        match result {
+            compositor::wasm_runtime::WasmResult::Ok => {
+                write_str("[Deploy] ");
+                write_str(task_id);
+                write_str(" EXECUTED in OS — code is LIVE!\n");
             }
-            Err(_) => {
-                write_str("[Deploy] Warning: Synapse write failed — WASM in memory only\n");
+            compositor::wasm_runtime::WasmResult::Trap(ref msg) => {
+                write_str("[Deploy] Execution trapped: ");
+                write_str(&msg[..msg.len().min(80)]);
+                write_str("\n");
+            }
+            compositor::wasm_runtime::WasmResult::LoadError(ref msg) => {
+                write_str("[Deploy] Load failed: ");
+                write_str(&msg[..msg.len().min(80)]);
+                write_str(" (stored in Synapse for later)\n");
+            }
+            compositor::wasm_runtime::WasmResult::OutOfFuel => {
+                write_str("[Deploy] Out of fuel (computation too long)\n");
             }
         }
     } else {
