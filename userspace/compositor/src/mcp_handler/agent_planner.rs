@@ -29,7 +29,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use libfolk::sys::io::write_str;
-use libfolk::sys::synapse::{upsert_edge, upsert_entity};
+// Graph writes removed — see eviction policy note in plan_task()
 use libfolk::sys::{fbp_patch, llm_generate};
 
 use compositor::draug::{TaskPlan, PlanStep};
@@ -129,24 +129,11 @@ pub fn plan_task(task_id: &str, task_desc: &str) -> Option<TaskPlan> {
         write_str("\n");
     }
 
-    // Store plan in knowledge graph
-    let _ = upsert_entity(task_id, task_id, "PLAN_TASK");
-    for (i, step) in steps.iter().enumerate() {
-        let mut step_id = String::with_capacity(32);
-        step_id.push_str("step_");
-        step_id.push_str(task_id);
-        step_id.push('_');
-        push_dec(&mut step_id, (i + 1) as u32);
-
-        let _ = upsert_entity(&step_id, &step.description, "TODO_STEP");
-
-        let mut edge_id = String::with_capacity(40);
-        edge_id.push_str("e_");
-        edge_id.push_str(task_id);
-        edge_id.push_str("_has_");
-        push_dec(&mut edge_id, (i + 1) as u32);
-        let _ = upsert_edge(&edge_id, task_id, "has_step", &step_id);
-    }
+    // NOTE: Knowledge graph writes removed (was: entities + edges per
+    // plan step). These consumed ~3KB per plan but were NEVER read back.
+    // Draug's operational state lives in task_levels/task_code/task_errors
+    // (persisted via draug_state.bin). Graph writes filled the 4MB Synapse
+    // DB in ~4 weeks. See eviction policy discussion in CHANGELOG.md.
 
     Some(TaskPlan {
         task_id: String::from(task_id),
@@ -312,31 +299,12 @@ pub fn execute_next_step(plan: &mut TaskPlan) -> bool {
             }
             write_str("\n");
 
-            // Update knowledge graph: mark step done
-            let mut step_id = String::with_capacity(32);
-            step_id.push_str("step_");
-            step_id.push_str(&plan.task_id);
-            step_id.push('_');
-            push_dec(&mut step_id, (step_idx + 1) as u32);
-
-            let mut edge_id = String::with_capacity(40);
-            edge_id.push_str("e_");
-            edge_id.push_str(&step_id);
-            edge_id.push_str("_status");
-            let _ = upsert_edge(&edge_id, &step_id, "status", "done");
-
             // Check if all steps are done
             if plan.steps.iter().all(|s| s.done) {
                 plan.completed = true;
                 write_str("[Executor] === ");
                 write_str(&plan.task_id);
                 write_str(" COMPLETE ===\n");
-
-                let mut task_edge = String::with_capacity(40);
-                task_edge.push_str("e_");
-                task_edge.push_str(&plan.task_id);
-                task_edge.push_str("_done");
-                let _ = upsert_edge(&task_edge, &plan.task_id, "status", "complete");
 
                 // Phase 16: compile to WASM and deploy into the OS
                 deploy_wasm(&plan.task_id);
