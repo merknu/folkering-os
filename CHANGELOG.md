@@ -256,9 +256,40 @@ Output gikk fra komplett gibberish til sammenhengende fraser.
 - Abandoned task guard: execute_next_step checks plan.completed
 - All proxy TCP timeouts reduced from 900K to 120K tsc_ms (WCET 16min→4min)
 
+### Async TCP — Zero UI Freeze (EAGAIN State Machine)
+- New kernel module `tcp_async.rs`: 4 non-blocking syscalls (0xE0-0xE3)
+  - `sys_tcp_connect` → slot_id or EAGAIN
+  - `sys_tcp_send` → bytes or EAGAIN
+  - `sys_tcp_poll_recv` → bytes, EAGAIN, or 0 (EOF)
+  - `sys_tcp_close` → free slot
+- `draug_async.rs`: Full async state machine for ALL Draug operations
+  - Skill tree L1-L3: fully async (<1ms per frame)
+  - Phase 15 Plan-and-Solve: fully async (<1ms per frame)
+  - Before: UI froze 3-80s per LLM call. After: NEVER freezes
+- 90-second timeout per async phase (prevents permanent hang)
+- 6 parse robustness fixes: fail_count for executor, overflow guard, etc.
+
+### TCP Shell Hardening
+- Idle client timeout: 5 minutes, frees socket for other users
+- recv error: proper disconnect instead of silent `unwrap_or(0)`
+- Buffer overflow: warns user "(line truncated at 255 bytes)"
+- All `line_buf` access verified bounds-safe
+
+### Synapse VFS Eviction
+- Removed unbounded knowledge graph writes from Phase 15
+- Before: entities + edges grew ~113 KB/day → 4 MB DB full in ~4 weeks
+- After: steady-state ~400 KB (10% of 4 MB) → never fills up
+- Bounded data only: draug_state.bin, draug_code_N.rs, driver WASM
+
+### Silverfir-nano JIT Pool
+- `JitPool`: 1 MB pre-allocated region with bitmap allocation
+- Eliminates mmap/munmap churn from repeated compilations
+- `dealloc()`: zeroes pages with INT3 (0xCC), clears bitmap
+- No memory leak possible: bitmap is single source of truth
+
 ### Commits
 ```
-ai-native-os branch (12 commits):
+ai-native-os branch (20 commits):
   29adabf  Phase 13-16 + TCP remote shell
   9db1ea1  Ping crash fix, skip KHunt, bridge after restore
   e76a97e  Cached proxy ping, adaptive interval, net/df
@@ -267,8 +298,18 @@ ai-native-os branch (12 commits):
   c4596f4  Audit: iter count, L1 persistence, abandoned task guard
   4933684  Heap fragmentation fixes
   bdd8457  Atomic memory ordering (Acquire/Release)
+  c88ce9d  Changelog (initial)
+  8d6ed28  Non-blocking async TCP syscalls (EAGAIN)
+  a5f2ecd  Draug async state machine types
+  1bdb0b5  Non-blocking Draug iterations
+  8721ec4  Remove blocking fallback
+  ce2a0a6  Phase 15 fully async
+  83a713d  6 parse robustness fixes
+  38d1c7d  TCP shell hardening
+  1cd3b70  Async TCP timeout (90s)
+  308b0f1  Remove unbounded graph writes
 
-silverfir-nano-wasm-hybrid branch (8 commits):
+silverfir-nano-wasm-hybrid branch (9 commits):
   73cd49b  WasmBackend dual-runtime enum
   b51c1ea  JIT scaffold + CodeBuffer
   e21de43  W^X memory + protect_in_table
@@ -277,6 +318,7 @@ silverfir-nano-wasm-hybrid branch (8 commits):
   f5bac38  JIT self-test PASS (compilation)
   933e18b  Native execution — returned 42
   800037c  All TCP timeouts reduced to 120K
+  faba2df  JitPool 1MB bitmap allocation
 
 folkering-proxy (6 commits):
   5d9a6b3  Rust rewrite + Phase 13-16
@@ -292,18 +334,29 @@ folkering-daq (1 commit):
 
 ---
 
-## Nøkkeltall
+## Nøkkeltall (oppdatert 13. april 2026)
 
 | Metrikk | Verdi |
 |---------|-------|
-| Total commits | 60+ |
-| Utviklingsperiode | 23. januar – 22. mars 2026 |
+| Total commits | 95+ (4 repos) |
+| Utviklingsperiode | 23. januar – 13. april 2026 |
 | Kernel | Rust no_std, x86-64, Limine bootloader |
-| Modell | SmolLM2-135M, Q4_0 kvantisering |
-| Tokenizer parity | 98.7% total, 100% for all text |
-| Vocab size | 49,152 tokens |
-| BPE merge rules | 48,900 |
-| KV-cache | 256 tokens, 11.7MB |
-| Mailbox | 128KB (256 sektorer) |
-| Arena | 8MB BumpArena |
-| MCP tools | 9 verktøy for debugging/konfigurering |
+| Kernel size | 2211 KB |
+| Syscalls | 100+ (inkl. async TCP 0xE0-E3, W^X 0x32, Draug bridge 0xD0-D1) |
+| Modell (on-device) | SmolLM2-135M, Q4_0 kvantisering |
+| Modell (Draug) | qwen2.5-coder:7b (L1), gemma4:31b-cloud (L2+) via Ollama |
+| WASM host functions | 53 (graphics, network, AI, VFS, system) |
+| WASM backend | Dual: wasmi (sandboxed) + silverfir-nano (trusted JIT) |
+| JIT self-test | PASS — native x86_64 execution returned 42 |
+| Draug skill tree | L1=20, L2=20, L3=20 (100% pass rate) |
+| Draug Phase 15 | 4/8 complex tasks COMPLETE (ringbuffer, bump_alloc, bitset, task_queue) |
+| TCP shell | port 2222, 12 commands, draug status/pause/resume |
+| Anti-gaming | 3 layers: ground-truth injection, tautology detection, mutation testing |
+| Security | Source scanner (14 patterns), SSRF protection, W^X enforcement |
+| UI freeze | **Zero** — all Draug TCP calls async via EAGAIN |
+| Boot persistence | 26-byte state, resumes after restart |
+| Synapse DB usage | ~400 KB / 4 MB (10%, bounded) |
+| Heap fragmentation | Fixed buffers in hot loop, JitPool for JIT |
+| MCP tools | 9+ debugging/konfigurering |
+| folkering-proxy | Rust, Chromium + Ollama + WASM compile + security |
+| folkering-daq | aarch64 Pi 5, TCP shell, openDAQ streaming |
