@@ -60,7 +60,21 @@ pub fn tcp_request_with_timeout(
     read_timeout_tsc_ms: u64,
 ) -> Result<alloc::vec::Vec<u8>, &'static str> {
     let read_budget = if read_timeout_tsc_ms == 0 { 900_000 } else { read_timeout_tsc_ms };
-    let mut guard = NET_STATE.lock();
+    // Use try_lock with retry to avoid deadlock if timer ISR or
+    // another context holds NET_STATE. 1000 spins ≈ a few µs.
+    let mut guard = {
+        let mut attempts = 0u32;
+        loop {
+            if let Some(g) = NET_STATE.try_lock() {
+                break g;
+            }
+            attempts += 1;
+            if attempts > 1000 {
+                return Err("NET_STATE locked");
+            }
+            core::hint::spin_loop();
+        }
+    };
     let state = guard.as_mut().ok_or("no network")?;
     if !state.has_ip {
         return Err("no IP address");

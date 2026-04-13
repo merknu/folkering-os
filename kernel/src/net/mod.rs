@@ -175,18 +175,23 @@ pub fn poll() {
 
             state.iface.update_ip_addrs(|addrs| {
                 addrs.clear();
-                addrs.push(IpCidr::Ipv4(config.address)).unwrap();
+                if addrs.push(IpCidr::Ipv4(config.address)).is_err() {
+                    crate::serial_strln!("[NET] DHCP: WARN address list full");
+                }
             });
 
             if let Some(router) = config.router {
                 crate::serial_str!("[NET] DHCP: gateway ");
                 print_ipv4(&router);
                 crate::drivers::serial::write_newline();
-                state
+                if state
                     .iface
                     .routes_mut()
                     .add_default_ipv4_route(router)
-                    .unwrap();
+                    .is_err()
+                {
+                    crate::serial_strln!("[NET] DHCP: WARN route table full");
+                }
             }
 
             // Configure DNS servers from DHCP

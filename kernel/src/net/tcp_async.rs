@@ -135,9 +135,22 @@ pub fn syscall_tcp_connect(ip_packed: u64, port: u64) -> u64 {
     slot_idx as u64
 }
 
+/// Basic pointer sanity check: non-null, reasonable length, no wraparound.
+/// Not a full user/kernel boundary check (everything runs in ring 0),
+/// but catches null pointers and wild lengths that would page-fault.
+#[inline]
+fn validate_user_ptr(ptr: u64, len: u64) -> bool {
+    if ptr == 0 || len > 1024 * 1024 {
+        return false; // null or > 1MB
+    }
+    // Check that ptr + len doesn't wrap around
+    (ptr as usize).checked_add(len as usize).is_some()
+}
+
 /// Non-blocking send. Returns bytes written, EAGAIN, or MAX on error.
 pub fn syscall_tcp_send(slot_id: u64, data_ptr: u64, data_len: u64) -> u64 {
     if slot_id as usize >= MAX_ASYNC_SLOTS { return u64::MAX; }
+    if data_len > 0 && !validate_user_ptr(data_ptr, data_len) { return u64::MAX; }
 
     let mut guard = match NET_STATE.try_lock() {
         Some(g) => g,
@@ -196,6 +209,7 @@ pub fn syscall_tcp_send(slot_id: u64, data_ptr: u64, data_len: u64) -> u64 {
 /// Returns 0 when peer has closed and all data is drained.
 pub fn syscall_tcp_poll_recv(slot_id: u64, buf_ptr: u64, buf_max: u64) -> u64 {
     if slot_id as usize >= MAX_ASYNC_SLOTS { return u64::MAX; }
+    if buf_max > 0 && !validate_user_ptr(buf_ptr, buf_max) { return u64::MAX; }
 
     let mut guard = match NET_STATE.try_lock() {
         Some(g) => g,

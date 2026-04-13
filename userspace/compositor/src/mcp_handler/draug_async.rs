@@ -50,8 +50,10 @@ pub(super) fn tick_async(draug: &mut DraugDaemon, now_ms: u64) -> bool {
 
     match draug.async_phase.clone() {
         AsyncPhase::Idle => tick_idle(draug, now_ms),
-        AsyncPhase::Connecting => tick_sending(draug), // connect merged into send
-        AsyncPhase::Sending => tick_sending(draug),
+        // Connecting is handled by tick_sending — tcp_send_async returns
+        // EAGAIN until the TCP handshake completes, which auto-promotes
+        // the slot from Connecting→Connected.
+        AsyncPhase::Connecting | AsyncPhase::Sending => tick_sending(draug),
         AsyncPhase::Reading => tick_reading(draug),
         AsyncPhase::Processing => tick_processing(draug, now_ms),
     }
@@ -252,26 +254,16 @@ fn start_patch_request(draug: &mut DraugDaemon, code: &str) -> bool {
     true
 }
 
-// ── CONNECTING / SENDING / READING (unchanged from before) ──────────
-
-fn tick_connecting(draug: &mut DraugDaemon) -> bool {
-    if draug.async_tcp_slot == 0xFFFF {
-        let result = tcp_connect_async(PROXY_IP, PROXY_PORT);
-        if result == TCP_EAGAIN { return false; }
-        if result == u64::MAX {
-            write_str("[Draug-async] connect failed\n");
-            draug.async_phase = AsyncPhase::Idle;
-            draug.record_skip();
-            return true;
-        }
-        draug.async_tcp_slot = result;
-    }
-    draug.async_phase = AsyncPhase::Sending;
-    draug.async_sent = 0;
-    true
-}
+// ── SENDING / READING ────────────────────────────────────────────────
 
 fn tick_sending(draug: &mut DraugDaemon) -> bool {
+    // Guard: if slot is invalid (shouldn't happen), reset to idle
+    if draug.async_tcp_slot == 0xFFFF {
+        write_str("[Draug-async] BUG: sending with invalid slot\n");
+        draug.async_phase = AsyncPhase::Idle;
+        draug.record_skip();
+        return true;
+    }
     let remaining = &draug.async_request[draug.async_sent..];
     if remaining.is_empty() {
         draug.async_phase = AsyncPhase::Reading;
