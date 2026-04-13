@@ -84,10 +84,18 @@ pub enum AsyncPhase {
 #[derive(Clone, PartialEq)]
 pub enum AsyncOp {
     None,
+    /// Skill tree: LLM call for code generation
     LlmGenerate,
+    /// Skill tree / Phase 15: cargo test via PATCH
     FbpPatch,
+    /// Phase 16: WASM compilation
     WasmCompile,
+    /// Health check
     ProxyPing,
+    /// Phase 15: LLM call for planning (STEP| format)
+    PlannerLlm,
+    /// Phase 15: LLM call for step execution
+    ExecutorLlm,
 }
 
 // ── Knowledge Hunt (Phase 7) ────────────────────────────────────────

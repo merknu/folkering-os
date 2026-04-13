@@ -1,31 +1,23 @@
 //! Draug Async Tick — non-blocking refactor iteration via EAGAIN TCP.
 //!
-//! Replaces the blocking `run_refactor_step()` with a state machine
-//! that returns in <1ms on every call. The compositor renders between
-//! states — UI never freezes during LLM calls.
-//!
-//! State flow per iteration:
-//!   Idle → pick task, build LLM request
-//!   Connecting → tcp_connect_async(proxy) → EAGAIN until connected
-//!   Sending → tcp_send_async(request) → EAGAIN until sent
-//!   Reading → tcp_poll_recv(response) → EAGAIN until complete
-//!   Processing → extract code, start PATCH (back to Connecting)
-//!   Idle → advance level, save state
+//! Handles both Skill Tree (L1-L3) and Phase 15 (Plan-and-Solve).
+//! Every call returns in <1ms. UI renders between calls.
 
 extern crate alloc;
 
 use alloc::string::String;
+use alloc::vec::Vec;
 use libfolk::sys::io::write_str;
 use libfolk::sys::{tcp_connect_async, tcp_send_async, tcp_poll_recv, tcp_close_async, TCP_EAGAIN};
-use compositor::draug::{AsyncPhase, AsyncOp, DraugDaemon};
+use compositor::draug::{AsyncPhase, AsyncOp, DraugDaemon, PlanStep};
 
-use super::knowledge_hunt::{write_dec, extract_rust_code_block, REFACTOR_TASKS};
+use super::knowledge_hunt::{write_dec, extract_rust_code_block, push_decimal, REFACTOR_TASKS};
+use super::agent_planner::COMPLEX_TASKS;
 
 const PROXY_IP: [u8; 4] = [10, 0, 2, 2];
 const PROXY_PORT: u16 = 14711;
 
 /// Non-blocking Draug tick. Called every compositor frame (~60Hz).
-/// Returns in <1ms regardless of network state.
 pub(super) fn tick_async(draug: &mut DraugDaemon, now_ms: u64) -> bool {
     match draug.async_phase.clone() {
         AsyncPhase::Idle => tick_idle(draug, now_ms),
@@ -36,117 +28,195 @@ pub(super) fn tick_async(draug: &mut DraugDaemon, now_ms: u64) -> bool {
     }
 }
 
-/// Idle: pick next task, build request, start connecting.
-fn tick_idle(draug: &mut DraugDaemon, now_ms: u64) -> bool {
-    // Gate check (same as blocking version)
-    if !draug.should_run_refactor_step(now_ms) { return false; }
+// ── IDLE: pick task, build request, start TCP connect ───────────────
 
+fn tick_idle(draug: &mut DraugDaemon, now_ms: u64) -> bool {
+    if !draug.should_run_refactor_step(now_ms) { return false; }
     draug.last_refactor_ms = now_ms;
 
-    // Pick task (skill tree or Phase 15)
-    let (task_idx, level) = match draug.next_task_and_level() {
-        Some(t) => t,
-        None => {
-            // Skill tree complete — Phase 15 falls back to blocking
-            // (complex multi-step planning not yet async)
-            if !draug.plan_mode_active {
-                draug.plan_mode_active = true;
-                draug.save_state();
-                write_str("\n[Draug-async] *** PHASE 15 activated ***\n");
-            }
-            // Phase 15 blocking fallback (will be migrated to async later)
-            super::knowledge_hunt::run_plan_step(draug, 0);
-            return true;
-        }
-    };
+    match draug.next_task_and_level() {
+        Some((task_idx, level)) => start_skill_tree(draug, task_idx, level),
+        None => start_phase15(draug),
+    }
+}
 
+/// Skill tree L1-L3: build LLM prompt, start async TCP.
+fn start_skill_tree(draug: &mut DraugDaemon, task_idx: usize, level: u8) -> bool {
     let (task_id, task_desc) = REFACTOR_TASKS[task_idx];
-
-    // Build LLM prompt
     let model = compositor::draug::model_for_level(level);
     let prompt = super::knowledge_hunt::build_level_prompt(
         level, task_id, task_desc, draug.get_task_code(task_idx),
     );
 
-    // Build the wire frame: LLM <model>\n<len>\n<prompt>
-    let mut req = alloc::vec::Vec::with_capacity(prompt.len() + 64);
-    req.extend_from_slice(b"LLM ");
-    req.extend_from_slice(model.as_bytes());
-    req.push(b'\n');
-    // Decimal-encode prompt length
-    let mut tmp = [0u8; 12];
-    let mut n = prompt.len();
-    let mut idx = 0;
-    if n == 0 { tmp[0] = b'0'; idx = 1; }
-    else { while n > 0 { tmp[idx] = b'0' + (n % 10) as u8; n /= 10; idx += 1; } }
-    for i in 0..idx / 2 { tmp.swap(i, idx - 1 - i); }
-    req.extend_from_slice(&tmp[..idx]);
-    req.push(b'\n');
-    req.extend_from_slice(prompt.as_bytes());
-
-    // Save context
-    draug.async_task_idx = task_idx;
-    draug.async_level = level;
-    draug.async_attempt = 0;
-    draug.async_request = req;
-    draug.async_sent = 0;
-    draug.async_response.clear();
-    draug.async_operation = AsyncOp::LlmGenerate;
-
-    // Log
-    write_str("\n[Draug-async] iter task=");
-    write_str(task_id);
-    write_str(" L");
-    write_dec(level as u32);
-    write_str(" connecting...\n");
-
-    // Update bridge
+    // Set task label for shell
     {
         let mut label = String::with_capacity(32);
         label.push_str(task_id);
         label.push_str(" L");
-        super::knowledge_hunt::push_decimal(&mut label, level as u32);
+        push_decimal(&mut label, level as u32);
         libfolk::sys::draug_bridge_set_task(&label);
     }
 
-    // Start TCP connect
-    let ip_packed = ((PROXY_IP[0] as u64) << 24) | ((PROXY_IP[1] as u64) << 16)
-        | ((PROXY_IP[2] as u64) << 8) | (PROXY_IP[3] as u64);
-    let result = tcp_connect_async(PROXY_IP, PROXY_PORT);
-    if result == u64::MAX {
-        write_str("[Draug-async] SKIP: connect failed\n");
-        draug.record_skip();
-        return true;
+    write_str("\n[Draug-async] ");
+    write_str(task_id);
+    write_str(" L");
+    write_dec(level as u32);
+    write_str(" → LLM\n");
+
+    draug.async_task_idx = task_idx;
+    draug.async_level = level;
+    draug.async_attempt = 0;
+    draug.async_operation = AsyncOp::LlmGenerate;
+    start_llm_request(draug, model, &prompt)
+}
+
+/// Phase 15: decide whether to plan a new task or execute next step.
+fn start_phase15(draug: &mut DraugDaemon) -> bool {
+    if !draug.plan_mode_active {
+        draug.plan_mode_active = true;
+        draug.save_state();
+        write_str("\n[Draug-async] *** PHASE 15 activated ***\n");
     }
 
+    // Check if active plan has pending steps
+    if let Some(ref plan) = draug.active_plan {
+        if !plan.completed {
+            if let Some(step_idx) = plan.steps.iter().position(|s| !s.done) {
+                return start_executor_step(draug, step_idx);
+            }
+        }
+    }
+
+    // Need a new plan
+    if draug.complex_task_idx >= COMPLEX_TASKS.len() {
+        write_str("[Draug-async] All complex tasks done!\n");
+        return false;
+    }
+
+    let (task_id, task_desc) = COMPLEX_TASKS[draug.complex_task_idx];
+    write_str("\n[Draug-async] [PLAN-NEW] ");
+    write_str(task_id);
+    write_str("\n");
+
+    libfolk::sys::draug_bridge_set_task(task_id);
+
+    // Build planner prompt
+    let mut prompt = String::with_capacity(512);
+    prompt.push_str("You are a chief software architect. Break down the following ");
+    prompt.push_str("coding task into 3 to 5 implementation steps. ");
+    prompt.push_str("Respond with ONLY one step per line, formatted exactly as: ");
+    prompt.push_str("STEP|Short description of the step\n");
+    prompt.push_str("No other text, no numbering, no blank lines.\n\n");
+    prompt.push_str("Task: Write ");
+    prompt.push_str(task_desc);
+
+    draug.async_operation = AsyncOp::PlannerLlm;
+    start_llm_request(draug, compositor::draug::PLANNER_MODEL, &prompt)
+}
+
+/// Phase 15: build executor prompt for a specific step.
+fn start_executor_step(draug: &mut DraugDaemon, step_idx: usize) -> bool {
+    let plan = draug.active_plan.as_ref().unwrap();
+    let step_desc = &plan.steps[step_idx].description;
+
+    write_str("[Draug-async] [EXEC] step ");
+    write_dec((step_idx + 1) as u32);
+    write_str("/");
+    write_dec(plan.steps.len() as u32);
+    write_str(": ");
+    write_str(&step_desc[..step_desc.len().min(50)]);
+    write_str("\n");
+
+    // Gather prior code
+    let mut prior_code = String::with_capacity(4096);
+    for prev in &plan.steps[..step_idx] {
+        if let Some(ref code) = prev.code {
+            if prior_code.len() + code.len() > 8192 { break; }
+            if !prior_code.is_empty() { prior_code.push('\n'); }
+            prior_code.push_str(code);
+        }
+    }
+
+    let mut prompt = String::with_capacity(2048);
+    prompt.push_str("You are building: ");
+    prompt.push_str(&plan.task_desc);
+    prompt.push_str("\n\n");
+    if !prior_code.is_empty() {
+        prompt.push_str("Here is the code written so far:\n```rust\n");
+        prompt.push_str(&prior_code);
+        prompt.push_str("\n```\n\n");
+    }
+    prompt.push_str("Current step: ");
+    prompt.push_str(step_desc);
+    prompt.push_str("\n\nWrite ONLY the code in a ```rust fenced block. ");
+    if !prior_code.is_empty() {
+        prompt.push_str("Include all previous code plus additions. ");
+    }
+    prompt.push_str("Must compile as lib.rs. No explanation.");
+
+    draug.async_task_idx = step_idx; // reuse for step index
+    draug.async_operation = AsyncOp::ExecutorLlm;
+    start_llm_request(draug, compositor::draug::EXECUTOR_MODEL, &prompt)
+}
+
+// ── Shared: build LLM wire frame and start TCP connect ──────────────
+
+fn start_llm_request(draug: &mut DraugDaemon, model: &str, prompt: &str) -> bool {
+    let mut req = Vec::with_capacity(prompt.len() + 64);
+    req.extend_from_slice(b"LLM ");
+    req.extend_from_slice(model.as_bytes());
+    req.push(b'\n');
+    encode_decimal(&mut req, prompt.len());
+    req.push(b'\n');
+    req.extend_from_slice(prompt.as_bytes());
+
+    draug.async_request = req;
+    draug.async_sent = 0;
+    draug.async_response.clear();
+
+    let result = tcp_connect_async(PROXY_IP, PROXY_PORT);
     draug.async_tcp_slot = if result == TCP_EAGAIN { 0xFFFF } else { result };
     draug.async_phase = AsyncPhase::Connecting;
     true
 }
 
-/// Connecting: poll until TCP handshake completes.
+fn start_patch_request(draug: &mut DraugDaemon, code: &str) -> bool {
+    let mut req = Vec::with_capacity(code.len() + 64);
+    req.extend_from_slice(b"PATCH draug_latest.rs\n");
+    encode_decimal(&mut req, code.len());
+    req.push(b'\n');
+    req.extend_from_slice(code.as_bytes());
+
+    draug.async_request = req;
+    draug.async_sent = 0;
+    draug.async_response.clear();
+    draug.async_operation = AsyncOp::FbpPatch;
+
+    let result = tcp_connect_async(PROXY_IP, PROXY_PORT);
+    draug.async_tcp_slot = if result == TCP_EAGAIN { 0xFFFF } else { result };
+    draug.async_phase = AsyncPhase::Connecting;
+    true
+}
+
+// ── CONNECTING / SENDING / READING (unchanged from before) ──────────
+
 fn tick_connecting(draug: &mut DraugDaemon) -> bool {
     if draug.async_tcp_slot == 0xFFFF {
-        // Still waiting for slot assignment — retry connect
         let result = tcp_connect_async(PROXY_IP, PROXY_PORT);
-        if result == TCP_EAGAIN {
-            return false; // still connecting, <1ms
-        } else if result == u64::MAX {
-            write_str("[Draug-async] SKIP: connect failed\n");
+        if result == TCP_EAGAIN { return false; }
+        if result == u64::MAX {
+            write_str("[Draug-async] connect failed\n");
             draug.async_phase = AsyncPhase::Idle;
             draug.record_skip();
             return true;
         }
         draug.async_tcp_slot = result;
     }
-
-    // Slot assigned = connected
     draug.async_phase = AsyncPhase::Sending;
     draug.async_sent = 0;
     true
 }
 
-/// Sending: push request bytes to TCP socket.
 fn tick_sending(draug: &mut DraugDaemon) -> bool {
     let remaining = &draug.async_request[draug.async_sent..];
     if remaining.is_empty() {
@@ -154,195 +224,291 @@ fn tick_sending(draug: &mut DraugDaemon) -> bool {
         draug.async_response.clear();
         return true;
     }
-
     let result = tcp_send_async(draug.async_tcp_slot, remaining);
-    if result == TCP_EAGAIN {
-        return false; // send buffer full, try next frame
-    }
+    if result == TCP_EAGAIN { return false; }
     if result == u64::MAX {
-        write_str("[Draug-async] send error\n");
         tcp_close_async(draug.async_tcp_slot);
         draug.async_phase = AsyncPhase::Idle;
         draug.record_skip();
         return true;
     }
     draug.async_sent += result as usize;
-    false // more to send, but <1ms
+    false
 }
 
-/// Reading: accumulate response bytes until peer closes or we have enough.
 fn tick_reading(draug: &mut DraugDaemon) -> bool {
     let mut buf = [0u8; 4096];
     let result = tcp_poll_recv(draug.async_tcp_slot, &mut buf);
-
-    if result == TCP_EAGAIN {
-        return false; // no data yet, <1ms
-    }
+    if result == TCP_EAGAIN { return false; }
     if result == u64::MAX {
-        write_str("[Draug-async] recv error\n");
         tcp_close_async(draug.async_tcp_slot);
         draug.async_phase = AsyncPhase::Idle;
         draug.record_skip();
         return true;
     }
     if result == 0 {
-        // Peer closed — response complete
         tcp_close_async(draug.async_tcp_slot);
         draug.async_tcp_slot = 0xFFFF;
         draug.async_phase = AsyncPhase::Processing;
         return true;
     }
-
-    // Accumulate data
     draug.async_response.extend_from_slice(&buf[..result as usize]);
-
-    // Safety cap: don't buffer more than 64KB
     if draug.async_response.len() > 65536 {
         tcp_close_async(draug.async_tcp_slot);
         draug.async_tcp_slot = 0xFFFF;
         draug.async_phase = AsyncPhase::Processing;
+    }
+    false
+}
+
+// ── PROCESSING: parse response based on async_operation ─────────────
+
+fn tick_processing(draug: &mut DraugDaemon, now_ms: u64) -> bool {
+    let response = core::mem::take(&mut draug.async_response);
+
+    match draug.async_operation.clone() {
+        AsyncOp::LlmGenerate => process_skill_llm(draug, &response, now_ms),
+        AsyncOp::FbpPatch => process_patch_result(draug, &response, now_ms),
+        AsyncOp::PlannerLlm => process_planner_response(draug, &response),
+        AsyncOp::ExecutorLlm => process_executor_llm(draug, &response),
+        _ => { draug.async_phase = AsyncPhase::Idle; true }
+    }
+}
+
+/// Skill tree: LLM returned code → extract → start PATCH.
+fn process_skill_llm(draug: &mut DraugDaemon, response: &[u8], _now_ms: u64) -> bool {
+    let code = match parse_llm_response(response) {
+        Some(c) => c,
+        None => {
+            write_str("[Draug-async] LLM parse failed\n");
+            draug.async_phase = AsyncPhase::Idle;
+            draug.record_skip();
+            return true;
+        }
+    };
+
+    write_str("[Draug-async] LLM OK → ");
+    write_dec(code.len() as u32);
+    write_str("B → PATCH\n");
+
+    if draug.async_level == 1 {
+        draug.store_task_code(draug.async_task_idx, code.clone());
+        draug.save_task_code(draug.async_task_idx);
+    }
+
+    start_patch_request(draug, &code);
+    true
+}
+
+/// Skill tree / Phase 15: PATCH result → advance or fail.
+fn process_patch_result(draug: &mut DraugDaemon, response: &[u8], now_ms: u64) -> bool {
+    if response.len() < 8 {
+        draug.async_phase = AsyncPhase::Idle;
+        return true;
+    }
+    let status = u32::from_le_bytes([response[0], response[1], response[2], response[3]]);
+
+    match draug.async_operation.clone() {
+        // Could be skill tree or Phase 15 executor
+        _ => {}
+    }
+
+    // Check which context we're in
+    let is_phase15 = draug.plan_mode_active && draug.active_plan.is_some();
+
+    if status == 0 {
+        if is_phase15 {
+            // Mark step done in plan
+            let step_idx = draug.async_task_idx;
+            if let Some(ref mut plan) = draug.active_plan {
+                if step_idx < plan.steps.len() {
+                    // Extract code from the request (it was the PATCH payload)
+                    let code = extract_code_from_patch_request(&draug.async_request);
+                    plan.steps[step_idx].code = Some(code);
+                    plan.steps[step_idx].done = true;
+
+                    write_str("[Draug-async] ");
+                    write_str(&plan.task_id);
+                    write_str(" step ");
+                    write_dec((step_idx + 1) as u32);
+                    write_str(" PASS\n");
+
+                    if plan.steps.iter().all(|s| s.done) {
+                        plan.completed = true;
+                        write_str("[Draug-async] === ");
+                        write_str(&plan.task_id);
+                        write_str(" COMPLETE ===\n");
+                    }
+                }
+            }
+        } else {
+            // Skill tree PASS
+            let iter = draug.advance_refactor(now_ms);
+            draug.record_refactor_pass();
+            draug.advance_task_level(draug.async_task_idx);
+            draug.reset_skips();
+            draug.clear_task_error(draug.async_task_idx);
+            draug.save_state();
+
+            let (task_id, _) = REFACTOR_TASKS[draug.async_task_idx];
+            write_str("[Draug-async] ");
+            write_str(task_id);
+            write_str(" L");
+            write_dec(draug.async_level as u32);
+            write_str(" PASS\n");
+
+            let at_l1 = draug.tasks_at_level(1);
+            let at_l2 = draug.tasks_at_level(2);
+            let at_l3 = draug.tasks_at_level(3);
+            write_str("[Draug-async] Skill: L1=");
+            write_dec(at_l1 as u32);
+            write_str("/20 L2=");
+            write_dec(at_l2 as u32);
+            write_str("/20 L3=");
+            write_dec(at_l3 as u32);
+            write_str("/20\n");
+        }
+    } else {
+        if is_phase15 {
+            write_str("[Draug-async] Phase 15 step FAIL\n");
+        } else {
+            draug.record_refactor_fail();
+            let (task_id, _) = REFACTOR_TASKS[draug.async_task_idx];
+            write_str("[Draug-async] ");
+            write_str(task_id);
+            write_str(" FAIL\n");
+        }
+    }
+
+    draug.async_phase = AsyncPhase::Idle;
+    draug.async_operation = AsyncOp::None;
+    true
+}
+
+/// Phase 15 Planner: parse STEP| lines → create TaskPlan.
+fn process_planner_response(draug: &mut DraugDaemon, response: &[u8]) -> bool {
+    let raw = match parse_llm_response(response) {
+        Some(text) => text,
+        None => {
+            write_str("[Draug-async] Planner LLM failed\n");
+            draug.complex_task_idx += 1; // skip this task
+            draug.async_phase = AsyncPhase::Idle;
+            return true;
+        }
+    };
+
+    // Parse STEP| lines
+    let mut steps = Vec::new();
+    for line in raw.split('\n') {
+        let trimmed = line.trim();
+        if let Some(desc) = trimmed.strip_prefix("STEP|") {
+            let desc = desc.trim();
+            if !desc.is_empty() && steps.len() < 5 {
+                steps.push(PlanStep {
+                    description: String::from(desc),
+                    code: None,
+                    done: false,
+                    fail_count: 0,
+                });
+            }
+        }
+    }
+
+    if steps.is_empty() {
+        write_str("[Draug-async] No STEP| lines → skip\n");
+        draug.complex_task_idx += 1;
+        draug.async_phase = AsyncPhase::Idle;
         return true;
     }
 
-    false // more data may come, <1ms
+    let (task_id, task_desc) = COMPLEX_TASKS[draug.complex_task_idx];
+    write_str("[Draug-async] Planned ");
+    write_dec(steps.len() as u32);
+    write_str(" steps for ");
+    write_str(task_id);
+    write_str("\n");
+
+    drop(draug.active_plan.take());
+    draug.active_plan = Some(compositor::draug::TaskPlan {
+        task_id: String::from(task_id),
+        task_desc: String::from(task_desc),
+        steps,
+        current_step: 0,
+        completed: false,
+    });
+    draug.complex_task_idx += 1;
+    draug.save_state();
+
+    draug.async_phase = AsyncPhase::Idle;
+    true
 }
 
-/// Processing: parse response, advance task state.
-fn tick_processing(draug: &mut DraugDaemon, now_ms: u64) -> bool {
-    let response = &draug.async_response;
-
-    match draug.async_operation {
-        AsyncOp::LlmGenerate => {
-            // Parse LLM response: [u32 status][u32 len][text]
-            if response.len() < 8 {
-                write_str("[Draug-async] LLM: short response\n");
-                draug.async_phase = AsyncPhase::Idle;
-                draug.record_skip();
-                return true;
-            }
-            let status = u32::from_le_bytes([response[0], response[1], response[2], response[3]]);
-            let output_len = u32::from_le_bytes([response[4], response[5], response[6], response[7]]) as usize;
-
-            if status != 0 {
-                write_str("[Draug-async] SKIP: LLM error\n");
-                draug.async_phase = AsyncPhase::Idle;
-                draug.record_skip();
-                return true;
-            }
-
-            let text_end = (8 + output_len).min(response.len());
-            let raw = match core::str::from_utf8(&response[8..text_end]) {
-                Ok(s) => s,
-                Err(_) => {
-                    write_str("[Draug-async] SKIP: non-UTF8\n");
-                    draug.async_phase = AsyncPhase::Idle;
-                    return true;
-                }
-            };
-
-            let code = extract_rust_code_block(raw);
-            if code.is_empty() {
-                write_str("[Draug-async] SKIP: empty code\n");
-                draug.async_phase = AsyncPhase::Idle;
-                return true;
-            }
-
-            write_str("[Draug-async] LLM OK, ");
-            write_dec(code.len() as u32);
-            write_str(" bytes code → sending PATCH\n");
-
-            // Build PATCH request
-            let filename = b"draug_latest.rs";
-            let mut req = alloc::vec::Vec::with_capacity(code.len() + 64);
-            req.extend_from_slice(b"PATCH draug_latest.rs\n");
-            // Decimal length
-            let mut tmp = [0u8; 12];
-            let mut n = code.len();
-            let mut idx = 0;
-            if n == 0 { tmp[0] = b'0'; idx = 1; }
-            else { while n > 0 { tmp[idx] = b'0' + (n % 10) as u8; n /= 10; idx += 1; } }
-            for i in 0..idx / 2 { tmp.swap(i, idx - 1 - i); }
-            req.extend_from_slice(&tmp[..idx]);
-            req.push(b'\n');
-            req.extend_from_slice(code.as_bytes());
-
-            // Save code for potential retry
-            // (reuse async_request for the code text)
-            draug.async_request = req;
-            draug.async_sent = 0;
-            draug.async_response.clear();
-            draug.async_operation = AsyncOp::FbpPatch;
-
-            // Store extracted code for L1 persistence
-            if draug.async_level == 1 {
-                draug.store_task_code(draug.async_task_idx, code);
-                draug.save_task_code(draug.async_task_idx);
-            }
-
-            // Connect for PATCH
-            let result = tcp_connect_async(PROXY_IP, PROXY_PORT);
-            draug.async_tcp_slot = if result == TCP_EAGAIN { 0xFFFF } else { result };
-            draug.async_phase = AsyncPhase::Connecting;
-            return true;
+/// Phase 15 Executor: LLM returned code → start PATCH.
+fn process_executor_llm(draug: &mut DraugDaemon, response: &[u8]) -> bool {
+    let code = match parse_llm_response(response) {
+        Some(text) => {
+            let extracted = extract_rust_code_block(&text);
+            if extracted.is_empty() { text } else { extracted }
         }
-
-        AsyncOp::FbpPatch => {
-            // Parse PATCH response: [u32 status][u32 len][text]
-            if response.len() < 8 {
-                write_str("[Draug-async] PATCH: short response\n");
-                draug.async_phase = AsyncPhase::Idle;
-                return true;
-            }
-            let status = u32::from_le_bytes([response[0], response[1], response[2], response[3]]);
-
-            let task_idx = draug.async_task_idx;
-            let level = draug.async_level;
-            let (task_id, _) = REFACTOR_TASKS[task_idx];
-
-            if status == 0 {
-                // SUCCESS
-                let iter = draug.advance_refactor(now_ms);
-                draug.record_refactor_pass();
-                draug.advance_task_level(task_idx);
-                draug.reset_skips();
-                draug.clear_task_error(task_idx);
-                draug.save_state();
-
-                write_str("[Draug-async] ");
-                write_str(task_id);
-                write_str(" L");
-                write_dec(level as u32);
-                write_str(" PASS\n");
-
-                let at_l1 = draug.tasks_at_level(1);
-                let at_l2 = draug.tasks_at_level(2);
-                let at_l3 = draug.tasks_at_level(3);
-                write_str("[Draug-async] Skill tree: L1=");
-                write_dec(at_l1 as u32);
-                write_str("/20 L2=");
-                write_dec(at_l2 as u32);
-                write_str("/20 L3=");
-                write_dec(at_l3 as u32);
-                write_str("/20\n");
-            } else {
-                // FAIL
-                draug.record_refactor_fail();
-                write_str("[Draug-async] ");
-                write_str(task_id);
-                write_str(" L");
-                write_dec(level as u32);
-                write_str(" FAIL\n");
-                // TODO: retry with error feedback (async retry loop)
-            }
-
-            draug.async_phase = AsyncPhase::Idle;
-            draug.async_operation = AsyncOp::None;
-            return true;
-        }
-
-        _ => {
+        None => {
+            write_str("[Draug-async] Executor LLM failed\n");
             draug.async_phase = AsyncPhase::Idle;
             return true;
+        }
+    };
+
+    write_str("[Draug-async] Executor → ");
+    write_dec(code.len() as u32);
+    write_str("B → PATCH\n");
+
+    start_patch_request(draug, &code);
+    true
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────
+
+/// Parse [u32 status][u32 len][text] from LLM response.
+fn parse_llm_response(response: &[u8]) -> Option<String> {
+    if response.len() < 8 { return None; }
+    let status = u32::from_le_bytes([response[0], response[1], response[2], response[3]]);
+    if status != 0 { return None; }
+    let output_len = u32::from_le_bytes([response[4], response[5], response[6], response[7]]) as usize;
+    let text_end = (8 + output_len).min(response.len());
+    let raw = core::str::from_utf8(&response[8..text_end]).ok()?;
+    let code = extract_rust_code_block(raw);
+    if code.is_empty() && raw.contains("STEP|") {
+        // Planner response — return raw text
+        Some(String::from(raw))
+    } else if code.is_empty() {
+        None
+    } else {
+        Some(code)
+    }
+}
+
+/// Extract the code payload from a PATCH request (after "PATCH name\nlen\n").
+fn extract_code_from_patch_request(request: &[u8]) -> String {
+    // Find second \n (after "PATCH draug_latest.rs\nNNN\n")
+    let mut newlines = 0;
+    for (i, &b) in request.iter().enumerate() {
+        if b == b'\n' {
+            newlines += 1;
+            if newlines == 2 {
+                return core::str::from_utf8(&request[i+1..])
+                    .map(String::from)
+                    .unwrap_or_default();
+            }
         }
     }
+    String::new()
+}
+
+/// Encode a usize as decimal ASCII into a Vec.
+fn encode_decimal(out: &mut Vec<u8>, mut n: usize) {
+    if n == 0 { out.push(b'0'); return; }
+    let mut tmp = [0u8; 12];
+    let mut i = 0;
+    while n > 0 { tmp[i] = b'0' + (n % 10) as u8; n /= 10; i += 1; }
+    for j in 0..i / 2 { tmp.swap(j, i - 1 - j); }
+    out.extend_from_slice(&tmp[..i]);
 }
