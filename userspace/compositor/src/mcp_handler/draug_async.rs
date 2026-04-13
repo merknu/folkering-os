@@ -50,7 +50,7 @@ pub(super) fn tick_async(draug: &mut DraugDaemon, now_ms: u64) -> bool {
 
     match draug.async_phase.clone() {
         AsyncPhase::Idle => tick_idle(draug, now_ms),
-        AsyncPhase::Connecting => tick_connecting(draug),
+        AsyncPhase::Connecting => tick_sending(draug), // connect merged into send
         AsyncPhase::Sending => tick_sending(draug),
         AsyncPhase::Reading => tick_reading(draug),
         AsyncPhase::Processing => tick_processing(draug, now_ms),
@@ -64,13 +64,13 @@ fn tick_idle(draug: &mut DraugDaemon, now_ms: u64) -> bool {
     draug.last_refactor_ms = now_ms;
 
     match draug.next_task_and_level() {
-        Some((task_idx, level)) => start_skill_tree(draug, task_idx, level),
-        None => start_phase15(draug),
+        Some((task_idx, level)) => start_skill_tree(draug, task_idx, level, now_ms),
+        None => start_phase15(draug, now_ms),
     }
 }
 
 /// Skill tree L1-L3: build LLM prompt, start async TCP.
-fn start_skill_tree(draug: &mut DraugDaemon, task_idx: usize, level: u8) -> bool {
+fn start_skill_tree(draug: &mut DraugDaemon, task_idx: usize, level: u8, now_ms: u64) -> bool {
     let (task_id, task_desc) = REFACTOR_TASKS[task_idx];
     let model = compositor::draug::model_for_level(level);
     let prompt = super::knowledge_hunt::build_level_prompt(
@@ -96,11 +96,12 @@ fn start_skill_tree(draug: &mut DraugDaemon, task_idx: usize, level: u8) -> bool
     draug.async_level = level;
     draug.async_attempt = 0;
     draug.async_operation = AsyncOp::LlmGenerate;
+    draug.async_phase_started_ms = now_ms;
     start_llm_request(draug, model, &prompt)
 }
 
 /// Phase 15: decide whether to plan a new task or execute next step.
-fn start_phase15(draug: &mut DraugDaemon) -> bool {
+fn start_phase15(draug: &mut DraugDaemon, now_ms: u64) -> bool {
     if !draug.plan_mode_active {
         draug.plan_mode_active = true;
         draug.save_state();
@@ -111,7 +112,7 @@ fn start_phase15(draug: &mut DraugDaemon) -> bool {
     if let Some(ref plan) = draug.active_plan {
         if !plan.completed {
             if let Some(step_idx) = plan.steps.iter().position(|s| !s.done) {
-                return start_executor_step(draug, step_idx);
+                return start_executor_step(draug, step_idx, now_ms);
             }
         }
     }
@@ -140,11 +141,12 @@ fn start_phase15(draug: &mut DraugDaemon) -> bool {
     prompt.push_str(task_desc);
 
     draug.async_operation = AsyncOp::PlannerLlm;
+    draug.async_phase_started_ms = now_ms;
     start_llm_request(draug, compositor::draug::PLANNER_MODEL, &prompt)
 }
 
 /// Phase 15: build executor prompt for a specific step.
-fn start_executor_step(draug: &mut DraugDaemon, step_idx: usize) -> bool {
+fn start_executor_step(draug: &mut DraugDaemon, step_idx: usize, now_ms: u64) -> bool {
     let plan = draug.active_plan.as_ref().unwrap();
     let step_desc = &plan.steps[step_idx].description;
 
@@ -183,8 +185,9 @@ fn start_executor_step(draug: &mut DraugDaemon, step_idx: usize) -> bool {
     }
     prompt.push_str("Must compile as lib.rs. No explanation.");
 
-    draug.async_task_idx = step_idx; // reuse for step index
+    draug.async_task_idx = step_idx;
     draug.async_operation = AsyncOp::ExecutorLlm;
+    draug.async_phase_started_ms = now_ms;
     start_llm_request(draug, compositor::draug::EXECUTOR_MODEL, &prompt)
 }
 
@@ -202,11 +205,17 @@ fn start_llm_request(draug: &mut DraugDaemon, model: &str, prompt: &str) -> bool
     draug.async_request = req;
     draug.async_sent = 0;
     draug.async_response.clear();
-    draug.async_phase_started_ms = libfolk::sys::uptime();
+    // Timestamp set by caller (tick_idle passes now_ms from compositor clock)
 
     let result = tcp_connect_async(PROXY_IP, PROXY_PORT);
-    draug.async_tcp_slot = if result == TCP_EAGAIN { 0xFFFF } else { result };
-    draug.async_phase = AsyncPhase::Connecting;
+    if result == u64::MAX {
+        write_str("[Draug-async] connect failed (no slots)\n");
+        draug.async_phase = AsyncPhase::Idle;
+        draug.record_skip();
+        return true;
+    }
+    draug.async_tcp_slot = result;
+    draug.async_phase = AsyncPhase::Sending;
     true
 }
 
@@ -221,11 +230,17 @@ fn start_patch_request(draug: &mut DraugDaemon, code: &str) -> bool {
     draug.async_sent = 0;
     draug.async_response.clear();
     draug.async_operation = AsyncOp::FbpPatch;
-    draug.async_phase_started_ms = libfolk::sys::uptime();
+    // Timestamp set by caller (tick_idle passes now_ms from compositor clock)
 
     let result = tcp_connect_async(PROXY_IP, PROXY_PORT);
-    draug.async_tcp_slot = if result == TCP_EAGAIN { 0xFFFF } else { result };
-    draug.async_phase = AsyncPhase::Connecting;
+    if result == u64::MAX {
+        write_str("[Draug-async] connect failed (no slots)\n");
+        draug.async_phase = AsyncPhase::Idle;
+        draug.record_skip();
+        return true;
+    }
+    draug.async_tcp_slot = result;
+    draug.async_phase = AsyncPhase::Sending;
     true
 }
 
@@ -301,13 +316,13 @@ fn tick_processing(draug: &mut DraugDaemon, now_ms: u64) -> bool {
         AsyncOp::LlmGenerate => process_skill_llm(draug, &response, now_ms),
         AsyncOp::FbpPatch => process_patch_result(draug, &response, now_ms),
         AsyncOp::PlannerLlm => process_planner_response(draug, &response),
-        AsyncOp::ExecutorLlm => process_executor_llm(draug, &response),
+        AsyncOp::ExecutorLlm => process_executor_llm(draug, &response, now_ms),
         _ => { draug.async_phase = AsyncPhase::Idle; true }
     }
 }
 
 /// Skill tree: LLM returned code → extract → start PATCH.
-fn process_skill_llm(draug: &mut DraugDaemon, response: &[u8], _now_ms: u64) -> bool {
+fn process_skill_llm(draug: &mut DraugDaemon, response: &[u8], now_ms: u64) -> bool {
     let code = match parse_llm_response(response) {
         Some(c) => c,
         None => {
@@ -327,6 +342,7 @@ fn process_skill_llm(draug: &mut DraugDaemon, response: &[u8], _now_ms: u64) -> 
         draug.save_task_code(draug.async_task_idx);
     }
 
+    draug.async_phase_started_ms = now_ms;
     start_patch_request(draug, &code);
     true
 }
@@ -479,7 +495,7 @@ fn process_planner_response(draug: &mut DraugDaemon, response: &[u8]) -> bool {
 }
 
 /// Phase 15 Executor: LLM returned code → start PATCH.
-fn process_executor_llm(draug: &mut DraugDaemon, response: &[u8]) -> bool {
+fn process_executor_llm(draug: &mut DraugDaemon, response: &[u8], now_ms: u64) -> bool {
     let code = match parse_llm_response(response) {
         Some(text) => {
             let extracted = extract_rust_code_block(&text);
@@ -498,6 +514,7 @@ fn process_executor_llm(draug: &mut DraugDaemon, response: &[u8]) -> bool {
     write_dec(code.len() as u32);
     write_str("B → PATCH\n");
 
+    draug.async_phase_started_ms = now_ms;
     start_patch_request(draug, &code);
     true
 }

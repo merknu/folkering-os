@@ -49,7 +49,8 @@ static SLOTS: Mutex<[AsyncSlot; MAX_ASYNC_SLOTS]> = Mutex::new([
 
 /// Create a non-blocking TCP connection.
 ///
-/// Returns slot_id (0-3) on success, EAGAIN if connecting, MAX on error.
+/// Returns slot_id (0-3) immediately. Connection completes in background.
+/// Caller should proceed to send — tcp_send will EAGAIN until connected.
 pub fn syscall_tcp_connect(ip_packed: u64, port: u64) -> u64 {
     let ip = [
         ((ip_packed >> 24) & 0xFF) as u8,
@@ -129,7 +130,9 @@ pub fn syscall_tcp_connect(ip_packed: u64, port: u64) -> u64 {
     slots[slot_idx].state = SlotState::Connecting;
     slots[slot_idx].handle = Some(tcp_handle);
 
-    EAGAIN // connecting, check back next frame
+    // Return slot_id immediately. Connection completes asynchronously.
+    // tcp_send will EAGAIN until the TCP handshake finishes.
+    slot_idx as u64
 }
 
 /// Non-blocking send. Returns bytes written, EAGAIN, or MAX on error.
@@ -151,12 +154,26 @@ pub fn syscall_tcp_send(slot_id: u64, data_ptr: u64, data_len: u64) -> u64 {
     state.iface.poll(now, &mut device, &mut state.sockets);
     super::tcp_shell::poll(state);
 
-    let slots = SLOTS.lock();
-    let slot = &slots[slot_id as usize];
+    let mut slots = SLOTS.lock();
+    let slot = &mut slots[slot_id as usize];
+
+    // Auto-promote Connecting → Connected if handshake done
+    if let (SlotState::Connecting, Some(h)) = (&slot.state, slot.handle) {
+        let socket = state.sockets.get_mut::<tcp::Socket>(h);
+        if socket.may_send() {
+            slot.state = SlotState::Connected;
+        } else if !socket.is_active() {
+            state.sockets.remove(h);
+            slot.state = SlotState::Free;
+            slot.handle = None;
+            return u64::MAX;
+        } else {
+            return EAGAIN; // still connecting
+        }
+    }
 
     let handle = match (&slot.state, slot.handle) {
         (SlotState::Connected, Some(h)) => h,
-        (SlotState::Connecting, _) => return EAGAIN,
         _ => return u64::MAX,
     };
 
