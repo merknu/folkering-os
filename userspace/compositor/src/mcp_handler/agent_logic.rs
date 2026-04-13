@@ -140,19 +140,29 @@ pub(super) fn tick(
         }
     }
 
-    // ===== Phase 13 — Overnight refactor loop =====
+    // ===== Phase 13 — Overnight refactor loop (async) =====
     //
-    // After the Knowledge Hunt has fired (Phase 7) and the system is
-    // idle, Draug rotates through a list of programming tasks, one
-    // per minute, prompting Gemma4 and sandboxing the result. The
-    // gate is self-rate-limiting; no extra scheduling needed.
+    // Non-blocking: tick_async returns in <1ms via EAGAIN polling.
+    // UI renders between phases. Falls back to blocking for Phase 15.
     {
         let refactor_ms = if tsc_per_us > 0 { rdtsc() / tsc_per_us / 1000 } else { libfolk::sys::uptime() };
-        if draug.should_run_refactor_step(refactor_ms)
+
+        // If async operation is in progress, always tick it (no gate check)
+        if draug.async_phase != compositor::draug::AsyncPhase::Idle {
+            if super::draug_async::tick_async(draug, refactor_ms) {
+                did_work = true;
+            }
+        } else if draug.should_run_refactor_step(refactor_ms)
             && active_agent.is_none()
             && mcp.async_tool_gen.is_none()
         {
-            knowledge_hunt::run_refactor_step(draug, refactor_ms);
+            // Phase 15 Plan-and-Solve still uses blocking path (complex state)
+            if draug.plan_mode_active {
+                knowledge_hunt::run_refactor_step(draug, refactor_ms);
+            } else {
+                // Skill tree L1-L3: use async path
+                super::draug_async::tick_async(draug, refactor_ms);
+            }
             did_work = true;
         }
     }

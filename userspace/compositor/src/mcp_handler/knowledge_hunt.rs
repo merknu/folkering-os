@@ -226,7 +226,7 @@ pub(super) fn run(draug: &mut DraugDaemon) -> bool {
 /// (short_id, task_description). The short_id is used as the
 /// knowledge-graph entity name for that task, and the description
 /// is interpolated into the LLM prompt template.
-const REFACTOR_TASKS: &[(&str, &str)] = &[
+pub(crate) const REFACTOR_TASKS: &[(&str, &str)] = &[
     ("fib_iter",     "an iterative Fibonacci function named `fib` that takes a `u32` and returns a `u64`"),
     ("factorial",    "a function named `factorial` that takes a `u32` and returns the factorial as a `u64`"),
     ("gcd",          "a function named `gcd` that takes two `u64` arguments and returns their greatest common divisor using Euclid's algorithm"),
@@ -610,7 +610,7 @@ fn level_name(level: u8) -> &'static str {
 /// L1: "Write <function>. Only code, no explanation."
 /// L2: "Write <function> + #[cfg(test)] module with 3+ test cases."
 /// L3: "Here is prior code: <code>. Write optimized version + tests."
-fn build_level_prompt(
+pub(crate) fn build_level_prompt(
     level: u8,
     task_id: &str,
     task_desc: &str,
@@ -866,7 +866,7 @@ pub(crate) fn extract_rust_code_block(raw: &str) -> alloc::string::String {
     alloc::string::String::from(raw.trim())
 }
 
-fn push_decimal(out: &mut alloc::string::String, mut v: u32) {
+pub(crate) fn push_decimal(out: &mut alloc::string::String, mut v: u32) {
     if v == 0 { out.push('0'); return; }
     let mut buf = [0u8; 10];
     let mut i = 0;
