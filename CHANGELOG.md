@@ -185,6 +185,113 @@ Output gikk fra komplett gibberish til sammenhengende fraser.
 
 ---
 
+## 12.-13. april 2026
+**Draug Autonomous Evolution — Phase 13-16 + Silverfir-nano JIT**
+
+### Phase 13: Overnight Code Loop
+- Draug writes Rust autonomously via Gemma4 LLM gateway (Ollama)
+- 177/177 iterations PASS, 0 fail — pipeline reliability proven
+- 20 math tasks (fib, gcd, is_prime, collatz, binary_search, etc.)
+- Host-side sandbox: `cargo test` + archive
+
+### Phase 14: Skill Tree (L1→L2→L3)
+- L1 (The Fixer): write function — 20/20 pass
+- L2 (TDD): function + `#[cfg(test)]` with 3+ tests — 20/20 pass
+- L3 (Evolution): optimize with prior code from MemPalace — 20/20 pass
+- **Error-driven retry**: compiler errors fed back to LLM (max 2 retries)
+- Boot persistence: 26-byte state to Synapse, resumes after restart
+- Model selection: `qwen2.5-coder:7b` for L1 (4x faster), `gemma4:31b-cloud` for L2+
+
+### Phase 15: Plan-and-Solve
+- Planner persona breaks complex tasks into `STEP|description` steps
+- Executor builds code incrementally with context chaining
+- 4/8 complex tasks COMPLETE: SPSC ringbuffer, bump allocator, bitset, task queue
+- Knowledge graph tracks plans as TODO_STEP entities
+
+### Phase 16: WASM Deploy Pipeline
+- New `draug-wasm-sandbox/` crate (wasm32-unknown-unknown target)
+- Proxy `WASM_COMPILE` command: compiles Rust to .wasm binary
+- Kernel syscall 0x63 `sys_wasm_compile`: returns .wasm bytes to OS
+- Verified: 79-byte fib.wasm compiled end-to-end
+
+### Silverfir-nano JIT (branch: silverfir-nano-wasm-hybrid)
+- `WasmBackend` enum: `Sandboxed` (wasmi) vs `Trusted` (silverfir JIT)
+- WASM parser: type, import, function, export, code sections
+- x86_64 translator: i32 arithmetic, comparisons, locals, control flow
+- W^X memory: `sys_mprotect` (syscall 0x32) enforces Write XOR Execute
+- **SELF-TEST PASS**: WASM `(i32.const 42)` → 15 bytes x86_64 → native execution → returned 42
+
+### TCP Remote Shell (port 2222)
+- Commands: help, ps (with state), uptime, mem, net, df, ping, clear
+- `draug status`: skill tree, iteration count, pass/fail/skip, current task, success rate
+- `draug pause/resume`: remote control via kernel atomic bridge (syscall 0xD0/0xD1)
+- Character echo + backspace, auto re-listen on disconnect
+- Firewall whitelist for port 2222 inbound SYN
+- Shell responsive during blocking LLM calls (polled from tcp_plain loops)
+- Also ported to folkering-daq (Pi 5)
+
+### 9 Stability Fixes
+- Model selection: L1 uses fast 7b, L2+ uses 31b
+- Boot persistence: skip KHunt on restore (saves 30-60s per boot)
+- Adaptive backoff: exponential 60→120→240→300s on Ollama downtime
+- Hibernation: pause after 30 consecutive skips
+- Proxy PING: 2s fast-fail health check (cached 60s)
+- LLM SKIP: Ollama errors don't count as task failures
+- Heap monitoring: memory_stats every 50 iters, pause at 80%
+- Error memory: task_errors[20] fed into next iteration's prompt
+- Proxy auto-retry Chrome + Ollama keepalive (ping every 4 min)
+
+### Security Hardening
+- Source code scanner: blocks `std::process`, `std::fs`, `include!`, etc.
+- URL allowlist: NAVIGATE only allows http(s), blocks internal IPs (SSRF)
+- Ground-truth test injection: hardcoded expected values for 10 functions
+- Tautology detection: rejects `assert_eq!(f(x), f(x))`
+- Mutation testing: mutates code, verifies tests catch it
+
+### Code Quality Audits
+- Atomic memory ordering: all Draug bridge atomics fixed to Acquire/Release
+- Heap fragmentation: fixed retry buffers, explicit plan cleanup, capped allocations
+- Iter count on skip: advance_refactor moved after proxy check (prevents permanent lockout)
+- L1 code persistence: task_code saved to Synapse for L3 context after boot
+- Abandoned task guard: execute_next_step checks plan.completed
+- All proxy TCP timeouts reduced from 900K to 120K tsc_ms (WCET 16min→4min)
+
+### Commits
+```
+ai-native-os branch (12 commits):
+  29adabf  Phase 13-16 + TCP remote shell
+  9db1ea1  Ping crash fix, skip KHunt, bridge after restore
+  e76a97e  Cached proxy ping, adaptive interval, net/df
+  aeb6a2a  Shell improvements — draug current, clear, remove traceroute
+  d90f99e  Audit: try_lock, ping cache, bridge rate-limit
+  c4596f4  Audit: iter count, L1 persistence, abandoned task guard
+  4933684  Heap fragmentation fixes
+  bdd8457  Atomic memory ordering (Acquire/Release)
+
+silverfir-nano-wasm-hybrid branch (8 commits):
+  73cd49b  WasmBackend dual-runtime enum
+  b51c1ea  JIT scaffold + CodeBuffer
+  e21de43  W^X memory + protect_in_table
+  57019be  WASM parser + x86_64 translator
+  48d16c1  Unsigned comparisons + load/store
+  f5bac38  JIT self-test PASS (compilation)
+  933e18b  Native execution — returned 42
+  800037c  All TCP timeouts reduced to 120K
+
+folkering-proxy (6 commits):
+  5d9a6b3  Rust rewrite + Phase 13-16
+  9f58b0a  WASM panic handler fix
+  a1feef6  Strip #[cfg(test)] for WASM
+  77f0010  Ground-truth test injection
+  34de80a  Tautology detection + mutation testing
+  fb012c0  Security: sandbox escape + SSRF prevention
+
+folkering-daq (1 commit):
+  372a222  TCP remote shell port 2222
+```
+
+---
+
 ## Nøkkeltall
 
 | Metrikk | Verdi |
