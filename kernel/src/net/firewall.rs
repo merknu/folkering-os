@@ -194,9 +194,20 @@ pub fn filter_packet(frame: &[u8]) -> FirewallAction {
             return FirewallAction::Drop;
         }
 
-        // All other TCP (SYN-ACK, ACK, data, FIN, RST) → Allow
-        ALLOWS.fetch_add(1, Ordering::Relaxed);
-        return FirewallAction::Allow;
+        // Rule 5.1: Stateful-ish — allow non-SYN TCP from known sources.
+        // Under SLIRP, all legitimate traffic comes from the gateway
+        // (10.0.2.2) or is to a whitelisted local port (2222).
+        let from_gateway = src_ip == [10, 0, 2, 2];
+        let to_shell = dst_port == 2222;
+
+        if from_gateway || to_shell {
+            ALLOWS.fetch_add(1, Ordering::Relaxed);
+            return FirewallAction::Allow;
+        }
+
+        // Non-SYN TCP from non-gateway source → spoofed or unknown
+        DROPS.fetch_add(1, Ordering::Relaxed);
+        return FirewallAction::Drop;
     }
 
     // Default: allow unknown protocols

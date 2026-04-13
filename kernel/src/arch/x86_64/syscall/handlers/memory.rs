@@ -1,6 +1,13 @@
 //! Memory syscalls: shared memory (Phase 6), anonymous mmap (Phase 9),
 //! and physical memory mapping (Phase 6.2).
 
+extern crate alloc;
+
+/// Freelist for recycling virtual address ranges from munmap.
+/// Prevents virtual address space exhaustion from JIT mmap/munmap churn.
+static MMAP_FREELIST: spin::Mutex<alloc::vec::Vec<(u64, usize)>> =
+    spin::Mutex::new(alloc::vec::Vec::new());
+
 /// Map physical memory flags
 pub mod map_flags {
     /// Allow reading from mapped memory
@@ -130,13 +137,23 @@ pub fn syscall_mmap(hint_addr: u64, size: u64, flags: u64) -> u64 {
         }
         hint_addr
     } else {
-        use core::sync::atomic::{AtomicU64, Ordering};
-        static NEXT_MMAP_ADDR: AtomicU64 = AtomicU64::new(MMAP_BASE);
-        let addr = NEXT_MMAP_ADDR.fetch_add(num_pages as u64 * PAGE_SIZE, Ordering::Relaxed);
-        if addr + (num_pages as u64 * PAGE_SIZE) > 0x7FFF_0000_0000 {
-            return u64::MAX;
+        // Freelist: reuse addresses from munmap before bumping.
+        let mut free = MMAP_FREELIST.lock();
+        let reused = free.iter().position(|&(_, pages)| pages >= num_pages)
+            .map(|i| free.remove(i).0);
+        drop(free);
+
+        if let Some(addr) = reused {
+            addr
+        } else {
+            use core::sync::atomic::{AtomicU64, Ordering};
+            static NEXT_MMAP_ADDR: AtomicU64 = AtomicU64::new(MMAP_BASE);
+            let addr = NEXT_MMAP_ADDR.fetch_add(num_pages as u64 * PAGE_SIZE, Ordering::Relaxed);
+            if addr + (num_pages as u64 * PAGE_SIZE) > 0x7FFF_0000_0000 {
+                return u64::MAX;
+            }
+            addr
         }
-        addr
     };
 
     let mut pt_flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
@@ -195,7 +212,8 @@ pub fn syscall_munmap(virt_addr: u64, size: u64) -> u64 {
     }
 
     if freed > 0 {
-        crate::serial_println!("[MUNMAP] Freed {} pages at {:#x}", freed, virt_addr);
+        // Return freed virtual address range to mmap freelist for reuse
+        MMAP_FREELIST.lock().push((virt_addr, freed));
     }
 
     0
