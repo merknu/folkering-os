@@ -147,8 +147,10 @@ pub(super) fn tick(
     {
         let refactor_ms = if tsc_per_us > 0 { rdtsc() / tsc_per_us / 1000 } else { libfolk::sys::uptime() };
 
-        // If async operation is in progress, always tick it (no gate check)
+        // Async state machine: <1ms per frame, never blocks UI.
+        // Handles both skill tree (L1-L3) and Phase 15 Plan-and-Solve.
         if draug.async_phase != compositor::draug::AsyncPhase::Idle {
+            // In-progress async operation — always poll (bypass gate)
             if super::draug_async::tick_async(draug, refactor_ms) {
                 did_work = true;
             }
@@ -156,14 +158,10 @@ pub(super) fn tick(
             && active_agent.is_none()
             && mcp.async_tool_gen.is_none()
         {
-            // Phase 15 Plan-and-Solve still uses blocking path (complex state)
-            if draug.plan_mode_active {
-                knowledge_hunt::run_refactor_step(draug, refactor_ms);
-            } else {
-                // Skill tree L1-L3: use async path
-                super::draug_async::tick_async(draug, refactor_ms);
+            // Start new iteration via async path
+            if super::draug_async::tick_async(draug, refactor_ms) {
+                did_work = true;
             }
-            did_work = true;
         }
     }
 

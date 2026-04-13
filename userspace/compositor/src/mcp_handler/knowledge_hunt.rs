@@ -536,7 +536,7 @@ pub(super) fn run_refactor_step(draug: &mut compositor::draug::DraugDaemon, now_
 }
 
 /// Phase 15 — execute one step of the active plan, or plan a new task.
-fn run_plan_step(draug: &mut compositor::draug::DraugDaemon, iter: u32) {
+pub(crate) fn run_plan_step(draug: &mut compositor::draug::DraugDaemon, iter: u32) {
     use super::agent_planner;
 
     // If there's an active plan with pending steps, execute the next one

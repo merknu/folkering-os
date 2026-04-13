@@ -43,13 +43,20 @@ fn tick_idle(draug: &mut DraugDaemon, now_ms: u64) -> bool {
 
     draug.last_refactor_ms = now_ms;
 
-    // Pick task
+    // Pick task (skill tree or Phase 15)
     let (task_idx, level) = match draug.next_task_and_level() {
         Some(t) => t,
         None => {
-            // Skill tree complete — Phase 15 would go here
-            // For now, do nothing in async mode for Phase 15
-            return false;
+            // Skill tree complete — Phase 15 falls back to blocking
+            // (complex multi-step planning not yet async)
+            if !draug.plan_mode_active {
+                draug.plan_mode_active = true;
+                draug.save_state();
+                write_str("\n[Draug-async] *** PHASE 15 activated ***\n");
+            }
+            // Phase 15 blocking fallback (will be migrated to async later)
+            super::knowledge_hunt::run_plan_step(draug, 0);
+            return true;
         }
     };
 
