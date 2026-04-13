@@ -24,7 +24,6 @@ pub static DRAUG_PAUSE_FLAG: AtomicU8 = AtomicU8::new(0);
 pub static DRAUG_ITER: AtomicU32 = AtomicU32::new(0);
 pub static DRAUG_PASSED: AtomicU32 = AtomicU32::new(0);
 pub static DRAUG_FAILED: AtomicU32 = AtomicU32::new(0);
-pub static DRAUG_SKIPS: AtomicU32 = AtomicU32::new(0);
 pub static DRAUG_RETRIES: AtomicU32 = AtomicU32::new(0);
 /// [L1_count, L2_count, L3_count, plan_mode, complex_idx, hibernating, consecutive_skips, 0]
 pub static DRAUG_STATE: [AtomicU8; 8] = [const { AtomicU8::new(0) }; 8];
@@ -392,7 +391,6 @@ fn cmd_draug(args: &str) -> String {
             let iter = DRAUG_ITER.load(Ordering::Acquire);
             let passed = DRAUG_PASSED.load(Ordering::Acquire);
             let failed = DRAUG_FAILED.load(Ordering::Acquire);
-            let skips = DRAUG_SKIPS.load(Ordering::Acquire);
             let retries = DRAUG_RETRIES.load(Ordering::Acquire);
             let l1 = DRAUG_STATE[0].load(Ordering::Acquire);
             let l2 = DRAUG_STATE[1].load(Ordering::Acquire);
@@ -453,7 +451,7 @@ fn cmd_draug(args: &str) -> String {
             out.push_str(" fail=");
             push_dec(&mut out, failed);
             out.push_str(" skip=");
-            push_dec(&mut out, skips);
+            push_dec(&mut out, consec_skips as u32);
             out.push_str(" retry=");
             push_dec(&mut out, retries);
 

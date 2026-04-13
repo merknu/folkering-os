@@ -89,7 +89,7 @@ impl WasmModule {
 
         // Parse sections
         while pos < data.len() {
-            let section_id = data[pos]; pos += 1;
+            let section_id = read_byte(data, pos)?; pos += 1;
             let (section_len, n) = read_leb128_u32(&data[pos..])?;
             pos += n;
             let section_end = pos + section_len as usize;
@@ -124,19 +124,25 @@ impl WasmModule {
 
 // ── Section parsers ─────────────────────────────────────────────────
 
+/// Bounds-checked byte read from section data
+#[inline]
+fn read_byte(data: &[u8], pos: usize) -> Result<u8, ParseError> {
+    data.get(pos).copied().ok_or(ParseError::UnexpectedEof)
+}
+
 fn parse_type_section(data: &[u8], module: &mut WasmModule) -> Result<(), ParseError> {
     let mut pos = 0;
     let (count, n) = read_leb128_u32(&data[pos..])?; pos += n;
 
     for _ in 0..count {
-        if data[pos] != 0x60 { return Err(ParseError::InvalidEncoding(String::from("expected functype 0x60"))); }
+        if read_byte(data, pos)? != 0x60 { return Err(ParseError::InvalidEncoding(String::from("expected functype 0x60"))); }
         pos += 1;
 
         // Params
         let (param_count, n) = read_leb128_u32(&data[pos..])?; pos += n;
         let mut params = Vec::new();
         for _ in 0..param_count {
-            params.push(read_valtype(data[pos])?);
+            params.push(read_valtype(read_byte(data, pos)?)?);
             pos += 1;
         }
 
@@ -144,7 +150,7 @@ fn parse_type_section(data: &[u8], module: &mut WasmModule) -> Result<(), ParseE
         let (result_count, n) = read_leb128_u32(&data[pos..])?; pos += n;
         let mut results = Vec::new();
         for _ in 0..result_count {
-            results.push(read_valtype(data[pos])?);
+            results.push(read_valtype(read_byte(data, pos)?)?);
             pos += 1;
         }
 
@@ -165,19 +171,25 @@ fn parse_import_section(data: &[u8], module: &mut WasmModule) -> Result<(), Pars
         let (field_len, n) = read_leb128_u32(&data[pos..])?; pos += n;
         pos += field_len as usize;
         // Import kind
-        let kind = data[pos]; pos += 1;
+        let kind = read_byte(data, pos)?; pos += 1;
         match kind {
             0x00 => { // func import
                 let (_type_idx, n) = read_leb128_u32(&data[pos..])?; pos += n;
                 module.num_imports += 1;
             }
-            0x01 => { pos += 2; } // table: skip elemtype + limits
+            0x01 => { // table: skip elemtype + limits
+                if pos + 2 > data.len() { return Err(ParseError::UnexpectedEof); }
+                pos += 2;
+            }
             0x02 => { // memory: skip limits
-                let flags = data[pos]; pos += 1;
+                let flags = read_byte(data, pos)?; pos += 1;
                 let (_min, n) = read_leb128_u32(&data[pos..])?; pos += n;
                 if flags & 1 != 0 { let (_, n) = read_leb128_u32(&data[pos..])?; pos += n; }
             }
-            0x03 => { pos += 2; } // global: skip valtype + mutability
+            0x03 => { // global: skip valtype + mutability
+                if pos + 2 > data.len() { return Err(ParseError::UnexpectedEof); }
+                pos += 2;
+            }
             _ => return Err(ParseError::InvalidEncoding(String::from("bad import kind"))),
         }
     }
@@ -201,10 +213,12 @@ fn parse_export_section(data: &[u8], module: &mut WasmModule) -> Result<(), Pars
 
     for _ in 0..count {
         let (name_len, n) = read_leb128_u32(&data[pos..])?; pos += n;
-        let name = core::str::from_utf8(&data[pos..pos + name_len as usize])
+        let name_end = pos + name_len as usize;
+        if name_end > data.len() { return Err(ParseError::UnexpectedEof); }
+        let name = core::str::from_utf8(&data[pos..name_end])
             .map_err(|_| ParseError::InvalidEncoding(String::from("bad export name")))?;
-        pos += name_len as usize;
-        let kind = data[pos]; pos += 1;
+        pos = name_end;
+        let kind = read_byte(data, pos)?; pos += 1;
         let (index, n) = read_leb128_u32(&data[pos..])?; pos += n;
 
         module.exports.push(Export {
@@ -229,7 +243,7 @@ fn parse_code_section(data: &[u8], module: &mut WasmModule) -> Result<(), ParseE
         let mut locals = Vec::new();
         for _ in 0..local_count {
             let (count, n) = read_leb128_u32(&data[pos..])?; pos += n;
-            let vtype = read_valtype(data[pos])?; pos += 1;
+            let vtype = read_valtype(read_byte(data, pos)?)?; pos += 1;
             locals.push((count, vtype));
         }
 

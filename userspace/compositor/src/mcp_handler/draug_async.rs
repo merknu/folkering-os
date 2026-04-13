@@ -62,6 +62,14 @@ pub(super) fn tick_async(draug: &mut DraugDaemon, now_ms: u64) -> bool {
 // ── IDLE: pick task, build request, start TCP connect ───────────────
 
 fn tick_idle(draug: &mut DraugDaemon, now_ms: u64) -> bool {
+    // Reclaim heap from previous async operation. shrink_to(0) releases
+    // excess capacity so we don't leak ~8KB per iteration over 24h.
+    if draug.async_response.capacity() > 0 {
+        draug.async_response = alloc::vec::Vec::new();
+    }
+    if draug.async_request.capacity() > 0 {
+        draug.async_request = alloc::vec::Vec::new();
+    }
     if !draug.should_run_refactor_step(now_ms) { return false; }
     draug.last_refactor_ms = now_ms;
 

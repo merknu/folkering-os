@@ -575,12 +575,26 @@ impl DraugDaemon {
     // under whpx with large responses), Phase 13 should still
     // proceed overnight.
 
-    pub fn should_run_refactor_step(&self, now_ms: u64) -> bool {
+    pub fn should_run_refactor_step(&mut self, now_ms: u64) -> bool {
         if !self.active { return false; }
         if self.dreaming || self.waiting_for_llm { return false; }
         if self.refactor_iter >= REFACTOR_MAX_ITER { return false; }
-        // Fix 8: hibernation — stop until user interaction or proxy comes back
-        if self.refactor_hibernating { return false; }
+        // Fix 8: hibernation — stop until proxy comes back.
+        // Auto-wake: try proxy ping every 60s while hibernating.
+        if self.refactor_hibernating {
+            if now_ms.saturating_sub(self.last_refactor_ms) >= 60_000 {
+                self.last_refactor_ms = now_ms;
+                if libfolk::sys::proxy_ping() {
+                    self.consecutive_skips = 0;
+                    self.refactor_hibernating = false;
+                    // Fall through to normal scheduling
+                } else {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
 
         let has_skill_work = self.next_task_and_level().is_some();
         let has_plan_work = self.plan_mode_active && self.has_plan_work();
@@ -743,10 +757,17 @@ impl DraugDaemon {
             let _ = libfolk::sys::shmem_destroy(resp.shmem_handle);
             return false;
         }
+        // Validate shmem response has expected size before reading
+        if resp.size < 26 {
+            let _ = libfolk::sys::shmem_unmap(resp.shmem_handle, VADDR);
+            let _ = libfolk::sys::shmem_destroy(resp.shmem_handle);
+            return false;
+        }
         let data = unsafe { core::slice::from_raw_parts(VADDR as *const u8, 26) };
         self.task_levels.copy_from_slice(&data[0..20]);
         self.refactor_iter = u32::from_le_bytes([data[20], data[21], data[22], data[23]]);
-        self.complex_task_idx = data[24] as usize;
+        let idx = data[24] as usize;
+        self.complex_task_idx = if idx <= COMPLEX_TASK_COUNT { idx } else { 0 };
         self.plan_mode_active = data[25] != 0;
         let _ = libfolk::sys::shmem_unmap(resp.shmem_handle, VADDR);
         let _ = libfolk::sys::shmem_destroy(resp.shmem_handle);
