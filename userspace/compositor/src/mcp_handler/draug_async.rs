@@ -475,18 +475,35 @@ fn process_patch_result(draug: &mut DraugDaemon, response: &[u8], now_ms: u64) -
             return true;
         }
 
-        // Final fail after retries
+        // Final fail after retries — FORCE ADVANCE to prevent infinite loop.
+        // The task at this level is unresolvable. Skip it so the system
+        // can progress to the next task instead of retrying forever.
         if is_phase15 {
             write_str("[Draug-async] Phase 15 step FAIL (after retries)\n");
             increment_step_fail(draug);
         } else {
             draug.record_refactor_fail();
-            let (task_id, _) = REFACTOR_TASKS[draug.async_task_idx];
+            let task_idx = draug.async_task_idx;
+            let (task_id, _) = REFACTOR_TASKS[task_idx];
             write_str("[Draug-async] ");
             write_str(task_id);
-            write_str(" FAIL (after ");
+            write_str(" L");
+            write_dec(draug.async_level as u32);
+            write_str(" SKIP (unresolvable after ");
             write_dec(draug.async_attempt as u32);
             write_str(" retries)\n");
+
+            // Store the error for future context
+            let err_len = response.len().saturating_sub(8).min(512);
+            if err_len > 0 {
+                if let Ok(s) = core::str::from_utf8(&response[8..8 + err_len]) {
+                    draug.store_task_error(task_idx, String::from(&s[..s.len().min(512)]));
+                }
+            }
+
+            // Force-advance the level so next_task_and_level moves on
+            draug.advance_task_level(task_idx);
+            draug.save_state();
         }
     }
 
