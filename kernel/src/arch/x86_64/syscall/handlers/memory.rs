@@ -4,8 +4,8 @@
 extern crate alloc;
 
 /// Fixed-size freelist for recycling virtual address ranges from munmap.
-/// 64 entries max — avoids unbounded Vec growth in kernel heap.
-const MMAP_FREELIST_CAP: usize = 64;
+/// 256 entries with coalescing and splitting for long-running stability.
+const MMAP_FREELIST_CAP: usize = 256;
 static MMAP_FREELIST: spin::Mutex<MmapFreelist> = spin::Mutex::new(MmapFreelist::new());
 
 struct MmapFreelist {
@@ -17,21 +17,48 @@ impl MmapFreelist {
     const fn new() -> Self {
         Self { entries: [(0, 0); MMAP_FREELIST_CAP], count: 0 }
     }
+
     fn push(&mut self, addr: u64, pages: usize) {
+        // Try to coalesce with an adjacent existing entry
+        let end = addr + (pages as u64) * 4096;
+        for i in 0..self.count {
+            let e_addr = self.entries[i].0;
+            let e_end = e_addr + (self.entries[i].1 as u64) * 4096;
+            if end == e_addr {
+                // New range is directly below existing → merge
+                self.entries[i] = (addr, pages + self.entries[i].1);
+                return;
+            }
+            if e_end == addr {
+                // New range is directly above existing → merge
+                self.entries[i].1 += pages;
+                return;
+            }
+        }
+        // No coalescing possible — add new entry
         if self.count < MMAP_FREELIST_CAP {
             self.entries[self.count] = (addr, pages);
             self.count += 1;
+        } else {
+            // Warn once when freelist is full
+            crate::serial_strln!("[MMAP] WARN: freelist full, VA range dropped");
         }
-        // If full, drop the entry (acceptable — bump allocator still works)
     }
+
     fn pop_fit(&mut self, needed: usize) -> Option<u64> {
         for i in 0..self.count {
             if self.entries[i].1 >= needed {
                 let addr = self.entries[i].0;
-                // Remove by swapping with last
-                self.count -= 1;
-                if i < self.count {
-                    self.entries[i] = self.entries[self.count];
+                let leftover = self.entries[i].1 - needed;
+                if leftover > 0 {
+                    // Split: keep remainder in freelist
+                    self.entries[i] = (addr + (needed as u64) * 4096, leftover);
+                } else {
+                    // Exact fit: remove entry
+                    self.count -= 1;
+                    if i < self.count {
+                        self.entries[i] = self.entries[self.count];
+                    }
                 }
                 return Some(addr);
             }

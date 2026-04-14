@@ -579,6 +579,11 @@ impl DraugDaemon {
         if !self.active { return false; }
         if self.dreaming || self.waiting_for_llm { return false; }
         if self.refactor_iter >= REFACTOR_MAX_ITER { return false; }
+        // Heap pressure guard: skip if physical RAM is tight (>90% used)
+        let (_total, _used, pct) = libfolk::sys::memory_stats();
+        if pct > 90 {
+            return false;
+        }
         // Fix 8: hibernation — stop until proxy comes back.
         // Auto-wake: try proxy ping every 60s while hibernating.
         if self.refactor_hibernating {

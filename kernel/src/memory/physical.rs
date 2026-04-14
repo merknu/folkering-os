@@ -439,18 +439,28 @@ pub fn alloc_contiguous(num_pages: usize) -> Option<usize> {
     alloc_pages(order)
 }
 
-/// Allocate a single page (convenience wrapper)
+/// Allocate a single page (convenience wrapper).
+///
+/// Checks buddy allocator first (for recycled freed pages), then
+/// falls back to bootstrap bump allocator. This ordering is critical:
+/// without it, freed pages go into buddy but are never reused because
+/// bootstrap always had pages available.
 #[inline]
 pub fn alloc_page() -> Option<usize> {
-    // Try bootstrap allocator first (used before heap is initialized)
+    // Try buddy allocator first — this is where free_page() puts pages
+    if let Some(page) = alloc_pages(0) {
+        return Some(page);
+    }
+
+    // Fall back to bootstrap allocator (bump, used before heap is ready
+    // and when buddy has no free blocks)
     if let Some(ref mut bootstrap) = *BOOTSTRAP_ALLOCATOR.lock() {
         if let Some(page) = bootstrap.alloc_page() {
             return Some(page);
         }
     }
 
-    // Fall back to buddy allocator
-    alloc_pages(0)
+    None
 }
 
 /// Free a single page (convenience wrapper)

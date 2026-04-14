@@ -53,6 +53,12 @@ pub fn init() {
     crate::drivers::serial::write_newline();
 }
 
+/// Return kernel heap stats: (total_bytes, used_bytes, free_bytes)
+pub fn heap_stats() -> (usize, usize, usize) {
+    let heap = ALLOCATOR.lock();
+    (heap.size(), heap.used(), heap.free())
+}
+
 /// Allocation error handler
 #[alloc_error_handler]
 fn alloc_error_handler(layout: core::alloc::Layout) -> ! {

@@ -156,6 +156,19 @@ unsafe impl GlobalAlloc for FreeListAllocator {
     }
 }
 
+/// Return (total_bytes, free_bytes) for the compositor heap.
+pub fn heap_stats() -> (usize, usize) {
+    unsafe {
+        let mut free_bytes = 0usize;
+        let mut current = *ALLOCATOR.free_head.get();
+        while !current.is_null() {
+            free_bytes += (*current).size;
+            current = (*current).next;
+        }
+        (HEAP_SIZE, free_bytes)
+    }
+}
+
 #[global_allocator]
 static ALLOCATOR: FreeListAllocator = FreeListAllocator {
     heap: UnsafeCell::new([0; HEAP_SIZE]),
