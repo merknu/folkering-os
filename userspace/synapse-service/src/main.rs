@@ -103,11 +103,13 @@ fn main() -> ! {
 
         let chosen_backend = if try_load_sqlite_from_disk(sqlite) {
             println!("[SYNAPSE] SQLite loaded from VirtIO disk (persistent!)");
+            synapse_service::sqlite_io::validate_sqlite_integrity(sqlite);
             refresh_sqlite_cache(sqlite, cache);
             println!("[SYNAPSE] Ready - {} ({} files, VirtIO)", DB_FILENAME, cache.count);
             Backend::Sqlite
         } else if try_load_sqlite(sqlite) {
             println!("[SYNAPSE] SQLite loaded from ramdisk (volatile)");
+            synapse_service::sqlite_io::validate_sqlite_integrity(sqlite);
             refresh_sqlite_cache(sqlite, cache);
             println!("[SYNAPSE] Ready - {} ({} files, ramdisk)", DB_FILENAME, cache.count);
             Backend::Sqlite

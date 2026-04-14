@@ -182,6 +182,12 @@ pub fn ipc_reply(request: &IpcMessage, reply_payload: [u64; 4]) -> Result<(), Er
         sender_lock.state = TaskState::Runnable;
     }
 
+    // Reset priority inheritance (we finished serving the sender's request)
+    {
+        let mut current_lock = current.lock();
+        current_lock.inherited_priority = 0;
+    }
+
     crate::task::scheduler::enqueue(sender_id);
     Ok(())
 }
@@ -325,6 +331,13 @@ pub fn ipc_reply_with_token(token: CallerToken, reply_payload: [u64; 4]) -> Resu
         sender_lock.ipc_reply = Some(reply_msg);
         sender_lock.context.rax = reply_payload[0];
         sender_lock.state = TaskState::Runnable;
+    }
+
+    // Reset priority inheritance on current task (we just finished
+    // serving the high-priority sender's request)
+    {
+        let mut current_lock = current.lock();
+        current_lock.inherited_priority = 0;
     }
 
     crate::task::scheduler::enqueue(sender_pid);

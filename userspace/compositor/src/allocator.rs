@@ -4,7 +4,7 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 
-const HEAP_SIZE: usize = 16 * 1024 * 1024; // 16MB heap (wasmi engine ~1MB + WASM 4MB surface + DrawCmd + previous app remnants)
+const HEAP_SIZE: usize = 32 * 1024 * 1024; // 32MB heap (wasmi + WASM surfaces + Draug async buffers + silverfir JIT)
 
 /// Minimum block size (header + usable). Must fit a FreeNode.
 const MIN_BLOCK: usize = 32;

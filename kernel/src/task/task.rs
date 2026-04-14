@@ -136,6 +136,7 @@ pub struct Task {
     // Scheduling fields
     pub priority: Priority,          // Task priority (0-255, higher = more important)
     pub base_priority: Priority,     // Base priority (before dynamic adjustments)
+    pub inherited_priority: Priority, // Priority inheritance: temporarily boosted when high-pri task blocks on us
     pub deadline_ms: Option<u64>,    // Absolute deadline in milliseconds (None = no deadline)
     pub cpu_time_used_ms: u64,       // Total CPU time used (for scheduling fairness)
     pub last_scheduled_ms: u64,      // Last time this was scheduled
@@ -366,6 +367,7 @@ impl Task {
             // Scheduling
             ptr::addr_of_mut!((*task_ptr).priority).write(PRIORITY_NORMAL);
             ptr::addr_of_mut!((*task_ptr).base_priority).write(PRIORITY_NORMAL);
+            ptr::addr_of_mut!((*task_ptr).inherited_priority).write(0);
             ptr::addr_of_mut!((*task_ptr).deadline_ms).write(None);
             ptr::addr_of_mut!((*task_ptr).cpu_time_used_ms).write(0);
             ptr::addr_of_mut!((*task_ptr).last_scheduled_ms).write(0);

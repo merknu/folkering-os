@@ -83,6 +83,12 @@ impl EnhancedScheduler {
 
                 let mut effective_priority = task_locked.priority as u16;
 
+                // Priority inheritance: if a higher-priority task is blocked
+                // waiting on us (via IPC), temporarily use their priority
+                if task_locked.inherited_priority > task_locked.priority {
+                    effective_priority = task_locked.inherited_priority as u16;
+                }
+
                 // AI-Native: incorporate semantic_priority
                 // semantic_priority acts as a modifier: 128 = neutral, >128 = boost, <128 = reduce
                 let semantic_delta = (task_locked.semantic_priority as i16) - 128;

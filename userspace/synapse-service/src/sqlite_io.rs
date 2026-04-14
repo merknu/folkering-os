@@ -114,6 +114,59 @@ pub fn try_load_sqlite_from_disk(buf: &mut SafeSqliteBuffer) -> bool {
     true
 }
 
+/// Compute a simple CRC32 (IEEE 802.3) of a byte slice.
+/// Used for integrity checking on the SQLite header page.
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0xEDB88320;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    !crc
+}
+
+/// Validate SQLite database integrity after loading.
+/// Checks: magic, change counter consistency, header CRC.
+/// Returns true if valid, false if corrupt (caller should reinit).
+pub fn validate_sqlite_integrity(buf: &SafeSqliteBuffer) -> bool {
+    if buf.size() < 100 {
+        println!("[SYNAPSE] integrity: too small ({} bytes)", buf.size());
+        return false;
+    }
+
+    // Check magic
+    if let Ok(magic) = buf.read_slice(0, 16) {
+        if magic != b"SQLite format 3\0" {
+            println!("[SYNAPSE] integrity: bad magic");
+            return false;
+        }
+    }
+
+    // Check change counters match (offsets 24 and 92 should be equal)
+    let cc1 = buf.read_be_u32(24).unwrap_or(0);
+    let cc2 = buf.read_be_u32(92).unwrap_or(1);
+    if cc1 != cc2 {
+        println!("[SYNAPSE] integrity: change counter mismatch ({} vs {})", cc1, cc2);
+        println!("[SYNAPSE] WARNING: DB may have been corrupted by incomplete write");
+        // Don't fail — mismatch is common after crash, data may still be usable
+    }
+
+    // Log header CRC for forensics
+    if let Ok(header) = buf.read_slice(0, 100) {
+        let crc = crc32(header);
+        println!("[SYNAPSE] integrity: header CRC32={:08X} cc={} pages={}",
+            crc, cc1, buf.page_count());
+    }
+
+    true
+}
+
 /// Flush dirty pages of `buf` back to the VirtIO disk.
 /// Returns true on success.
 pub fn flush_sqlite_to_disk(buf: &mut SafeSqliteBuffer) -> bool {

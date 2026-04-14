@@ -127,16 +127,23 @@ pub fn ipc_send(target: TaskId, msg: &IpcMessage) -> Result<IpcMessage, Errno> {
             }
         }
 
-        // 7. Block current task (wait for reply)
+        // 7. Block current task (wait for reply) + priority inheritance
+        let sender_priority;
         {
             let mut current_lock = current.lock();
+            sender_priority = current_lock.priority;
             current_lock.state = TaskState::BlockedOnSend(target);
             current_lock.ipc_reply = None;
         }
 
-        // 8. Wake target if it's waiting on receive
+        // 8. Wake target if it's waiting on receive.
+        //    Priority inheritance: if sender has higher priority than target,
+        //    temporarily boost target so it runs sooner (avoids priority inversion).
         {
             let mut target_lock = target_task.lock();
+            if sender_priority > target_lock.inherited_priority {
+                target_lock.inherited_priority = sender_priority;
+            }
             if target_lock.state == TaskState::BlockedOnReceive {
                 target_lock.state = TaskState::Runnable;
                 crate::task::scheduler::enqueue(target);
