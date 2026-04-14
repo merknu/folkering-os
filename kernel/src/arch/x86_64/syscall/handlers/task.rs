@@ -1,5 +1,7 @@
 //! Task lifecycle syscalls: spawn, exit, yield, get_pid, task_list, uptime.
 
+extern crate alloc;
+
 pub fn syscall_spawn(binary_ptr: u64, binary_len: u64) -> u64 {
     use crate::task::spawn;
 
@@ -23,14 +25,37 @@ pub fn syscall_exit(exit_code: u64) -> u64 {
     let current_id = task::get_current_task();
     crate::serial_println!("syscall: exit(code={}) task={}", exit_code, current_id);
 
-    if let Some(task_arc) = task::get_task(current_id) {
+    // Collect resources to free BEFORE removing from task table
+    let (page_table_phys, stack_base) = if let Some(task_arc) = task::get_task(current_id) {
         let mut t = task_arc.lock();
         t.state = TaskState::Exited;
-    }
+        let pt = t.page_table_phys;
+        let sb = t.kernel_stack_base.as_ref().map(|p| p.as_ptr());
+        (pt, sb)
+    } else {
+        (0, None)
+    };
 
     let _ = task::remove_task(current_id);
 
-    crate::serial_println!("[EXIT] Task {} removed from scheduler", current_id);
+    // Free user-space page tables (if task had its own address space)
+    if page_table_phys != 0 {
+        if let Err(_) = crate::memory::paging::free_task_page_table(page_table_phys) {
+            crate::serial_println!("[EXIT] WARN: failed to free page table for task {}", current_id);
+        }
+    }
+
+    // Free kernel stack (was leaked via mem::forget during allocation)
+    if let Some(base) = stack_base {
+        unsafe {
+            // Reconstruct the Vec and let it drop, freeing the 8KB heap allocation.
+            // SAFETY: We are the only owner; the task has been removed from the scheduler
+            // and will never be scheduled again (we're in the exit handler's HLT loop).
+            let _ = alloc::vec::Vec::from_raw_parts(base, 0, 8192);
+        }
+    }
+
+    crate::serial_println!("[EXIT] Task {} resources freed", current_id);
 
     loop {
         x86_64::instructions::hlt();

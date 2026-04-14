@@ -16,6 +16,7 @@ use libfolk::sys::synapse::{
     SYN_OP_VECTOR_SEARCH, SYN_OP_GET_EMBEDDING, SYN_OP_EMBEDDING_COUNT,
     SYN_OP_WRITE_FILE, SYN_OP_WRITE_INTENT, SYN_OP_READ_INTENT, SYN_OP_QUERY_MIME,
     SYN_OP_QUERY_INTENT,
+    SYN_OP_UPSERT_ENTITY, SYN_OP_UPSERT_EDGE, SYN_OP_GRAPH_WALK,
     SYN_STATUS_NOT_FOUND, SYN_STATUS_INVALID, SYN_STATUS_ERROR,
     SYNAPSE_VERSION, hash_name,
 };
@@ -26,7 +27,10 @@ use libsqlite::vector::{
     get_embedding_by_file_id, count_embeddings, EMBEDDING_SIZE,
 };
 
-use crate::btree::{overwrite_blob_inplace, sqlite_insert_file, sqlite_insert_intent, sqlite_read_intent};
+use crate::btree::{
+    overwrite_blob_inplace, sqlite_insert_file, sqlite_insert_intent, sqlite_read_intent,
+    sqlite_insert_entity, sqlite_insert_edge, sqlite_expire_edge, sqlite_graph_walk,
+};
 use crate::cache::{
     count_sqlite_files, find_max_rowid, get_file_size, open_db, refresh_fpk_cache,
     refresh_sqlite_cache, update_dir_cache,
@@ -80,6 +84,10 @@ pub fn handle_request<T: TokenSource>(
         SYN_OP_VECTOR_SEARCH => handle_vector_search(msg, src, sqlite, backend),
         SYN_OP_GET_EMBEDDING => handle_get_embedding(msg, src, sqlite, backend),
         SYN_OP_EMBEDDING_COUNT => handle_embedding_count(src, sqlite, backend),
+        // Phase 9: Bi-Temporal Knowledge Graph
+        SYN_OP_UPSERT_ENTITY => handle_upsert_entity(msg, src, sqlite, backend),
+        SYN_OP_UPSERT_EDGE => handle_upsert_edge(msg, src, sqlite, backend),
+        SYN_OP_GRAPH_WALK => handle_graph_walk(msg, src, sqlite, backend),
         _ => { let _ = reply(src, SYN_STATUS_INVALID, 0); }
     }
 }
@@ -448,13 +456,18 @@ fn handle_read_file_shmem<T: TokenSource>(
             let bytes_read = {
                 let mut arena = match ShmemArena::map(shmem_handle, vaddr::SHMEM_BUFFER) {
                     Ok(a) => a,
-                    Err(_) => { let _ = reply(src, SYN_STATUS_ERROR, 0); return; }
+                    Err(_) => {
+                        let _ = shmem_destroy(shmem_handle);
+                        let _ = reply(src, SYN_STATUS_ERROR, 0);
+                        return;
+                    }
                 };
                 let buf = unsafe { arena.as_mut_slice(buffer_size) };
                 read_file(file_name, buf)
             };
 
             if bytes_read == 0 {
+                let _ = shmem_destroy(shmem_handle);
                 let _ = reply(src, SYN_STATUS_ERROR, 0);
                 return;
             }
@@ -682,6 +695,7 @@ fn handle_read_intent<T: TokenSource>(
                         drop(arena);
                         let _ = reply(src, ((total as u64) << 32) | handle as u64, 0);
                     } else {
+                        let _ = shmem_destroy(handle);
                         let _ = reply(src, SYN_STATUS_ERROR, 0);
                     }
                 }
@@ -862,6 +876,7 @@ fn handle_vector_search<T: TokenSource>(
         Err(_) => { let _ = reply(src, SYN_STATUS_ERROR, 0); return; }
     };
     if shmem_grant(result_shmem, requester_task).is_err() {
+        let _ = shmem_destroy(result_shmem);
         let _ = reply(src, SYN_STATUS_ERROR, 0);
         return;
     }
@@ -869,7 +884,11 @@ fn handle_vector_search<T: TokenSource>(
     {
         let mut arena = match ShmemArena::map(result_shmem, vaddr::VECTOR_RESULTS) {
             Ok(a) => a,
-            Err(_) => { let _ = reply(src, SYN_STATUS_ERROR, 0); return; }
+            Err(_) => {
+                let _ = shmem_destroy(result_shmem);
+                let _ = reply(src, SYN_STATUS_ERROR, 0);
+                return;
+            }
         };
         let dst = unsafe { arena.as_mut_slice(buffer_size) };
         for (i, result) in results[..result_count].iter().enumerate() {
@@ -913,6 +932,7 @@ fn handle_get_embedding<T: TokenSource>(
         Err(_) => { let _ = reply(src, SYN_STATUS_ERROR, 0); return; }
     };
     if shmem_grant(shmem_handle, requester_task).is_err() {
+        let _ = shmem_destroy(shmem_handle);
         let _ = reply(src, SYN_STATUS_ERROR, 0);
         return;
     }
@@ -920,7 +940,11 @@ fn handle_get_embedding<T: TokenSource>(
     {
         let mut arena = match ShmemArena::map(shmem_handle, vaddr::VECTOR_QUERY) {
             Ok(a) => a,
-            Err(_) => { let _ = reply(src, SYN_STATUS_ERROR, 0); return; }
+            Err(_) => {
+                let _ = shmem_destroy(shmem_handle);
+                let _ = reply(src, SYN_STATUS_ERROR, 0);
+                return;
+            }
         };
         let dst = unsafe { arena.as_mut_slice(EMBEDDING_SIZE) };
         embedding.to_blob(dst);
@@ -945,4 +969,247 @@ fn handle_embedding_count<T: TokenSource>(
     };
     let count = count_embeddings(&db).unwrap_or(0);
     let _ = reply(src, count as u64, 0);
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Phase 9: Bi-Temporal Knowledge Graph handlers
+// ════════════════════════════════════════════════════════════════════════
+
+/// Decode a length-prefixed string from a shared-memory request buffer.
+/// Layout: [len: u16 LE][bytes]. Advances `pos` past the field.
+/// Returns `None` if the slice would run past `end`.
+fn read_prefixed_str<'a>(slice: &'a [u8], pos: &mut usize, end: usize) -> Option<&'a str> {
+    if *pos + 2 > end { return None; }
+    let len = u16::from_le_bytes([slice[*pos], slice[*pos + 1]]) as usize;
+    *pos += 2;
+    if *pos + len > end { return None; }
+    let s = core::str::from_utf8(&slice[*pos..*pos + len]).ok()?;
+    *pos += len;
+    Some(s)
+}
+
+/// Monotonic timestamp for valid_from / valid_to fields. We can't
+/// easily call into the kernel uptime syscall from synapse-service
+/// without pulling more crates in, so we use a process-local counter
+/// that ticks on every operation. The important guarantee for
+/// temporal supersession is ORDERING, not wall-clock accuracy.
+fn next_timestamp() -> i64 {
+    use core::sync::atomic::{AtomicI64, Ordering};
+    static CLOCK: AtomicI64 = AtomicI64::new(1);
+    CLOCK.fetch_add(1, Ordering::Relaxed)
+}
+
+fn handle_upsert_entity<T: TokenSource>(
+    msg: AsyncIpcMessage,
+    src: &mut T,
+    sqlite: &mut SafeSqliteBuffer,
+    backend: Backend,
+) {
+    if backend != Backend::Sqlite {
+        let _ = reply(src, SYN_STATUS_ERROR, 0);
+        return;
+    }
+
+    let shmem_handle = ((msg.payload0 >> 16) & 0xFFFF) as u32;
+    let total_size = (msg.payload0 >> 32) as usize;
+    if shmem_handle == 0 || total_size < 6 {
+        let _ = reply(src, SYN_STATUS_ERROR, 0);
+        return;
+    }
+
+    // Copy out into owned local buffers before touching sqlite (the
+    // ShmemArena borrow conflicts with the &mut SafeSqliteBuffer).
+    let mut eid_buf = [0u8; 128];
+    let mut name_buf = [0u8; 128];
+    let mut type_buf = [0u8; 64];
+    let mut eid_len = 0usize;
+    let mut name_len = 0usize;
+    let mut type_len = 0usize;
+    {
+        let arena = match ShmemArena::map(shmem_handle, vaddr::ENTITY_SHMEM) {
+            Ok(a) => a,
+            Err(_) => { let _ = reply(src, SYN_STATUS_ERROR, 0); return; }
+        };
+        let slice = unsafe { arena.as_slice(total_size) };
+        let mut pos = 0usize;
+        let eid = match read_prefixed_str(slice, &mut pos, total_size) {
+            Some(s) => s,
+            None => { let _ = reply(src, SYN_STATUS_ERROR, 0); return; }
+        };
+        let name = match read_prefixed_str(slice, &mut pos, total_size) {
+            Some(s) => s,
+            None => { let _ = reply(src, SYN_STATUS_ERROR, 0); return; }
+        };
+        let etype = match read_prefixed_str(slice, &mut pos, total_size) {
+            Some(s) => s,
+            None => { let _ = reply(src, SYN_STATUS_ERROR, 0); return; }
+        };
+        eid_len = eid.len().min(eid_buf.len());
+        name_len = name.len().min(name_buf.len());
+        type_len = etype.len().min(type_buf.len());
+        eid_buf[..eid_len].copy_from_slice(&eid.as_bytes()[..eid_len]);
+        name_buf[..name_len].copy_from_slice(&name.as_bytes()[..name_len]);
+        type_buf[..type_len].copy_from_slice(&etype.as_bytes()[..type_len]);
+    }
+
+    let eid = unsafe { core::str::from_utf8_unchecked(&eid_buf[..eid_len]) };
+    let name = unsafe { core::str::from_utf8_unchecked(&name_buf[..name_len]) };
+    let etype = unsafe { core::str::from_utf8_unchecked(&type_buf[..type_len]) };
+
+    let ts = next_timestamp();
+    match sqlite_insert_entity(sqlite, eid, name, etype, ts) {
+        Some(rowid) => {
+            flush_sqlite_to_disk(sqlite);
+            let _ = reply(src, rowid as u64, 0);
+        }
+        None => { let _ = reply(src, SYN_STATUS_ERROR, 0); }
+    }
+}
+
+fn handle_upsert_edge<T: TokenSource>(
+    msg: AsyncIpcMessage,
+    src: &mut T,
+    sqlite: &mut SafeSqliteBuffer,
+    backend: Backend,
+) {
+    if backend != Backend::Sqlite {
+        let _ = reply(src, SYN_STATUS_ERROR, 0);
+        return;
+    }
+
+    let shmem_handle = ((msg.payload0 >> 16) & 0xFFFF) as u32;
+    let total_size = (msg.payload0 >> 32) as usize;
+    if shmem_handle == 0 || total_size < 8 {
+        let _ = reply(src, SYN_STATUS_ERROR, 0);
+        return;
+    }
+
+    let mut eid_buf = [0u8; 128];
+    let mut subj_buf = [0u8; 128];
+    let mut pred_buf = [0u8; 64];
+    let mut obj_buf = [0u8; 128];
+    let (mut eid_len, mut subj_len, mut pred_len, mut obj_len) = (0usize, 0usize, 0usize, 0usize);
+    {
+        let arena = match ShmemArena::map(shmem_handle, vaddr::EDGE_SHMEM) {
+            Ok(a) => a,
+            Err(_) => { let _ = reply(src, SYN_STATUS_ERROR, 0); return; }
+        };
+        let slice = unsafe { arena.as_slice(total_size) };
+        let mut pos = 0usize;
+        let eid = match read_prefixed_str(slice, &mut pos, total_size) {
+            Some(s) => s, None => { let _ = reply(src, SYN_STATUS_ERROR, 0); return; }
+        };
+        let subj = match read_prefixed_str(slice, &mut pos, total_size) {
+            Some(s) => s, None => { let _ = reply(src, SYN_STATUS_ERROR, 0); return; }
+        };
+        let pred = match read_prefixed_str(slice, &mut pos, total_size) {
+            Some(s) => s, None => { let _ = reply(src, SYN_STATUS_ERROR, 0); return; }
+        };
+        let obj = match read_prefixed_str(slice, &mut pos, total_size) {
+            Some(s) => s, None => { let _ = reply(src, SYN_STATUS_ERROR, 0); return; }
+        };
+        eid_len = eid.len().min(eid_buf.len());
+        subj_len = subj.len().min(subj_buf.len());
+        pred_len = pred.len().min(pred_buf.len());
+        obj_len = obj.len().min(obj_buf.len());
+        eid_buf[..eid_len].copy_from_slice(&eid.as_bytes()[..eid_len]);
+        subj_buf[..subj_len].copy_from_slice(&subj.as_bytes()[..subj_len]);
+        pred_buf[..pred_len].copy_from_slice(&pred.as_bytes()[..pred_len]);
+        obj_buf[..obj_len].copy_from_slice(&obj.as_bytes()[..obj_len]);
+    }
+
+    let eid = unsafe { core::str::from_utf8_unchecked(&eid_buf[..eid_len]) };
+    let subj = unsafe { core::str::from_utf8_unchecked(&subj_buf[..subj_len]) };
+    let pred = unsafe { core::str::from_utf8_unchecked(&pred_buf[..pred_len]) };
+    let obj = unsafe { core::str::from_utf8_unchecked(&obj_buf[..obj_len]) };
+
+    // Step 1: expire any existing active edge for the same (subject, predicate).
+    let ts = next_timestamp();
+    let expired = sqlite_expire_edge(sqlite, subj, pred, ts);
+    if expired > 0 {
+        println!("[SYNAPSE] upsert_edge: superseded {} prior edge(s)", expired);
+    }
+
+    // Step 2: insert the new edge with valid_to = 0 (active).
+    match sqlite_insert_edge(sqlite, eid, subj, pred, obj, ts, 0, 1.0) {
+        Some(rowid) => {
+            flush_sqlite_to_disk(sqlite);
+            let _ = reply(src, rowid as u64, 0);
+        }
+        None => { let _ = reply(src, SYN_STATUS_ERROR, 0); }
+    }
+}
+
+fn handle_graph_walk<T: TokenSource>(
+    msg: AsyncIpcMessage,
+    src: &mut T,
+    sqlite: &SafeSqliteBuffer,
+    backend: Backend,
+) {
+    if backend != Backend::Sqlite {
+        let _ = reply(src, SYN_STATUS_ERROR, 0);
+        return;
+    }
+
+    let shmem_handle = ((msg.payload0 >> 16) & 0xFFFF) as u32;
+    let max_depth = ((msg.payload0 >> 32) & 0xFFFFFFFF) as u32;
+    if shmem_handle == 0 {
+        let _ = reply(src, SYN_STATUS_ERROR, 0);
+        return;
+    }
+
+    // Copy the start entity id out of shmem into a local buffer.
+    let mut start_buf = [0u8; 128];
+    let mut start_len = 0usize;
+    {
+        let arena = match ShmemArena::map(shmem_handle, vaddr::GRAPH_WALK) {
+            Ok(a) => a,
+            Err(_) => { let _ = reply(src, SYN_STATUS_ERROR, 0); return; }
+        };
+        let slice = unsafe { arena.as_slice(4096) };
+        let mut pos = 0usize;
+        let s = match read_prefixed_str(slice, &mut pos, slice.len()) {
+            Some(s) => s,
+            None => { let _ = reply(src, SYN_STATUS_ERROR, 0); return; }
+        };
+        start_len = s.len().min(start_buf.len());
+        start_buf[..start_len].copy_from_slice(&s.as_bytes()[..start_len]);
+    }
+    let start = unsafe { core::str::from_utf8_unchecked(&start_buf[..start_len]) };
+
+    // Run the BFS.
+    let hops = sqlite_graph_walk(sqlite, start, max_depth);
+
+    println!("[SYNAPSE] graph_walk from '{}' max_depth={} found {} hop(s)",
+        start, max_depth, hops.len());
+
+    // Write results back into the same shmem region.
+    // Layout: [hop_count: u16 LE] repeated [eid_len:u16 LE][eid][depth:u16 LE]
+    let mut arena = match ShmemArena::map(shmem_handle, vaddr::GRAPH_WALK) {
+        Ok(a) => a,
+        Err(_) => { let _ = reply(src, SYN_STATUS_ERROR, 0); return; }
+    };
+    let slice = unsafe { arena.as_mut_slice(4096) };
+    let hop_count = (hops.len() as u16).min(255);
+    slice[0..2].copy_from_slice(&hop_count.to_le_bytes());
+    let mut pos = 2usize;
+    for hop in hops.iter().take(hop_count as usize) {
+        let eid_bytes = hop.entity_id.as_bytes();
+        let eid_len = eid_bytes.len().min(128);
+        if pos + 2 + eid_len + 2 > slice.len() { break; }
+        slice[pos..pos + 2].copy_from_slice(&(eid_len as u16).to_le_bytes());
+        pos += 2;
+        slice[pos..pos + eid_len].copy_from_slice(&eid_bytes[..eid_len]);
+        pos += eid_len;
+        slice[pos..pos + 2].copy_from_slice(&(hop.depth as u16).to_le_bytes());
+        pos += 2;
+        println!("[SYNAPSE]   hop: {} (depth={})", hop.entity_id, hop.depth);
+    }
+    drop(arena);
+
+    // Shift the hop count into bits 16..31 so it can't collide with
+    // the low-valued status sentinels (SYN_STATUS_NOT_FOUND=1,
+    // SYN_STATUS_INVALID=2, ...). The libfolk wrapper unpacks via
+    // `(ret >> 16) & 0xFFFF`.
+    let _ = reply(src, (hop_count as u64) << 16, 0);
 }
