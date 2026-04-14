@@ -13,7 +13,7 @@
 //!   RSP — native stack pointer (preserved)
 //!   RBP — native frame pointer (preserved)
 //!
-//! Current status: SCAFFOLD — types defined, no code emission yet.
+//! Code emission happens in translate.rs which uses CodeBuffer.emit().
 
 extern crate alloc;
 
@@ -54,45 +54,4 @@ impl CodeBuffer {
         self.code
     }
 
-    // ── x86_64 instruction helpers ──────────────────────────────────
-
-    /// push reg (1 byte: 0x50 + reg)
-    pub fn push_reg(&mut self, reg: u8) { self.emit(&[0x50 + reg]); }
-
-    /// pop reg (1 byte: 0x58 + reg)
-    pub fn pop_reg(&mut self, reg: u8) { self.emit(&[0x58 + reg]); }
-
-    /// mov reg, imm32 (5 bytes: 0xB8 + reg, imm32 LE)
-    pub fn mov_reg_imm32(&mut self, reg: u8, val: u32) {
-        self.emit(&[0xB8 + reg]);
-        self.emit(&val.to_le_bytes());
-    }
-
-    /// add eax, reg (2 bytes: 0x01, 0xC0 + reg*8)
-    pub fn add_eax_reg(&mut self, reg: u8) {
-        self.emit(&[0x01, 0xC0 + reg * 8]);
-    }
-
-    /// sub eax, reg
-    pub fn sub_eax_reg(&mut self, reg: u8) {
-        self.emit(&[0x29, 0xC0 + reg * 8]);
-    }
-
-    /// ret (1 byte: 0xC3)
-    pub fn ret(&mut self) { self.emit(&[0xC3]); }
-
-    /// nop (1 byte: 0x90)
-    pub fn nop(&mut self) { self.emit(&[0x90]); }
-}
-
-/// x86_64 register indices (lower 3 bits of ModR/M)
-pub mod regs {
-    pub const RAX: u8 = 0;
-    pub const RCX: u8 = 1;
-    pub const RDX: u8 = 2;
-    pub const RBX: u8 = 3;
-    pub const RSP: u8 = 4;
-    pub const RBP: u8 = 5;
-    pub const RSI: u8 = 6;
-    pub const RDI: u8 = 7;
 }

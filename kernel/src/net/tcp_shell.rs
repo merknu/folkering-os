@@ -1,6 +1,6 @@
 //! TCP Remote Shell — plaintext shell server on port 2222.
 //!
-//! Commands: help, ps, uptime, mem, ping, traceroute, draug status/pause/resume
+//! Commands: help, ps, uptime, mem, net, df, ping, draug status/pause/resume
 //! Features: character echo, backspace, Draug bridge via kernel-global atomics.
 
 extern crate alloc;
@@ -356,13 +356,21 @@ fn cmd_net(state: &mut super::state::NetState) -> String {
 }
 
 fn cmd_df() -> String {
-    let mut out = String::with_capacity(256);
-    out.push_str("Filesystem          Size     Notes\r\n");
-    out.push_str("---                 ----     -----\r\n");
-    out.push_str("virtio-data.img     365 MB   model(364MB) + synapse DB(4MB)\r\n");
-    out.push_str("synapse (SQLite)    4 MB     files + knowledge graph\r\n");
-    out.push_str("kernel heap         16 MB    (see 'mem' for details)\r\n");
-    out.push_str("draug archives      host     ~/folkering/draug-sandbox/archive/");
+    let mut out = String::with_capacity(384);
+    out.push_str("Filesystem          Size       Used       Notes\r\n");
+    out.push_str("---                 ----       ----       -----\r\n");
+    // Physical memory stats (real data)
+    let (total_pages, free_pages) = crate::memory::physical::memory_stats();
+    let total_mb = (total_pages * 4) / 1024;
+    let used_mb = ((total_pages - free_pages) * 4) / 1024;
+    out.push_str("physical RAM        ");
+    push_dec(&mut out, total_mb as u32);
+    out.push_str(" MB    ");
+    push_dec(&mut out, used_mb as u32);
+    out.push_str(" MB    kernel + userspace\r\n");
+    // Static info for disk (kernel has no live disk usage stats yet)
+    out.push_str("virtio-data.img     365 MB     ~368 MB  model + synapse DB\r\n");
+    out.push_str("draug archives      host       -        ~/folkering/draug-sandbox/archive/");
     out
 }
 

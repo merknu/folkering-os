@@ -45,6 +45,9 @@ pub fn syscall_ask_gemini(prompt_ptr: u64, prompt_len: u64, response_buf_ptr: u6
     if prompt_len == 0 || prompt_len > 8192 {
         return u64::MAX;
     }
+    // Validate both pointers
+    if prompt_ptr < 0x200000 || prompt_ptr >= 0xFFFF_8000_0000_0000 { return u64::MAX; }
+    if response_buf_ptr < 0x200000 || response_buf_ptr >= 0xFFFF_8000_0000_0000 { return u64::MAX; }
 
     let prompt_bytes = unsafe {
         core::slice::from_raw_parts(prompt_ptr as *const u8, prompt_len)

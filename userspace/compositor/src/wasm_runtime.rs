@@ -56,6 +56,14 @@ pub const FUEL_FOREGROUND: u64 = 5_000_000;
 /// Reduced fuel for background windows (save CPU for foreground)
 pub const FUEL_BACKGROUND: u64 = 200_000;
 
+/// Create a wasmi Engine with fuel metering enabled.
+/// Without this, set_fuel() silently fails and WASM code runs unlimited.
+fn engine_with_fuel() -> Engine {
+    let mut config = Config::default();
+    config.consume_fuel(true);
+    Engine::new(&config)
+}
+
 /// Maximum pending events per frame (prevent unbounded growth)
 const MAX_EVENTS: usize = 64;
 
@@ -364,7 +372,7 @@ fn execute_wasm_sandboxed(
     wasm_bytes: &[u8],
     config: WasmConfig,
 ) -> (WasmResult, WasmOutput) {
-    let engine = Engine::default();
+    let engine = engine_with_fuel();
 
     let module = match Module::new(&engine, wasm_bytes) {
         Ok(m) => m,
@@ -444,7 +452,7 @@ impl PersistentWasmApp {
 
     /// Internal: wasmi-based sandboxed instantiation.
     fn new_sandboxed(wasm_bytes: &[u8], config: WasmConfig) -> Result<Self, String> {
-        let engine = Engine::default();
+        let engine = engine_with_fuel();
 
         let module = Module::new(&engine, wasm_bytes)
             .map_err(|e| alloc::format!("Module parse: {:?}", e))?;
@@ -640,7 +648,7 @@ impl PersistentWasmApp {
 ///
 /// Returns the transformed bytes, or None if the adapter fails.
 pub fn execute_adapter(adapter_wasm: &[u8], input_data: &[u8]) -> Option<Vec<u8>> {
-    let engine = Engine::default();
+    let engine = engine_with_fuel();
 
     // Adapter host state: input/output buffers
     struct AdapterState {
@@ -1100,7 +1108,7 @@ pub fn execute_shadow_test(
     wasm_bytes: &[u8],
     synthetic_inputs: &[InputEvent],
 ) -> TestReport {
-    let engine = Engine::default();
+    let engine = engine_with_fuel();
 
     let module = match Module::new(&engine, wasm_bytes) {
         Ok(m) => m,

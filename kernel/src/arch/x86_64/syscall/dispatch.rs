@@ -3,6 +3,14 @@
 use super::debug::SYSCALL_RESULT;
 use super::handlers::*;
 
+/// Validate a userspace pointer: non-null, in userspace range, no wraparound.
+#[inline]
+fn valid_user_ptr(ptr: u64, len: u64) -> bool {
+    ptr >= 0x200000 && ptr < 0xFFFF_8000_0000_0000
+        && len <= 128 * 1024 * 1024 // cap at 128MB
+        && (ptr as u128 + len as u128) < 0xFFFF_8000_0000_0000
+}
+
 /// Syscall handler (called from assembly)
 #[no_mangle]
 #[inline(never)]
@@ -123,15 +131,18 @@ pub(super) extern "C" fn syscall_handler(
         },
         // Draug bridge: set current task name string
         0xD1 => {
-            let ptr = arg1 as *const u8;
             let len = (arg2 as usize).min(31);
-            let mut buf = crate::net::tcp_shell::DRAUG_CURRENT_TASK.lock();
-            if len > 0 {
-                let src = unsafe { core::slice::from_raw_parts(ptr, len) };
-                buf[..len].copy_from_slice(src);
+            if len > 0 && !valid_user_ptr(arg1, len as u64) {
+                u64::MAX
+            } else {
+                let mut buf = crate::net::tcp_shell::DRAUG_CURRENT_TASK.lock();
+                if len > 0 {
+                    let src = unsafe { core::slice::from_raw_parts(arg1 as *const u8, len) };
+                    buf[..len].copy_from_slice(src);
+                }
+                buf[len] = 0; // NUL terminate
+                0
             }
-            buf[len] = 0; // NUL terminate
-            0
         },
         // Async TCP (non-blocking, returns EAGAIN)
         0xE0 => crate::net::tcp_async::syscall_tcp_connect(arg1, arg2),

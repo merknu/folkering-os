@@ -266,6 +266,7 @@ pub fn translate_function(
 
             // ── Control flow ────────────────────────────────────────
             op::BLOCK => {
+                if pc >= bc.len() { return Err(super::JitError::ParseError(alloc::string::String::from("truncated block"))); }
                 let _block_type = bc[pc]; pc += 1; // skip block type
                 label_stack.push(Label {
                     patch_offsets: Vec::new(),
@@ -274,6 +275,7 @@ pub fn translate_function(
                 });
             }
             op::LOOP => {
+                if pc >= bc.len() { return Err(super::JitError::ParseError(alloc::string::String::from("truncated loop"))); }
                 let _block_type = bc[pc]; pc += 1;
                 label_stack.push(Label {
                     patch_offsets: Vec::new(),
@@ -282,6 +284,7 @@ pub fn translate_function(
                 });
             }
             op::IF => {
+                if pc >= bc.len() { return Err(super::JitError::ParseError(alloc::string::String::from("truncated if"))); }
                 let _block_type = bc[pc]; pc += 1;
                 // pop condition; test; jz else/end
                 buf.emit(&[0x58]);                  // pop rax
@@ -307,7 +310,9 @@ pub fn translate_function(
                         let target = buf.offset();
                         let rel = (target as i32) - (if_patch as i32) - 4;
                         let code = buf.code_mut();
-                        code[if_patch..if_patch+4].copy_from_slice(&rel.to_le_bytes());
+                        if if_patch + 4 <= code.len() {
+                            code[if_patch..if_patch+4].copy_from_slice(&rel.to_le_bytes());
+                        }
                     }
 
                     // Replace the patch list with the skip-jump
@@ -319,9 +324,11 @@ pub fn translate_function(
                     let target = buf.offset();
                     // Patch all forward jumps to here
                     for patch in &label.patch_offsets {
-                        let rel = (target as i32) - (*patch as i32) - 4;
                         let code = buf.code_mut();
-                        code[*patch..*patch+4].copy_from_slice(&rel.to_le_bytes());
+                        if *patch + 4 <= code.len() {
+                            let rel = (target as i32) - (*patch as i32) - 4;
+                            code[*patch..*patch+4].copy_from_slice(&rel.to_le_bytes());
+                        }
                     }
                 }
                 // If label stack is empty, this is the function end

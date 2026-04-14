@@ -11,7 +11,7 @@ pub fn syscall_ping(ip_packed: u64) -> u64 {
 }
 
 pub fn syscall_dns_lookup(name_ptr: u64, name_len: u64) -> u64 {
-    if name_ptr == 0 || name_len == 0 || name_len > 255 {
+    if name_ptr < 0x200000 || name_ptr >= 0xFFFF_8000_0000_0000 || name_len == 0 || name_len > 255 {
         return 0;
     }
 
@@ -28,7 +28,10 @@ pub fn syscall_dns_lookup(name_ptr: u64, name_len: u64) -> u64 {
 }
 
 pub fn syscall_github_fetch(user_ptr: u64, user_len: u64, repo_ptr: u64, repo_len: u64) -> u64 {
-    if user_ptr == 0 || user_len == 0 || user_len > 64 || repo_ptr == 0 || repo_len == 0 || repo_len > 64 {
+    if user_ptr < 0x200000 || user_ptr >= 0xFFFF_8000_0000_0000
+        || user_len == 0 || user_len > 64
+        || repo_ptr < 0x200000 || repo_ptr >= 0xFFFF_8000_0000_0000
+        || repo_len == 0 || repo_len > 64 {
         return u64::MAX;
     }
     let user = unsafe { core::slice::from_raw_parts(user_ptr as *const u8, user_len as usize) };
@@ -57,7 +60,10 @@ pub fn syscall_github_fetch(user_ptr: u64, user_len: u64, repo_ptr: u64, repo_le
 }
 
 pub fn syscall_github_clone(user_ptr: u64, user_len: u64, repo_ptr: u64, repo_len: u64) -> u64 {
-    if user_ptr == 0 || user_len == 0 || user_len > 64 || repo_ptr == 0 || repo_len == 0 || repo_len > 64 {
+    if user_ptr < 0x200000 || user_ptr >= 0xFFFF_8000_0000_0000
+        || user_len == 0 || user_len > 64
+        || repo_ptr < 0x200000 || repo_ptr >= 0xFFFF_8000_0000_0000
+        || repo_len == 0 || repo_len > 64 {
         return u64::MAX;
     }
     let user = unsafe { core::slice::from_raw_parts(user_ptr as *const u8, user_len as usize) };
@@ -383,6 +389,9 @@ pub fn syscall_fbp_request(
     if url_len == 0 || url_len > 512 || buf_max == 0 || buf_max > 262144 {
         return u64::MAX;
     }
+    // Validate pointers
+    if url_ptr < 0x200000 || url_ptr >= 0xFFFF_8000_0000_0000 { return u64::MAX; }
+    if buf_ptr < 0x200000 || buf_ptr >= 0xFFFF_8000_0000_0000 { return u64::MAX; }
 
     let url_bytes = unsafe {
         core::slice::from_raw_parts(url_ptr as *const u8, url_len as usize)
@@ -641,6 +650,10 @@ pub fn syscall_fbp_patch(
         crate::serial_strln!("");
         return u64::MAX;
     }
+    // Validate pointers
+    if filename_ptr < 0x200000 || filename_ptr >= 0xFFFF_8000_0000_0000 { return u64::MAX; }
+    if content_ptr < 0x200000 || content_ptr >= 0xFFFF_8000_0000_0000 { return u64::MAX; }
+    if result_ptr < 0x200000 || result_ptr >= 0xFFFF_8000_0000_0000 { return u64::MAX; }
 
     let filename_bytes = unsafe {
         core::slice::from_raw_parts(filename_ptr as *const u8, filename_len as usize)
@@ -779,6 +792,10 @@ pub fn syscall_llm_generate(
         crate::serial_strln!("");
         return u64::MAX;
     }
+    // Validate pointers
+    if model_ptr < 0x200000 || model_ptr >= 0xFFFF_8000_0000_0000 { return u64::MAX; }
+    if prompt_ptr < 0x200000 || prompt_ptr >= 0xFFFF_8000_0000_0000 { return u64::MAX; }
+    if result_ptr < 0x200000 || result_ptr >= 0xFFFF_8000_0000_0000 { return u64::MAX; }
 
     let model_bytes = unsafe {
         core::slice::from_raw_parts(model_ptr as *const u8, model_len)
