@@ -38,8 +38,16 @@ we tested on), copy `run_bytes.c` over and compile once:
 # From the host (adjust host/user):
 scp run_bytes.c knut@folkering-daq.local:~/a64-harness/
 ssh knut@folkering-daq.local \
-    "gcc -O2 -Wall -o ~/a64-harness/run_bytes ~/a64-harness/run_bytes.c"
+    "gcc -O2 -Wall -no-pie -o ~/a64-harness/run_bytes ~/a64-harness/run_bytes.c"
 ```
+
+`-no-pie` matters: with PIE (the Debian default) the helper functions
+used by Phase 4A would be placed at a fresh ASLR-randomised address
+on every `run_bytes` invocation.  The Phase 4A flow queries the
+helper address in one SSH call and runs the JIT in a second SSH call
+— PIE would land them on different layouts and the baked-in
+MOVZ/MOVK address would point at garbage.  `-no-pie` pins the
+addresses at link time so they're stable across invocations.
 
 The binary is stand-alone (glibc + kernel syscalls only), ~70 KiB.
 No root required — `mmap(PROT_EXEC)` is allowed in user processes on
@@ -49,9 +57,17 @@ a standard Pi OS kernel.
 
 ```sh
 cd tools/a64-encoder
-cargo run --example run_on_pi                # default: knut@192.168.68.72
+cargo run --example run_on_pi                # Phase 3: 6 stack+arith+if/else cases
+cargo run --example call_on_pi               # Phase 4A: BLR into a real C helper
 cargo run --example run_on_pi -- user@host   # override destination
 ```
+
+The `call_on_pi` example exercises the `Call(n)` lowering (MOVZ/MOVK
+chain → X16, BLR X16) against one of the `helper_*` functions
+compiled into `run_bytes`.  It first asks `run_bytes --addrs` for
+the helper's current absolute address, then bakes that address into
+the emitted JIT.  A successful run prints
+`[ ok ] Call(helper_return_42) returned 42 via BLR`.
 
 Expected output:
 
