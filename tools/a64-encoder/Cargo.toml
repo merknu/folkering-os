@@ -1,0 +1,7 @@
+[package]
+name = "a64-encoder"
+version = "0.1.0"
+edition = "2021"
+description = "AArch64 (A64) instruction encoder — emits 32-bit little-endian opcodes for JIT code generation"
+
+[dependencies]
