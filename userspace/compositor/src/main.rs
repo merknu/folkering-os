@@ -345,6 +345,9 @@ fn main() -> ! {
 
     write_str("[COMPOSITOR] *** NEURAL DESKTOP ***\n");
 
+    // ===== Silverfir-nano JIT self-test =====
+    compositor::wasm_runtime::test_silverfir_jit();
+
     // ===== Continue with normal operation =====
     let mut compositor = Compositor::new();
 
@@ -624,7 +627,29 @@ fn main() -> ! {
     // last_clock_second now in render (RenderState)
     // tz_offset_minutes, tz_synced, tz_sync_pending now in mcp
     let mut active_agent: Option<compositor::agent::AgentSession> = None; // ReAct agentic loop
-    let mut draug = compositor::draug::DraugDaemon::new(); // Background AI daemon
+    let mut draug = compositor::draug::DraugDaemon::new();
+    // Stability Fix 1: restore state from previous session
+    if draug.restore_state() {
+        libfolk::sys::io::write_str("[Draug] Restored state: iter=");
+        let mut nb = [0u8; 16];
+        libfolk::sys::io::write_str(crate::util::format_usize(draug.refactor_iter as usize, &mut nb));
+        libfolk::sys::io::write_str(" levels=[");
+        for i in 0..20 {
+            if i > 0 { libfolk::sys::io::write_str(","); }
+            libfolk::sys::io::write_str(crate::util::format_usize(draug.task_levels[i] as usize, &mut nb));
+        }
+        libfolk::sys::io::write_str("]\n");
+
+        // Push restored state to kernel bridge so TCP shell shows correct values
+        libfolk::sys::draug_bridge_update(
+            draug.refactor_iter, draug.refactor_passed, draug.refactor_failed,
+            draug.refactor_retries,
+            draug.tasks_at_level(1) as u8, draug.tasks_at_level(2) as u8,
+            draug.tasks_at_level(3) as u8,
+            if draug.plan_mode_active { 1 } else { 0 },
+            draug.complex_task_idx as u8, 0, 0,
+        );
+    }
 
     // Pillar 4: WASM warm cache — pre-compiled modules for instant response
     // wasm.cache initialized by WasmState::new()
@@ -776,11 +801,19 @@ fn main() -> ! {
                 damage.add_damage(compositor::damage::Rect::new(ram_clear_x as u32, 0, 70, 20)); // RAM
             }
 
-            // Lazy timezone sync via MCP: send TimeSyncRequest, poll for TimeSync response
+            // Try direct kernel NTP first (uses UDP syscall), fall back to MCP proxy
             if !mcp.tz_synced && !mcp.tz_sync_pending {
-                if libfolk::mcp::client::send_time_sync() {
+                // Try NTP via kernel: pool.ntp.org → 162.159.200.123 (Cloudflare time)
+                let ntp_ip = [162, 159, 200, 123];
+                let ntp_time = libfolk::sys::ntp_query(ntp_ip);
+                if ntp_time > 0 {
+                    // Got NTP time! Set as authoritative, no need for proxy.
+                    mcp.tz_synced = true;
+                    write_str("[NTP] Sync OK via kernel UDP\n");
+                    // Compute timezone offset later when we know local time vs UTC
+                } else if libfolk::mcp::client::send_time_sync() {
                     mcp.tz_sync_pending = true;
-                    write_str("[MCP] TimeSyncRequest sent\n");
+                    write_str("[MCP] TimeSyncRequest sent (NTP failed, fallback)\n");
                 }
             }
         }
@@ -941,13 +974,25 @@ fn main() -> ! {
         if kr.did_work { did_work = true; }
         if kr.need_redraw { need_redraw = true; }
 
-        // ===== Command dispatch (moved to command_dispatch.rs) =====
-        let dr = command_dispatch::dispatch_omnibar(
-            &mut input, &mut wasm, &mut wm, &mut mcp,
-            &mut stream, &mut draug, &mut fb, &mut damage,
-            &mut com3_queue, &mut active_agent, &mut drivers_seeded,
-            execute_command, &mut cursor,
-        );
+        // ===== Command dispatch (moved to command_dispatch/) =====
+        // Phase C1: 13 parameters → 1 DispatchContext.
+        let dr = {
+            let mut ctx = command_dispatch::DispatchContext {
+                input: &mut input,
+                wasm: &mut wasm,
+                wm: &mut wm,
+                mcp: &mut mcp,
+                stream: &mut stream,
+                draug: &mut draug,
+                fb: &mut fb,
+                damage: &mut damage,
+                com3_queue: &mut com3_queue,
+                active_agent: &mut active_agent,
+                drivers_seeded: &mut drivers_seeded,
+                cursor: &mut cursor,
+            };
+            command_dispatch::dispatch_omnibar(&mut ctx, execute_command)
+        };
         let mut deferred_app_handle = dr.deferred_app_handle;
         if dr.did_work { did_work = true; }
         if dr.need_redraw { need_redraw = true; }
@@ -1007,12 +1052,29 @@ fn main() -> ! {
                 app_tile_w: APP_TILE_W, app_tile_h: APP_TILE_H, app_tile_gap: APP_TILE_GAP, app_tile_cols: APP_TILE_COLS,
                 cursor_w: CURSOR_W, cursor_h: CURSOR_H,
             };
-            let rr = rendering::render_frame(
-                &mut fb, &mut wm, &mut wasm, &input, &mut render, &mut mcp,
-                &iqe, &mut damage, &mut draug, &categories[..], &rl,
-                &cursor, cursor_drawn, &mut cursor_bg.0,
-                &ram_history.data, ram_history.idx, ram_history.count,
-            );
+            // Phase C2: 17 parameters → 1 RenderContext.
+            let rr = {
+                let mut rctx = rendering::RenderContext {
+                    fb: &mut fb,
+                    wm: &mut wm,
+                    wasm: &mut wasm,
+                    input: &input,
+                    render: &mut render,
+                    mcp: &mut mcp,
+                    iqe: &iqe,
+                    damage: &mut damage,
+                    draug: &mut draug,
+                    categories: &categories[..],
+                    layout: &rl,
+                    cursor: &cursor,
+                    cursor_drawn,
+                    cursor_bg: &mut cursor_bg.0,
+                    ram_history: &ram_history.data,
+                    ram_history_idx: ram_history.idx,
+                    ram_history_count: ram_history.count,
+                };
+                rendering::render_frame(&mut rctx)
+            };
             if rr.did_work { did_work = true; }
         }
 

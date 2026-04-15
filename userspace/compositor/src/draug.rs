@@ -62,6 +62,130 @@ pub const DREAM_MAX_PER_SESSION: u32 = 10;
 /// AutoDream: max refactoring failures before marking as "perfected"
 pub const DREAM_STRIKE_LIMIT: u8 = 3;
 
+// ── Async TCP State Machine ────────────────────────────────────────
+
+/// Non-blocking phase of a Draug iteration.
+/// Each phase takes <1ms. Compositor renders between phases.
+#[derive(Clone, PartialEq)]
+pub enum AsyncPhase {
+    /// Ready for next iteration (gate check).
+    Idle,
+    /// TCP connect in progress (EAGAIN polling).
+    Connecting,
+    /// Sending request bytes (EAGAIN polling).
+    Sending,
+    /// Reading response (EAGAIN polling).
+    Reading,
+    /// Response complete — process result.
+    Processing,
+}
+
+/// What operation the async TCP is serving.
+#[derive(Clone, PartialEq)]
+pub enum AsyncOp {
+    None,
+    /// Skill tree: LLM call for code generation
+    LlmGenerate,
+    /// Skill tree / Phase 15: cargo test via PATCH
+    FbpPatch,
+    /// Phase 16: WASM compilation
+    WasmCompile,
+    /// Health check
+    ProxyPing,
+    /// Phase 15: LLM call for planning (STEP| format)
+    PlannerLlm,
+    /// Phase 15: LLM call for step execution
+    ExecutorLlm,
+}
+
+// ── Knowledge Hunt (Phase 7) ────────────────────────────────────────
+//
+// When the system idles, Draug fires a one-shot "Knowledge Hunt" that
+// asks the host-side Cloud DOM Proxy to fetch a configured URL and
+// persists the extracted text to the MemPalace (files.db) under a
+// symbolic "room" like `knowledge/rust_wiki.txt`. Intended for demo
+// + proof-of-concept; a future session will promote this into a
+// general reading queue driven by pending user intents.
+
+/// Idle threshold before a Knowledge Hunt fires (15 seconds). Kept
+/// intentionally short so the demo triggers without a 45-minute wait.
+pub const KNOWLEDGE_HUNT_IDLE_MS: u64 = 15_000;
+
+/// Cooldown between successive Knowledge Hunts (5 minutes). Currently
+/// the hunt is one-shot per boot, but this constant is used by the
+/// scheduler so future sessions can convert the flag into a queue.
+pub const KNOWLEDGE_HUNT_COOLDOWN_MS: u64 = 300_000;
+
+/// URL the first Knowledge Hunt fetches. Hardcoded for Phase 7; a
+/// later pass will pull this from an intent queue fed by the user.
+pub const KNOWLEDGE_HUNT_URL: &str = "https://en.wikipedia.org/wiki/Rust_(programming_language)";
+
+/// MemPalace "room" the hunt stores its result under. This ends up
+/// as the `name` column in the Synapse `files` table.
+pub const KNOWLEDGE_HUNT_ROOM: &str = "knowledge/rust_wiki.txt";
+
+// ── Overnight auto-refactor loop (Phase 13) ──────────────────────────
+//
+// After the one-shot Knowledge Hunt + Graph supersession test fire,
+// Draug enters an overnight loop where it rotates through a list of
+// programming tasks, prompting Gemma4 for each and sandboxing the
+// result. Designed to run for hours without supervision — the gates
+// below cap wall-clock work and rate-limit the Ollama calls.
+
+/// Minimum wall-clock interval between refactor iterations.
+/// 60 seconds → on cloud-backed Gemma4 (~3-5s per call) + cargo
+/// check (~0.2-1s) we spend about 10% of each interval actually
+/// working. Keeps the local Ollama endpoint happy.
+pub const REFACTOR_INTERVAL_MS: u64 = 60_000;
+
+/// Hard safety cap on total iterations per boot. With the Phase 14
+/// skill tree (20 tasks × 3 levels + retries), 1000 gives ~10 full
+/// retry budgets per task-level. At 60s/iter that's ~16 hours.
+pub const REFACTOR_MAX_ITER: u32 = 1000;
+
+/// Phase 15 — number of complex tasks in agent_planner::COMPLEX_TASKS.
+/// Kept as a constant here so the lib crate doesn't reference the bin.
+pub const COMPLEX_TASK_COUNT: usize = 8;
+
+/// Phase 14 — Draug Autonomy Curriculum.
+///
+/// Five cognitive training levels:
+///   L1: The Fixer — write function, retry with compiler feedback
+///   L2: TDD — write function + tests, verify both compile
+///   L3: Evolution — optimize prior code using MemPalace context
+///   L4: OS Integration — use libfolk syscalls (future)
+///   L5: Hardware — lock-free structures for DAQ (future)
+///
+/// Only L1-L3 are active in the current build. L4-L5 are defined
+/// in the curriculum but skipped until the sandbox has libfolk stubs.
+///
+/// Stability: model selection per level — L1 uses a fast 7B coder
+/// model to reduce GPU pressure by ~75%. L2+ uses the full 31B.
+
+/// Select LLM model based on skill level.
+pub fn model_for_level(level: u8) -> &'static str {
+    match level {
+        0 | 1 => "qwen2.5-coder:7b",  // fast, good for simple functions
+        _ => "gemma4:31b-cloud",        // full reasoning for TDD/optimization
+    }
+}
+
+/// Model for Phase 15 Planner persona (needs strong reasoning).
+pub const PLANNER_MODEL: &str = "gemma4:31b-cloud";
+/// Model for Phase 15 Executor persona (complex multi-step).
+pub const EXECUTOR_MODEL: &str = "gemma4:31b-cloud";
+pub const ACTIVE_SKILL_LEVELS: u8 = 3;
+pub const MAX_SKILL_LEVELS: u8 = 5;
+/// Number of tasks in REFACTOR_TASKS.
+pub const TASK_COUNT: usize = 20;
+/// Max retries per attempt when cargo check fails.
+pub const MAX_RETRIES: u8 = 2;
+
+/// Wait this long after boot before the first refactor attempt —
+/// gives the Knowledge Hunt + Graph test room to finish without
+/// competing for the proxy socket. 30 seconds after last user input.
+pub const REFACTOR_INITIAL_IDLE_MS: u64 = 30_000;
+
 /// Compress source code for LLM prompts: strip comments, blank lines, trailing spaces.
 /// Saves 30-50% of tokens without losing meaning.
 fn compress_source(src: &str) -> String {
@@ -116,7 +240,8 @@ pub struct PendingCreative {
 }
 
 /// Maximum pending creative changes
-pub const MAX_PENDING_CREATIVE: usize = 8;
+/// Cap pending creative items to limit heap use (~50KB WASM each).
+pub const MAX_PENDING_CREATIVE: usize = 3;
 
 /// System observation snapshot
 pub struct Observation {
@@ -282,6 +407,96 @@ pub struct DraugDaemon {
     pattern_mine_count: u32,
     /// Last insight stored — avoid duplicates
     last_insight_hash: u32,
+
+    /// Knowledge Hunt (Phase 7): one-shot flag that flips true after
+    /// the first successful hunt of this boot. A future session will
+    /// promote this into an `Option<String>` reading queue so Draug
+    /// can chew through multiple URLs.
+    knowledge_hunted: bool,
+
+    /// Phase 13 — Overnight auto-refactor loop state. Draug picks a
+    /// new programming task every REFACTOR_INTERVAL_MS, runs it
+    /// through the LLM gateway, ships the result to the sandbox,
+    /// records the outcome, then sleeps until the next tick.
+    /// Bounded by REFACTOR_MAX_ITER to avoid runaway execution.
+    pub refactor_iter: u32,
+    pub last_refactor_ms: u64,
+    pub refactor_passed: u32,
+    pub refactor_failed: u32,
+
+    /// Phase 14 — Skill tree state.
+    ///
+    /// `task_levels[i]` = highest completed level for task i (0-3).
+    /// `task_code[i]` = L1 code for task i, fed into L2/L3 prompts.
+    /// `refactor_retries` = lifetime count of error-driven retries.
+    pub task_levels: [u8; TASK_COUNT],
+    pub task_code: [Option<alloc::string::String>; TASK_COUNT],
+    pub refactor_retries: u32,
+
+    /// Phase 15 — Agentic Plan-and-Solve state.
+    pub active_plan: Option<TaskPlan>,
+    pub complex_task_idx: usize,
+    pub plan_mode_active: bool,
+
+    // ── Stability fields ─────────────────────────────────────────
+    /// Fix 4: Error memory — last compiler error per task.
+    pub task_errors: [Option<alloc::string::String>; TASK_COUNT],
+    /// Fix 5: Consecutive LLM skips (Ollama down). For backoff.
+    pub consecutive_skips: u32,
+    /// Fix 8: Hibernation mode — set after 30 consecutive skips.
+    pub refactor_hibernating: bool,
+    /// Cached proxy ping result (avoid 2s TCP per iteration).
+    pub last_ping_ms: u64,
+    pub last_ping_ok: bool,
+
+    // ── Async TCP state machine ──────────────────────────────────
+    /// Current async phase (non-blocking Draug iteration).
+    pub async_phase: AsyncPhase,
+    /// TCP slot ID for the current async connection (0xFFFF = none).
+    pub async_tcp_slot: u64,
+    /// Buffer for accumulating async TCP response.
+    pub async_response: alloc::vec::Vec<u8>,
+    /// What we're waiting for (LLM or PATCH).
+    pub async_operation: AsyncOp,
+    /// The prompt/request bytes to send.
+    pub async_request: alloc::vec::Vec<u8>,
+    /// Bytes sent so far.
+    pub async_sent: usize,
+    /// Task context preserved across async calls.
+    pub async_task_idx: usize,
+    pub async_level: u8,
+    pub async_attempt: u8,
+    /// Uptime (ms) when current async phase started — for timeout.
+    /// If now - async_phase_started_ms > ASYNC_TIMEOUT_MS, force abort.
+    pub async_phase_started_ms: u64,
+}
+
+/// Timeout for any single async TCP phase (connect/send/read).
+/// 90 seconds wall clock — enough for cold Ollama + cargo test,
+/// but prevents permanent hang if proxy stops responding.
+pub const ASYNC_TIMEOUT_MS: u64 = 90_000;
+
+// ── Phase 15 types (must live in lib crate so draug.rs can own them) ──
+
+/// A multi-step task plan generated by the Planner persona.
+#[derive(Clone)]
+pub struct TaskPlan {
+    pub task_id: alloc::string::String,
+    pub task_desc: alloc::string::String,
+    pub steps: alloc::vec::Vec<PlanStep>,
+    pub current_step: usize,
+    pub completed: bool,
+}
+
+/// A single step within a task plan.
+#[derive(Clone)]
+pub struct PlanStep {
+    pub description: alloc::string::String,
+    pub code: Option<alloc::string::String>,
+    pub done: bool,
+    /// How many times this step has FINAL-failed (after retries).
+    /// After 3, the entire task is abandoned.
+    pub fail_count: u8,
 }
 
 /// Compact observation summary for the log
@@ -320,7 +535,301 @@ impl DraugDaemon {
             last_pattern_mine_ms: 0,
             pattern_mine_count: 0,
             last_insight_hash: 0,
+            knowledge_hunted: false,
+            refactor_iter: 0,
+            last_refactor_ms: 0,
+            refactor_passed: 0,
+            refactor_failed: 0,
+            task_levels: [0u8; TASK_COUNT],
+            task_code: [const { None }; TASK_COUNT],
+            refactor_retries: 0,
+            active_plan: None,
+            complex_task_idx: 0,
+            plan_mode_active: false,
+            task_errors: [const { None }; TASK_COUNT],
+            consecutive_skips: 0,
+            refactor_hibernating: false,
+            last_ping_ms: 0,
+            last_ping_ok: false,
+            async_phase: AsyncPhase::Idle,
+            async_tcp_slot: 0xFFFF,
+            async_response: alloc::vec::Vec::new(),
+            async_operation: AsyncOp::None,
+            async_request: alloc::vec::Vec::new(),
+            async_sent: 0,
+            async_task_idx: 0,
+            async_level: 0,
+            async_attempt: 0,
+            async_phase_started_ms: 0,
         }
+    }
+
+    // ── Phase 13 — Overnight refactor loop gate ──────────────────
+    //
+    // Returns true at most once per REFACTOR_INTERVAL_MS wall-clock
+    // interval, and never after REFACTOR_MAX_ITER steps.
+    //
+    // Phase 13.4: decoupled from KHunt. The refactor loop only
+    // needs `llm_generate` + `fbp_patch`, not the one-shot
+    // Wikipedia fetch. If KHunt is flaky (virtio-net RX stalls
+    // under whpx with large responses), Phase 13 should still
+    // proceed overnight.
+
+    pub fn should_run_refactor_step(&mut self, now_ms: u64) -> bool {
+        if !self.active { return false; }
+        if self.dreaming || self.waiting_for_llm { return false; }
+        if self.refactor_iter >= REFACTOR_MAX_ITER { return false; }
+        // Heap pressure guard: skip if physical RAM is tight (>90% used)
+        let (_total, _used, pct) = libfolk::sys::memory_stats();
+        if pct > 90 {
+            return false;
+        }
+        // Fix 8: hibernation — stop until proxy comes back.
+        // Auto-wake: try proxy ping every 60s while hibernating.
+        if self.refactor_hibernating {
+            if now_ms.saturating_sub(self.last_refactor_ms) >= 60_000 {
+                self.last_refactor_ms = now_ms;
+                if libfolk::sys::proxy_ping() {
+                    self.consecutive_skips = 0;
+                    self.refactor_hibernating = false;
+                    // Fall through to normal scheduling
+                } else {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+
+        let has_skill_work = self.next_task_and_level().is_some();
+        let has_plan_work = self.plan_mode_active && self.has_plan_work();
+        let needs_plan_transition = !has_skill_work
+            && !self.plan_mode_active
+            && self.complex_task_idx < COMPLEX_TASK_COUNT;
+
+        if !has_skill_work && !has_plan_work && !needs_plan_transition { return false; }
+
+        if now_ms.saturating_sub(self.last_user_input_ms) < REFACTOR_INITIAL_IDLE_MS {
+            return false;
+        }
+        if self.last_refactor_ms == 0 {
+            return true;
+        }
+        // Adaptive interval: L1 with fast 7b model needs less wait,
+        // L2+ with 31b needs full 60s. Backoff on skips.
+        let base_interval = if self.consecutive_skips > 5 {
+            let multiplier = 1u64 << ((self.consecutive_skips.saturating_sub(5)).min(3) as u64);
+            (REFACTOR_INTERVAL_MS * multiplier).min(300_000)
+        } else if !self.plan_mode_active {
+            // Skill tree mode: check current level
+            match self.next_task_and_level() {
+                Some((_, 1)) => 15_000,  // L1: 15s (7b model responds in ~3s)
+                _ => REFACTOR_INTERVAL_MS, // L2+: 60s
+            }
+        } else {
+            REFACTOR_INTERVAL_MS // Plan mode: 60s (31b model)
+        };
+        now_ms.saturating_sub(self.last_refactor_ms) >= base_interval
+    }
+
+    /// Advance the refactor counter. Called BEFORE the actual work so
+    /// the iteration number logged to serial matches the counter
+    /// after the increment.
+    pub fn advance_refactor(&mut self, now_ms: u64) -> u32 {
+        self.refactor_iter += 1;
+        self.last_refactor_ms = now_ms;
+        self.refactor_iter
+    }
+
+    pub fn record_refactor_pass(&mut self) { self.refactor_passed += 1; }
+    pub fn record_refactor_fail(&mut self) { self.refactor_failed += 1; }
+
+    // ── Phase 14 — Skill Tree ───────────────────────────────────────
+
+    /// Returns `(task_index, target_level)` for the next task to
+    /// attempt. Breadth-first: all L1s first, then all L2s, then L3s.
+    /// Returns `None` when every task has reached ACTIVE_SKILL_LEVELS.
+    pub fn next_task_and_level(&self) -> Option<(usize, u8)> {
+        for level in 1..=ACTIVE_SKILL_LEVELS {
+            for i in 0..TASK_COUNT {
+                if self.task_levels[i] < level {
+                    return Some((i, level));
+                }
+            }
+        }
+        None
+    }
+
+    /// Record that task `idx` passed its current level.
+    pub fn advance_task_level(&mut self, idx: usize) {
+        if idx < TASK_COUNT && self.task_levels[idx] < MAX_SKILL_LEVELS {
+            self.task_levels[idx] += 1;
+        }
+    }
+
+    /// Store L1 code so L2/L3 prompts can reference it.
+    pub fn store_task_code(&mut self, idx: usize, code: alloc::string::String) {
+        if idx < TASK_COUNT {
+            self.task_code[idx] = Some(code);
+        }
+    }
+
+    /// Retrieve stored code for a task (used by L2/L3 prompts).
+    pub fn get_task_code(&self, idx: usize) -> Option<&str> {
+        if idx < TASK_COUNT {
+            self.task_code[idx].as_deref()
+        } else {
+            None
+        }
+    }
+
+    /// How many tasks have completed a given level?
+    pub fn tasks_at_level(&self, level: u8) -> usize {
+        self.task_levels.iter().filter(|&&l| l >= level).count()
+    }
+
+    /// Phase 15: is there remaining plan work?
+    pub fn has_plan_work(&self) -> bool {
+        self.complex_task_idx < COMPLEX_TASK_COUNT
+            || self.active_plan.as_ref().map_or(false, |p| !p.completed)
+    }
+
+    // ── Stability methods ───────────────────────────────────────────
+
+    /// Fix 4: Store error for cross-iteration learning.
+    pub fn store_task_error(&mut self, idx: usize, error: alloc::string::String) {
+        if idx < TASK_COUNT { self.task_errors[idx] = Some(error); }
+    }
+    pub fn get_task_error(&self, idx: usize) -> Option<&str> {
+        if idx < TASK_COUNT { self.task_errors[idx].as_deref() } else { None }
+    }
+    pub fn clear_task_error(&mut self, idx: usize) {
+        if idx < TASK_COUNT { self.task_errors[idx] = None; }
+    }
+
+    /// Check if Draug is active (not paused).
+    pub fn is_active(&self) -> bool { self.active }
+    /// Set Draug active state (for remote pause/resume).
+    pub fn set_active(&mut self, v: bool) { self.active = v; }
+
+    /// Fix 5: Record a skip (Ollama down).
+    pub fn record_skip(&mut self) {
+        self.consecutive_skips = self.consecutive_skips.saturating_add(1);
+        // Fix 8: hibernate after 30 consecutive skips
+        if self.consecutive_skips >= 30 && !self.refactor_hibernating {
+            self.refactor_hibernating = true;
+        }
+    }
+    /// Fix 5: Reset skips on success.
+    pub fn reset_skips(&mut self) {
+        self.consecutive_skips = 0;
+        self.refactor_hibernating = false;
+    }
+
+    /// Save critical state to Synapse.
+    pub fn save_state(&self) {
+        let mut buf = [0u8; 26];
+        buf[0..20].copy_from_slice(&self.task_levels);
+        buf[20..24].copy_from_slice(&self.refactor_iter.to_le_bytes());
+        buf[24] = self.complex_task_idx as u8;
+        buf[25] = if self.plan_mode_active { 1 } else { 0 };
+        let _ = libfolk::sys::synapse::write_file("draug_state.bin", &buf);
+    }
+
+    /// Save L1 code for a specific task (called after L1 PASS).
+    /// Stored separately from the 26-byte state to keep save_state fast.
+    pub fn save_task_code(&self, idx: usize) {
+        if idx >= TASK_COUNT { return; }
+        if let Some(ref code) = self.task_code[idx] {
+            let mut name = alloc::string::String::with_capacity(24);
+            name.push_str("draug_code_");
+            // Simple decimal index
+            if idx >= 10 { name.push((b'0' + (idx / 10) as u8) as char); }
+            name.push((b'0' + (idx % 10) as u8) as char);
+            name.push_str(".rs");
+            let _ = libfolk::sys::synapse::write_file(&name, code.as_bytes());
+        }
+    }
+
+    /// Fix 1: Restore state from Synapse on boot.
+    pub fn restore_state(&mut self) -> bool {
+        let resp = match libfolk::sys::synapse::read_file_shmem("draug_state.bin") {
+            Ok(r) if r.size >= 26 => r,
+            _ => return false,
+        };
+        const VADDR: usize = 0x30003000;
+        if libfolk::sys::shmem_map(resp.shmem_handle, VADDR).is_err() {
+            let _ = libfolk::sys::shmem_destroy(resp.shmem_handle);
+            return false;
+        }
+        // Validate shmem response has expected size before reading
+        if resp.size < 26 {
+            let _ = libfolk::sys::shmem_unmap(resp.shmem_handle, VADDR);
+            let _ = libfolk::sys::shmem_destroy(resp.shmem_handle);
+            return false;
+        }
+        let data = unsafe { core::slice::from_raw_parts(VADDR as *const u8, 26) };
+        self.task_levels.copy_from_slice(&data[0..20]);
+        self.refactor_iter = u32::from_le_bytes([data[20], data[21], data[22], data[23]]);
+        let idx = data[24] as usize;
+        self.complex_task_idx = if idx <= COMPLEX_TASK_COUNT { idx } else { 0 };
+        self.plan_mode_active = data[25] != 0;
+        let _ = libfolk::sys::shmem_unmap(resp.shmem_handle, VADDR);
+        let _ = libfolk::sys::shmem_destroy(resp.shmem_handle);
+
+        // Skip the one-shot KHunt + KGraph test (saves 30-60s boot time)
+        self.knowledge_hunted = true;
+
+        // Restore L1 code for L3 prompts
+        for i in 0..TASK_COUNT {
+            if self.task_levels[i] >= 1 {
+                let mut name = alloc::string::String::with_capacity(24);
+                name.push_str("draug_code_");
+                if i >= 10 { name.push((b'0' + (i / 10) as u8) as char); }
+                name.push((b'0' + (i % 10) as u8) as char);
+                name.push_str(".rs");
+                if let Ok(resp) = libfolk::sys::synapse::read_file_shmem(&name) {
+                    let sz = resp.size as usize;
+                    if sz > 0 && sz < 4096 {
+                        const CODE_VADDR: usize = 0x30004000;
+                        if libfolk::sys::shmem_map(resp.shmem_handle, CODE_VADDR).is_ok() {
+                            let bytes = unsafe {
+                                core::slice::from_raw_parts(CODE_VADDR as *const u8, sz)
+                            };
+                            if let Ok(s) = core::str::from_utf8(bytes) {
+                                self.task_code[i] = Some(alloc::string::String::from(s));
+                            }
+                            let _ = libfolk::sys::shmem_unmap(resp.shmem_handle, CODE_VADDR);
+                        }
+                        let _ = libfolk::sys::shmem_destroy(resp.shmem_handle);
+                    }
+                }
+            }
+        }
+
+        true
+    }
+
+    // ── Knowledge Hunt gate ──────────────────────────────────────────
+    //
+    // Draug fires one Knowledge Hunt per boot when the system has been
+    // idle long enough. The actual fetch + SQLite write is driven from
+    // `mcp_handler::knowledge_hunt::run`, which calls
+    // `mark_knowledge_hunted()` on success so the gate stays closed
+    // afterward.
+
+    /// Is it time to fire a Knowledge Hunt?
+    pub fn should_hunt_knowledge(&self, now_ms: u64) -> bool {
+        if self.knowledge_hunted { return false; }
+        if !self.active { return false; }
+        if self.dreaming || self.waiting_for_llm { return false; }
+        now_ms.saturating_sub(self.last_user_input_ms) >= KNOWLEDGE_HUNT_IDLE_MS
+    }
+
+    /// Mark the hunt as done (called on both success and terminal
+    /// failure so we don't spam the proxy with retries).
+    pub fn mark_knowledge_hunted(&mut self) {
+        self.knowledge_hunted = true;
     }
 
     /// Record a user command for prediction history.

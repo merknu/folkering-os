@@ -38,18 +38,22 @@ impl SuspiciousPacket {
 
 const QUEUE_SIZE: usize = 16;
 
-/// Lock-free ring buffer for suspicious packet metadata.
-/// Single producer (firewall in receive()), multiple consumers (AI/diagnostics).
+/// Ring buffer for suspicious packet metadata.
+/// Protected by a spin mutex for correctness. The push path only fires
+/// on dropped SYN packets (~0.1/sec), so contention is negligible.
 pub struct SuspiciousQueue {
-    entries: [SuspiciousPacket; QUEUE_SIZE],
+    entries: spin::Mutex<[SuspiciousPacket; QUEUE_SIZE]>,
     write_head: AtomicUsize,
     pub count: AtomicU32,
 }
 
+// Safety: inner Mutex provides synchronization
+unsafe impl Sync for SuspiciousQueue {}
+
 impl SuspiciousQueue {
     pub const fn new() -> Self {
         Self {
-            entries: [SuspiciousPacket::EMPTY; QUEUE_SIZE],
+            entries: spin::Mutex::new([SuspiciousPacket::EMPTY; QUEUE_SIZE]),
             write_head: AtomicUsize::new(0),
             count: AtomicU32::new(0),
         }
@@ -57,20 +61,28 @@ impl SuspiciousQueue {
 
     /// Push a suspicious packet (overwrites oldest if full)
     pub fn push(&self, pkt: SuspiciousPacket) {
-        let idx = self.write_head.fetch_add(1, Ordering::Relaxed) % QUEUE_SIZE;
-        // Safety: single producer (firewall runs under NET_STATE lock context)
-        unsafe {
-            let ptr = &self.entries as *const _ as *mut [SuspiciousPacket; QUEUE_SIZE];
-            (*ptr)[idx] = pkt;
+        let idx = self.write_head.fetch_add(1, Ordering::Release) % QUEUE_SIZE;
+        if let Some(mut entries) = self.entries.try_lock() {
+            entries[idx] = pkt;
         }
         self.count.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Read the N most recent entries (for diagnostics)
-    pub fn recent(&self, n: usize) -> &[SuspiciousPacket] {
-        let end = self.write_head.load(Ordering::Relaxed).min(QUEUE_SIZE);
-        let start = end.saturating_sub(n);
-        &self.entries[start..end]
+    /// Read the N most recent entries (for diagnostics).
+    /// Returns count of entries copied into `out`.
+    pub fn recent(&self, out: &mut [SuspiciousPacket]) -> usize {
+        let head = self.write_head.load(Ordering::Acquire);
+        let n = out.len().min(QUEUE_SIZE).min(head);
+        if let Some(entries) = self.entries.try_lock() {
+            for i in 0..n {
+                // Walk backwards from most recent
+                let idx = (head.wrapping_sub(1).wrapping_sub(i)) % QUEUE_SIZE;
+                out[i] = entries[idx];
+            }
+            n
+        } else {
+            0
+        }
     }
 }
 
@@ -161,7 +173,7 @@ pub fn filter_packet(frame: &[u8]) -> FirewallAction {
         return FirewallAction::Drop; // Silently drop all traffic from blocked IPs
     }
 
-    // Rule 5: TCP — block unsolicited inbound SYN
+    // Rule 5: TCP — block unsolicited inbound SYN (except whitelisted ports)
     if proto == PROTO_TCP {
         // TCP flags at offset 13 within TCP header
         if frame.len() < transport_offset + 14 {
@@ -171,6 +183,12 @@ pub fn filter_packet(frame: &[u8]) -> FirewallAction {
 
         // SYN set, ACK not set → unsolicited connection attempt
         if (tcp_flags & TCP_SYN) != 0 && (tcp_flags & TCP_ACK) == 0 {
+            // Allow SYN to whitelisted local server ports
+            if dst_port == 2222 {
+                // TCP remote shell — allow inbound connections
+                ALLOWS.fetch_add(1, Ordering::Relaxed);
+                return FirewallAction::Allow;
+            }
             // Track for anomaly detection (auto-block after 3 attempts)
             record_syn_attempt(src_ip);
             log_drop(src_ip, src_port, dst_port);
@@ -188,9 +206,20 @@ pub fn filter_packet(frame: &[u8]) -> FirewallAction {
             return FirewallAction::Drop;
         }
 
-        // All other TCP (SYN-ACK, ACK, data, FIN, RST) → Allow
-        ALLOWS.fetch_add(1, Ordering::Relaxed);
-        return FirewallAction::Allow;
+        // Rule 5.1: Stateful-ish — allow non-SYN TCP from known sources.
+        // Under SLIRP, all legitimate traffic comes from the gateway
+        // (10.0.2.2) or is to a whitelisted local port (2222).
+        let from_gateway = src_ip == [10, 0, 2, 2];
+        let to_shell = dst_port == 2222;
+
+        if from_gateway || to_shell {
+            ALLOWS.fetch_add(1, Ordering::Relaxed);
+            return FirewallAction::Allow;
+        }
+
+        // Non-SYN TCP from non-gateway source → spoofed or unknown
+        DROPS.fetch_add(1, Ordering::Relaxed);
+        return FirewallAction::Drop;
     }
 
     // Default: allow unknown protocols

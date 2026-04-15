@@ -568,6 +568,66 @@ extern "C" fn irq_virtio_blk() {
     );
 }
 
+/// VirtIO-blk MSI-X completion handler (vector 64). Identical stub
+/// prologue to the legacy `irq_virtio_blk`; routes to the MSI-X
+/// variant which sends EOI itself.
+#[unsafe(naked)]
+extern "C" fn irq_virtio_blk_msix() {
+    core::arch::naked_asm!(
+        "push rax",
+        "push rcx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "call {handler}",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop rcx",
+        "pop rax",
+        "iretq",
+        handler = sym folkering_kernel::drivers::virtio_blk::msix_handler,
+    );
+}
+
+/// NVMe I/O queue MSI-X handler (vector 65). Phase 1 polls for
+/// completions so this mostly just clears the pending flag — the
+/// stub exists so stray interrupts have a safe landing pad.
+#[unsafe(naked)]
+extern "C" fn irq_nvme_msix() {
+    core::arch::naked_asm!(
+        "push rax",
+        "push rcx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "call {handler}",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop rcx",
+        "pop rax",
+        "iretq",
+        handler = sym folkering_kernel::drivers::nvme::nvme_msix_handler,
+    );
+}
+
 make_exception_handler!(irq_34, 34, "\n[IRQ2] Cascade (Vector 34)!");
 make_exception_handler!(irq_35, 35, "\n[IRQ3] COM2 (Vector 35)!");
 make_exception_handler!(irq_36, 36, "\n[IRQ4] COM1 (Vector 36)!");
@@ -1537,6 +1597,11 @@ unsafe fn init_idt() {
     IDT[45].set_handler(core::mem::transmute(irq_virtio_blk as *const ()));
     // AP wake timer (vector 48) — just sends EOI, no task preemption
     IDT[48].set_handler(core::mem::transmute(irq_ap_timer as *const ()));
+    // VirtIO-blk MSI-X (vector 64) — set here because main.rs owns the IDT
+    // that's actually loaded; arch::x86_64::idt's lazy_static is dormant.
+    IDT[64].set_handler(core::mem::transmute(irq_virtio_blk_msix as *const ()));
+    // NVMe MSI-X (vector 65) — same reason.
+    IDT[65].set_handler(core::mem::transmute(irq_nvme_msix as *const ()));
     // Special vectors
     IDT[128].set_handler(core::mem::transmute(vec_128 as *const ())); // INT 0x80
     IDT[254].set_handler(core::mem::transmute(vec_254 as *const ()));

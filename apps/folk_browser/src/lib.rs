@@ -34,6 +34,7 @@ extern "C" {
     fn folk_submit_display_list(ptr: i32, len: i32) -> i32;
     fn folk_draw_pixels(x: i32, y: i32, w: i32, h: i32, pixel_ptr: i32, pixel_len: i32) -> i32;
     fn folk_http_get_large(url_ptr: i32, url_len: i32, buf_ptr: i32, max_len: i32) -> i32;
+    fn folk_http_post(url_ptr: i32, url_len: i32, body_ptr: i32, body_len: i32, buf_ptr: i32, max_len: i32) -> i32;
     fn folk_log_telemetry(action: i32, target: i32, duration: i32);
     fn folk_semantic_extract(html_ptr: i32, html_len: i32, buf_ptr: i32, max_len: i32) -> i32;
 }
@@ -67,11 +68,18 @@ const H2_SIZE: i32 = 20;
 
 // Limits
 const MAX_URL: usize = 256;
-const MAX_HTML: usize = 4096;
-const MAX_ELEMENTS: usize = 128;
+const MAX_HTML: usize = 8192;
+const MAX_ELEMENTS: usize = 256;
 const MAX_TEXT_PER_ELEM: usize = 200;
-const MAX_DISPLAY_LIST: usize = 8192;
-const MAX_SEMANTIC: usize = 1024;
+const MAX_DISPLAY_LIST: usize = 16384;
+const MAX_SEMANTIC: usize = 2048;
+const MAX_LINKS: usize = 48;
+const MAX_HREF: usize = 200;
+const HISTORY_SIZE: usize = 10;
+const MAX_FORMS: usize = 8;
+const MAX_INPUTS: usize = 32;
+const MAX_FORM_FIELD: usize = 64;
+const NO_FORM: u16 = 0xFFFF;
 
 // ── HTML Element types ──────────────────────────────────────────────────
 
@@ -94,6 +102,17 @@ enum ElemType {
     Title = 13,
     Img = 14,    // image — text field stores src URL
     Unknown = 15,
+    Form = 16,   // invisible container; metadata in FORMS table
+    Input = 17,  // interactive input field; metadata in INPUTS table
+}
+
+#[derive(Clone, Copy, PartialEq)]
+#[repr(u8)]
+enum InputType {
+    Text = 0,
+    Submit = 1,
+    Hidden = 2,
+    Password = 3,
 }
 
 #[derive(Clone, Copy)]
@@ -113,6 +132,62 @@ impl HtmlElement {
         Self {
             elem_type: ElemType::Text, text: [0u8; MAX_TEXT_PER_ELEM],
             text_len: 0, x: 0, y: 0, w: 0, h: 0,
+        }
+    }
+}
+
+/// Sparse link table: maps an element index to its href.
+/// Populated during HTML parsing for every <a href="..."> encountered.
+#[derive(Clone, Copy)]
+struct LinkRect {
+    elem_idx: u16,
+    href_len: u16,
+    href: [u8; MAX_HREF],
+}
+
+impl LinkRect {
+    const fn empty() -> Self {
+        Self { elem_idx: 0, href_len: 0, href: [0u8; MAX_HREF] }
+    }
+}
+
+/// Form metadata captured during HTML parsing.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct FormInfo {
+    action: [u8; MAX_HREF],
+    action_len: u16,
+    method: u8, // 0 = GET, 1 = POST
+}
+
+impl FormInfo {
+    const fn empty() -> Self {
+        Self { action: [0u8; MAX_HREF], action_len: 0, method: 0 }
+    }
+}
+
+/// Input field metadata. `value` is the live editable buffer for text
+/// inputs and the button label for submit buttons.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct InputInfo {
+    elem_idx: u16,    // index into ELEMENTS, or u16::MAX for hidden inputs
+    form_idx: u16,    // index into FORMS, or NO_FORM (0xFFFF) if loose
+    input_type: u8,   // InputType discriminant
+    name_len: u8,
+    value_len: u8,
+    _pad: u8,
+    name: [u8; MAX_FORM_FIELD],
+    value: [u8; MAX_FORM_FIELD],
+}
+
+impl InputInfo {
+    const fn empty() -> Self {
+        Self {
+            elem_idx: 0, form_idx: NO_FORM, input_type: 0,
+            name_len: 0, value_len: 0, _pad: 0,
+            name: [0u8; MAX_FORM_FIELD],
+            value: [0u8; MAX_FORM_FIELD],
         }
     }
 }
@@ -157,6 +232,27 @@ static mut TITLE_LEN: usize = 0;
 static mut LINK_COUNT: u16 = 0;
 static mut EDITING_URL: bool = true;
 
+// Clickable link rectangles (sparse, indexed by parse order)
+static mut LINKS: [LinkRect; MAX_LINKS] = [LinkRect::empty(); MAX_LINKS];
+static mut LINK_RECT_COUNT: usize = 0;
+
+// History stack — last N visited URLs (oldest at index 0).
+// On Back, we pop the most recent and navigate to it.
+static mut HISTORY: [[u8; MAX_URL]; HISTORY_SIZE] = [[0u8; MAX_URL]; HISTORY_SIZE];
+static mut HISTORY_LENS: [usize; HISTORY_SIZE] = [0; HISTORY_SIZE];
+static mut HISTORY_COUNT: usize = 0;
+
+// Form/input parser state
+static mut FORMS: [FormInfo; MAX_FORMS] = [FormInfo::empty(); MAX_FORMS];
+static mut FORM_COUNT: usize = 0;
+static mut CURRENT_FORM_IDX: u16 = NO_FORM;
+
+static mut INPUTS: [InputInfo; MAX_INPUTS] = [InputInfo::empty(); MAX_INPUTS];
+static mut INPUT_COUNT: usize = 0;
+
+/// Index into INPUTS of the currently focused text input, or -1 if none.
+static mut FOCUSED_INPUT: i32 = -1;
+
 static mut EVT: [i32; 4] = [0i32; 4];
 static mut INITIALIZED: bool = false;
 
@@ -187,6 +283,11 @@ unsafe fn parse_html() {
     let mut count = 0usize;
     let mut i = 0usize;
     LINK_COUNT = 0;
+    LINK_RECT_COUNT = 0;
+    FORM_COUNT = 0;
+    INPUT_COUNT = 0;
+    CURRENT_FORM_IDX = NO_FORM;
+    FOCUSED_INPUT = -1;
     TITLE_LEN = 0;
 
     while i < html.len() && count < MAX_ELEMENTS {
@@ -206,14 +307,52 @@ unsafe fn parse_html() {
             let tag_start = i;
             while i < html.len() && html[i] != b'>' && html[i] != b' ' { i += 1; }
             let tag_name = &html[tag_start..i];
+            let attrs_start = i;
 
             // Skip attributes + closing >
             while i < html.len() && html[i] != b'>' { i += 1; }
+            let attrs_end = i;
             if i < html.len() { i += 1; }
 
-            if closing { continue; }
+            // Attribute area (between tag name and closing '>'). Used for
+            // extracting href on <a> tags and src on <img> tags.
+            let attrs = &html[attrs_start..attrs_end];
+
+            if closing {
+                // Detect </form> to clear active form context
+                if match_tag(tag_name) == ElemType::Form {
+                    CURRENT_FORM_IDX = NO_FORM;
+                }
+                continue;
+            }
 
             let elem_type = match_tag(tag_name);
+
+            // <form> opens a context — record action/method, no element
+            if elem_type == ElemType::Form {
+                if FORM_COUNT < MAX_FORMS {
+                    let f = &mut *(core::ptr::addr_of_mut!(FORMS) as *mut FormInfo)
+                        .add(FORM_COUNT);
+                    f.action_len = 0;
+                    f.method = 0;
+                    if let Some(action) = extract_attr(attrs, b"action") {
+                        let alen = action.len().min(MAX_HREF);
+                        for j in 0..alen { f.action[j] = action[j]; }
+                        f.action_len = alen as u16;
+                    }
+                    f.method = if let Some(m) = extract_attr(attrs, b"method") {
+                        if m.len() == 4
+                            && (m[0] == b'P' || m[0] == b'p')
+                            && (m[1] == b'O' || m[1] == b'o')
+                            && (m[2] == b'S' || m[2] == b's')
+                            && (m[3] == b'T' || m[3] == b't')
+                        { 1 } else { 0 }
+                    } else { 0 };
+                    CURRENT_FORM_IDX = FORM_COUNT as u16;
+                    FORM_COUNT += 1;
+                }
+                continue;
+            }
 
             // Skip script/style content entirely (find matching closing tag)
             if elem_type == ElemType::Unknown {
@@ -250,19 +389,65 @@ unsafe fn parse_html() {
                 }
             }
 
-            // Self-closing tags (including img)
-            if elem_type == ElemType::Br || elem_type == ElemType::Hr || elem_type == ElemType::Img {
+            // Self-closing tags (including img and input)
+            if elem_type == ElemType::Br
+                || elem_type == ElemType::Hr
+                || elem_type == ElemType::Img
+                || elem_type == ElemType::Input
+            {
                 if elem_type == ElemType::Img && count < MAX_ELEMENTS {
-                    // Extract src attribute from the tag area we already skipped past
-                    // Rescan the tag for src="..."
-                    let tag_area = &html[tag_start..i.min(html.len())];
-                    if let Some(src) = extract_attr(tag_area, b"src") {
+                    if let Some(src) = extract_attr(attrs, b"src") {
                         let e = &mut *elems.add(count);
                         *e = HtmlElement::empty();
                         e.elem_type = ElemType::Img;
                         let copy = src.len().min(MAX_TEXT_PER_ELEM);
                         for j in 0..copy { e.text[j] = src[j]; }
                         e.text_len = copy;
+                        count += 1;
+                    }
+                } else if elem_type == ElemType::Input {
+                    // Determine input type
+                    let mut input_type = InputType::Text;
+                    if let Some(t) = extract_attr(attrs, b"type") {
+                        if attr_eq_ci(t, b"submit") { input_type = InputType::Submit; }
+                        else if attr_eq_ci(t, b"hidden") { input_type = InputType::Hidden; }
+                        else if attr_eq_ci(t, b"password") { input_type = InputType::Password; }
+                        else if attr_eq_ci(t, b"button") { input_type = InputType::Submit; }
+                        // text, search, email, url etc. all default to Text
+                    }
+
+                    let visible = input_type != InputType::Hidden;
+
+                    if INPUT_COUNT < MAX_INPUTS {
+                        let inp = &mut *(core::ptr::addr_of_mut!(INPUTS) as *mut InputInfo)
+                            .add(INPUT_COUNT);
+                        inp.name_len = 0;
+                        inp.value_len = 0;
+                        inp.elem_idx = if visible && count < MAX_ELEMENTS {
+                            count as u16
+                        } else {
+                            u16::MAX
+                        };
+                        inp.form_idx = CURRENT_FORM_IDX;
+                        inp.input_type = input_type as u8;
+
+                        if let Some(name) = extract_attr(attrs, b"name") {
+                            let nl = name.len().min(MAX_FORM_FIELD);
+                            for j in 0..nl { inp.name[j] = name[j]; }
+                            inp.name_len = nl as u8;
+                        }
+                        if let Some(value) = extract_attr(attrs, b"value") {
+                            let vl = value.len().min(MAX_FORM_FIELD);
+                            for j in 0..vl { inp.value[j] = value[j]; }
+                            inp.value_len = vl as u8;
+                        }
+                        INPUT_COUNT += 1;
+                    }
+
+                    if visible && count < MAX_ELEMENTS {
+                        let e = &mut *elems.add(count);
+                        *e = HtmlElement::empty();
+                        e.elem_type = ElemType::Input;
                         count += 1;
                     }
                 } else {
@@ -289,7 +474,21 @@ unsafe fn parse_html() {
                 for j in 0..copy { e.text[j] = trimmed[j]; }
                 e.text_len = copy;
 
-                if elem_type == ElemType::A { LINK_COUNT += 1; }
+                if elem_type == ElemType::A {
+                    LINK_COUNT += 1;
+                    // Record clickable link with its href URL
+                    if LINK_RECT_COUNT < MAX_LINKS {
+                        if let Some(href) = extract_attr(attrs, b"href") {
+                            let lr_ptr = core::ptr::addr_of_mut!(LINKS) as *mut LinkRect;
+                            let lr = &mut *lr_ptr.add(LINK_RECT_COUNT);
+                            lr.elem_idx = count as u16;
+                            let copy = href.len().min(MAX_HREF);
+                            for j in 0..copy { lr.href[j] = href[j]; }
+                            lr.href_len = copy as u16;
+                            LINK_RECT_COUNT += 1;
+                        }
+                    }
+                }
                 if elem_type == ElemType::Title {
                     let tc = copy.min(64);
                     let title = core::ptr::addr_of_mut!(PAGE_TITLE) as *mut u8;
@@ -344,7 +543,20 @@ fn match_tag(name: &[u8]) -> ElemType {
     else if s == b"i" || s == b"em" { ElemType::I }
     else if s == b"title" { ElemType::Title }
     else if s == b"img" { ElemType::Img }
+    else if s == b"form" { ElemType::Form }
+    else if s == b"input" { ElemType::Input }
     else { ElemType::Unknown }
+}
+
+/// Case-insensitive ASCII byte-slice equality.
+fn attr_eq_ci(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() { return false; }
+    for i in 0..a.len() {
+        let av = if a[i] >= b'A' && a[i] <= b'Z' { a[i] + 32 } else { a[i] };
+        let bv = if b[i] >= b'A' && b[i] <= b'Z' { b[i] + 32 } else { b[i] };
+        if av != bv { return false; }
+    }
+    true
 }
 
 fn trim_bytes(s: &[u8]) -> &[u8] {
@@ -479,9 +691,46 @@ unsafe fn layout_elements(viewport_w: i32) {
             ElemType::Title => {
                 e.x = 0; e.y = 0; e.w = 0; e.h = 0; // invisible
             }
+            ElemType::Form => {
+                // Form is a logical container, not laid out
+                e.x = 0; e.y = 0; e.w = 0; e.h = 0;
+            }
+            ElemType::Input => {
+                // Look up the input's type to size it appropriately
+                let mut input_type = 0u8;
+                let inputs_p = core::ptr::addr_of!(INPUTS) as *const InputInfo;
+                for j in 0..INPUT_COUNT {
+                    let inp = &*inputs_p.add(j);
+                    if inp.elem_idx == i as u16 {
+                        input_type = inp.input_type;
+                        break;
+                    }
+                }
+                e.x = MARGIN;
+                e.y = y;
+                if input_type == InputType::Submit as u8 {
+                    e.w = 120;
+                    e.h = 28;
+                } else {
+                    e.w = 320;
+                    e.h = 26;
+                }
+                y += e.h + 6;
+            }
         }
     }
     CONTENT_HEIGHT = y + MARGIN;
+}
+
+/// Find the INPUTS index whose `elem_idx` points at the given element index.
+/// Returns `usize::MAX` if no match.
+unsafe fn input_for_elem(elem_idx: usize) -> usize {
+    let inputs_p = core::ptr::addr_of!(INPUTS) as *const InputInfo;
+    for j in 0..INPUT_COUNT {
+        let inp = &*inputs_p.add(j);
+        if inp.elem_idx == elem_idx as u16 { return j; }
+    }
+    usize::MAX
 }
 
 // ── Display List Builder ────────────────────────────────────────────────
@@ -508,7 +757,12 @@ unsafe fn build_display_list(viewport_w: i32, viewport_h: i32) {
 
         // Culling: skip elements outside viewport
         if ey + e.h < 0 || ey > viewport_h { continue; }
-        if e.text_len == 0 && e.elem_type != ElemType::Hr && e.elem_type != ElemType::Br && e.elem_type != ElemType::Img { continue; }
+        if e.text_len == 0
+            && e.elem_type != ElemType::Hr
+            && e.elem_type != ElemType::Br
+            && e.elem_type != ElemType::Img
+            && e.elem_type != ElemType::Input
+        { continue; }
 
         match e.elem_type {
             ElemType::Hr => {
@@ -575,6 +829,47 @@ unsafe fn build_display_list(viewport_w: i32, viewport_h: i32) {
             ElemType::A => {
                 pos = emit_text(dl, pos, e, ey, LINK_COLOR);
             }
+            ElemType::Input => {
+                let inp_idx = input_for_elem(i);
+                if inp_idx == usize::MAX { continue; }
+                let inputs_p = core::ptr::addr_of!(INPUTS) as *const InputInfo;
+                let inp = &*inputs_p.add(inp_idx);
+                let is_submit = inp.input_type == InputType::Submit as u8;
+                let is_focused = FOCUSED_INPUT == inp_idx as i32;
+
+                if is_submit {
+                    // Green submit button background
+                    pos = emit_rect(dl, pos, e.x, ey, e.w, e.h, 0x238636);
+                    // Label = inp.value (or "Submit" fallback)
+                    if inp.value_len > 0 {
+                        pos = emit_text_raw(
+                            dl, pos, e.x + 12, ey + 6,
+                            inp.value.as_ptr() as u32, inp.value_len as u16, 0xFFFFFF,
+                        );
+                    }
+                } else {
+                    // White text input background
+                    pos = emit_rect(dl, pos, e.x, ey, e.w, e.h, 0xF5F5F5);
+                    // Border (focused = blue, unfocused = light gray)
+                    let border_color = if is_focused { 0x58A6FF } else { 0xCCCCCC };
+                    pos = emit_rect(dl, pos, e.x, ey, e.w, 1, border_color);
+                    pos = emit_rect(dl, pos, e.x, ey + e.h - 1, e.w, 1, border_color);
+                    pos = emit_rect(dl, pos, e.x, ey, 1, e.h, border_color);
+                    pos = emit_rect(dl, pos, e.x + e.w - 1, ey, 1, e.h, border_color);
+                    // Current value (rendered in dark text on the white box)
+                    if inp.value_len > 0 {
+                        pos = emit_text_raw(
+                            dl, pos, e.x + 6, ey + 5,
+                            inp.value.as_ptr() as u32, inp.value_len as u16, 0x0D1117,
+                        );
+                    }
+                    // Cursor (only when focused)
+                    if is_focused {
+                        let cursor_x = e.x + 6 + (inp.value_len as i32) * FONT_W;
+                        pos = emit_rect(dl, pos, cursor_x, ey + 5, 2, FONT_H, 0x0D1117);
+                    }
+                }
+            }
             _ => {
                 pos = emit_text(dl, pos, e, ey, TEXT_COLOR);
             }
@@ -582,6 +877,51 @@ unsafe fn build_display_list(viewport_w: i32, viewport_h: i32) {
     }
 
     DL_LEN = pos;
+}
+
+/// Emit a filled rectangle (display list opcode 0x01).
+unsafe fn emit_rect(dl: *mut u8, mut pos: usize, x: i32, y: i32, w: i32, h: i32, color: i32) -> usize {
+    if pos + 13 > MAX_DISPLAY_LIST { return pos; }
+    *dl.add(pos) = 0x01; pos += 1;
+    let vals: [u16; 4] = [x as u16, y as u16, w as u16, h as u16];
+    for v in &vals {
+        let b = v.to_le_bytes();
+        *dl.add(pos) = b[0]; *dl.add(pos + 1) = b[1]; pos += 2;
+    }
+    let cb = (color as u32).to_le_bytes();
+    for j in 0..4 { *dl.add(pos + j) = cb[j]; }
+    pos += 4;
+    pos
+}
+
+/// Emit a text run from a raw pointer + length (display list opcode 0x02).
+/// Used for input fields whose text lives outside the ELEMENTS array.
+unsafe fn emit_text_raw(
+    dl: *mut u8,
+    mut pos: usize,
+    x: i32,
+    y: i32,
+    text_ptr: u32,
+    text_len: u16,
+    color: i32,
+) -> usize {
+    if text_len == 0 || pos + 15 > MAX_DISPLAY_LIST { return pos; }
+    if y < -100 || y > 800 { return pos; }
+
+    *dl.add(pos) = 0x02; pos += 1;
+    let xb = (x as u16).to_le_bytes();
+    *dl.add(pos) = xb[0]; *dl.add(pos + 1) = xb[1]; pos += 2;
+    let yb = (y as u16).to_le_bytes();
+    *dl.add(pos) = yb[0]; *dl.add(pos + 1) = yb[1]; pos += 2;
+    let pb = text_ptr.to_le_bytes();
+    for j in 0..4 { *dl.add(pos + j) = pb[j]; }
+    pos += 4;
+    let lb = text_len.to_le_bytes();
+    *dl.add(pos) = lb[0]; *dl.add(pos + 1) = lb[1]; pos += 2;
+    let cb = (color as u32).to_le_bytes();
+    for j in 0..4 { *dl.add(pos + j) = cb[j]; }
+    pos += 4;
+    pos
 }
 
 /// Emit a text element into the display list using opcode 0x02
@@ -725,6 +1065,293 @@ unsafe fn generate_semantic_view() {
     }
 }
 
+// ── History & URL resolution ────────────────────────────────────────────
+
+/// Push the current URL onto the back stack. If the stack is full, drop the
+/// oldest entry to make room (FIFO eviction).
+unsafe fn history_push(url: &[u8]) {
+    if HISTORY_COUNT == HISTORY_SIZE {
+        // Shift everything down by one — drop oldest
+        for i in 0..HISTORY_SIZE - 1 {
+            let h = core::ptr::addr_of_mut!(HISTORY) as *mut [u8; MAX_URL];
+            let src = &*h.add(i + 1);
+            let dst = &mut *h.add(i);
+            *dst = *src;
+            HISTORY_LENS[i] = HISTORY_LENS[i + 1];
+        }
+        HISTORY_COUNT = HISTORY_SIZE - 1;
+    }
+    let len = url.len().min(MAX_URL);
+    let h = core::ptr::addr_of_mut!(HISTORY) as *mut [u8; MAX_URL];
+    let entry = &mut *h.add(HISTORY_COUNT);
+    for i in 0..len { entry[i] = url[i]; }
+    HISTORY_LENS[HISTORY_COUNT] = len;
+    HISTORY_COUNT += 1;
+}
+
+/// Pop the most recent entry from the back stack into URL. Returns true on
+/// success, false if the stack was empty.
+unsafe fn history_back() -> bool {
+    if HISTORY_COUNT == 0 { return false; }
+    HISTORY_COUNT -= 1;
+    let h = core::ptr::addr_of!(HISTORY) as *const [u8; MAX_URL];
+    let entry = &*h.add(HISTORY_COUNT);
+    let len = HISTORY_LENS[HISTORY_COUNT];
+    let u = core::ptr::addr_of_mut!(URL) as *mut u8;
+    for i in 0..len { *u.add(i) = entry[i]; }
+    URL_LEN = len;
+    CURSOR_POS = len;
+    true
+}
+
+/// Resolve a possibly-relative href against the current URL and write the
+/// result into the URL buffer. Handles four common cases:
+///   - "https://...", "http://..."  → use as-is
+///   - "//host/..."                  → prepend "https:"
+///   - "/path"                       → prepend scheme://host of current URL
+///   - "relative"                    → take current URL up to last '/' and append
+unsafe fn resolve_url(href: &[u8]) {
+    let u = core::ptr::addr_of_mut!(URL) as *mut u8;
+
+    // Already absolute?
+    if href.len() >= 7 && &href[..7] == b"http://" {
+        let len = href.len().min(MAX_URL);
+        for i in 0..len { *u.add(i) = href[i]; }
+        URL_LEN = len; CURSOR_POS = len;
+        return;
+    }
+    if href.len() >= 8 && &href[..8] == b"https://" {
+        let len = href.len().min(MAX_URL);
+        for i in 0..len { *u.add(i) = href[i]; }
+        URL_LEN = len; CURSOR_POS = len;
+        return;
+    }
+
+    // Protocol-relative ("//host/...") — assume https
+    if href.len() >= 2 && href[0] == b'/' && href[1] == b'/' {
+        let prefix = b"https:";
+        let mut pos = 0;
+        for &b in prefix { if pos < MAX_URL { *u.add(pos) = b; pos += 1; } }
+        for &b in href { if pos < MAX_URL { *u.add(pos) = b; pos += 1; } }
+        URL_LEN = pos; CURSOR_POS = pos;
+        return;
+    }
+
+    // Snapshot the current URL — we mutate URL in-place below
+    let mut cur = [0u8; MAX_URL];
+    let cur_len = URL_LEN;
+    for i in 0..cur_len { cur[i] = *u.add(i); }
+
+    // Find end of "scheme://"
+    let mut scheme_end = 0usize;
+    let mut k = 0usize;
+    while k + 2 < cur_len {
+        if cur[k] == b':' && cur[k+1] == b'/' && cur[k+2] == b'/' {
+            scheme_end = k + 3;
+            break;
+        }
+        k += 1;
+    }
+
+    // Find end of host (first '/' or '?' or '#' after scheme)
+    let mut host_end = scheme_end;
+    while host_end < cur_len {
+        let c = cur[host_end];
+        if c == b'/' || c == b'?' || c == b'#' { break; }
+        host_end += 1;
+    }
+
+    // Absolute path: "/foo" → scheme://host + href
+    if !href.is_empty() && href[0] == b'/' {
+        let mut pos = 0;
+        for i in 0..host_end {
+            if pos < MAX_URL { *u.add(pos) = cur[i]; pos += 1; }
+        }
+        for &b in href {
+            if pos < MAX_URL { *u.add(pos) = b; pos += 1; }
+        }
+        URL_LEN = pos; CURSOR_POS = pos;
+        return;
+    }
+
+    // Pure relative: take everything up to (and including) the last '/'
+    // in the path portion of the current URL.
+    let mut last_slash = host_end;
+    let mut k2 = host_end;
+    while k2 < cur_len {
+        let c = cur[k2];
+        if c == b'?' || c == b'#' { break; }
+        if c == b'/' { last_slash = k2; }
+        k2 += 1;
+    }
+    let base_end = if last_slash > host_end { last_slash + 1 } else { host_end };
+
+    let mut pos = 0;
+    for i in 0..base_end {
+        if pos < MAX_URL { *u.add(pos) = cur[i]; pos += 1; }
+    }
+    // If the current URL had no slash after the host (e.g. https://example.com),
+    // synthesize one before appending the relative href.
+    if base_end == host_end && pos < MAX_URL {
+        *u.add(pos) = b'/'; pos += 1;
+    }
+    for &b in href {
+        if pos < MAX_URL { *u.add(pos) = b; pos += 1; }
+    }
+    URL_LEN = pos; CURSOR_POS = pos;
+}
+
+// ── Form submission ─────────────────────────────────────────────────────
+
+#[inline]
+fn hex_nibble(n: u8) -> u8 {
+    if n < 10 { b'0' + n } else { b'A' + n - 10 }
+}
+
+/// Build a URL-encoded query string from all inputs that belong to the
+/// given form. Returns the number of bytes written into `out`.
+unsafe fn build_query_string(form_idx: u16, out: &mut [u8]) -> usize {
+    let mut qpos = 0usize;
+    let mut first = true;
+    let inputs_p = core::ptr::addr_of!(INPUTS) as *const InputInfo;
+
+    for j in 0..INPUT_COUNT {
+        let inp = &*inputs_p.add(j);
+        if inp.form_idx != form_idx { continue; }
+        if inp.input_type == InputType::Submit as u8 { continue; }
+        if inp.name_len == 0 { continue; }
+
+        if !first {
+            if qpos < out.len() { out[qpos] = b'&'; qpos += 1; } else { break; }
+        }
+        first = false;
+
+        // Encode name
+        for k in 0..(inp.name_len as usize) {
+            if qpos >= out.len() { return qpos; }
+            out[qpos] = inp.name[k];
+            qpos += 1;
+        }
+        if qpos < out.len() { out[qpos] = b'='; qpos += 1; } else { return qpos; }
+
+        // Encode value (RFC 3986 unreserved + space → '+')
+        for k in 0..(inp.value_len as usize) {
+            let b = inp.value[k];
+            let unreserved = (b >= b'A' && b <= b'Z')
+                || (b >= b'a' && b <= b'z')
+                || (b >= b'0' && b <= b'9')
+                || b == b'-' || b == b'_' || b == b'.' || b == b'~';
+            if unreserved {
+                if qpos >= out.len() { return qpos; }
+                out[qpos] = b;
+                qpos += 1;
+            } else if b == b' ' {
+                if qpos >= out.len() { return qpos; }
+                out[qpos] = b'+';
+                qpos += 1;
+            } else {
+                if qpos + 3 > out.len() { return qpos; }
+                out[qpos] = b'%';
+                out[qpos + 1] = hex_nibble(b >> 4);
+                out[qpos + 2] = hex_nibble(b & 0xF);
+                qpos += 3;
+            }
+        }
+    }
+    qpos
+}
+
+/// Submit a form by index. Handles both GET (`method=0`) and POST
+/// (`method=1`). For POST we route through the new `folk_http_post`
+/// host function and then re-feed the response into the renderer
+/// just like `fetch_page` does.
+unsafe fn submit_form(form_idx: u16) {
+    if form_idx == NO_FORM || (form_idx as usize) >= FORM_COUNT { return; }
+    let form_p = core::ptr::addr_of!(FORMS) as *const FormInfo;
+    let form = &*form_p.add(form_idx as usize);
+
+    // Snapshot current URL for history before we mutate it
+    let url_p = core::ptr::addr_of!(URL) as *const u8;
+    let mut saved_url = [0u8; MAX_URL];
+    let saved_len = URL_LEN;
+    for i in 0..saved_len { saved_url[i] = *url_p.add(i); }
+
+    // Resolve the action against the current URL (empty action = current)
+    if form.action_len > 0 {
+        let action_slice = &form.action[..form.action_len as usize];
+        resolve_url(action_slice);
+    }
+
+    // Build the URL-encoded query string from this form's inputs
+    let mut query = [0u8; 1024];
+    let qlen = build_query_string(form_idx, &mut query);
+
+    if form.method == 1 {
+        // ── POST: keep URL clean, body carries the query string ─────
+        history_push(&saved_url[..saved_len]);
+
+        LOADING = true;
+        SCROLL_Y = 0;
+        ELEM_COUNT = 0;
+        SEMANTIC_LEN = 0;
+
+        let url_bytes = core::slice::from_raw_parts(
+            core::ptr::addr_of!(URL) as *const u8, URL_LEN);
+        let html_ptr = core::ptr::addr_of_mut!(HTML_BUF) as *mut u8;
+
+        let bytes = folk_http_post(
+            url_bytes.as_ptr() as i32, url_bytes.len() as i32,
+            query.as_ptr() as i32,    qlen as i32,
+            html_ptr as i32,          MAX_HTML as i32,
+        );
+
+        if bytes > 0 {
+            HTML_LEN = bytes as usize;
+            parse_html();
+            let sw = folk_screen_width();
+            layout_elements(sw.min(1024));
+            folk_log_telemetry(11, bytes as i32, 0); // POST telemetry tag
+            IMG_LOADED = false;
+            try_load_first_image();
+        } else {
+            let err = b"<h1>POST Failed</h1><p>The form submission did not return a response.</p>";
+            let copy = err.len().min(MAX_HTML);
+            for j in 0..copy { *html_ptr.add(j) = err[j]; }
+            HTML_LEN = copy;
+            parse_html();
+            let sw = folk_screen_width();
+            layout_elements(sw.min(1024));
+        }
+
+        LOADING = false;
+        EDITING_URL = false;
+        return;
+    }
+
+    // ── GET: append "?query" / "&query" to the resolved URL ─────────
+    if qlen > 0 {
+        let u = core::ptr::addr_of_mut!(URL) as *mut u8;
+        let mut has_query = false;
+        for i in 0..URL_LEN {
+            if *u.add(i) == b'?' { has_query = true; break; }
+        }
+        let sep = if has_query { b'&' } else { b'?' };
+        if URL_LEN < MAX_URL {
+            *u.add(URL_LEN) = sep;
+            URL_LEN += 1;
+        }
+        for k in 0..qlen {
+            if URL_LEN >= MAX_URL { break; }
+            *u.add(URL_LEN) = query[k];
+            URL_LEN += 1;
+        }
+        CURSOR_POS = URL_LEN;
+    }
+
+    history_push(&saved_url[..saved_len]);
+    fetch_page();
+}
+
 // ── Input ───────────────────────────────────────────────────────────────
 
 unsafe fn handle_input() {
@@ -733,24 +1360,134 @@ unsafe fn handle_input() {
         if folk_poll_event(e as i32) == 0 { break; }
         let event_type = *e.add(0);
 
-        // Mouse click on SEMANTIC button (top-left corner, 32x16 area)
+        // Mouse click handling
         if event_type == 2 {
             let mx = *e.add(1);
             let my = *e.add(2);
+
+            // STD/SEM mode toggle button
             if mx >= 4 && mx < 36 && my >= 4 && my < 20 {
-                // Toggle semantic mode
                 if MODE == ViewMode::Standard {
                     MODE = ViewMode::Semantic;
                     if SEMANTIC_LEN == 0 { generate_semantic_view(); }
                 } else {
                     MODE = ViewMode::Standard;
                 }
+                continue;
+            }
+
+            // BACK button (24×16 to the right of STD/SEM)
+            if mx >= 40 && mx < 64 && my >= 4 && my < 20 {
+                if history_back() {
+                    fetch_page();
+                    return;
+                }
+                continue;
+            }
+
+            // Link / input hit detection — only in standard mode + content area
+            let sh = folk_screen_height();
+            if MODE == ViewMode::Standard
+                && my >= URLBAR_H
+                && my < sh - STATUS_H
+            {
+                let elems_p = core::ptr::addr_of!(ELEMENTS) as *const HtmlElement;
+
+                // 1) Inputs (text fields & submit buttons) — checked first
+                //    so they win over any overlapping link rect.
+                let inputs_p = core::ptr::addr_of!(INPUTS) as *const InputInfo;
+                let mut input_hit = false;
+                for j in 0..INPUT_COUNT {
+                    let inp = &*inputs_p.add(j);
+                    if inp.elem_idx == u16::MAX { continue; } // hidden
+                    let idx = inp.elem_idx as usize;
+                    if idx >= ELEM_COUNT { continue; }
+                    let el = &*elems_p.add(idx);
+                    let sx = el.x;
+                    let sy = el.y - SCROLL_Y;
+                    if mx >= sx && mx < sx + el.w && my >= sy && my < sy + el.h {
+                        if inp.input_type == InputType::Submit as u8 {
+                            FOCUSED_INPUT = -1;
+                            submit_form(inp.form_idx);
+                            return;
+                        } else {
+                            FOCUSED_INPUT = j as i32;
+                            input_hit = true;
+                            break;
+                        }
+                    }
+                }
+                if input_hit { continue; }
+
+                // 2) Links
+                let lr_ptr = core::ptr::addr_of!(LINKS) as *const LinkRect;
+                for li in 0..LINK_RECT_COUNT {
+                    let lr = &*lr_ptr.add(li);
+                    let idx = lr.elem_idx as usize;
+                    if idx >= ELEM_COUNT { continue; }
+                    let el = &*elems_p.add(idx);
+                    let sx = el.x;
+                    let sy = el.y - SCROLL_Y;
+                    if mx >= sx && mx < sx + el.w && my >= sy && my < sy + el.h {
+                        // Hit! Push current URL onto history, navigate
+                        let cur_url = core::slice::from_raw_parts(
+                            core::ptr::addr_of!(URL) as *const u8, URL_LEN);
+                        history_push(cur_url);
+
+                        let href_len = lr.href_len as usize;
+                        let mut href_local = [0u8; MAX_HREF];
+                        for j in 0..href_len { href_local[j] = lr.href[j]; }
+                        resolve_url(&href_local[..href_len]);
+
+                        fetch_page();
+                        return;
+                    }
+                }
+
+                // 3) Click on empty area — unfocus any text input
+                FOCUSED_INPUT = -1;
             }
             continue;
         }
 
         if event_type != 3 { continue; }
         let key = *e.add(3) as u8;
+
+        // If a text input is focused, route keys there first
+        if FOCUSED_INPUT >= 0 && (FOCUSED_INPUT as usize) < INPUT_COUNT && !EDITING_URL {
+            let inp_p = core::ptr::addr_of_mut!(INPUTS) as *mut InputInfo;
+            let inp = &mut *inp_p.add(FOCUSED_INPUT as usize);
+            match key {
+                0x0D | 0x0A => {
+                    // Enter — submit the parent form (if any)
+                    let fidx = inp.form_idx;
+                    FOCUSED_INPUT = -1;
+                    if fidx != NO_FORM {
+                        submit_form(fidx);
+                        return;
+                    }
+                    continue;
+                }
+                0x08 => {
+                    // Backspace
+                    if inp.value_len > 0 { inp.value_len -= 1; }
+                    continue;
+                }
+                0x1B => {
+                    // Esc — unfocus
+                    FOCUSED_INPUT = -1;
+                    continue;
+                }
+                0x20..=0x7E => {
+                    if (inp.value_len as usize) < MAX_FORM_FIELD - 1 {
+                        inp.value[inp.value_len as usize] = key;
+                        inp.value_len += 1;
+                    }
+                    continue;
+                }
+                _ => { continue; }
+            }
+        }
 
         match key {
             0x0D => { // Enter
@@ -775,6 +1512,9 @@ unsafe fn handle_input() {
                     let mut i = CURSOR_POS - 1;
                     while i < URL_LEN - 1 { *u.add(i) = *u.add(i+1); i += 1; }
                     URL_LEN -= 1; CURSOR_POS -= 1;
+                } else if !EDITING_URL && history_back() {
+                    fetch_page();
+                    return;
                 }
             }
             0x82 => { // Left
@@ -841,18 +1581,28 @@ unsafe fn render() {
     folk_draw_rect(4, 4, 32, 16, mode_bg);
     draw(8, 8, mode_text, mode_fg);
 
-    // URL text
+    // BACK button — dimmed when history is empty
+    let back_active = HISTORY_COUNT > 0;
+    let (back_bg, back_fg) = if back_active {
+        (0x1B2838_i32, 0xC9D1D9_i32)
+    } else {
+        (0x161B22_i32, 0x484F58_i32)
+    };
+    folk_draw_rect(40, 4, 24, 16, back_bg);
+    draw(48, 8, b"<", back_fg);
+
+    // URL text (shifted right to make room for BACK button)
     if URL_LEN > 0 {
         let url = core::slice::from_raw_parts(core::ptr::addr_of!(URL) as *const u8, URL_LEN);
-        let show = URL_LEN.min(((usable_w - 100) / FONT_W) as usize);
-        folk_draw_text(40, 8, url.as_ptr() as i32, show as i32, URLBAR_TEXT);
+        let show = URL_LEN.min(((usable_w - 132) / FONT_W) as usize);
+        folk_draw_text(72, 8, url.as_ptr() as i32, show as i32, URLBAR_TEXT);
     } else {
-        draw(40, 8, b"Type URL and press Enter...", 0x484F58);
+        draw(72, 8, b"Type URL and press Enter...", 0x484F58);
     }
 
     // Cursor in URL bar
     if EDITING_URL {
-        let cx = 40 + (CURSOR_POS as i32) * FONT_W;
+        let cx = 72 + (CURSOR_POS as i32) * FONT_W;
         folk_draw_rect(cx, 6, 2, FONT_H, CURSOR_COLOR);
     }
 
@@ -891,8 +1641,10 @@ unsafe fn render() {
     let mut sb = [0u8; 80];
     let sl = {
         let mut m = Msg::new(&mut sb);
-        m.u32(ELEM_COUNT as u32); m.s(b" elements | ");
-        m.u32(LINK_COUNT as u32); m.s(b" links | ");
+        m.u32(ELEM_COUNT as u32); m.s(b" el | ");
+        m.u32(LINK_COUNT as u32); m.s(b" lnk | ");
+        m.u32(FORM_COUNT as u32); m.s(b" frm | ");
+        m.u32(INPUT_COUNT as u32); m.s(b" inp | ");
         if MODE == ViewMode::Standard { m.s(b"Standard"); } else { m.s(b"Semantic"); }
         m.s(b" | Scroll: "); m.u32(SCROLL_Y as u32);
         m.s(b"/"); m.u32(CONTENT_HEIGHT as u32);

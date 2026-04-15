@@ -257,11 +257,11 @@ impl FramebufferView {
     pub fn draw_char(&mut self, x: usize, y: usize, ch: char, fg: u32, bg: u32) {
         use super::font::FONT_8X16;
 
-        let ch_idx = ch as usize;
+        let ch_idx = unicode_to_cp437(ch);
         let glyph = if ch_idx < 256 {
             &FONT_8X16[ch_idx]
         } else {
-            &FONT_8X16[0] // Use first glyph for unknown chars
+            &FONT_8X16[0]
         };
 
         for row in 0..16 {
@@ -451,7 +451,7 @@ impl FramebufferView {
     pub fn draw_char_alpha(&mut self, x: usize, y: usize, ch: char, fg: u32, bg: u32, bg_alpha: u8) {
         use super::font::FONT_8X16;
 
-        let ch_idx = ch as usize;
+        let ch_idx = unicode_to_cp437(ch);
         let glyph = if ch_idx < 256 {
             &FONT_8X16[ch_idx]
         } else {
@@ -556,4 +556,48 @@ pub mod colors {
     pub const FOLK_BLUE: u32 = 0x2D5AA0;
     pub const FOLK_DARK: u32 = 0x1A1A2E;
     pub const FOLK_ACCENT: u32 = 0x4ECDC4;
+}
+
+/// Map a Unicode code point to a CP437 byte index for the bitmap font.
+/// CP437 (IBM PC code page) covers ASCII + many Latin/Greek/box-drawing chars.
+/// This handles common European characters (Norwegian, German, Spanish, French).
+pub fn unicode_to_cp437(ch: char) -> usize {
+    let c = ch as u32;
+    // ASCII range — direct mapping
+    if c < 0x80 { return c as usize; }
+
+    // Common Latin-1 / European characters mapped to CP437 positions
+    match ch {
+        // Norwegian / Danish
+        'Æ' => 0x92, 'æ' => 0x91,
+        'Ø' => 0x9D, 'ø' => 0xED, // CP437 has ø as 0xED (lowercase phi, close enough)
+        'Å' => 0x8F, 'å' => 0x86,
+        // Swedish / German
+        'Ä' => 0x8E, 'ä' => 0x84,
+        'Ö' => 0x99, 'ö' => 0x94,
+        'Ü' => 0x9A, 'ü' => 0x81,
+        'ß' => 0xE1,
+        // Spanish
+        'Ñ' => 0xA5, 'ñ' => 0xA4,
+        'á' => 0xA0, 'é' => 0x82, 'í' => 0xA1, 'ó' => 0xA2, 'ú' => 0xA3,
+        'À' => 0x41, 'Á' => 0x41, 'É' => 0x90, 'Í' => 0x49, 'Ó' => 0x4F, 'Ú' => 0x55,
+        // French
+        'à' => 0x85, 'â' => 0x83, 'ç' => 0x87, 'Ç' => 0x80,
+        'è' => 0x8A, 'ê' => 0x88, 'ë' => 0x89,
+        'î' => 0x8C, 'ï' => 0x8B,
+        'ô' => 0x93, 'œ' => 0x6F, 'Œ' => 0x4F,
+        'ù' => 0x97, 'û' => 0x96, 'ÿ' => 0x98,
+        // Common punctuation / symbols
+        '€' => 0xEE, '£' => 0x9C, '¥' => 0x9D,
+        '«' => 0xAE, '»' => 0xAF,
+        '°' => 0xF8, '±' => 0xF1, '²' => 0xFD,
+        '·' => 0xFA, '½' => 0xAB, '¼' => 0xAC,
+        '¿' => 0xA8, '¡' => 0xAD,
+        '–' => 0x2D, '—' => 0x2D, // em/en dash → minus
+        '\u{2018}' => 0x27, '\u{2019}' => 0x27, // smart quotes → apostrophe
+        '\u{201C}' => 0x22, '\u{201D}' => 0x22, // smart double quotes → "
+        '\u{2026}' => 0x2E, // ellipsis → period
+        // Unknown — return 256 to trigger fallback to NUL glyph
+        _ => 256,
+    }
 }

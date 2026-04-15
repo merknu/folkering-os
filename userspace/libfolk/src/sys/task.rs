@@ -2,7 +2,7 @@
 //!
 //! Functions for controlling the current task's execution.
 
-use crate::syscall::{syscall0, syscall1, syscall2, syscall3, syscall4, syscall6, SYS_EXIT, SYS_YIELD, SYS_GET_PID, SYS_SPAWN, SYS_PARALLEL_GEMM, SYS_ASK_GEMINI, SYS_GPU_FLUSH, SYS_GPU_INFO, SYS_COM3_READ};
+use crate::syscall::{syscall0, syscall1, syscall2, syscall3, syscall4, syscall5, syscall6, SYS_EXIT, SYS_YIELD, SYS_GET_PID, SYS_SPAWN, SYS_PARALLEL_GEMM, SYS_ASK_GEMINI, SYS_GPU_FLUSH, SYS_GPU_INFO, SYS_COM3_READ};
 
 /// Exit the current task with the given exit code
 ///
@@ -85,6 +85,336 @@ pub fn ask_gemini(prompt: &str, response_buf: &mut [u8]) -> usize {
     if ret == u64::MAX { 0 } else { ret as usize }
 }
 
+/// Query an NTP server for current Unix time.
+/// server_ip is the resolved IP (use dns_lookup first).
+/// Returns Unix timestamp (seconds since 1970-01-01 UTC) or 0 on failure.
+pub fn ntp_query(server_ip: [u8; 4]) -> u64 {
+    let packed = ((server_ip[0] as u64) << 24)
+        | ((server_ip[1] as u64) << 16)
+        | ((server_ip[2] as u64) << 8)
+        | (server_ip[3] as u64);
+    unsafe { syscall1(0x5C, packed) }
+}
+
+/// Play raw PCM audio (16-bit signed stereo @ 44100Hz).
+/// Returns true on success.
+pub fn audio_play(samples: &[i16]) -> bool {
+    let ret = unsafe {
+        syscall2(
+            0x5A, // SYS_AUDIO_PLAY
+            samples.as_ptr() as u64,
+            samples.len() as u64,
+        )
+    };
+    ret == 0
+}
+
+/// Beep — generate a 440Hz tone for the given duration (ms).
+pub fn audio_beep(duration_ms: u32) -> bool {
+    let ret = unsafe {
+        syscall1(0x5B, duration_ms as u64)
+    };
+    ret == 0
+}
+
+/// Send a UDP packet to target IP:port. Returns true on success.
+/// Max payload: 1472 bytes (MTU - IP - UDP headers).
+pub fn udp_send(target_ip: [u8; 4], target_port: u16, data: &[u8]) -> bool {
+    let packed = ((target_ip[0] as u64) << 24)
+        | ((target_ip[1] as u64) << 16)
+        | ((target_ip[2] as u64) << 8)
+        | (target_ip[3] as u64);
+    let ret = unsafe {
+        syscall4(
+            0x58, // SYS_UDP_SEND
+            packed,
+            target_port as u64,
+            data.as_ptr() as u64,
+            data.len() as u64,
+        )
+    };
+    ret == 0
+}
+
+/// Send a UDP packet and wait for one response. Returns bytes received.
+/// Max payload: 1472 bytes. Max response: 4096 bytes.
+pub fn udp_send_recv(
+    target_ip: [u8; 4],
+    target_port: u16,
+    data: &[u8],
+    response: &mut [u8],
+    timeout_ms: u32,
+) -> usize {
+    let packed = ((target_ip[0] as u64) << 24)
+        | ((target_ip[1] as u64) << 16)
+        | ((target_ip[2] as u64) << 8)
+        | (target_ip[3] as u64);
+    // Pack response_len (low 32) and timeout_ms (high 32) into one u64
+    let resp_arg = (response.len() as u64) | ((timeout_ms as u64) << 32);
+    let ret = unsafe {
+        syscall6(
+            0x59, // SYS_UDP_SEND_RECV
+            packed,
+            target_port as u64,
+            data.as_ptr() as u64,
+            data.len() as u64,
+            response.as_mut_ptr() as u64,
+            resp_arg,
+        )
+    };
+    if ret == u64::MAX { 0 } else { ret as usize }
+}
+
+/// Direct HTTP(S) fetch via kernel TLS stack. No proxy needed.
+/// Returns bytes written to response_buf, or 0 on error.
+pub fn http_fetch(url: &str, response_buf: &mut [u8]) -> usize {
+    let ret = unsafe {
+        syscall4(
+            0x57, // SYS_HTTP_FETCH
+            url.as_ptr() as u64,
+            url.len() as u64,
+            response_buf.as_mut_ptr() as u64,
+            response_buf.len() as u64,
+        )
+    };
+    if ret == u64::MAX { 0 } else { ret as usize }
+}
+
+/// Fetch an FBP-encoded DOM snapshot from the host-side folkering-proxy.
+///
+/// The kernel opens a plain TCP connection to the QEMU SLIRP gateway
+/// (10.0.2.2:14711 — which maps to the host's 127.0.0.1:14711), sends
+/// `NAVIGATE <url>\n`, reads the `[u32 length][FBP bytes]` reply,
+/// strips the length prefix, and writes the raw FBP payload bytes
+/// into `response_buf`.
+///
+/// Returns the number of FBP bytes written, or 0 on any error.
+pub fn fbp_request(url: &str, response_buf: &mut [u8]) -> usize {
+    let ret = unsafe {
+        syscall4(
+            0x5E, // SYS_FBP_REQUEST
+            url.as_ptr() as u64,
+            url.len() as u64,
+            response_buf.as_mut_ptr() as u64,
+            response_buf.len() as u64,
+        )
+    };
+    if ret == u64::MAX { 0 } else { ret as usize }
+}
+
+/// FBP interact: send an INTERACTION_EVENT to the host-side proxy
+/// on the same TCP session as a NAVIGATE, then read back the
+/// post-click DOM snapshot.
+///
+/// `action` is an `ACTION_*` constant from fbp_rs (e.g.
+/// `ACTION_CLICK = 0x01`). `node_id` is the 1-based element index
+/// in the most recent DOM_STATE_UPDATE. Returns the number of FBP
+/// bytes written to `response_buf`, or 0 on error.
+pub fn fbp_interact(
+    url: &str,
+    action: u8,
+    node_id: u32,
+    response_buf: &mut [u8],
+) -> usize {
+    let action_and_node = (action as u64) | ((node_id as u64) << 8);
+    let ret = unsafe {
+        syscall5(
+            0x5F, // SYS_FBP_INTERACT
+            url.as_ptr() as u64,
+            url.len() as u64,
+            response_buf.as_mut_ptr() as u64,
+            response_buf.len() as u64,
+            action_and_node,
+        )
+    };
+    if ret == u64::MAX { 0 } else { ret as usize }
+}
+
+/// Phase 11 — Draug source-patch channel.
+///
+/// Ships a Rust source file to the host-side proxy, which writes it
+/// into the `draug-sandbox` crate and runs `cargo check` to validate
+/// it. Returns `PatchStatus` with the status code from the proxy
+/// (0 = OK, 1 = BUILD_FAILED, 2 = BAD_FILENAME, …) and the number of
+/// bytes written to `result_buf` (cargo's stderr on failure, compiler
+/// summary on success). Returns `None` on IPC/TCP failure.
+#[derive(Debug, Clone, Copy)]
+pub struct PatchStatus {
+    pub status: u32,
+    pub output_len: usize,
+}
+
+/// Phase 12 — Generative LLM gateway.
+///
+/// Ships a prompt to the host-side proxy's `LLM <model>` command,
+/// which POSTs it to the local Ollama `/api/generate` endpoint and
+/// returns the raw response text. Writes up to `result_buf.len()`
+/// bytes of the LLM's reply into `result_buf`.
+///
+/// Returns `PatchStatus` (reused as the generic status/output_len
+/// carrier) with the proxy's LLM status code and the number of
+/// response bytes actually written. `None` on IPC/TCP failure.
+pub fn llm_generate(
+    model: &str,
+    prompt: &str,
+    result_buf: &mut [u8],
+) -> Option<PatchStatus> {
+    let model_len = model.len() as u64;
+    let prompt_len = prompt.len() as u64;
+    let result_max = result_buf.len() as u64;
+    let mask = 0x1F_FFFFu64; // 21 bits each — matches the kernel unpacker
+    let packed = (model_len & mask)
+        | ((prompt_len & mask) << 21)
+        | ((result_max & mask) << 42);
+
+    let ret = unsafe {
+        syscall4(
+            0x62, // SYS_LLM_GENERATE
+            model.as_ptr() as u64,
+            prompt.as_ptr() as u64,
+            result_buf.as_mut_ptr() as u64,
+            packed,
+        )
+    };
+    if ret == u64::MAX {
+        return None;
+    }
+    let status = ((ret >> 32) & 0xFFFF_FFFF) as u32;
+    let output_len = (ret & 0xFFFF_FFFF) as usize;
+    Some(PatchStatus { status, output_len })
+}
+
+pub fn fbp_patch(
+    filename: &str,
+    content: &[u8],
+    result_buf: &mut [u8],
+) -> Option<PatchStatus> {
+    // The kernel syscall entry asm only reliably passes 5 args
+    // (arg0..arg4 via rdi/rsi/rdx/r10/r8); `r9` gets clobbered by
+    // the rearrangement pass and arg6 is never loaded from the stack.
+    // So we pack all three lengths into one u64 (21 bits each) and
+    // use a 4-arg syscall.
+    let filename_len = filename.len() as u64;
+    let content_len = content.len() as u64;
+    let result_max = result_buf.len() as u64;
+    let mask = 0x1F_FFFFu64; // 21 bits
+    let packed = (filename_len & mask)
+        | ((content_len & mask) << 21)
+        | ((result_max & mask) << 42);
+
+    let ret = unsafe {
+        syscall4(
+            0x61, // SYS_FBP_PATCH
+            filename.as_ptr() as u64,
+            content.as_ptr() as u64,
+            result_buf.as_mut_ptr() as u64,
+            packed,
+        )
+    };
+    if ret == u64::MAX {
+        return None;
+    }
+    let status = ((ret >> 32) & 0xFFFF_FFFF) as u32;
+    let output_len = (ret & 0xFFFF_FFFF) as usize;
+    Some(PatchStatus { status, output_len })
+}
+
+// ── Async TCP (non-blocking, for Draug state machine) ────────────
+
+/// EAGAIN sentinel — means "not ready, try next frame"
+pub const TCP_EAGAIN: u64 = 0xFFFF_FFFE;
+
+/// Start a non-blocking TCP connection. Returns slot_id, EAGAIN, or MAX.
+pub fn tcp_connect_async(ip: [u8; 4], port: u16) -> u64 {
+    let packed = ((ip[0] as u64) << 24) | ((ip[1] as u64) << 16)
+        | ((ip[2] as u64) << 8) | (ip[3] as u64);
+    unsafe { crate::syscall::syscall2(0xE0, packed, port as u64) }
+}
+
+/// Non-blocking send. Returns bytes_sent, EAGAIN, or MAX.
+pub fn tcp_send_async(slot: u64, data: &[u8]) -> u64 {
+    unsafe { crate::syscall::syscall3(0xE1, slot, data.as_ptr() as u64, data.len() as u64) }
+}
+
+/// Non-blocking receive. Returns bytes_read, EAGAIN, 0 (peer closed), or MAX.
+pub fn tcp_poll_recv(slot: u64, buf: &mut [u8]) -> u64 {
+    unsafe { crate::syscall::syscall3(0xE2, slot, buf.as_mut_ptr() as u64, buf.len() as u64) }
+}
+
+/// Close async TCP connection.
+pub fn tcp_close_async(slot: u64) {
+    unsafe { crate::syscall::syscall1(0xE3, slot); }
+}
+
+/// Draug Bridge — push status to kernel tcp_shell atomics.
+/// Returns true if the remote shell has set the pause flag.
+pub fn draug_bridge_update(
+    iter: u32, passed: u32, failed: u32, retries: u32,
+    l1: u8, l2: u8, l3: u8, plan_mode: u8,
+    complex_idx: u8, hibernating: u8, consec_skips: u8,
+) -> bool {
+    let arg1 = ((iter as u64) << 32) | (passed as u64);
+    let arg2 = ((failed as u64) << 32) | (retries as u64);
+    let arg3 = ((l1 as u64) << 24) | ((l2 as u64) << 16) | ((l3 as u64) << 8) | (plan_mode as u64);
+    let arg4 = ((complex_idx as u64) << 16) | ((hibernating as u64) << 8) | (consec_skips as u64);
+    let ret = unsafe { crate::syscall::syscall4(0xD0, arg1, arg2, arg3, arg4) };
+    ret != 0 // 1 = paused
+}
+
+/// Draug Bridge — set current task name for TCP shell display.
+pub fn draug_bridge_set_task(name: &str) {
+    let len = name.len().min(31);
+    unsafe { crate::syscall::syscall2(0xD1, name.as_ptr() as u64, len as u64); }
+}
+
+/// Stability Fix 7 — Proxy health check.
+/// Returns true if the proxy is reachable (~2s timeout).
+pub fn proxy_ping() -> bool {
+    unsafe { crate::syscall::syscall0(0x64) == 1 }
+}
+
+/// Phase 16 — WASM compilation.
+///
+/// Sends `WASM_COMPILE` to the proxy which compiles the sandbox to
+/// `wasm32-unknown-unknown`. Returns the .wasm binary bytes in
+/// `wasm_buf`. Returns `Some(PatchStatus)` where:
+///   - status=0, output_len=wasm_bytes_written on success
+///   - status>0 on error (output_len = error message length)
+///   - None on TCP/IPC failure
+pub fn wasm_compile(wasm_buf: &mut [u8]) -> Option<PatchStatus> {
+    let ret = unsafe {
+        crate::syscall::syscall2(
+            0x63, // SYS_WASM_COMPILE
+            wasm_buf.as_mut_ptr() as u64,
+            wasm_buf.len() as u64,
+        )
+    };
+    if ret == u64::MAX {
+        return None;
+    }
+    let status = ((ret >> 32) & 0xFFFF_FFFF) as u32;
+    let output_len = (ret & 0xFFFF_FFFF) as usize;
+    Some(PatchStatus { status, output_len })
+}
+
+/// HTTP(S) POST via kernel TLS stack. Sends `body` as the request body
+/// with `Content-Type: application/x-www-form-urlencoded`. Returns the
+/// number of response-body bytes written to `response_buf`, or 0 on error.
+pub fn http_post(url: &str, body: &[u8], response_buf: &mut [u8]) -> usize {
+    let ret = unsafe {
+        crate::syscall::syscall6(
+            0x5D, // SYS_HTTP_POST
+            url.as_ptr() as u64,
+            url.len() as u64,
+            body.as_ptr() as u64,
+            body.len() as u64,
+            response_buf.as_mut_ptr() as u64,
+            response_buf.len() as u64,
+        )
+    };
+    if ret == u64::MAX { 0 } else { ret as usize }
+}
+
 /// Flush GPU framebuffer dirty rectangle to display (fire-and-forget).
 pub fn gpu_flush(x: u32, y: u32, w: u32, h: u32) {
     unsafe { syscall4(SYS_GPU_FLUSH, x as u64, y as u64, w as u64, h as u64); }
@@ -132,26 +462,30 @@ pub fn ws_connect(ip: [u8; 4], port: u16, host: &str, path: &str) -> Option<u8> 
     let packed_ip = ip[0] as u64 | ((ip[1] as u64) << 8) | ((ip[2] as u64) << 16) | ((ip[3] as u64) << 24);
     let packed_port = port as u64 | ((total as u64) << 16);
 
-    let ret = unsafe { syscall3(0xA0, packed_ip, packed_port, buf.as_ptr() as u64) };
+    // Phase B4: moved from 0xA0 (collided with SYS_PCI_ENUMERATE) to 0xC0
+    let ret = unsafe { syscall3(0xC0, packed_ip, packed_port, buf.as_ptr() as u64) };
     if ret == u64::MAX { None } else { Some(ret as u8) }
 }
 
 /// WebSocket: Send text data on a connection.
 pub fn ws_send(slot_id: u8, data: &[u8]) -> bool {
-    let ret = unsafe { syscall3(0xA1, slot_id as u64, data.as_ptr() as u64, data.len() as u64) };
+    // Phase B4: moved from 0xA1 (collided with SYS_PORT_INB) to 0xC1
+    let ret = unsafe { syscall3(0xC1, slot_id as u64, data.as_ptr() as u64, data.len() as u64) };
     ret == 0
 }
 
 /// WebSocket: Non-blocking receive poll. Returns bytes read (0 = nothing yet).
 /// Returns None on connection closed/error.
 pub fn ws_poll_recv(slot_id: u8, buf: &mut [u8]) -> Option<usize> {
-    let ret = unsafe { syscall3(0xA2, slot_id as u64, buf.as_mut_ptr() as u64, buf.len() as u64) };
+    // Phase B4: moved from 0xA2 (collided with SYS_PORT_INW) to 0xC2
+    let ret = unsafe { syscall3(0xC2, slot_id as u64, buf.as_mut_ptr() as u64, buf.len() as u64) };
     if ret == u64::MAX { None } else { Some(ret as usize) }
 }
 
 /// WebSocket: Close a connection.
 pub fn ws_close(slot_id: u8) {
-    unsafe { syscall1(0xA3, slot_id as u64); }
+    // Phase B4: moved from 0xA3 (collided with SYS_PORT_INL) to 0xC3
+    unsafe { syscall1(0xC3, slot_id as u64); }
 }
 
 /// Telemetry: Record an app-level event for AutoDream pattern mining.

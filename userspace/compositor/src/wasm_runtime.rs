@@ -45,6 +45,9 @@ use wasmi::*;
 #[path = "host_api/mod.rs"]
 mod host_api;
 
+#[path = "silverfir/mod.rs"]
+mod silverfir;
+
 /// Maximum fuel (instructions) per WASM execution tick
 /// Default fuel for WASM apps (1M instructions per frame)
 const FUEL_LIMIT: u64 = 1_000_000;
@@ -52,6 +55,14 @@ const FUEL_LIMIT: u64 = 1_000_000;
 pub const FUEL_FOREGROUND: u64 = 5_000_000;
 /// Reduced fuel for background windows (save CPU for foreground)
 pub const FUEL_BACKGROUND: u64 = 200_000;
+
+/// Create a wasmi Engine with fuel metering enabled.
+/// Without this, set_fuel() silently fails and WASM code runs unlimited.
+fn engine_with_fuel() -> Engine {
+    let mut config = Config::default();
+    config.consume_fuel(true);
+    Engine::new(&config)
+}
 
 /// Maximum pending events per frame (prevent unbounded growth)
 const MAX_EVENTS: usize = 64;
@@ -63,6 +74,31 @@ const SURFACE_OFFSET: usize = 0x100000;
 /// 1024*768*4 = 3MB at offset 1MB = need 4MB = 64 pages
 /// But only grow if heap can afford it (check before growing)
 const MIN_SURFACE_PAGES: u32 = 64;
+
+// ── Dual-Runtime Backend ──────────────────────────────────────────────────
+
+/// WASM execution backend selection.
+///
+/// Folkering OS supports two WASM runtimes:
+///
+/// - **Sandboxed** (wasmi): Interpreter with fuel metering, memory bounds,
+///   and capability checking. Used for untrusted code (user apps, AI-generated
+///   tools, AutoDream evaluations). ~20-100x slower than native.
+///
+/// - **Trusted** (silverfir-nano): JIT compiler targeting native x86_64.
+///   Used for verified internal modules (hardware drivers, Draug-compiled
+///   modules after 3-layer validation, inference kernels). ~2-5x native.
+///
+/// Selection rule: if the code has passed ground-truth testing, mutation
+/// testing, and tautology detection — it earns Trusted. Everything else
+/// is Sandboxed by default.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum WasmBackend {
+    /// wasmi interpreter — safe, slow, fuel-metered
+    Sandboxed,
+    /// silverfir-nano JIT — fast, trusted code only
+    Trusted,
+}
 
 // ── Public Types ─────────────────────────────────────────────────────────
 
@@ -202,7 +238,141 @@ pub fn execute_wasm(
     wasm_bytes: &[u8],
     config: WasmConfig,
 ) -> (WasmResult, WasmOutput) {
-    let engine = Engine::default();
+    execute_wasm_with_backend(wasm_bytes, config, WasmBackend::Sandboxed)
+}
+
+/// Execute with explicit backend selection.
+pub fn execute_wasm_with_backend(
+    wasm_bytes: &[u8],
+    config: WasmConfig,
+    backend: WasmBackend,
+) -> (WasmResult, WasmOutput) {
+    match backend {
+        WasmBackend::Sandboxed => execute_wasm_sandboxed(wasm_bytes, config),
+        WasmBackend::Trusted => {
+            // Attempt silverfir-nano JIT compilation.
+            // Falls back to wasmi if JIT is not yet implemented or fails.
+            match silverfir::JitModule::compile(wasm_bytes) {
+                Ok(mut module) => {
+                    libfolk::sys::io::write_str("[WASM] silverfir-nano: JIT compiled OK\n");
+                    match module.call_void("run") {
+                        Ok(()) => (WasmResult::Ok, empty_output()),
+                        Err(_) => (WasmResult::Trap(String::from("silverfir JIT trap")), empty_output()),
+                    }
+                }
+                Err(silverfir::JitError::NotYetImplemented) => {
+                    // Expected: JIT scaffold, fall back to wasmi
+                    execute_wasm_sandboxed(wasm_bytes, config)
+                }
+                Err(_) => {
+                    libfolk::sys::io::write_str("[WASM] silverfir-nano: compilation failed, falling back to wasmi\n");
+                    execute_wasm_sandboxed(wasm_bytes, config)
+                }
+            }
+        }
+    }
+}
+
+/// Test silverfir-nano JIT compilation on a minimal WASM binary.
+/// Called once at boot to verify the JIT pipeline works end-to-end.
+pub fn test_silverfir_jit() {
+    libfolk::sys::io::write_str("[silverfir] Running JIT self-test...\n");
+
+    // Minimal WASM: one function that returns 42
+    // (module (func (export "run") (result i32) (i32.const 42)))
+    let wasm: &[u8] = &[
+        0x00, 0x61, 0x73, 0x6D, // magic
+        0x01, 0x00, 0x00, 0x00, // version
+        // type section: 1 type, ()->i32
+        0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7F,
+        // function section: 1 func, type 0
+        0x03, 0x02, 0x01, 0x00,
+        // export section: "run" = func 0
+        0x07, 0x07, 0x01, 0x03, 0x72, 0x75, 0x6E, 0x00, 0x00,
+        // code section: 1 body
+        0x0A, 0x06, 0x01,
+        // body: 0 locals, i32.const 42, end
+        0x04, 0x00, 0x41, 0x2A, 0x0B,
+    ];
+
+    match silverfir::JitModule::compile(wasm) {
+        Ok(mut module) => {
+            libfolk::sys::io::write_str("[silverfir] Compile OK: ");
+            let mut nb = [0u8; 16];
+            libfolk::sys::io::write_str(format_usize(module.functions.len(), &mut nb));
+            libfolk::sys::io::write_str(" function(s), ");
+
+            // Show emitted x86_64 bytes
+            if let Some(code) = module.functions.first() {
+                libfolk::sys::io::write_str(format_usize(code.len(), &mut nb));
+                libfolk::sys::io::write_str(" bytes of x86_64\n");
+
+                // Log the actual machine code for debugging
+                libfolk::sys::io::write_str("[silverfir] x86_64:");
+                for (i, byte) in code.iter().enumerate().take(32) {
+                    if i % 16 == 0 { libfolk::sys::io::write_str("\n  "); }
+                    let hi = b"0123456789abcdef"[(byte >> 4) as usize];
+                    let lo = b"0123456789abcdef"[(byte & 0xf) as usize];
+                    libfolk::sys::io::write_str(" ");
+                    let hex = [hi, lo];
+                    if let Ok(s) = core::str::from_utf8(&hex) {
+                        libfolk::sys::io::write_str(s);
+                    }
+                }
+                libfolk::sys::io::write_str("\n");
+            }
+
+            // Actually EXECUTE the JIT-compiled code and verify return value
+            libfolk::sys::io::write_str("[silverfir] Executing JIT code natively...\n");
+            match module.call_u32("run") {
+                Ok(result) => {
+                    libfolk::sys::io::write_str("[silverfir] Return value: ");
+                    libfolk::sys::io::write_str(format_usize(result as usize, &mut nb));
+                    if result == 42 {
+                        libfolk::sys::io::write_str(" === SELF-TEST PASS: native x86_64 execution returned 42!\n");
+                    } else {
+                        libfolk::sys::io::write_str(" !== 42 — SELF-TEST FAIL: wrong return value\n");
+                    }
+                }
+                Err(_) => {
+                    libfolk::sys::io::write_str("[silverfir] SELF-TEST FAIL: execution fault\n");
+                }
+            }
+        }
+        Err(silverfir::JitError::NotYetImplemented) => {
+            libfolk::sys::io::write_str("[silverfir] SELF-TEST SKIP: JIT not yet implemented\n");
+        }
+        Err(silverfir::JitError::UnsupportedOpcode(op)) => {
+            libfolk::sys::io::write_str("[silverfir] SELF-TEST FAIL: unsupported opcode 0x");
+            let hex = [b"0123456789abcdef"[(op >> 4) as usize], b"0123456789abcdef"[(op & 0xf) as usize]];
+            if let Ok(s) = core::str::from_utf8(&hex) {
+                libfolk::sys::io::write_str(s);
+            }
+            libfolk::sys::io::write_str("\n");
+        }
+        Err(_) => {
+            libfolk::sys::io::write_str("[silverfir] SELF-TEST FAIL: compilation error\n");
+        }
+    }
+}
+
+fn format_usize(mut v: usize, buf: &mut [u8; 16]) -> &str {
+    if v == 0 { return "0"; }
+    let mut i = 15;
+    while v > 0 && i > 0 {
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        i -= 1;
+    }
+    core::str::from_utf8(&buf[i+1..16]).unwrap_or("?")
+}
+
+/// Sandboxed execution via wasmi interpreter with fuel metering.
+fn execute_wasm_sandboxed(
+    wasm_bytes: &[u8],
+    config: WasmConfig,
+) -> (WasmResult, WasmOutput) {
+    let engine = engine_with_fuel();
 
     let module = match Module::new(&engine, wasm_bytes) {
         Ok(m) => m,
@@ -260,8 +430,29 @@ pub struct PersistentWasmApp {
 
 impl PersistentWasmApp {
     /// Compile and instantiate a WASM module for persistent execution.
+    /// Uses Sandboxed (wasmi) backend by default.
     pub fn new(wasm_bytes: &[u8], config: WasmConfig) -> Result<Self, String> {
-        let engine = Engine::default();
+        Self::new_with_backend(wasm_bytes, config, WasmBackend::Sandboxed)
+    }
+
+    /// Compile with explicit backend selection.
+    pub fn new_with_backend(
+        wasm_bytes: &[u8],
+        config: WasmConfig,
+        backend: WasmBackend,
+    ) -> Result<Self, String> {
+        match backend {
+            WasmBackend::Sandboxed => Self::new_sandboxed(wasm_bytes, config),
+            WasmBackend::Trusted => {
+                // Silverfir-nano: placeholder — fall back to wasmi
+                Self::new_sandboxed(wasm_bytes, config)
+            }
+        }
+    }
+
+    /// Internal: wasmi-based sandboxed instantiation.
+    fn new_sandboxed(wasm_bytes: &[u8], config: WasmConfig) -> Result<Self, String> {
+        let engine = engine_with_fuel();
 
         let module = Module::new(&engine, wasm_bytes)
             .map_err(|e| alloc::format!("Module parse: {:?}", e))?;
@@ -457,7 +648,7 @@ impl PersistentWasmApp {
 ///
 /// Returns the transformed bytes, or None if the adapter fails.
 pub fn execute_adapter(adapter_wasm: &[u8], input_data: &[u8]) -> Option<Vec<u8>> {
-    let engine = Engine::default();
+    let engine = engine_with_fuel();
 
     // Adapter host state: input/output buffers
     struct AdapterState {
@@ -774,6 +965,26 @@ fn register_shadow_functions(linker: &mut Linker<ShadowState>) {
         |_: Caller<ShadowState>| {},
     );
 
+    // Clipboard — return empty in shadow
+    let _ = linker.func_wrap("env", "folk_clipboard_set",
+        |_: Caller<ShadowState>, _p: i32, _l: i32| -> i32 { 0 },
+    );
+    let _ = linker.func_wrap("env", "folk_clipboard_get",
+        |_: Caller<ShadowState>, _p: i32, _l: i32| -> i32 { 0 },
+    );
+    let _ = linker.func_wrap("env", "folk_clipboard_len",
+        |_: Caller<ShadowState>| -> i32 { 0 },
+    );
+    let _ = linker.func_wrap("env", "folk_audio_beep",
+        |_: Caller<ShadowState>, _d: i32| -> i32 { 0 },
+    );
+    let _ = linker.func_wrap("env", "folk_audio_play",
+        |_: Caller<ShadowState>, _p: i32, _l: i32| -> i32 { 0 },
+    );
+    let _ = linker.func_wrap("env", "folk_ntp_query",
+        |_: Caller<ShadowState>, _a: i32, _b: i32, _c: i32, _d: i32| -> i64 { 0 },
+    );
+
     // Surface — return 0 (no surface in shadow)
     let _ = linker.func_wrap("env", "folk_get_surface",
         |_: Caller<ShadowState>| -> i32 { 0 },
@@ -897,7 +1108,7 @@ pub fn execute_shadow_test(
     wasm_bytes: &[u8],
     synthetic_inputs: &[InputEvent],
 ) -> TestReport {
-    let engine = Engine::default();
+    let engine = engine_with_fuel();
 
     let module = match Module::new(&engine, wasm_bytes) {
         Ok(m) => m,

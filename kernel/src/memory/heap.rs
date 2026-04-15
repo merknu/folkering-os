@@ -9,7 +9,7 @@ use linked_list_allocator::LockedHeap;
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
 const HEAP_START: usize = 0xFFFF_FFFF_8100_0000;
-const HEAP_SIZE: usize = 16 * 1024 * 1024; // 16MB
+const HEAP_SIZE: usize = 32 * 1024 * 1024; // 32MB (doubled for 24h+ Draug runs)
 
 /// Initialize kernel heap
 pub fn init() {
@@ -51,6 +51,12 @@ pub fn init() {
     crate::serial_str!("[HEAP] Kernel heap initialized at ");
     crate::drivers::serial::write_hex(HEAP_START as u64);
     crate::drivers::serial::write_newline();
+}
+
+/// Return kernel heap stats: (total_bytes, used_bytes, free_bytes)
+pub fn heap_stats() -> (usize, usize, usize) {
+    let heap = ALLOCATOR.lock();
+    (heap.size(), heap.used(), heap.free())
 }
 
 /// Allocation error handler

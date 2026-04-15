@@ -24,6 +24,19 @@ unsafe fn cmos_read(reg: u8) -> u8 {
     data_port.read()
 }
 
+/// Write a CMOS register
+unsafe fn cmos_write(reg: u8, value: u8) {
+    let mut addr_port = Port::<u8>::new(0x70);
+    let mut data_port = Port::<u8>::new(0x71);
+    addr_port.write(0x80 | reg);
+    data_port.write(value);
+}
+
+/// Convert binary byte to BCD (assumes value < 100)
+fn bin_to_bcd(bin: u8) -> u8 {
+    ((bin / 10) << 4) | (bin % 10)
+}
+
 /// Convert BCD byte to binary
 fn bcd_to_bin(bcd: u8) -> u8 {
     ((bcd >> 4) * 10) + (bcd & 0x0F)
@@ -139,4 +152,92 @@ pub fn init() {
 /// Get current Unix timestamp
 pub fn unix_timestamp() -> u64 {
     to_unix_timestamp(&read_rtc())
+}
+
+/// Write date/time to CMOS RTC.
+/// Detects BCD vs binary format and writes accordingly.
+pub fn write_rtc(dt: &DateTime) {
+    unsafe {
+        // Wait for any in-progress update to complete
+        loop {
+            if (cmos_read(0x0A) & 0x80) == 0 {
+                break;
+            }
+        }
+
+        // Read status B to check format
+        let status_b = cmos_read(0x0B);
+        let is_binary = (status_b & 0x04) != 0;
+
+        // Disable RTC updates while we write
+        cmos_write(0x0B, status_b | 0x80);
+
+        let conv = |v: u8| if is_binary { v } else { bin_to_bcd(v) };
+
+        cmos_write(0x00, conv(dt.second));
+        cmos_write(0x02, conv(dt.minute));
+        cmos_write(0x04, conv(dt.hour));
+        cmos_write(0x07, conv(dt.day));
+        cmos_write(0x08, conv(dt.month));
+        cmos_write(0x09, conv((dt.year - 2000) as u8));
+
+        // Re-enable RTC updates
+        cmos_write(0x0B, status_b);
+    }
+}
+
+/// Convert Unix timestamp to DateTime and write to RTC.
+/// Used by NTP sync.
+pub fn set_unix_time(unix_secs: u64) {
+    let dt = unix_to_datetime(unix_secs);
+    crate::serial_str!("[CMOS] Setting RTC to ");
+    crate::drivers::serial::write_dec(dt.year as u32);
+    crate::serial_str!("-");
+    if dt.month < 10 { crate::serial_str!("0"); }
+    crate::drivers::serial::write_dec(dt.month as u32);
+    crate::serial_str!("-");
+    if dt.day < 10 { crate::serial_str!("0"); }
+    crate::drivers::serial::write_dec(dt.day as u32);
+    crate::serial_str!(" ");
+    if dt.hour < 10 { crate::serial_str!("0"); }
+    crate::drivers::serial::write_dec(dt.hour as u32);
+    crate::serial_str!(":");
+    if dt.minute < 10 { crate::serial_str!("0"); }
+    crate::drivers::serial::write_dec(dt.minute as u32);
+    crate::serial_str!(":");
+    if dt.second < 10 { crate::serial_str!("0"); }
+    crate::drivers::serial::write_dec(dt.second as u32);
+    crate::serial_strln!(" UTC");
+    write_rtc(&dt);
+}
+
+/// Convert Unix timestamp to DateTime (UTC).
+fn unix_to_datetime(unix_secs: u64) -> DateTime {
+    let second = (unix_secs % 60) as u8;
+    let mut t = unix_secs / 60;
+    let minute = (t % 60) as u8;
+    t /= 60;
+    let hour = (t % 24) as u8;
+    let mut days = t / 24;
+
+    let mut year: u16 = 1970;
+    loop {
+        let year_days = if is_leap(year as u64) { 366 } else { 365 };
+        if days < year_days { break; }
+        days -= year_days;
+        year += 1;
+    }
+
+    let month_days: [u8; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut month: u8 = 1;
+    for (i, &md) in month_days.iter().enumerate() {
+        let mut d = md as u64;
+        if i == 1 && is_leap(year as u64) { d = 29; }
+        if days < d { break; }
+        days -= d;
+        month += 1;
+    }
+    let day = (days + 1) as u8;
+
+    DateTime { year, month, day, hour, minute, second }
 }
