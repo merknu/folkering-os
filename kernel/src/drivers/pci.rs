@@ -121,6 +121,19 @@ pub fn pci_read16(bus: u8, device: u8, function: u8, offset: u8) -> u16 {
     ((val32 >> ((offset & 2) * 8)) & 0xFFFF) as u16
 }
 
+/// Write 16-bit value to PCI config space. Implemented as a
+/// read-modify-write on the enclosing dword so we preserve the
+/// adjacent 16 bits. Needed by MSI-X enable (bit 15 of Message
+/// Control at cap+2).
+pub fn pci_write16(bus: u8, device: u8, function: u8, offset: u8, value: u16) {
+    let aligned = offset & 0xFC;
+    let shift = (offset & 2) * 8;
+    let mut val32 = pci_read32(bus, device, function, aligned);
+    val32 &= !(0xFFFFu32 << shift);
+    val32 |= (value as u32) << shift;
+    pci_write32(bus, device, function, aligned, val32);
+}
+
 /// Read 8-bit value from PCI config space
 pub fn pci_read8(bus: u8, device: u8, function: u8, offset: u8) -> u8 {
     let val32 = pci_read32(bus, device, function, offset & 0xFC);

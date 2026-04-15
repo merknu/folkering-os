@@ -26,7 +26,14 @@ const VIRTIO_PCI_QUEUE_SEL: u16 = 0x0E;         // 16-bit, RW
 const VIRTIO_PCI_QUEUE_NOTIFY: u16 = 0x10;      // 16-bit, RW
 const VIRTIO_PCI_DEVICE_STATUS: u16 = 0x12;     // 8-bit, RW
 const VIRTIO_PCI_ISR_STATUS: u16 = 0x13;         // 8-bit, RO
-const VIRTIO_PCI_CONFIG: u16 = 0x14;             // Device-specific config
+const VIRTIO_PCI_CONFIG: u16 = 0x14;             // Device-specific config (legacy, no MSI-X)
+
+// When MSI-X is enabled, two 16-bit registers are inserted at 0x14/0x16
+// and the device-specific config shifts from 0x14 to 0x18.
+const VIRTIO_PCI_CONFIG_MSIX_VECTOR: u16 = 0x14; // 16-bit, RW — config-change vector
+const VIRTIO_PCI_QUEUE_MSIX_VECTOR: u16 = 0x16;  // 16-bit, RW — queue vector (per QUEUE_SEL)
+const VIRTIO_PCI_CONFIG_WITH_MSIX: u16 = 0x18;   // Device-specific config when MSI-X on
+const VIRTIO_MSI_NO_VECTOR: u16 = 0xFFFF;        // Sentinel: no vector assigned / refused
 
 // ── VirtIO Device Status Bits ────────────────────────────────────────────────
 
@@ -152,8 +159,10 @@ struct VirtioBlkDevice {
     burst_data_phys: usize,
     /// Virtual address of burst DATA buffer
     burst_data_virt: usize,
-    /// PCI interrupt line (for IOAPIC routing)
+    /// PCI interrupt line (for IOAPIC routing — only meaningful on legacy path)
     irq_line: u8,
+    /// True if this device is routed via MSI-X; false if via IOAPIC/IRQ11.
+    msix_enabled: bool,
     /// Device capacity in sectors
     capacity: u64,
 }
@@ -186,7 +195,8 @@ fn write_io32(base: u16, offset: u16, val: u32) {
 
 // ── Interrupt Handler ────────────────────────────────────────────────────────
 
-/// Called from IDT vector 45 (VirtIO block IRQ)
+/// Called from IDT vector 45 (legacy VirtIO block IRQ via IOAPIC).
+/// Reads ISR to acknowledge edge/level, signals completion, sends EOI.
 pub fn irq_handler() {
     let dev = BLOCK_DEVICE.lock();
     if let Some(ref blk) = *dev {
@@ -203,7 +213,78 @@ pub fn irq_handler() {
     crate::arch::x86_64::apic::send_eoi();
 }
 
+/// MSI-X completion handler for VirtIO-blk. With MSI-X the ISR
+/// register is never set by the device, so we skip reading it. We
+/// send EOI ourselves — the naked IRQ wrapper in main.rs (unlike
+/// the idt.rs dispatcher stub) does not.
+pub fn msix_handler() {
+    IO_COMPLETE.store(true, Ordering::Release);
+    IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
+    crate::arch::x86_64::apic::send_eoi();
+}
+
 // ── Initialization ───────────────────────────────────────────────────────────
+
+/// Try to configure MSI-X for this VirtIO-blk device. Returns `true` if
+/// the MSI-X table was programmed and the cap's Enable bit was set.
+/// Does *not* bind a queue-vector yet — that happens after QUEUE_SEL=0,
+/// per VirtIO legacy PCI layout rules. On success, the caller must also
+/// write `config_msix_vector = NO_VECTOR` and bind the queue vector.
+fn try_enable_msix(pci_dev: &PciDevice, io_base: u16) -> bool {
+    let cap_info = match super::msix::parse_cap(pci_dev) {
+        Some(ci) => ci,
+        None => {
+            crate::serial_strln!("[MSI-X] VirtIO-blk: no MSI-X cap, using IOAPIC");
+            return false;
+        }
+    };
+
+    let table_virt = match super::msix::locate_table(pci_dev, &cap_info) {
+        Some(v) => v,
+        None => {
+            crate::serial_strln!("[MSI-X] VirtIO-blk: BAR decode failed, using IOAPIC");
+            return false;
+        }
+    };
+
+    let vector = match super::msix::alloc_vector() {
+        Some(v) => v,
+        None => {
+            crate::serial_strln!("[MSI-X] Out of vectors, VirtIO-blk using IOAPIC");
+            return false;
+        }
+    };
+
+    let apic_id = crate::arch::x86_64::apic::get_apic_id();
+
+    // Register our handler before the device can fire.
+    if crate::arch::x86_64::idt::register_msix_handler(vector, msix_handler).is_err() {
+        crate::serial_strln!("[MSI-X] Handler registration failed, falling back");
+        super::msix::free_vector(vector);
+        return false;
+    }
+
+    // SAFETY: table_virt is derived from the device's MSI-X BAR, mapped
+    // via HHDM; cap_info.table_size is guaranteed ≥ 1 for a working
+    // cap, so entry 0 is always valid. No other code touches this table.
+    unsafe {
+        super::msix::configure_entry(table_virt, 0, vector, apic_id);
+    }
+    super::msix::enable_msix(pci_dev, cap_info.cap_offset);
+
+    // Disable config-change vector (we don't handle config changes).
+    write_io16(io_base, VIRTIO_PCI_CONFIG_MSIX_VECTOR, VIRTIO_MSI_NO_VECTOR);
+
+    crate::serial_str!("[MSI-X] VirtIO-blk using vector ");
+    crate::drivers::serial::write_dec(vector as u32);
+    crate::serial_str!(" (APIC target ");
+    crate::drivers::serial::write_dec(apic_id as u32);
+    crate::serial_str!(", table_size=");
+    crate::drivers::serial::write_dec(cap_info.table_size as u32);
+    crate::serial_strln!(")");
+
+    true
+}
 
 /// Initialize VirtIO block device
 pub fn init() -> Result<(), BlockError> {
@@ -280,10 +361,42 @@ pub fn init() -> Result<(), BlockError> {
     // Step 5: FEATURES_OK (legacy: go straight to DRIVER_OK)
     // Legacy transport skips FEATURES_OK
 
+    // ── Try MSI-X before queue setup ─────────────────────────────────────
+    // If MSI-X is available and the device accepts our vector, we route
+    // completion interrupts directly to a LAPIC instead of IRQ11/IOAPIC.
+    // The queue_msix_vector register only reads back our value once
+    // QUEUE_SEL is set to the target queue — so order is:
+    //   1. Program MSI-X table entry 0, enable MSI-X in PCI config.
+    //   2. Write config_msix_vector = NO_VECTOR (we don't handle config changes).
+    //   3. QUEUE_SEL = 0; write queue_msix_vector = our vector.
+    //   4. Readback — if it returns NO_VECTOR (0xFFFF), the device refused.
+    //      Fall back to IOAPIC.
+    let msix_enabled = try_enable_msix(&pci_dev, io_base);
+
     // ── Setup Virtqueue 0 ────────────────────────────────────────────────
 
     // Select queue 0
     write_io16(io_base, VIRTIO_PCI_QUEUE_SEL, 0);
+
+    // If MSI-X is on, assign the queue-0 vector NOW (after QUEUE_SEL=0).
+    // This is separate from the above routine because the MSI-X register
+    // layout requires QUEUE_SEL to be set before queue_msix_vector is
+    // meaningful to the device.
+    let msix_enabled = if msix_enabled {
+        write_io16(io_base, VIRTIO_PCI_QUEUE_MSIX_VECTOR, 0);
+        let readback = read_io16(io_base, VIRTIO_PCI_QUEUE_MSIX_VECTOR);
+        if readback == 0 {
+            crate::serial_strln!("[MSI-X] VirtIO-blk queue 0 vector bound");
+            true
+        } else {
+            crate::serial_str!("[MSI-X] VirtIO-blk queue vector readback=0x");
+            crate::drivers::serial::write_hex(readback as u64);
+            crate::serial_strln!(" — device refused, falling back to IOAPIC");
+            false
+        }
+    } else {
+        false
+    };
 
     // Read queue size
     let queue_size = read_io16(io_base, VIRTIO_PCI_QUEUE_SIZE);
@@ -329,9 +442,16 @@ pub fn init() -> Result<(), BlockError> {
     }
 
     // ── Read Device Config (capacity) ────────────────────────────────────
-
-    let cap_lo = read_io32(io_base, VIRTIO_PCI_CONFIG) as u64;
-    let cap_hi = read_io32(io_base, VIRTIO_PCI_CONFIG + 4) as u64;
+    // With MSI-X enabled, the device-specific config shifts from 0x14
+    // to 0x18 (the extra 4 bytes are occupied by config/queue MSI-X
+    // vectors). See VirtIO legacy PCI spec §4.1.4.8.
+    let config_base = if msix_enabled {
+        VIRTIO_PCI_CONFIG_WITH_MSIX
+    } else {
+        VIRTIO_PCI_CONFIG
+    };
+    let cap_lo = read_io32(io_base, config_base) as u64;
+    let cap_hi = read_io32(io_base, config_base + 4) as u64;
     let capacity = cap_lo | (cap_hi << 32);
 
     crate::serial_str!("[VIRTIO_BLK] Capacity: ");
@@ -393,18 +513,21 @@ pub fn init() -> Result<(), BlockError> {
     crate::drivers::serial::write_hex(burst_data_phys as u64);
     crate::drivers::serial::write_newline();
 
-    // ── Setup IOAPIC Interrupt ───────────────────────────────────────────
-
+    // ── Setup Completion Interrupt ───────────────────────────────────────
+    // MSI-X was already programmed above; if it succeeded we don't touch
+    // the IOAPIC at all. Otherwise fall back to IRQ → IOAPIC → vector 45.
     let irq_line = pci_dev.interrupt_line;
-    if irq_line > 0 && irq_line < 24 {
-        crate::serial_str!("[VIRTIO_BLK] Routing IRQ");
-        crate::drivers::serial::write_dec(irq_line as u32);
-        crate::serial_strln!(" -> IDT vector 45 via IOAPIC (level-triggered, active-low)");
-        crate::arch::x86_64::ioapic_enable_irq_level(irq_line, 45);
-    } else {
-        crate::serial_str!("[VIRTIO_BLK] WARNING: Invalid IRQ line ");
-        crate::drivers::serial::write_dec(irq_line as u32);
-        crate::serial_strln!(", interrupts may not work");
+    if !msix_enabled {
+        if irq_line > 0 && irq_line < 24 {
+            crate::serial_str!("[VIRTIO_BLK] Routing IRQ");
+            crate::drivers::serial::write_dec(irq_line as u32);
+            crate::serial_strln!(" -> IDT vector 45 via IOAPIC (level-triggered, active-low)");
+            crate::arch::x86_64::ioapic_enable_irq_level(irq_line, 45);
+        } else {
+            crate::serial_str!("[VIRTIO_BLK] WARNING: Invalid IRQ line ");
+            crate::drivers::serial::write_dec(irq_line as u32);
+            crate::serial_strln!(", interrupts may not work");
+        }
     }
 
     // Store the device
@@ -418,6 +541,7 @@ pub fn init() -> Result<(), BlockError> {
         burst_data_phys,
         burst_data_virt,
         irq_line,
+        msix_enabled,
         capacity,
     });
 

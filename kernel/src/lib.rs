@@ -192,21 +192,30 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
         // Initialize IOMMU (Intel VT-d) if available
         drivers::iommu::init();
 
-        // Initialize VirtIO block device (if present)
+        // Initialize VirtIO block device (if present). We still init
+        // it (self-test, disk layout) even when NVMe wins the backend
+        // race below, because the VirtIO disk carries the model and
+        // Synapse DB that aren't MVFS-managed.
         serial_strln!("[INIT] Looking for VirtIO block device...");
-        match drivers::virtio_blk::init() {
+        let virtio_blk_ready = match drivers::virtio_blk::init() {
             Ok(()) => {
                 serial_strln!("[INIT] VirtIO block device ready");
-                // Initialize disk layout (format if needed, run self-test)
                 match drivers::virtio_blk::init_disk() {
-                    Ok(()) => { serial_strln!("[INIT] Disk initialized"); }
-                    Err(_) => { serial_strln!("[INIT] WARNING: Disk initialization failed"); }
+                    Ok(()) => {
+                        serial_strln!("[INIT] Disk initialized");
+                        true
+                    }
+                    Err(_) => {
+                        serial_strln!("[INIT] WARNING: Disk initialization failed");
+                        false
+                    }
                 }
             }
             Err(_) => {
                 serial_strln!("[INIT] No VirtIO block device (running without persistent storage)");
+                false
             }
-        }
+        };
 
         // Initialize VirtIO network device
         serial_strln!("[INIT] Looking for VirtIO network device...");
@@ -231,6 +240,33 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
 
         // AC97 audio (optional — only present if QEMU started with -device AC97)
         drivers::ac97::init();
+
+        // NVMe controller (optional). First driver to use MSI-X with no
+        // IOAPIC fallback — absence is logged but never fatal.
+        let nvme_ready = drivers::nvme::init().is_ok();
+        if nvme_ready {
+            serial_strln!("[INIT] NVMe ready");
+        } else {
+            serial_strln!("[INIT] No NVMe controller");
+        }
+
+        // MVFS backend selection: prefer NVMe when present, otherwise
+        // fall back to VirtIO-blk. Whichever wins is where we load
+        // initial state from AND where all future flushes go.
+        if nvme_ready {
+            crate::fs::mvfs::use_nvme_backend();
+            crate::fs::mvfs::load_from_disk();
+        } else if virtio_blk_ready {
+            crate::fs::mvfs::load_from_disk();
+        } else {
+            serial_strln!("[INIT] MVFS running in-memory only (no persistent backend)");
+        }
+
+        // Storage throughput baseline. Runs after MVFS load so the
+        // MVFS region is known good; benchmark uses VirtIO-blk's
+        // journal region and a high-LBA scratch on NVMe, both
+        // backup+restore'd to avoid corrupting anything real.
+        drivers::storage_bench::run();
 
         // Initialize keyboard driver (uses IRQ1 via IOAPIC)
         // NOTE: keyboard::init() will try to enable PIC IRQ1, but it's masked
@@ -421,6 +457,17 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
                         serial_str!("[BOOT] Synapse spawned, id=");
                         drivers::serial::write_dec(task_id);
                         serial_strln!("");
+
+                        // Synapse is the authoritative owner of the
+                        // on-disk SQLite region. Grant it the raw
+                        // block-I/O capability so `syscall_block_*`
+                        // authorize. Every other task is locked out —
+                        // block-device access must go through Synapse
+                        // IPC or the MVFS syscall family.
+                        let _ = capability::grant_raw_block_io(task_id);
+                        // Synapse also needs IPC send-any (it talks
+                        // to the intent service, compositor, shell).
+                        let _ = capability::grant_ipc_send_any(task_id);
                     }
                     Err(e) => {
                         serial_str!("[BOOT] Synapse spawn FAILED: ");
@@ -544,6 +591,81 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
                                         drivers::serial::write_newline();
                                     }
                                 }
+                            }
+
+                            // Grant the compositor a capability for every PCI
+                            // device's MMIO BAR. The WASM-driver runtime maps
+                            // these via syscall_map_physical; without these
+                            // caps the call would be rejected and VirtIO
+                            // drivers lose access to their device registers.
+                            //
+                            // Also grant IoPort capabilities for every I/O
+                            // BAR, so syscall_port_* calls authorize against
+                            // the compositor instead of a global allowlist.
+                            //
+                            // Keyed on is_compositor so other tasks don't get
+                            // a blanket grant — preserves "only compositor
+                            // can touch hardware" while replacing the old
+                            // address-range bypass with unforgeable tokens.
+                            if is_compositor {
+                                // DriverPrivilege lets the compositor later call
+                                // `syscall_pci_acquire` for devices that are
+                                // hot-plugged or weren't in the boot enumeration.
+                                // Without this cap the acquire syscall is gated
+                                // off for everyone, so hardware access stays
+                                // locked to whatever this boot-loop hands out.
+                                let _ = capability::grant_driver_privilege(task_id);
+
+                                // The WASM `folk_tensor_read` host fn in
+                                // compositor/src/host_api/ai.rs issues direct
+                                // block_read calls to pull tensor-dump data
+                                // from the debug mailbox sectors. Grant the
+                                // cap so that path still works. Future
+                                // refactor should replace this with a
+                                // per-range `BlockSectors` cap — compositor
+                                // only needs sectors 1-256 of the data disk.
+                                let _ = capability::grant_raw_block_io(task_id);
+
+                                let pci_list = drivers::pci::PCI_DEVICES.lock();
+                                let mut mmio_grants = 0u32;
+                                let mut io_grants = 0u32;
+                                for i in 0..pci_list.count {
+                                    if let Some(ref dev) = pci_list.devices[i] {
+                                        for b in 0..6u8 {
+                                            let sz = drivers::pci::bar_size(
+                                                dev.bus, dev.device, dev.function, b,
+                                            ) as u64;
+                                            if sz == 0 { continue; }
+                                            match drivers::pci::decode_bar(dev, b as usize) {
+                                                drivers::pci::BarType::Mmio32 { base, .. } => {
+                                                    if capability::grant_mmio_region(task_id, base as u64, sz).is_ok() {
+                                                        mmio_grants += 1;
+                                                    }
+                                                }
+                                                drivers::pci::BarType::Mmio64 { base, .. } => {
+                                                    if capability::grant_mmio_region(task_id, base, sz).is_ok() {
+                                                        mmio_grants += 1;
+                                                    }
+                                                }
+                                                drivers::pci::BarType::Io { base } => {
+                                                    let port_size = sz.min(0xFFFF) as u16;
+                                                    if capability::grant_io_port(task_id, base, port_size).is_ok() {
+                                                        io_grants += 1;
+                                                    }
+                                                }
+                                                drivers::pci::BarType::None => {}
+                                            }
+                                        }
+                                    }
+                                }
+                                drop(pci_list);
+                                serial_str!("[BOOT] Granted ");
+                                drivers::serial::write_dec(mmio_grants);
+                                serial_str!(" MMIO + ");
+                                drivers::serial::write_dec(io_grants);
+                                serial_str!(" IoPort BAR caps to compositor (task ");
+                                drivers::serial::write_dec(task_id);
+                                serial_strln!(")");
                             }
                         }
                         Err(e) => {

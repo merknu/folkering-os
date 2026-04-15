@@ -1,10 +1,58 @@
 //! Interrupt Descriptor Table (IDT)
 
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Timer tick counter for debugging
 static TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// MSI-X handler dispatch table for vectors 64..=95.
+/// Slot i corresponds to IDT vector `MSIX_BASE + i`. A slot of 0 means
+/// unregistered; otherwise it's an `fn()` pointer cast to usize.
+///
+/// We use AtomicUsize rather than AtomicPtr<fn()> because `AtomicPtr` over
+/// function pointers isn't stable; the usize cast is the canonical
+/// no_std-friendly way to pass `fn()` atomically.
+const MSIX_BASE: u8 = 64;
+const MSIX_COUNT: usize = 32;
+static MSIX_HANDLERS: [AtomicUsize; MSIX_COUNT] = {
+    const ZERO: AtomicUsize = AtomicUsize::new(0);
+    [ZERO; MSIX_COUNT]
+};
+
+/// Register an MSI-X handler for the given IDT vector (must be in 64..=95).
+/// The handler runs in interrupt context — keep it short and non-blocking.
+/// Returns `Err(())` if the vector is out of range.
+pub fn register_msix_handler(vector: u8, handler: fn()) -> Result<(), ()> {
+    if vector < MSIX_BASE || vector >= MSIX_BASE + MSIX_COUNT as u8 {
+        return Err(());
+    }
+    let idx = (vector - MSIX_BASE) as usize;
+    MSIX_HANDLERS[idx].store(handler as usize, Ordering::Release);
+    Ok(())
+}
+
+/// Clear a registered MSI-X handler. Safe to call on unregistered slots.
+pub fn unregister_msix_handler(vector: u8) {
+    if vector < MSIX_BASE || vector >= MSIX_BASE + MSIX_COUNT as u8 {
+        return;
+    }
+    let idx = (vector - MSIX_BASE) as usize;
+    MSIX_HANDLERS[idx].store(0, Ordering::Release);
+}
+
+/// Dispatch helper called from every MSI-X stub. Inlined into the stub
+/// bodies by the macro expansion; factored out so the stub code stays
+/// uniform and the compiler can share it.
+#[inline(always)]
+fn msix_dispatch(vector_idx: usize) {
+    let ptr = MSIX_HANDLERS[vector_idx].load(Ordering::Acquire);
+    if ptr != 0 {
+        let f: fn() = unsafe { core::mem::transmute(ptr) };
+        f();
+    }
+    super::apic::send_eoi();
+}
 
 lazy_static! {
     static ref IDT: InterruptDescriptorTable = {
@@ -39,6 +87,40 @@ lazy_static! {
         idt[55].set_handler_fn(wasm_irq_handler_55);
         idt[56].set_handler_fn(wasm_irq_handler_56);
         idt[57].set_handler_fn(wasm_irq_handler_57);
+
+        // MSI-X vectors (64-95) — dispatch through MSIX_HANDLERS at runtime
+        idt[64].set_handler_fn(msix_handler_64);
+        idt[65].set_handler_fn(msix_handler_65);
+        idt[66].set_handler_fn(msix_handler_66);
+        idt[67].set_handler_fn(msix_handler_67);
+        idt[68].set_handler_fn(msix_handler_68);
+        idt[69].set_handler_fn(msix_handler_69);
+        idt[70].set_handler_fn(msix_handler_70);
+        idt[71].set_handler_fn(msix_handler_71);
+        idt[72].set_handler_fn(msix_handler_72);
+        idt[73].set_handler_fn(msix_handler_73);
+        idt[74].set_handler_fn(msix_handler_74);
+        idt[75].set_handler_fn(msix_handler_75);
+        idt[76].set_handler_fn(msix_handler_76);
+        idt[77].set_handler_fn(msix_handler_77);
+        idt[78].set_handler_fn(msix_handler_78);
+        idt[79].set_handler_fn(msix_handler_79);
+        idt[80].set_handler_fn(msix_handler_80);
+        idt[81].set_handler_fn(msix_handler_81);
+        idt[82].set_handler_fn(msix_handler_82);
+        idt[83].set_handler_fn(msix_handler_83);
+        idt[84].set_handler_fn(msix_handler_84);
+        idt[85].set_handler_fn(msix_handler_85);
+        idt[86].set_handler_fn(msix_handler_86);
+        idt[87].set_handler_fn(msix_handler_87);
+        idt[88].set_handler_fn(msix_handler_88);
+        idt[89].set_handler_fn(msix_handler_89);
+        idt[90].set_handler_fn(msix_handler_90);
+        idt[91].set_handler_fn(msix_handler_91);
+        idt[92].set_handler_fn(msix_handler_92);
+        idt[93].set_handler_fn(msix_handler_93);
+        idt[94].set_handler_fn(msix_handler_94);
+        idt[95].set_handler_fn(msix_handler_95);
 
         idt
     };
@@ -171,3 +253,49 @@ wasm_irq_handler!(wasm_irq_handler_54, 54);
 wasm_irq_handler!(wasm_irq_handler_55, 55);
 wasm_irq_handler!(wasm_irq_handler_56, 56);
 wasm_irq_handler!(wasm_irq_handler_57, 57);
+
+// ── MSI-X IRQ Handlers (vectors 64-95) ──────────────────────────────────
+// Each stub dispatches through MSIX_HANDLERS and sends LAPIC EOI.
+// MSI-X does not use IOAPIC masking — the device controls delivery via
+// the per-entry vector_control mask bit, so stubs don't touch IOAPIC.
+
+macro_rules! msix_irq_handler {
+    ($name:ident, $vector:expr) => {
+        extern "x86-interrupt" fn $name(_stack_frame: InterruptStackFrame) {
+            msix_dispatch($vector - MSIX_BASE as usize);
+        }
+    };
+}
+
+msix_irq_handler!(msix_handler_64, 64);
+msix_irq_handler!(msix_handler_65, 65);
+msix_irq_handler!(msix_handler_66, 66);
+msix_irq_handler!(msix_handler_67, 67);
+msix_irq_handler!(msix_handler_68, 68);
+msix_irq_handler!(msix_handler_69, 69);
+msix_irq_handler!(msix_handler_70, 70);
+msix_irq_handler!(msix_handler_71, 71);
+msix_irq_handler!(msix_handler_72, 72);
+msix_irq_handler!(msix_handler_73, 73);
+msix_irq_handler!(msix_handler_74, 74);
+msix_irq_handler!(msix_handler_75, 75);
+msix_irq_handler!(msix_handler_76, 76);
+msix_irq_handler!(msix_handler_77, 77);
+msix_irq_handler!(msix_handler_78, 78);
+msix_irq_handler!(msix_handler_79, 79);
+msix_irq_handler!(msix_handler_80, 80);
+msix_irq_handler!(msix_handler_81, 81);
+msix_irq_handler!(msix_handler_82, 82);
+msix_irq_handler!(msix_handler_83, 83);
+msix_irq_handler!(msix_handler_84, 84);
+msix_irq_handler!(msix_handler_85, 85);
+msix_irq_handler!(msix_handler_86, 86);
+msix_irq_handler!(msix_handler_87, 87);
+msix_irq_handler!(msix_handler_88, 88);
+msix_irq_handler!(msix_handler_89, 89);
+msix_irq_handler!(msix_handler_90, 90);
+msix_irq_handler!(msix_handler_91, 91);
+msix_irq_handler!(msix_handler_92, 92);
+msix_irq_handler!(msix_handler_93, 93);
+msix_irq_handler!(msix_handler_94, 94);
+msix_irq_handler!(msix_handler_95, 95);

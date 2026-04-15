@@ -14,3 +14,6 @@ pub mod iqe;
 pub mod telemetry;
 pub mod iommu;
 pub mod ac97;
+pub mod msix;
+pub mod nvme;
+pub mod storage_bench;
