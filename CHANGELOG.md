@@ -337,14 +337,74 @@ folkering-daq (1 commit):
 
 ---
 
-## Nøkkeltall (oppdatert 13. april 2026)
+## 15. april 2026
+**Hardware sprint: MSI-X, NVMe, DMA-pool, MVFS-på-NVMe**
+
+### MSI-X interrupt routing
+- `drivers/msix.rs` — capability walker (PCI cap 0x11), vector allocator
+  for IDT 64-95, MMIO-mapping table locator (NO_CACHE flags), entry
+  programmer. VirtIO-blk migrated from IRQ11/IOAPIC til MSI-X vektor 64.
+- Self-test + KGraph + MVFS-round-trip bekreftet end-to-end på MSI-X-banen.
+- Oppdaget + fikset: `arch/x86_64/idt.rs`'s lazy_static IDT er inaktiv
+  (kernel bruker main.rs' manuelt oppsatte IDT). Naked asm-stubs for vektor
+  64 + 65 lagt til der.
+
+### NVMe driver (`drivers/nvme.rs`)
+- PCI class-0x01/0x08/0x02 detect, BAR0 MMIO (NO_CACHE), CAP/VS/CC/CSTS
+  handshake, admin + I/O queue pair med phase-tag polling.
+- Identify Controller + Namespace (QEMU: 32768 LBAs × 512 B = 16 MiB).
+- PRP1 / PRP1+PRP2 / PRP-list transfers opp til 63 datasider per kommando
+  (~252 KiB). Alle tre moduser verifisert med self-test.
+- Write/read round-trip (0xDEADBEEF på LBA 1) + flerblokk multi-PRP-test
+  (8/16/32 blokker).
+
+### DMA-side-pool (Phase 4)
+- 64 forhåndsallokerte 4 KiB-sider med `AtomicU64` fri-bitmap (CAS-basert
+  acquire, fetch_or release). Zero allocations på hot path.
+- `lease_pages()` med error-unwind — partielle leases slippes ved feil.
+- Leak-sjekk: 64/64 sider frie etter self-test bekrefter korrekt release.
+
+### Completion-timeout + CSTS.CFS watchdog
+- `submit_and_wait` bundet til 500M iter med periodisk Controller Fatal
+  Status-sjekk. Wedget controller → ren feil, aldri kernel-hang.
+
+### Interrupt-drevet completion (hybrid wait)
+- 1M-iter spin-pause budsjett (~300 μs) deretter `hlt` mellom fase-sjekker.
+- MSI-X eller timer-tick vekker CPU. Fast commands beholder tight-loop-ytelse.
+- Empirisk: 5M budsjett var verre under QEMU/whpx fordi `pause`-VM-exit
+  dominerer — på bare-metal inverterer tradeoff. Dokumentert i kildekoden.
+
+### MVFS-på-NVMe (pluggable backend)
+- `Backend` enum + `AtomicU8` selector + `use_nvme_backend()` switch i
+  `fs/mvfs.rs`. Alle `virtio_blk::*` call-sites routet gjennom dispatcher.
+- Boot-order endret: NVMe init før MVFS load; foretrekker NVMe når tilgjengelig.
+- Persistens-bevis: `boot_counter = 1` (fersk disk) → full QEMU reboot →
+  `boot_counter = 2` fra `[MVFS] loaded 1 entries from disk`.
+
+### Storage throughput baseline (`drivers/storage_bench.rs`)
+- TSC-timet 1 MiB sekvensiell write/read + 100 random 512 B reads.
+- NVMe: **455 MB/s write, 432 MB/s read, 42 μs random**.
+- VirtIO-blk ekskludert — KVM VirtIO status=0xFF quirk kontaminerer tallene
+  (retry-workarounden ville blitt målt, ikke enheten).
+
+```
+1bbca04  feat: MSI-X + NVMe driver with MVFS-on-NVMe persistence
+         10 files changed, 2838 insertions(+), 24 deletions(-)
+```
+
+---
+
+## Nøkkeltall (oppdatert 15. april 2026)
 
 | Metrikk | Verdi |
 |---------|-------|
-| Total commits | 95+ (4 repos) |
-| Utviklingsperiode | 23. januar – 13. april 2026 |
+| Total commits | 96+ (4 repos) |
+| Utviklingsperiode | 23. januar – 15. april 2026 |
 | Kernel | Rust no_std, x86-64, Limine bootloader |
-| Kernel size | 2211 KB |
+| Kernel size | 2400 KB |
+| Storage backends | NVMe (primary) + VirtIO-blk (fallback), swappable via MVFS dispatcher |
+| NVMe throughput | 455 MB/s write, 432 MB/s read, 42 μs random (1 MiB, 512 B sectors) |
+| Interrupts | MSI-X vektor 64 (VirtIO-blk) + 65 (NVMe), legacy IOAPIC behold for keyboard/mouse |
 | Syscalls | 100+ (inkl. async TCP 0xE0-E3, W^X 0x32, Draug bridge 0xD0-D1) |
 | Modell (on-device) | SmolLM2-135M, Q4_0 kvantisering |
 | Modell (Draug) | qwen2.5-coder:7b (L1), gemma4:31b-cloud (L2+) via Ollama |
