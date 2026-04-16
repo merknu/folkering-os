@@ -618,6 +618,77 @@ impl Encoder {
         Ok(())
     }
 
+    /// DUP Vd.4S, Vn.S[0] — broadcast lane 0 of Vn to all 4 lanes of
+    /// Vd. Lowering for `f32x4.splat`: the source f32 lives in Sn
+    /// (low 32 bits of Vn lane 0), and this instruction replicates
+    /// it across the full 128-bit register.
+    ///
+    /// Encoding (AdvSIMD DUP element, vector):
+    /// `0 Q 0 0 1 1 1 0 0 0 0 imm5(5) 0 0 0 0 0 1 Rn(5) Rd(5)`
+    /// For Q=1 (4S), imm5=00100 (32-bit lane 0), base 0x4E040400.
+    pub fn dup_4s_from_vs_lane0(&mut self, vd: Vreg, vn: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x4E04_0400u32 | (vn.enc() << 5) | vd.enc());
+        Ok(())
+    }
+
+    /// DUP Vd.4S, Wn — replicate the low 32 bits of a W register
+    /// across all 4 lanes of Vd. Lowering for `i32x4.splat`: the
+    /// integer source is in the X-bank, this crosses the bank.
+    ///
+    /// Encoding (AdvSIMD DUP general):
+    /// `0 Q 0 0 1 1 1 0 0 0 0 imm5(5) 0 0 0 0 1 1 Rn(5) Rd(5)`
+    /// For Q=1 (4S), imm5=00100 (32-bit element), base 0x4E040C00.
+    pub fn dup_4s_from_w(&mut self, vd: Vreg, wn: Reg) -> Result<(), EncodeError> {
+        self.emit(0x4E04_0C00u32 | (wn.enc() << 5) | vd.enc());
+        Ok(())
+    }
+
+    /// ADD Vd.4S, Vn.4S, Vm.4S — lane-wise i32 add (no float).
+    ///
+    /// Encoding (C6.2.1 AdvSIMD 3-same, U=0, size=10, opcode=10000):
+    /// `0 Q 0 0 1 1 1 0 size 1 Rm 1 0 0 0 0 1 Rn Rd`, base 0x4EA08400.
+    pub fn add_4s_vector(&mut self, vd: Vreg, vn: Vreg, vm: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x4EA0_8400u32 | (vm.enc() << 16) | (vn.enc() << 5) | vd.enc());
+        Ok(())
+    }
+
+    /// SUB Vd.4S, Vn.4S, Vm.4S — lane-wise i32 subtract.
+    /// Encoding (same as ADD but U=1): base 0x6EA08400.
+    pub fn sub_4s_vector(&mut self, vd: Vreg, vn: Vreg, vm: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x6EA0_8400u32 | (vm.enc() << 16) | (vn.enc() << 5) | vd.enc());
+        Ok(())
+    }
+
+    /// MUL Vd.4S, Vn.4S, Vm.4S — lane-wise i32 multiply (low 32 bits
+    /// of product). Unlike FMUL this is plain integer mul.
+    ///
+    /// Encoding (C6.2.180 AdvSIMD 3-same, U=0, size=10, opcode=10011):
+    /// bits 15:10 = 100111, base 0x4EA09C00.
+    pub fn mul_4s_vector(&mut self, vd: Vreg, vn: Vreg, vm: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x4EA0_9C00u32 | (vm.enc() << 16) | (vn.enc() << 5) | vd.enc());
+        Ok(())
+    }
+
+    /// UMOV Wd, Vn.S[lane] — extract one 32-bit lane of Vn into
+    /// general register Wd. Lowering for `i32x4.extract_lane N`.
+    /// Zero-extends into the full X register.
+    ///
+    /// Encoding (C6.2.312 AdvSIMD copy UMOV general):
+    /// `0 Q 0 0 1 1 1 0 0 0 0 imm5(5) 0 0 1 1 1 1 Rn(5) Rd(5)`
+    /// For 32-bit S lanes, Q=0 (destination is W), imm5 = lane<<3 | 0b100.
+    /// Base 0x0E003C00.
+    pub fn umov_w_from_vs_lane(
+        &mut self,
+        wd: Reg,
+        vn: Vreg,
+        lane: u8,
+    ) -> Result<(), EncodeError> {
+        if lane >= 4 { return Err(EncodeError::ImmediateOutOfRange); }
+        let imm5 = ((lane as u32) << 3) | 0b100;
+        self.emit(0x0E00_3C00u32 | (imm5 << 16) | (vn.enc() << 5) | wd.enc());
+        Ok(())
+    }
+
     // ── Phase 15: conversions ───────────────────────────────────────
     //
     // Covers sign-extensions (WASM's extend8_s / extend16_s / extend32_s),
@@ -1747,6 +1818,75 @@ mod tests {
     #[test]
     fn dup_s_lane_out_of_range_rejected() {
         assert!(Encoder::new().dup_s_from_v_s_lane(Vreg::S0, Vreg::S0, 4).is_err());
+    }
+
+    #[test]
+    fn dup_4s_from_vs_lane0_basic() {
+        // dup v0.4s, v1.s[0]
+        // base 0x4E040400 | (1<<5) | 0 = 0x4E040420
+        assert_eq!(
+            one(|e| e.dup_4s_from_vs_lane0(Vreg::S0, Vreg::S1)),
+            0x4E040420
+        );
+    }
+
+    #[test]
+    fn dup_4s_from_w_basic() {
+        // dup v0.4s, w1
+        // base 0x4E040C00 | (1<<5) | 0 = 0x4E040C20
+        assert_eq!(one(|e| e.dup_4s_from_w(Vreg::S0, Reg::X1)), 0x4E040C20);
+    }
+
+    #[test]
+    fn add_4s_vector_basic() {
+        // add v0.4s, v1.4s, v2.4s
+        // base 0x4EA08400 | (2<<16) | (1<<5) | 0 = 0x4EA28420
+        assert_eq!(
+            one(|e| e.add_4s_vector(Vreg::S0, Vreg::S1, Vreg::S2)),
+            0x4EA28420
+        );
+    }
+
+    #[test]
+    fn sub_4s_vector_basic() {
+        // sub v0.4s, v1.4s, v2.4s
+        // base 0x6EA08400 | (2<<16) | (1<<5) | 0 = 0x6EA28420
+        assert_eq!(
+            one(|e| e.sub_4s_vector(Vreg::S0, Vreg::S1, Vreg::S2)),
+            0x6EA28420
+        );
+    }
+
+    #[test]
+    fn mul_4s_vector_basic() {
+        // mul v0.4s, v1.4s, v2.4s
+        // base 0x4EA09C00 | (2<<16) | (1<<5) | 0 = 0x4EA29C20
+        assert_eq!(
+            one(|e| e.mul_4s_vector(Vreg::S0, Vreg::S1, Vreg::S2)),
+            0x4EA29C20
+        );
+    }
+
+    #[test]
+    fn umov_w_from_vs_lane_0() {
+        // umov w0, v1.s[0]
+        // imm5 = 0b00100 = 4
+        // base 0x0E003C00 | (4<<16) | (1<<5) | 0 = 0x0E043C20
+        assert_eq!(
+            one(|e| e.umov_w_from_vs_lane(Reg::X0, Vreg::S1, 0)),
+            0x0E043C20
+        );
+    }
+
+    #[test]
+    fn umov_w_from_vs_lane_3() {
+        // umov w0, v1.s[3]
+        // imm5 = 0b11100 = 28
+        // base 0x0E003C00 | (28<<16) | (1<<5) | 0 = 0x0E1C3C20
+        assert_eq!(
+            one(|e| e.umov_w_from_vs_lane(Reg::X0, Vreg::S1, 3)),
+            0x0E1C3C20
+        );
     }
 
     // ── Phase 15 conversion encoders ────────────────────────────────

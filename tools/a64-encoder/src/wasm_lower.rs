@@ -282,6 +282,18 @@ pub enum WasmOp {
     F32x4Mul,
     /// Pop one V128, push lane `N` (0..=3) as a scalar F32.
     F32x4ExtractLane(u8),
+    /// Pop F32 scalar, push V128 with all four lanes = the scalar.
+    F32x4Splat,
+    /// Pop I32 scalar, push V128 with all four lanes = the scalar.
+    I32x4Splat,
+    /// Pop two V128s, push lane-wise i32 sum (`ADD Vd.4S`).
+    I32x4Add,
+    /// Pop two V128s, push lane-wise i32 difference.
+    I32x4Sub,
+    /// Pop two V128s, push lane-wise i32 product (low 32 bits).
+    I32x4Mul,
+    /// Pop V128, push lane `N` as scalar I32 (`UMOV Wd, Vn.S[N]`).
+    I32x4ExtractLane(u8),
     /// Copy local `n` onto the stack.
     LocalGet(u32),
     /// Pop stack top, store into local `n`.
@@ -920,6 +932,12 @@ impl Lowerer {
             WasmOp::F32x4Add => self.lower_f32x4_add(),
             WasmOp::F32x4Mul => self.lower_f32x4_mul(),
             WasmOp::F32x4ExtractLane(lane) => self.lower_f32x4_extract_lane(lane),
+            WasmOp::F32x4Splat => self.lower_f32x4_splat(),
+            WasmOp::I32x4Splat => self.lower_i32x4_splat(),
+            WasmOp::I32x4Add => self.lower_i32x4_add(),
+            WasmOp::I32x4Sub => self.lower_i32x4_sub(),
+            WasmOp::I32x4Mul => self.lower_i32x4_mul(),
+            WasmOp::I32x4ExtractLane(lane) => self.lower_i32x4_extract_lane(lane),
             // Phase 15 conversions.
             WasmOp::I32Extend8S => self.lower_i32_extend_narrow(true, false),
             WasmOp::I32Extend16S => self.lower_i32_extend_narrow(false, false),
@@ -1337,6 +1355,63 @@ impl Lowerer {
         // first lane), but we emit the DUP unconditionally so the
         // semantics are obvious from the disassembly.
         self.enc.dup_s_from_v_s_lane(dst, src, lane)?;
+        Ok(())
+    }
+
+    /// Lower `f32x4.splat` — pop F32, push V128 with the scalar
+    /// replicated across all 4 lanes. DUP Vd.4S, Vn.S[0] broadcasts
+    /// lane 0 of the source V register (where the scalar lives).
+    fn lower_f32x4_splat(&mut self) -> Result<(), LowerError> {
+        let src = self.pop_f32_slot()?;
+        let dst = self.push_v128_slot()?;
+        self.enc.dup_4s_from_vs_lane0(dst, src)?;
+        Ok(())
+    }
+
+    /// Lower `i32x4.splat` — pop I32, push V128. Bank crossing:
+    /// the scalar lives in the X bank, target is V. `DUP Vd.4S, Wn`
+    /// handles it in one instruction.
+    fn lower_i32x4_splat(&mut self) -> Result<(), LowerError> {
+        let src = self.pop_i32_slot()?;
+        let dst = self.push_v128_slot()?;
+        self.enc.dup_4s_from_w(dst, src)?;
+        Ok(())
+    }
+
+    /// Lower `i32x4.add/sub/mul` — integer vector arithmetic.
+    /// Structurally identical to the f32x4 variants, just a
+    /// different AdvSIMD opcode (ADD/SUB/MUL vs FADD/FMUL).
+    fn lower_i32x4_add(&mut self) -> Result<(), LowerError> {
+        let rhs = self.pop_v128_slot()?;
+        let lhs = self.pop_v128_slot()?;
+        let dst = self.push_v128_slot()?;
+        self.enc.add_4s_vector(dst, lhs, rhs)?;
+        Ok(())
+    }
+
+    fn lower_i32x4_sub(&mut self) -> Result<(), LowerError> {
+        let rhs = self.pop_v128_slot()?;
+        let lhs = self.pop_v128_slot()?;
+        let dst = self.push_v128_slot()?;
+        self.enc.sub_4s_vector(dst, lhs, rhs)?;
+        Ok(())
+    }
+
+    fn lower_i32x4_mul(&mut self) -> Result<(), LowerError> {
+        let rhs = self.pop_v128_slot()?;
+        let lhs = self.pop_v128_slot()?;
+        let dst = self.push_v128_slot()?;
+        self.enc.mul_4s_vector(dst, lhs, rhs)?;
+        Ok(())
+    }
+
+    /// Lower `i32x4.extract_lane N` — pop V128, push I32 scalar.
+    /// UMOV Wd, Vn.S[N] — zero-extends the 32-bit lane into the
+    /// full X register, matching the i32 slot semantics.
+    fn lower_i32x4_extract_lane(&mut self, lane: u8) -> Result<(), LowerError> {
+        let src = self.pop_v128_slot()?;
+        let dst = self.push_i32_slot()?;
+        self.enc.umov_w_from_vs_lane(dst, src, lane)?;
         Ok(())
     }
 

@@ -192,6 +192,88 @@ fn cases() -> Vec<Case> {
             },
             expected: 1,
         },
+        // ── f32x4.splat ───────────────────────────────────────────
+        // Broadcast 7.25 to 4 lanes. Extract lane 2 → must be 7.25.
+        Case {
+            name: "f32x4.splat 7.25 → lane 2 = 7.25",
+            ops: vec![
+                WasmOp::F32Const(7.25),
+                WasmOp::F32x4Splat,
+                WasmOp::F32x4ExtractLane(2),
+                WasmOp::F32Const(7.25),
+                WasmOp::F32Eq,
+                WasmOp::End,
+            ],
+            expected: 1,
+        },
+        // ── i32x4.splat + add + extract_lane ──────────────────────
+        // Splat 10 → [10,10,10,10], splat 5 → [5,5,5,5], add → [15]×4,
+        // extract lane 0 → 15.
+        Case {
+            name: "i32x4.splat(10) + splat(5) → extract lane 0 = 15",
+            ops: vec![
+                WasmOp::I32Const(10),
+                WasmOp::I32x4Splat,
+                WasmOp::I32Const(5),
+                WasmOp::I32x4Splat,
+                WasmOp::I32x4Add,
+                WasmOp::I32x4ExtractLane(0),
+                WasmOp::End,
+            ],
+            expected: 15,
+        },
+        // ── i32x4.sub ─────────────────────────────────────────────
+        // splat(100) - splat(58) = 42 in every lane, extract lane 3.
+        Case {
+            name: "i32x4.sub splat(100) - splat(58) → lane 3 = 42",
+            ops: vec![
+                WasmOp::I32Const(100),
+                WasmOp::I32x4Splat,
+                WasmOp::I32Const(58),
+                WasmOp::I32x4Splat,
+                WasmOp::I32x4Sub,
+                WasmOp::I32x4ExtractLane(3),
+                WasmOp::End,
+            ],
+            expected: 42,
+        },
+        // ── i32x4.mul ─────────────────────────────────────────────
+        // splat(6) * splat(7) = 42, extract lane 1.
+        Case {
+            name: "i32x4.mul splat(6) * splat(7) → lane 1 = 42",
+            ops: vec![
+                WasmOp::I32Const(6),
+                WasmOp::I32x4Splat,
+                WasmOp::I32Const(7),
+                WasmOp::I32x4Splat,
+                WasmOp::I32x4Mul,
+                WasmOp::I32x4ExtractLane(1),
+                WasmOp::End,
+            ],
+            expected: 42,
+        },
+        // ── Mixed i32x4 vector from memory ────────────────────────
+        // Write [10, 20, 30, 40] as four consecutive i32s at mem[0],
+        // load as v128, extract lane 2 → 30.
+        Case {
+            name: "i32x4 mem load → extract_lane(2) = 30",
+            ops: {
+                let mut ops = Vec::new();
+                for (i, &v) in [10i32, 20, 30, 40].iter().enumerate() {
+                    ops.push(WasmOp::I32Const((4 * i) as i32));
+                    ops.push(WasmOp::I32Const(v));
+                    ops.push(WasmOp::I32Store(0));
+                }
+                ops.extend_from_slice(&[
+                    WasmOp::I32Const(0),
+                    WasmOp::V128Load(0),
+                    WasmOp::I32x4ExtractLane(2),
+                    WasmOp::End,
+                ]);
+                ops
+            },
+            expected: 30,
+        },
         // ── v128.store round-trip ─────────────────────────────────
         // Load a vector from mem[0], store it to mem[48], then read
         // back mem[48] as v128, extract lane 1, compare to original.

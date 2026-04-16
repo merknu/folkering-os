@@ -336,6 +336,16 @@ pub fn parse_ops(bytes: &[u8], pos: &mut usize) -> Result<Vec<WasmOp>, ParseErro
                         if off > u32::MAX as u64 { return Err(ParseError::IntegerTooLarge); }
                         ops.push(WasmOp::V128Store(off as u32));
                     }
+                    0x11 => ops.push(WasmOp::I32x4Splat),
+                    0x13 => ops.push(WasmOp::F32x4Splat),
+                    0x1B => {
+                        // i32x4.extract_lane laneidx
+                        if *pos >= bytes.len() { return Err(ParseError::UnexpectedEof); }
+                        let lane = bytes[*pos];
+                        *pos += 1;
+                        if lane > 3 { return Err(ParseError::UnknownOpcode(lane)); }
+                        ops.push(WasmOp::I32x4ExtractLane(lane));
+                    }
                     0x1F => {
                         // f32x4.extract_lane laneidx
                         if *pos >= bytes.len() { return Err(ParseError::UnexpectedEof); }
@@ -346,6 +356,9 @@ pub fn parse_ops(bytes: &[u8], pos: &mut usize) -> Result<Vec<WasmOp>, ParseErro
                         }
                         ops.push(WasmOp::F32x4ExtractLane(lane));
                     }
+                    0xAE => ops.push(WasmOp::I32x4Add),
+                    0xB1 => ops.push(WasmOp::I32x4Sub),
+                    0xB5 => ops.push(WasmOp::I32x4Mul),
                     0xE4 => ops.push(WasmOp::F32x4Add),
                     0xE6 => ops.push(WasmOp::F32x4Mul),
                     _ => {
