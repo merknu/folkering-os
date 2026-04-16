@@ -141,6 +141,22 @@ pub fn parse_ops(bytes: &[u8], pos: &mut usize) -> Result<Vec<WasmOp>, ParseErro
                 let bits = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
                 ops.push(WasmOp::F32Const(f32::from_bits(bits)));
             }
+            0x42 => {
+                // i64.const — signed LEB128, full 64-bit range.
+                let v = read_sleb128(bytes, pos)?;
+                ops.push(WasmOp::I64Const(v));
+            }
+            0x50 => ops.push(WasmOp::I64Eqz),
+            0x51 => ops.push(WasmOp::I64Eq),
+            0x52 => ops.push(WasmOp::I64Ne),
+            0x53 => ops.push(WasmOp::I64LtS),
+            0x55 => ops.push(WasmOp::I64GtS),
+            0x7C => ops.push(WasmOp::I64Add),
+            0x7D => ops.push(WasmOp::I64Sub),
+            0x7E => ops.push(WasmOp::I64Mul),
+            0xA7 => ops.push(WasmOp::I32WrapI64),
+            0xAC => ops.push(WasmOp::I64ExtendI32S),
+            0xAD => ops.push(WasmOp::I64ExtendI32U),
             0x28 => {
                 // i32.load memarg: align (uleb) then offset (uleb).
                 let _align = read_uleb128(bytes, pos)?;

@@ -41,12 +41,26 @@ use crate::{
 /// so the lowerer can pick the right register bank (X vs V) and the
 /// right instruction family (integer vs FP) for each op.
 ///
-/// Phase 9 introduces F32 alongside I32; I64/F64/V128 are future
-/// phases and would slot in here the same way.
+/// I32 and I64 share the X register bank — same 5-bit register field
+/// addresses a 32-bit W-view or a 64-bit X-view of the same file.
+/// F32/F64 similarly share V-bank. The lowerer uses the type tag to
+/// pick the right instruction width (e.g. `add` vs `and_w`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValType {
     I32,
+    I64,
     F32,
+}
+
+impl ValType {
+    /// True for integer-bank types (X/W register views).
+    fn is_int(self) -> bool {
+        matches!(self, ValType::I32 | ValType::I64)
+    }
+    /// True for SIMD/FP-bank types (V/S/D register views).
+    fn is_fp(self) -> bool {
+        matches!(self, ValType::F32)
+    }
 }
 
 /// Simplified WASM operator set.  Hand-constructed by callers, or
@@ -96,6 +110,30 @@ pub enum WasmOp {
     /// Pop one, push 1 if value is zero else 0. Unary version of
     /// `I32Eq` with implicit zero right-hand side.
     I32Eqz,
+    /// Push a 64-bit constant onto the stack.
+    I64Const(i64),
+    /// Pop two i64s, push their sum.
+    I64Add,
+    /// Pop two i64s, push (left − right).
+    I64Sub,
+    /// Pop two i64s, push (left × right).
+    I64Mul,
+    /// Pop one i64, push 1 (i32) if zero else 0.
+    I64Eqz,
+    /// Pop two i64s, push i32 1 if equal else 0.
+    I64Eq,
+    /// Pop two i64s, push i32 1 if not equal else 0.
+    I64Ne,
+    /// Pop two i64s, push i32 1 if left < right (signed) else 0.
+    I64LtS,
+    /// Pop two i64s, push i32 1 if left > right (signed) else 0.
+    I64GtS,
+    /// Pop i64, push its low 32 bits as i32 (wrap semantics).
+    I32WrapI64,
+    /// Pop i32, push as i64 with signed extension.
+    I64ExtendI32S,
+    /// Pop i32, push as i64 with zero extension.
+    I64ExtendI32U,
     /// Pop two, push bitwise AND.
     I32And,
     /// Pop two, push bitwise OR.
@@ -249,6 +287,12 @@ enum BinOp {
 #[derive(Clone, Copy)]
 enum FBinOp { Add, Sub, Mul, Div }
 
+/// i64 arithmetic subset. Same ADD/SUB/MUL encoders as i32 (both
+/// are 64-bit X-width already), but the lowerer uses the typed
+/// i64 stack helpers so the operand-stack type tag stays correct.
+#[derive(Clone, Copy)]
+enum I64Op { Add, Sub, Mul }
+
 /// Maximum WASM operand-stack depth in i32 slots (X0..X15).
 const MAX_I32_STACK: usize = 16;
 /// Maximum operand-stack depth in f32 slots (S0..S15).
@@ -278,9 +322,12 @@ const MEM_BASE_REG: Reg = Reg(28);
 
 /// Mapping from a WASM local index to its host register. The
 /// lowerer holds one of these per local, populated at construction.
+/// I32 and I64 share the X-bank — the variant tells callers which
+/// instruction width to use.
 #[derive(Debug, Clone, Copy)]
 enum LocalLoc {
     I32(Reg),
+    I64(Reg),
     F32(Vreg),
 }
 
@@ -337,9 +384,10 @@ pub struct Lowerer {
     stack: Vec<ValType>,
     /// Count of live I32 slots (= next free X index). Incremented on
     /// `push_i32`, decremented on pop of an I32.
-    i32_depth: usize,
-    /// Count of live F32 slots (= next free S index).
-    f32_depth: usize,
+    /// Count of live integer slots (I32 + I64 combined, same X bank).
+    int_depth: usize,
+    /// Count of live SIMD/FP slots (F32 + later F64, same V bank).
+    fp_depth: usize,
     /// Per-local host-register mapping, indexed by WASM local index.
     locals: Vec<LocalLoc>,
     label_stack: Vec<Label>,
@@ -381,8 +429,8 @@ impl Lowerer {
         Ok(Self {
             enc,
             stack: Vec::new(),
-            i32_depth: 0,
-            f32_depth: 0,
+            int_depth: 0,
+            fp_depth: 0,
             locals,
             label_stack: Vec::new(),
             call_targets: Vec::new(),
@@ -400,30 +448,41 @@ impl Lowerer {
         types: &[ValType],
         _frame: bool,
     ) -> Result<Vec<LocalLoc>, LowerError> {
-        let mut i32_idx: u8 = 0;
-        let mut f32_idx: u8 = 0;
+        // I32 and I64 locals share X19..X27 — same physical register
+        // file, different instruction widths. `int_idx` counts either.
+        let mut int_idx: u8 = 0;
+        let mut fp_idx: u8 = 0;
         let mut out = Vec::with_capacity(types.len());
         for &ty in types {
             match ty {
                 ValType::I32 => {
-                    if (i32_idx as usize) >= MAX_I32_LOCALS {
+                    if (int_idx as usize) >= MAX_I32_LOCALS {
                         return Err(LowerError::TooManyLocals);
                     }
-                    let r = Reg(LOCAL_I32_BASE_REG + i32_idx);
+                    let r = Reg(LOCAL_I32_BASE_REG + int_idx);
                     enc.movz(r, 0, MovShift::Lsl0)?;
                     out.push(LocalLoc::I32(r));
-                    i32_idx += 1;
+                    int_idx += 1;
                 }
-                ValType::F32 => {
-                    if (f32_idx as usize) >= MAX_F32_LOCALS {
+                ValType::I64 => {
+                    if (int_idx as usize) >= MAX_I32_LOCALS {
                         return Err(LowerError::TooManyLocals);
                     }
-                    let v = Vreg(LOCAL_F32_BASE_REG + f32_idx);
-                    // Zero-init: FMOV Sv, WZR (bit-casts the zero
-                    // register's low 32 into the S register).
+                    let r = Reg(LOCAL_I32_BASE_REG + int_idx);
+                    // MOVZ X (64-bit) clears the full 64 bits.
+                    enc.movz(r, 0, MovShift::Lsl0)?;
+                    out.push(LocalLoc::I64(r));
+                    int_idx += 1;
+                }
+                ValType::F32 => {
+                    if (fp_idx as usize) >= MAX_F32_LOCALS {
+                        return Err(LowerError::TooManyLocals);
+                    }
+                    let v = Vreg(LOCAL_F32_BASE_REG + fp_idx);
+                    // Zero-init: FMOV Sv, WZR.
                     enc.fmov_s_from_w(v, Reg::ZR)?;
                     out.push(LocalLoc::F32(v));
-                    f32_idx += 1;
+                    fp_idx += 1;
                 }
             }
         }
@@ -458,8 +517,8 @@ impl Lowerer {
         Ok(Self {
             enc,
             stack: Vec::new(),
-            i32_depth: 0,
-            f32_depth: 0,
+            int_depth: 0,
+            fp_depth: 0,
             locals,
             label_stack: Vec::new(),
             call_targets,
@@ -505,8 +564,8 @@ impl Lowerer {
         Ok(Self {
             enc,
             stack: Vec::new(),
-            i32_depth: 0,
-            f32_depth: 0,
+            int_depth: 0,
+            fp_depth: 0,
             locals,
             label_stack: Vec::new(),
             call_targets,
@@ -535,6 +594,18 @@ impl Lowerer {
             WasmOp::I32LeU  => self.lower_binop(BinOp::Cmp(Condition::Ls)),
             WasmOp::I32GeU  => self.lower_binop(BinOp::Cmp(Condition::Hs)),
             WasmOp::I32Eqz  => self.lower_eqz(),
+            WasmOp::I64Const(c) => self.lower_i64_const(c),
+            WasmOp::I64Add => self.lower_i64_binop(I64Op::Add),
+            WasmOp::I64Sub => self.lower_i64_binop(I64Op::Sub),
+            WasmOp::I64Mul => self.lower_i64_binop(I64Op::Mul),
+            WasmOp::I64Eqz => self.lower_i64_eqz(),
+            WasmOp::I64Eq => self.lower_i64_cmp(Condition::Eq),
+            WasmOp::I64Ne => self.lower_i64_cmp(Condition::Ne),
+            WasmOp::I64LtS => self.lower_i64_cmp(Condition::Lt),
+            WasmOp::I64GtS => self.lower_i64_cmp(Condition::Gt),
+            WasmOp::I32WrapI64 => self.lower_wrap_i64(),
+            WasmOp::I64ExtendI32S => self.lower_extend_i32(true),
+            WasmOp::I64ExtendI32U => self.lower_extend_i32(false),
             WasmOp::I32And  => self.lower_binop(BinOp::And),
             WasmOp::I32Or   => self.lower_binop(BinOp::Or),
             WasmOp::I32Xor  => self.lower_binop(BinOp::Xor),
@@ -614,12 +685,12 @@ impl Lowerer {
 
     /// Push an I32 slot; returns the X-bank register that holds it.
     fn push_i32_slot(&mut self) -> Result<Reg, LowerError> {
-        if self.i32_depth >= MAX_I32_STACK {
+        if self.int_depth >= MAX_I32_STACK {
             return Err(LowerError::TypedStackOverflow(ValType::I32));
         }
-        let r = Reg::new(self.i32_depth as u8)
+        let r = Reg::new(self.int_depth as u8)
             .ok_or(LowerError::TypedStackOverflow(ValType::I32))?;
-        self.i32_depth += 1;
+        self.int_depth += 1;
         self.stack.push(ValType::I32);
         Ok(r)
     }
@@ -635,18 +706,18 @@ impl Lowerer {
             });
         }
         self.stack.pop();
-        self.i32_depth -= 1;
-        Reg::new(self.i32_depth as u8).ok_or(LowerError::StackUnderflow)
+        self.int_depth -= 1;
+        Reg::new(self.int_depth as u8).ok_or(LowerError::StackUnderflow)
     }
 
     /// Push an F32 slot; returns the V-bank register.
     fn push_f32_slot(&mut self) -> Result<Vreg, LowerError> {
-        if self.f32_depth >= MAX_F32_STACK {
+        if self.fp_depth >= MAX_F32_STACK {
             return Err(LowerError::TypedStackOverflow(ValType::F32));
         }
-        let v = Vreg::new(self.f32_depth as u8)
+        let v = Vreg::new(self.fp_depth as u8)
             .ok_or(LowerError::TypedStackOverflow(ValType::F32))?;
-        self.f32_depth += 1;
+        self.fp_depth += 1;
         self.stack.push(ValType::F32);
         Ok(v)
     }
@@ -661,8 +732,36 @@ impl Lowerer {
             });
         }
         self.stack.pop();
-        self.f32_depth -= 1;
-        Vreg::new(self.f32_depth as u8).ok_or(LowerError::StackUnderflow)
+        self.fp_depth -= 1;
+        Vreg::new(self.fp_depth as u8).ok_or(LowerError::StackUnderflow)
+    }
+
+    /// Push an I64 slot; returns the X-bank register. Shares the
+    /// `int_depth` counter with I32 since both types live in the
+    /// same physical register file — the width distinction is in
+    /// the instruction, not the register.
+    fn push_i64_slot(&mut self) -> Result<Reg, LowerError> {
+        if self.int_depth >= MAX_I32_STACK {
+            return Err(LowerError::TypedStackOverflow(ValType::I64));
+        }
+        let r = Reg::new(self.int_depth as u8)
+            .ok_or(LowerError::TypedStackOverflow(ValType::I64))?;
+        self.int_depth += 1;
+        self.stack.push(ValType::I64);
+        Ok(r)
+    }
+
+    fn pop_i64_slot(&mut self) -> Result<Reg, LowerError> {
+        let ty = self.stack.last().copied().ok_or(LowerError::StackUnderflow)?;
+        if ty != ValType::I64 {
+            return Err(LowerError::TypeMismatch {
+                expected: ValType::I64,
+                got: ty,
+            });
+        }
+        self.stack.pop();
+        self.int_depth -= 1;
+        Reg::new(self.int_depth as u8).ok_or(LowerError::StackUnderflow)
     }
 
     // ── Op-specific lowering ────────────────────────────────────────
@@ -733,6 +832,87 @@ impl Lowerer {
         Ok(())
     }
 
+    /// Lower `i64.const c`. 64-bit values need up to 4 halfwords;
+    /// `MOVZ` sets bits 0..15 and clears the rest, then up to three
+    /// `MOVK`s patch in each non-zero high halfword.
+    fn lower_i64_const(&mut self, c: i64) -> Result<(), LowerError> {
+        let bits = c as u64;
+        let r = self.push_i64_slot()?;
+        let h0 = (bits & 0xFFFF) as u16;
+        self.enc.movz(r, h0, MovShift::Lsl0)?;
+        let h1 = ((bits >> 16) & 0xFFFF) as u16;
+        if h1 != 0 { self.enc.movk(r, h1, MovShift::Lsl16)?; }
+        let h2 = ((bits >> 32) & 0xFFFF) as u16;
+        if h2 != 0 { self.enc.movk(r, h2, MovShift::Lsl32)?; }
+        let h3 = ((bits >> 48) & 0xFFFF) as u16;
+        if h3 != 0 { self.enc.movk(r, h3, MovShift::Lsl48)?; }
+        Ok(())
+    }
+
+    fn lower_i64_binop(&mut self, op: I64Op) -> Result<(), LowerError> {
+        let rhs = self.pop_i64_slot()?;
+        let lhs = self.pop_i64_slot()?;
+        let dst = self.push_i64_slot()?;
+        match op {
+            I64Op::Add => self.enc.add(dst, lhs, rhs)?,
+            I64Op::Sub => self.enc.sub(dst, lhs, rhs)?,
+            I64Op::Mul => self.enc.mul(dst, lhs, rhs)?,
+        }
+        Ok(())
+    }
+
+    /// Lower `i64.eqz` — unary. CMP X + CSET Xd, EQ. The result is
+    /// i32, so the i64 slot is popped and an i32 slot is pushed.
+    fn lower_i64_eqz(&mut self) -> Result<(), LowerError> {
+        let src = self.pop_i64_slot()?;
+        let dst = self.push_i32_slot()?;
+        self.enc.cmp_x(src, Reg::ZR)?;
+        self.enc.cset(dst, Condition::Eq)?;
+        Ok(())
+    }
+
+    /// Lower `i64.<cmp>`. Like `lower_f32_cmp`, this pops two values
+    /// of one type (i64) and pushes an i32 boolean result — a cross-
+    /// type stack transition.
+    fn lower_i64_cmp(&mut self, cond: Condition) -> Result<(), LowerError> {
+        let rhs = self.pop_i64_slot()?;
+        let lhs = self.pop_i64_slot()?;
+        let dst = self.push_i32_slot()?;
+        self.enc.cmp_x(lhs, rhs)?;
+        self.enc.cset(dst, cond)?;
+        Ok(())
+    }
+
+    /// Lower `i32.wrap_i64` — the top i64 becomes an i32. Physically
+    /// the same X register, but we zero the upper 32 bits so that
+    /// subsequent 64-bit ops on its low-32-bit value don't see stale
+    /// high bits. `AND Wd, Wn, Wn` trivially zeros the upper 32 of
+    /// the hosting X via 32-bit-write-zeroes semantics.
+    fn lower_wrap_i64(&mut self) -> Result<(), LowerError> {
+        let src = self.pop_i64_slot()?;
+        let dst = self.push_i32_slot()?;
+        // dst will be the SAME physical register as src — we popped
+        // the i64 (decrementing int_depth) and pushed an i32 at the
+        // same slot. AND Wd, Wn, Wn clears upper 32 of the parent X.
+        self.enc.and_w(dst, src, src)?;
+        Ok(())
+    }
+
+    /// Lower `i64.extend_i32_s/_u`. Signed uses SXTW; unsigned
+    /// leverages the fact that `AND Wd, Wn, Wn` already zero-
+    /// extends to 64 bits via the ISA's 32-bit-write rule.
+    fn lower_extend_i32(&mut self, signed: bool) -> Result<(), LowerError> {
+        let src = self.pop_i32_slot()?;
+        let dst = self.push_i64_slot()?;
+        if signed {
+            self.enc.sxtw(dst, src)?;
+        } else {
+            // `mov wd, wn` via 32-bit AND — zero-extends to X.
+            self.enc.and_w(dst, src, src)?;
+        }
+        Ok(())
+    }
+
     /// Lower `i32.eqz` — unary "is zero". `cmp_w` against WZR
     /// (register 31 in 32-bit form reads as zero) sets the Z flag,
     /// then `cset Xd, EQ` converts Z=1 to a 1 in Xd.
@@ -791,6 +971,11 @@ impl Lowerer {
                 // A64 has no "MOV Xd, Xn"; idiom is `ADD Xd, XZR, Xn`.
                 self.enc.add(dst, Reg::ZR, local)?;
             }
+            LocalLoc::I64(local) => {
+                let dst = self.push_i64_slot()?;
+                // Same encoder — ADD X is already 64-bit.
+                self.enc.add(dst, Reg::ZR, local)?;
+            }
             LocalLoc::F32(local) => {
                 let dst = self.push_f32_slot()?;
                 self.enc.fmov_s_s(dst, local)?;
@@ -803,6 +988,10 @@ impl Lowerer {
         match self.local_loc(idx)? {
             LocalLoc::I32(local) => {
                 let src = self.pop_i32_slot()?;
+                self.enc.add(local, Reg::ZR, src)?;
+            }
+            LocalLoc::I64(local) => {
+                let src = self.pop_i64_slot()?;
                 self.enc.add(local, Reg::ZR, src)?;
             }
             LocalLoc::F32(local) => {
@@ -1021,9 +1210,11 @@ impl Lowerer {
     /// counters along the way. Used for `else` depth-reset.
     fn truncate_stack_to(&mut self, target: usize) {
         while self.stack.len() > target {
-            match self.stack.pop().unwrap() {
-                ValType::I32 => self.i32_depth -= 1,
-                ValType::F32 => self.f32_depth -= 1,
+            let ty = self.stack.pop().unwrap();
+            if ty.is_int() {
+                self.int_depth -= 1;
+            } else {
+                self.fp_depth -= 1;
             }
         }
     }
@@ -1083,6 +1274,11 @@ impl Lowerer {
             1 => match self.stack_top_type().unwrap() {
                 ValType::I32 => {
                     self.pop_i32_slot()?;
+                }
+                ValType::I64 => {
+                    // 64-bit result already sits in X0 by design; just
+                    // pop the slot bookkeeping.
+                    self.pop_i64_slot()?;
                 }
                 ValType::F32 => {
                     let s = self.pop_f32_slot()?;
@@ -1176,14 +1372,14 @@ impl Lowerer {
         // unreachable.
         match self.stack_top_type() {
             None => return Err(LowerError::StackNotSingleton),
-            Some(ValType::I32) => {
-                let top = Reg::new((self.i32_depth - 1) as u8).unwrap();
+            Some(ValType::I32) | Some(ValType::I64) => {
+                let top = Reg::new((self.int_depth - 1) as u8).unwrap();
                 if top.0 != 0 {
                     self.enc.add(Reg::X0, Reg::ZR, top)?;
                 }
             }
             Some(ValType::F32) => {
-                let s = Vreg::new((self.f32_depth - 1) as u8).unwrap();
+                let s = Vreg::new((self.fp_depth - 1) as u8).unwrap();
                 self.enc.fmov_w_from_s(Reg::X0, s)?;
             }
         }

@@ -464,6 +464,73 @@ impl Encoder {
         Ok(())
     }
 
+    /// CMP Xn, Xm — 64-bit compare (alias for `SUBS XZR, Xn, Xm`).
+    /// Used by i64 comparisons. Flags set from the full 64-bit
+    /// subtraction so signed/unsigned comparisons work correctly
+    /// across the entire i64 range.
+    ///
+    /// Encoding (C6.2.340, sf=1, Rd=XZR): base 0xEB000000.
+    pub fn cmp_x(&mut self, rn: Reg, rm: Reg) -> Result<(), EncodeError> {
+        let word = 0xEB00_0000u32
+            | (rm.enc() << 16)
+            | (rn.enc() << 5)
+            | 31u32; // Rd = XZR
+        self.emit(word);
+        Ok(())
+    }
+
+    /// SXTW Xd, Wn — sign-extend 32-bit to 64-bit.
+    /// Alias for `SBFM Xd, Xn, #0, #31`. Used by WASM's
+    /// `i64.extend_i32_s`.
+    ///
+    /// Encoding (C6.2.264 — SBFM, sf=1, opc=00, N=1, immr=0, imms=31):
+    /// `1 00 100110 1 000000 011111 Rn Rd`, base 0x93407C00.
+    pub fn sxtw(&mut self, xd: Reg, wn: Reg) -> Result<(), EncodeError> {
+        self.emit(0x9340_7C00u32 | (wn.enc() << 5) | xd.enc());
+        Ok(())
+    }
+
+    // ── Integer bitops (64-bit X variants) ──────────────────────────
+    //
+    // Mirror the 32-bit W encoders but with sf=1 so shifts respect
+    // mod 64 and the full X register is written. Used by i64 bit ops.
+
+    /// AND Xd, Xn, Xm. Encoding base 0x8A000000.
+    pub fn and_x(&mut self, rd: Reg, rn: Reg, rm: Reg) -> Result<(), EncodeError> {
+        self.emit(0x8A00_0000u32 | (rm.enc() << 16) | (rn.enc() << 5) | rd.enc());
+        Ok(())
+    }
+
+    /// ORR Xd, Xn, Xm. Encoding base 0xAA000000.
+    pub fn orr_x(&mut self, rd: Reg, rn: Reg, rm: Reg) -> Result<(), EncodeError> {
+        self.emit(0xAA00_0000u32 | (rm.enc() << 16) | (rn.enc() << 5) | rd.enc());
+        Ok(())
+    }
+
+    /// EOR Xd, Xn, Xm. Encoding base 0xCA000000.
+    pub fn eor_x(&mut self, rd: Reg, rn: Reg, rm: Reg) -> Result<(), EncodeError> {
+        self.emit(0xCA00_0000u32 | (rm.enc() << 16) | (rn.enc() << 5) | rd.enc());
+        Ok(())
+    }
+
+    /// LSL Xd, Xn, Xm — 64-bit LSLV. Encoding base 0x9AC02000.
+    pub fn lsl_x(&mut self, rd: Reg, rn: Reg, rm: Reg) -> Result<(), EncodeError> {
+        self.emit(0x9AC0_2000u32 | (rm.enc() << 16) | (rn.enc() << 5) | rd.enc());
+        Ok(())
+    }
+
+    /// LSR Xd, Xn, Xm. Encoding base 0x9AC02400.
+    pub fn lsr_x(&mut self, rd: Reg, rn: Reg, rm: Reg) -> Result<(), EncodeError> {
+        self.emit(0x9AC0_2400u32 | (rm.enc() << 16) | (rn.enc() << 5) | rd.enc());
+        Ok(())
+    }
+
+    /// ASR Xd, Xn, Xm. Encoding base 0x9AC02800.
+    pub fn asr_x(&mut self, rd: Reg, rn: Reg, rm: Reg) -> Result<(), EncodeError> {
+        self.emit(0x9AC0_2800u32 | (rm.enc() << 16) | (rn.enc() << 5) | rd.enc());
+        Ok(())
+    }
+
     /// CMP Wn, Wm — 32-bit compare (alias for `SUBS WZR, Wn, Wm`).
     ///
     /// Subtracts Wm from Wn on the low 32 bits and updates the NZCV
@@ -1115,6 +1182,44 @@ mod tests {
     fn fcmp_s_basic() {
         // fcmp s0, s1  →  1e212000
         assert_eq!(one(|e| e.fcmp_s(Vreg::S0, Vreg::S1)), 0x1E212000);
+    }
+
+    // ── Phase 12 i64 encoders ───────────────────────────────────────
+
+    #[test]
+    fn cmp_x_basic() {
+        // cmp x0, x1  →  eb01001f
+        assert_eq!(one(|e| e.cmp_x(Reg::X0, Reg::X1)), 0xEB01001F);
+    }
+
+    #[test]
+    fn sxtw_basic() {
+        // sxtw x0, w1  →  93407c20
+        assert_eq!(one(|e| e.sxtw(Reg::X0, Reg::X1)), 0x93407C20);
+    }
+
+    #[test]
+    fn and_x_basic() {
+        // and x0, x0, x1  →  8a010000
+        assert_eq!(one(|e| e.and_x(Reg::X0, Reg::X0, Reg::X1)), 0x8A010000);
+    }
+
+    #[test]
+    fn orr_x_basic() {
+        // orr x0, x0, x1  →  aa010000
+        assert_eq!(one(|e| e.orr_x(Reg::X0, Reg::X0, Reg::X1)), 0xAA010000);
+    }
+
+    #[test]
+    fn eor_x_basic() {
+        // eor x0, x0, x1  →  ca010000
+        assert_eq!(one(|e| e.eor_x(Reg::X0, Reg::X0, Reg::X1)), 0xCA010000);
+    }
+
+    #[test]
+    fn lsl_x_basic() {
+        // lsl x0, x0, x1  →  9ac12000
+        assert_eq!(one(|e| e.lsl_x(Reg::X0, Reg::X0, Reg::X1)), 0x9AC12000);
     }
 
     // ── Phase 8 bitops ──────────────────────────────────────────────
