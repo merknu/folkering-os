@@ -14,3 +14,9 @@ libfolk = { path = "../libfolk" }
 # used as a host-side library. Point at the repo-relative path and
 # disable the default `std` feature so it compiles under no_std here.
 a64-encoder = { path = "../../tools/a64-encoder", default-features = false }
+# HMAC-SHA256 for signing CODE frames before shipping them to the
+# Pi-side daemon. The daemon only mmaps+executes CODE that verifies
+# against the shared secret — this is the gate that stops anyone on
+# the LAN from shipping arbitrary A64 machine code to our worker.
+hmac = { version = "0.12", default-features = false }
+sha2 = { version = "0.10", default-features = false }

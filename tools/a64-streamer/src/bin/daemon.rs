@@ -25,9 +25,9 @@ mod unix {
     use std::ptr;
 
     use a64_streamer::{
-        parse_data, read_frame, serialize_error, serialize_hello, serialize_result, write_frame,
-        Hello, Helper, DEFAULT_PORT, FRAME_BYE, FRAME_CODE, FRAME_DATA, FRAME_ERROR, FRAME_EXEC,
-        FRAME_HELLO, FRAME_RESULT,
+        auth, parse_data, read_frame, serialize_error, serialize_hello, serialize_result,
+        write_frame, Hello, Helper, DEFAULT_PORT, FRAME_BYE, FRAME_CODE, FRAME_DATA, FRAME_ERROR,
+        FRAME_EXEC, FRAME_HELLO, FRAME_RESULT,
     };
 
     // ── Exposed callables (match run_bytes.c layout) ────────────────
@@ -201,7 +201,46 @@ mod unix {
 
             match ty {
                 FRAME_CODE => {
-                    if payload.is_empty() {
+                    // CODE frames authenticate before we mmap+execute.
+                    // Payload layout: `<code bytes> || <32-byte HMAC tag>`.
+                    // The tag is computed over the code bytes only with
+                    // the shared secret (see `auth`). An attacker who
+                    // speaks the protocol but doesn't hold the key can
+                    // connect, receive HELLO, but can't ship any code —
+                    // split + verify rejects everything before mmap.
+                    if payload.len() < auth::TAG_LEN {
+                        let _ = write_frame(
+                            &mut stream,
+                            FRAME_ERROR,
+                            &serialize_error(
+                                7,
+                                "CODE missing HMAC tag (payload too short)",
+                            ),
+                        );
+                        eprintln!(
+                            "[daemon] CODE rejected: payload {} B < tag {} B",
+                            payload.len(),
+                            auth::TAG_LEN,
+                        );
+                        continue;
+                    }
+                    let tag_start = payload.len() - auth::TAG_LEN;
+                    let code_bytes = &payload[..tag_start];
+                    let tag = &payload[tag_start..];
+                    if !auth::verify(code_bytes, tag) {
+                        let _ = write_frame(
+                            &mut stream,
+                            FRAME_ERROR,
+                            &serialize_error(7, "CODE HMAC verification failed"),
+                        );
+                        eprintln!(
+                            "[daemon] CODE rejected: HMAC mismatch ({} code bytes, tag {:02x?}...)",
+                            code_bytes.len(),
+                            &tag[..4],
+                        );
+                        continue;
+                    }
+                    if code_bytes.is_empty() {
                         let _ = write_frame(
                             &mut stream,
                             FRAME_ERROR,
@@ -209,11 +248,11 @@ mod unix {
                         );
                         continue;
                     }
-                    match CodeMap::install(&payload) {
+                    match CodeMap::install(code_bytes) {
                         Ok(m) => {
                             eprintln!(
-                                "[daemon] CODE installed: {} bytes @ {:p}",
-                                payload.len(),
+                                "[daemon] CODE installed: {} bytes @ {:p} (HMAC verified)",
+                                code_bytes.len(),
                                 m.ptr
                             );
                             code = Some(m);

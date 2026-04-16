@@ -30,6 +30,8 @@
 //! will migrate to Folkering DAQ once that's ready). Single connection
 //! at a time — per-connection state, no concurrency yet.
 
+pub mod auth;
+
 use std::io::{Read, Result as IoResult, Write};
 
 // ── Frame types ─────────────────────────────────────────────────────

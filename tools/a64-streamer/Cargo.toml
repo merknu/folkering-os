@@ -23,3 +23,7 @@ path = "src/bin/relay.rs"
 [dependencies]
 libc = "0.2"
 a64-encoder = { path = "../a64-encoder" }
+# HMAC-SHA256 for CODE-frame authentication. No-std-capable so the
+# same module can be shared with the Folkering userspace client.
+hmac = { version = "0.12", default-features = false }
+sha2 = { version = "0.10", default-features = false }

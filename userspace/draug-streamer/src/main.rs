@@ -32,6 +32,14 @@ use a64_encoder::{Lowerer, WasmOp};
 mod protocol;
 mod tcp;
 
+// Share the HMAC auth module with the Pi-side daemon so both agree
+// on the secret key + sign/verify algorithm. The #[path] attribute
+// lets us embed the same source file directly without forcing the
+// daemon's crate to become a dependency of our no_std userspace
+// binary (which would pull std via transitive-feature issues).
+#[path = "../../../tools/a64-streamer/src/auth.rs"]
+mod auth;
+
 use protocol::{
     build_data_payload, build_frame, parse_hello, parse_result, take_frame, Hello,
     FRAME_BYE, FRAME_CODE, FRAME_DATA, FRAME_EXEC, FRAME_HEADER_LEN, FRAME_HELLO, FRAME_RESULT,
@@ -139,8 +147,12 @@ fn run() -> Result<(), StreamError> {
     // toolchain (memory-mode prologue, I32Load, I32Const, I32Mul, End).
     // The result is returned in X0.
     let code = jit_sensor_model(hello.mem_base)?;
-    println!("[DRAUG-STREAMER] JIT produced {} bytes", code.len());
-    send_frame(&mut sess, FRAME_CODE, &code)?;
+    println!(
+        "[DRAUG-STREAMER] JIT produced {} bytes (+ {}-byte HMAC tag)",
+        code.len(),
+        auth::TAG_LEN,
+    );
+    send_code_signed(&mut sess, &code)?;
 
     // ── Live sensor stream — uptime_ms in an infinite loop ────────
     //
@@ -216,6 +228,19 @@ fn send_frame(sess: &mut TcpSession, ty: u8, payload: &[u8]) -> Result<(), Strea
     let frame = build_frame(ty, payload);
     sess.send_all(&frame)?;
     Ok(())
+}
+
+/// Send a CODE frame with its HMAC-SHA256 tag appended. The Pi-side
+/// daemon refuses any CODE frame whose tag doesn't verify under the
+/// shared secret, so every place that ships code must go through
+/// this helper — keeps the "only signed code gets executed" invariant
+/// local and obvious.
+fn send_code_signed(sess: &mut TcpSession, code: &[u8]) -> Result<(), StreamError> {
+    let tag = auth::sign(code);
+    let mut payload: Vec<u8> = Vec::with_capacity(code.len() + auth::TAG_LEN);
+    payload.extend_from_slice(code);
+    payload.extend_from_slice(&tag);
+    send_frame(sess, FRAME_CODE, &payload)
 }
 
 /// Read one complete frame: 5-byte header, then `length` bytes of

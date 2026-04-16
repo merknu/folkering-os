@@ -23,8 +23,8 @@ use std::net::TcpStream;
 
 use a64_encoder::{FnSig, Lowerer, ValType, WasmOp};
 use a64_streamer::{
-    parse_hello, parse_result, read_frame, serialize_data, write_frame, DEFAULT_PORT, FRAME_BYE,
-    FRAME_CODE, FRAME_DATA, FRAME_EXEC, FRAME_HELLO, FRAME_RESULT,
+    auth, parse_hello, parse_result, read_frame, serialize_data, write_frame, DEFAULT_PORT,
+    FRAME_BYE, FRAME_CODE, FRAME_DATA, FRAME_EXEC, FRAME_HELLO, FRAME_RESULT,
 };
 
 fn main() {
@@ -343,11 +343,22 @@ fn main() {
 
 /// Send CODE+EXEC, return the i32 result. Panics on protocol errors.
 fn send_code_and_exec(sock: &mut TcpStream, bytes: &[u8]) -> i32 {
-    write_frame(sock, FRAME_CODE, bytes).expect("write CODE");
+    send_code_signed(sock, bytes).expect("write CODE");
     write_frame(sock, FRAME_EXEC, &[]).expect("write EXEC");
     let (ty, payload) = read_frame(sock).expect("read RESULT");
     assert_eq!(ty, FRAME_RESULT, "expected RESULT, got 0x{ty:02x}");
     parse_result(&payload).expect("parse RESULT")
+}
+
+/// Send a CODE frame with its HMAC-SHA256 tag appended. The Pi-side
+/// daemon rejects any CODE without a valid tag, so every client that
+/// wants to ship code has to go through this helper.
+fn send_code_signed(sock: &mut TcpStream, code: &[u8]) -> std::io::Result<()> {
+    let tag = auth::sign(code);
+    let mut payload = Vec::with_capacity(code.len() + auth::TAG_LEN);
+    payload.extend_from_slice(code);
+    payload.extend_from_slice(&tag);
+    write_frame(sock, FRAME_CODE, &payload)
 }
 
 fn report(name: &str, got: i32, expected: i32, passed: &mut i32, failed: &mut i32) {
