@@ -72,18 +72,61 @@ mod unix {
 
     // ── Linear-memory buffer ────────────────────────────────────────
     //
-    // 64 KiB, aligned to 8 so i64.store offsets are well-formed.
-    // Static lifetime = stable address we can bake into JIT prologues.
-
-    #[repr(align(8))]
-    pub struct MemBuffer(pub [u8; LINEAR_MEM_SIZE]);
+    // 64 KiB backed by a `mmap(MAP_SHARED | MAP_ANONYMOUS)` region
+    // rather than a static array. The difference only matters when
+    // we start running the JIT in a forked child (see
+    // `exec_with_timeout` below): MAP_SHARED pages stay synchronized
+    // across parent/child, so DATA frames written by the parent are
+    // visible to the child that actually executes the code. With a
+    // plain static the child would see a copy-on-write snapshot of
+    // the buffer at fork time and any writes would stay private.
+    //
+    // Alignment: mmap-returned pages are always page-aligned (4 KiB
+    // on x86_64), which is stricter than the 8-byte alignment the
+    // JIT's i64.store / f64.store encoders require. Safe by
+    // construction.
 
     pub const LINEAR_MEM_SIZE: usize = 64 * 1024;
 
-    pub static mut MEM_BUFFER: MemBuffer = MemBuffer([0u8; LINEAR_MEM_SIZE]);
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Base of the shared linear-memory mapping. Initialized once at
+    /// daemon startup via `init_mem_buffer`. Stored as an integer so
+    /// we can read it from async contexts without carrying around a
+    /// raw pointer (`*mut u8` isn't `Sync` out of the box).
+    static MEM_PTR: AtomicUsize = AtomicUsize::new(0);
+
+    pub fn init_mem_buffer() {
+        let ptr = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                LINEAR_MEM_SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            panic!(
+                "[daemon] mmap MEM_BUFFER ({} bytes) failed: {}",
+                LINEAR_MEM_SIZE,
+                std::io::Error::last_os_error(),
+            );
+        }
+        MEM_PTR.store(ptr as usize, Ordering::Release);
+    }
+
+    /// Raw pointer to the start of the shared linear memory.
+    /// Panics if `init_mem_buffer` hasn't run yet.
+    pub fn mem_ptr() -> *mut u8 {
+        let p = MEM_PTR.load(Ordering::Acquire);
+        assert_ne!(p, 0, "MEM_BUFFER not initialized");
+        p as *mut u8
+    }
 
     fn mem_base() -> u64 {
-        unsafe { MEM_BUFFER.0.as_ptr() as u64 }
+        MEM_PTR.load(Ordering::Acquire) as u64
     }
 
     // ── mmap'd code region ──────────────────────────────────────────
@@ -139,6 +182,109 @@ mod unix {
             unsafe {
                 libc::munmap(self.ptr as *mut _, self.capacity);
             }
+        }
+    }
+
+    // ── Execution with timeout ──────────────────────────────────────
+    //
+    // Each EXEC runs in a forked child so a runaway JIT (infinite
+    // loop, illegal instruction, any segfault) cannot wedge the
+    // daemon. Parent polls waitpid(WNOHANG) with a deadline; on
+    // timeout SIGKILL the child and report EXEC_TIMEOUT to the
+    // client. The child conveys its i32 return value via a pipe
+    // (exit codes are 8-bit on Linux, too narrow for the real
+    // result).
+    //
+    // Why fork and not sigsetjmp/siglongjmp: cross-stack-frame
+    // longjmp skips Rust Drops and is fiddly to get right, and a
+    // JIT can crash in ways a signal handler can't recover from
+    // (a hung `wfi`, an illegal instruction that triggers a
+    // non-catchable trap). Process isolation via fork sidesteps
+    // all of that — the worst a malicious EXEC can do is kill its
+    // own child.
+
+    /// Wall-clock timeout for a single EXEC cycle. Generous enough
+    /// that legitimate compute-heavy JITs (matrix multiplies, FFTs)
+    /// have headroom, tight enough that runaway loops surface fast.
+    pub const EXEC_TIMEOUT_MS: u64 = 5000;
+
+    /// Interval between `waitpid(WNOHANG)` polls in the parent. At
+    /// 1 ms we spend ~0.1% CPU per in-flight EXEC and catch
+    /// timeouts within ~1 ms of the deadline.
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1);
+
+    pub fn exec_with_timeout(f: extern "C" fn() -> i32) -> Result<i32, String> {
+        use std::time::Instant;
+
+        // Pipe for child → parent result.
+        let mut pipefd = [0 as libc::c_int; 2];
+        if unsafe { libc::pipe(pipefd.as_mut_ptr()) } < 0 {
+            return Err(format!("pipe: {}", std::io::Error::last_os_error()));
+        }
+        let rfd = pipefd[0];
+        let wfd = pipefd[1];
+
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            unsafe {
+                libc::close(rfd);
+                libc::close(wfd);
+            }
+            return Err(format!("fork: {}", std::io::Error::last_os_error()));
+        }
+
+        if pid == 0 {
+            // Child: run the JIT, ship the result, bail.
+            unsafe { libc::close(rfd) };
+            let rv = f();
+            let bytes = rv.to_le_bytes();
+            unsafe {
+                libc::write(wfd, bytes.as_ptr() as *const libc::c_void, 4);
+                libc::close(wfd);
+                libc::_exit(0);
+            }
+        }
+
+        // Parent: close write end, wait for child.
+        unsafe { libc::close(wfd) };
+
+        let deadline = Instant::now()
+            + std::time::Duration::from_millis(EXEC_TIMEOUT_MS);
+
+        loop {
+            let mut status: libc::c_int = 0;
+            let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if r == pid {
+                // Child exited. Slurp the result bytes.
+                let mut buf = [0u8; 4];
+                let n = unsafe {
+                    libc::read(rfd, buf.as_mut_ptr() as *mut libc::c_void, 4)
+                };
+                unsafe { libc::close(rfd) };
+                if n != 4 {
+                    return Err(format!(
+                        "child produced {} bytes, expected 4 (likely crashed)",
+                        n.max(0),
+                    ));
+                }
+                return Ok(i32::from_le_bytes(buf));
+            }
+            if r < 0 {
+                unsafe { libc::close(rfd) };
+                return Err(format!("waitpid: {}", std::io::Error::last_os_error()));
+            }
+            if Instant::now() >= deadline {
+                // Deadline hit. Kill the child, reap its corpse,
+                // return timeout error.
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                    let mut status: libc::c_int = 0;
+                    libc::waitpid(pid, &mut status, 0);
+                    libc::close(rfd);
+                }
+                return Err(format!("EXEC timeout ({} ms deadline)", EXEC_TIMEOUT_MS));
+            }
+            std::thread::sleep(POLL_INTERVAL);
         }
     }
 
@@ -280,7 +426,7 @@ mod unix {
                         unsafe {
                             ptr::copy_nonoverlapping(
                                 body.as_ptr(),
-                                MEM_BUFFER.0.as_mut_ptr().add(offset as usize),
+                                mem_ptr().add(offset as usize),
                                 body.len(),
                             );
                         }
@@ -294,12 +440,26 @@ mod unix {
                     }
                 },
                 FRAME_EXEC => match code.as_ref() {
-                    Some(m) => {
-                        let rv = (m.as_fn())();
-                        if write_frame(&mut stream, FRAME_RESULT, &serialize_result(rv)).is_err() {
-                            return;
+                    Some(m) => match exec_with_timeout(m.as_fn()) {
+                        Ok(rv) => {
+                            if write_frame(&mut stream, FRAME_RESULT, &serialize_result(rv))
+                                .is_err()
+                            {
+                                return;
+                            }
                         }
-                    }
+                        Err(reason) => {
+                            eprintln!("[daemon] EXEC aborted: {reason}");
+                            let _ = write_frame(
+                                &mut stream,
+                                FRAME_ERROR,
+                                &serialize_error(
+                                    8,
+                                    &format!("EXEC aborted: {reason}"),
+                                ),
+                            );
+                        }
+                    },
                     None => {
                         let _ = write_frame(
                             &mut stream,
@@ -324,6 +484,13 @@ mod unix {
     }
 
     pub fn run() {
+        // Must allocate the shared linear-memory region BEFORE any
+        // connection handling — `mem_base()` and `init_mem_buffer`
+        // panic otherwise. The mapping is inherited across `fork`,
+        // so child processes spawned by `exec_with_timeout` see the
+        // same pages.
+        init_mem_buffer();
+
         let bind = std::env::args()
             .nth(1)
             .unwrap_or_else(|| format!("0.0.0.0:{DEFAULT_PORT}"));
