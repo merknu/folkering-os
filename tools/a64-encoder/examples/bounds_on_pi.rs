@@ -108,7 +108,7 @@ fn cases() -> Vec<Case> {
                 WasmOp::I32Load(0),
                 WasmOp::End,
             ],
-            expected: 0xFF,
+            expected: 0xFE, // OOB load
         },
         // Address = mem_size exactly — first fully-invalid slot.
         Case {
@@ -118,7 +118,7 @@ fn cases() -> Vec<Case> {
                 WasmOp::I32Load(0),
                 WasmOp::End,
             ],
-            expected: 0xFF,
+            expected: 0xFE, // OOB load
         },
         // i32.store far out of range — must not segfault the harness.
         // Stores leave nothing on the operand stack, so follow with a
@@ -134,7 +134,7 @@ fn cases() -> Vec<Case> {
                 WasmOp::I32Const(1),
                 WasmOp::End,
             ],
-            expected: 0xFF,
+            expected: 0xFD, // OOB store
         },
         // Addr is in-bounds by itself but the static offset pushes the
         // access off the end. effective = 0xFFFC + 4 = 0x10000 → OOB.
@@ -149,7 +149,7 @@ fn cases() -> Vec<Case> {
                 WasmOp::I32Load(4),
                 WasmOp::End,
             ],
-            expected: 0xFF,
+            expected: 0xFE, // OOB load
         },
         // ── i64 width: 8-byte access ─────────────────────────────────
         // Last valid i64 addr = mem_size - 8 = 0xFFF8.
@@ -175,7 +175,7 @@ fn cases() -> Vec<Case> {
                 WasmOp::I64Load(0),
                 WasmOp::End,
             ],
-            expected: 0xFF,
+            expected: 0xFE, // OOB load
         },
         // ── f32 / f64 ───────────────────────────────────────────────
         Case {
@@ -199,7 +199,7 @@ fn cases() -> Vec<Case> {
                 WasmOp::F32Load(0),
                 WasmOp::End,
             ],
-            expected: 0xFF,
+            expected: 0xFE, // OOB load
         },
         Case {
             name: "f64 store+load @ 0 (in-bounds) → 1",
@@ -222,7 +222,7 @@ fn cases() -> Vec<Case> {
                 WasmOp::F64Load(0),
                 WasmOp::End,
             ],
-            expected: 0xFF,
+            expected: 0xFE, // OOB load
         },
     ]
 }

@@ -858,7 +858,7 @@ impl Lowerer {
             has_frame: true,
             has_memory: true,
             saved_int_pairs: 0,
-            frame_size_base: 32, // X29+X30 (16) + X28 save (16)
+            frame_size_base: 16, // base pair; total=32 with memory
             mem_size: 64 * 1024,
             table_base: None,
             indirect_sigs: Vec::new(),
@@ -1362,7 +1362,7 @@ impl Lowerer {
             return Err(LowerError::MemoryNotConfigured);
         }
         let addr = self.pop_i32_slot()?;
-        self.emit_bounds_check(addr, 8, offset)?;
+        self.emit_bounds_check(addr, 8, offset, false)?;
         let dst = self.push_f64_slot()?;
         self.enc.add_ext_uxtw(Reg::X16, MEM_BASE_REG, addr)?;
         self.enc.ldr_d_imm(dst, Reg::X16, offset)?;
@@ -1375,7 +1375,7 @@ impl Lowerer {
         }
         let val = self.pop_f64_slot()?;
         let addr = self.pop_i32_slot()?;
-        self.emit_bounds_check(addr, 8, offset)?;
+        self.emit_bounds_check(addr, 8, offset, true)?;
         self.enc.add_ext_uxtw(Reg::X16, MEM_BASE_REG, addr)?;
         self.enc.str_d_imm(val, Reg::X16, offset)?;
         Ok(())
@@ -1442,7 +1442,7 @@ impl Lowerer {
             return Err(LowerError::MemoryNotConfigured);
         }
         let addr = self.pop_i32_slot()?;
-        self.emit_bounds_check(addr, 16, offset)?;
+        self.emit_bounds_check(addr, 16, offset, false)?;
         let dst = self.push_v128_slot()?;
         self.enc.add_ext_uxtw(Reg::X16, MEM_BASE_REG, addr)?;
         self.enc.ldr_q_imm(dst, Reg::X16, offset)?;
@@ -1455,7 +1455,7 @@ impl Lowerer {
         }
         let val = self.pop_v128_slot()?;
         let addr = self.pop_i32_slot()?;
-        self.emit_bounds_check(addr, 16, offset)?;
+        self.emit_bounds_check(addr, 16, offset, true)?;
         self.enc.add_ext_uxtw(Reg::X16, MEM_BASE_REG, addr)?;
         self.enc.str_q_imm(val, Reg::X16, offset)?;
         Ok(())
@@ -1746,7 +1746,7 @@ impl Lowerer {
             return Err(LowerError::MemoryNotConfigured);
         }
         let addr = self.pop_i32_slot()?;
-        self.emit_bounds_check(addr, 8, offset)?;
+        self.emit_bounds_check(addr, 8, offset, false)?;
         let dst = self.push_i64_slot()?;
         // Effective-address computation into X16 (caller-saved IP)
         // since `addr` was an i32 slot and `dst` is an i64 slot; they
@@ -1765,7 +1765,7 @@ impl Lowerer {
         }
         let val = self.pop_i64_slot()?;
         let addr = self.pop_i32_slot()?;
-        self.emit_bounds_check(addr, 8, offset)?;
+        self.emit_bounds_check(addr, 8, offset, true)?;
         self.enc.add_ext_uxtw(Reg::X16, MEM_BASE_REG, addr)?;
         self.enc.str_imm(val, Reg::X16, offset)?;
         Ok(())
@@ -2648,18 +2648,19 @@ impl Lowerer {
         addr_reg: Reg,
         access_size: u32,
         offset: u32,
+        is_store: bool,
     ) -> Result<(), LowerError> {
+        // OOB load = exit 0xFE (kind=1), OOB store = exit 0xFD (kind=2)
+        let trap_kind: u16 = if is_store { 2 } else { 1 };
+
         let Some(access_end) = offset.checked_add(access_size) else {
-            return self.emit_trap();
+            return self.emit_trap_kind(trap_kind);
         };
         if access_end > self.mem_size {
-            return self.emit_trap();
+            return self.emit_trap_kind(trap_kind);
         }
         let max_valid = self.mem_size - access_end;
 
-        // Materialize max_valid in X16 (AAPCS64 IP0 scratch — same
-        // register the f32/f64 load/store paths use right after, but
-        // only after this bounds check completes, so no conflict).
         let lo = (max_valid & 0xFFFF) as u16;
         let hi = ((max_valid >> 16) & 0xFFFF) as u16;
         self.enc.movz(Reg::X16, lo, MovShift::Lsl0)?;
@@ -2668,17 +2669,11 @@ impl Lowerer {
         }
         self.enc.cmp_w(addr_reg, Reg::X16)?;
 
-        // Emit B.LS with a 0-offset placeholder; we'll patch after
-        // the trap block so the branch skips over the trap when the
-        // address is in range.
         let b_cond_pos = self.enc.pos();
         self.enc.b_cond(Condition::Ls, 0)?;
 
-        self.emit_trap()?;
+        self.emit_trap_kind(trap_kind)?;
 
-        // Patch the B.LS offset to point at the instruction right
-        // after the trap block — i.e. the real load/store that will
-        // be emitted next.
         let after_trap = self.enc.pos();
         let skip_offset = (after_trap as i32) - (b_cond_pos as i32);
         let patched = Encoder::encode_b_cond(Condition::Ls, skip_offset)?;
@@ -2690,15 +2685,19 @@ impl Lowerer {
     /// restores the saved MEM_BASE_REG and frame pointer if they were
     /// pushed in the prologue, and RETs. Safe to call from the
     /// middle of a function because it doesn't fall through.
-    fn emit_trap(&mut self) -> Result<(), LowerError> {
-        // MOVN Xd, #0 sets Xd = ~0 = 0xFFFF_FFFF_FFFF_FFFF. The low
-        // 8 bits (0xFF) show up as the process exit code on the Pi
-        // harness — distinctive signature that's easy to grep for.
-        self.enc.movn(Reg::X0, 0, MovShift::Lsl0)?;
-        // Shared epilogue handles callee-saved restore + frame pop.
+    /// Emit a trap with a distinguishable exit code. MOVN X0, #kind:
+    ///   0 → -1 → 0xFF (general trap)
+    ///   1 → -2 → 0xFE (OOB load)
+    ///   2 → -3 → 0xFD (OOB store)
+    fn emit_trap_kind(&mut self, kind: u16) -> Result<(), LowerError> {
+        self.enc.movn(Reg::X0, kind, MovShift::Lsl0)?;
         self.emit_epilogue()?;
         self.enc.ret(Reg::X30)?;
         Ok(())
+    }
+
+    fn emit_trap(&mut self) -> Result<(), LowerError> {
+        self.emit_trap_kind(0)
     }
 
     /// Lower `i32.load off` — pop addr, compute effective address as
@@ -2710,7 +2709,7 @@ impl Lowerer {
             return Err(LowerError::MemoryNotConfigured);
         }
         let addr = self.pop_i32_slot()?;
-        self.emit_bounds_check(addr, 4, offset)?;
+        self.emit_bounds_check(addr, 4, offset, false)?;
         let dst = self.push_i32_slot()?;
         // Xdst = X28 + UXTW(Waddr). Safe to use dst as the effective-
         // address register because we don't touch its upper bits
@@ -2728,7 +2727,7 @@ impl Lowerer {
             return Err(LowerError::MemoryNotConfigured);
         }
         let addr = self.pop_i32_slot()?;
-        self.emit_bounds_check(addr, 4, offset)?;
+        self.emit_bounds_check(addr, 4, offset, false)?;
         let dst = self.push_f32_slot()?;
         // Can't reuse dst (V-bank) as the effective-address reg —
         // those are different banks. Use X16 (caller-saved IP).
@@ -2746,7 +2745,7 @@ impl Lowerer {
         }
         let val = self.pop_f32_slot()?;
         let addr = self.pop_i32_slot()?;
-        self.emit_bounds_check(addr, 4, offset)?;
+        self.emit_bounds_check(addr, 4, offset, true)?;
         self.enc.add_ext_uxtw(Reg::X16, MEM_BASE_REG, addr)?;
         self.enc.str_s_imm(val, Reg::X16, offset)?;
         Ok(())
@@ -2762,7 +2761,7 @@ impl Lowerer {
         }
         let val = self.pop_i32_slot()?;
         let addr = self.pop_i32_slot()?;
-        self.emit_bounds_check(addr, 4, offset)?;
+        self.emit_bounds_check(addr, 4, offset, true)?;
         self.enc.add_ext_uxtw(addr, MEM_BASE_REG, addr)?;
         self.enc.str_w_imm(val, addr, offset)?;
         Ok(())
