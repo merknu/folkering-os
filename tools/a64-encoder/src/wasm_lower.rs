@@ -317,6 +317,13 @@ pub enum WasmOp {
     /// no portable reduction op. Implemented as two FADDPs
     /// (pairwise vector + pairwise scalar).
     F32x4HorizontalSum,
+    /// Pop two V128s, push lane-wise maximum. Combined with a zero
+    /// splat this is the single-instruction ReLU primitive:
+    /// `f32x4.max(x, f32x4.splat(0.0))` maps to one FMAX.
+    F32x4Max,
+    /// Pop two V128s, push lane-wise minimum. Pairs with Max for
+    /// `clamp(x, lo, hi) = min(max(x, lo), hi)`.
+    F32x4Min,
     /// Copy local `n` onto the stack.
     LocalGet(u32),
     /// Pop stack top, store into local `n`.
@@ -966,6 +973,8 @@ impl Lowerer {
             WasmOp::F32x4Div => self.lower_f32x4_div(),
             WasmOp::F32x4Fma => self.lower_f32x4_fma(),
             WasmOp::F32x4HorizontalSum => self.lower_f32x4_horizontal_sum(),
+            WasmOp::F32x4Max => self.lower_f32x4_max(),
+            WasmOp::F32x4Min => self.lower_f32x4_min(),
             // Phase 15 conversions.
             WasmOp::I32Extend8S => self.lower_i32_extend_narrow(true, false),
             WasmOp::I32Extend16S => self.lower_i32_extend_narrow(false, false),
@@ -1527,6 +1536,22 @@ impl Lowerer {
             "FMA should write back to the acc slot"
         );
         self.enc.fmla_4s(dst, a, b)?;
+        Ok(())
+    }
+
+    fn lower_f32x4_max(&mut self) -> Result<(), LowerError> {
+        let rhs = self.pop_v128_slot()?;
+        let lhs = self.pop_v128_slot()?;
+        let dst = self.push_v128_slot()?;
+        self.enc.fmax_4s(dst, lhs, rhs)?;
+        Ok(())
+    }
+
+    fn lower_f32x4_min(&mut self) -> Result<(), LowerError> {
+        let rhs = self.pop_v128_slot()?;
+        let lhs = self.pop_v128_slot()?;
+        let dst = self.push_v128_slot()?;
+        self.enc.fmin_4s(dst, lhs, rhs)?;
         Ok(())
     }
 

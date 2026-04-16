@@ -776,6 +776,25 @@ impl Encoder {
         Ok(())
     }
 
+    /// FMAX Vd.4S, Vn.4S, Vm.4S — lane-wise maximum of two f32x4.
+    /// Single-instruction ReLU when paired with a zero splat.
+    ///
+    /// Encoding (C6.2.111 AdvSIMD 3-same, U=0, sz=0, opcode=11110):
+    /// `0 Q 0 0 1 1 1 0 0 sz 1 Rm 1 1 1 1 0 1 Rn Rd`, base 0x4E20F400.
+    pub fn fmax_4s(&mut self, vd: Vreg, vn: Vreg, vm: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x4E20_F400u32 | (vm.enc() << 16) | (vn.enc() << 5) | vd.enc());
+        Ok(())
+    }
+
+    /// FMIN Vd.4S, Vn.4S, Vm.4S — lane-wise minimum of two f32x4.
+    /// Pairs with FMAX to build `clamp(x, lo, hi) = min(max(x, lo), hi)`.
+    ///
+    /// Encoding (same family, bit 23 set): base 0x4EA0F400.
+    pub fn fmin_4s(&mut self, vd: Vreg, vn: Vreg, vm: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x4EA0_F400u32 | (vm.enc() << 16) | (vn.enc() << 5) | vd.enc());
+        Ok(())
+    }
+
     // ── Phase 15: conversions ───────────────────────────────────────
     //
     // Covers sign-extensions (WASM's extend8_s / extend16_s / extend32_s),
@@ -2031,6 +2050,20 @@ mod tests {
             one(|e| e.faddp_s_from_2s_scalar(Vreg::S0, Vreg::S1)),
             0x7E30D820
         );
+    }
+
+    #[test]
+    fn fmax_4s_basic() {
+        // fmax v0.4s, v1.4s, v2.4s
+        // base 0x4E20F400 | (2<<16) | (1<<5) | 0 = 0x4E22F420
+        assert_eq!(one(|e| e.fmax_4s(Vreg::S0, Vreg::S1, Vreg::S2)), 0x4E22F420);
+    }
+
+    #[test]
+    fn fmin_4s_basic() {
+        // fmin v0.4s, v1.4s, v2.4s
+        // base 0x4EA0F400 | (2<<16) | (1<<5) | 0 = 0x4EA2F420
+        assert_eq!(one(|e| e.fmin_4s(Vreg::S0, Vreg::S1, Vreg::S2)), 0x4EA2F420);
     }
 
     // ── Phase 15 conversion encoders ────────────────────────────────

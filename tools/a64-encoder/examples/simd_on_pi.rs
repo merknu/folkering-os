@@ -476,6 +476,78 @@ fn cases() -> Vec<Case> {
             },
             expected: 1,
         },
+        // ── ReLU — f32x4.max(x, splat(0)) ─────────────────────────
+        //
+        // Input vector x = [-1.5, 2.5, -3.75, 4.0].
+        // ReLU(x) = [max(-1.5, 0), max(2.5, 0), max(-3.75, 0), max(4.0, 0)]
+        //         = [0.0, 2.5, 0.0, 4.0]
+        // Check lane 0 → 0.0 (negative clamped).
+        Case {
+            name: "ReLU: f32x4.max(x, splat(0)) lane 0: max(-1.5, 0) = 0.0",
+            ops: vec![
+                WasmOp::V128Const(
+                    (((-1.5_f32).to_bits() as u128) <<   0)
+                  | (( 2.5_f32 .to_bits() as u128) <<  32)
+                  | (((-3.75_f32).to_bits() as u128) << 64)
+                  | (( 4.0_f32 .to_bits() as u128) <<  96),
+                ),
+                WasmOp::F32Const(0.0),
+                WasmOp::F32x4Splat,
+                WasmOp::F32x4Max,
+                WasmOp::F32x4ExtractLane(0),
+                WasmOp::F32Const(0.0),
+                WasmOp::F32Eq,
+                WasmOp::End,
+            ],
+            expected: 1,
+        },
+        // Lane 1 should be UNCLAMPED (2.5 stays 2.5).
+        Case {
+            name: "ReLU lane 1: max(2.5, 0) = 2.5 (positive pass-through)",
+            ops: vec![
+                WasmOp::V128Const(
+                    (((-1.5_f32).to_bits() as u128) <<   0)
+                  | (( 2.5_f32 .to_bits() as u128) <<  32)
+                  | (((-3.75_f32).to_bits() as u128) << 64)
+                  | (( 4.0_f32 .to_bits() as u128) <<  96),
+                ),
+                WasmOp::F32Const(0.0),
+                WasmOp::F32x4Splat,
+                WasmOp::F32x4Max,
+                WasmOp::F32x4ExtractLane(1),
+                WasmOp::F32Const(2.5),
+                WasmOp::F32Eq,
+                WasmOp::End,
+            ],
+            expected: 1,
+        },
+        // ── Clamp: min(max(x, lo), hi) ─────────────────────────────
+        // x = [-5, 2, 10, 0.5], lo = 0, hi = 3
+        // max(x, 0)            = [0, 2, 10, 0.5]
+        // min([0,2,10,0.5], 3) = [0, 2, 3, 0.5]
+        // Lane 2 = 3 (clipped from 10).
+        Case {
+            name: "Clamp: min(max(x, 0), 3) lane 2: clip(10) = 3.0",
+            ops: vec![
+                WasmOp::V128Const(
+                    (((-5.0_f32).to_bits() as u128) <<   0)
+                  | (( 2.0_f32 .to_bits() as u128) <<  32)
+                  | ((10.0_f32 .to_bits() as u128) <<  64)
+                  | (( 0.5_f32 .to_bits() as u128) <<  96),
+                ),
+                WasmOp::F32Const(0.0),
+                WasmOp::F32x4Splat,
+                WasmOp::F32x4Max,
+                WasmOp::F32Const(3.0),
+                WasmOp::F32x4Splat,
+                WasmOp::F32x4Min,
+                WasmOp::F32x4ExtractLane(2),
+                WasmOp::F32Const(3.0),
+                WasmOp::F32Eq,
+                WasmOp::End,
+            ],
+            expected: 1,
+        },
         // ── v128.const — inline 16-byte literal ─────────────────────
         //
         // Materializes a 128-bit constant via the PC-relative literal
