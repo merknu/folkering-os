@@ -324,6 +324,12 @@ pub enum WasmOp {
     /// Pop two V128s, push lane-wise minimum. Pairs with Max for
     /// `clamp(x, lo, hi) = min(max(x, lo), hi)`.
     F32x4Min,
+    /// Pop V128, push lane-wise |x| (clears sign bit).
+    F32x4Abs,
+    /// Pop V128, push lane-wise -x (flips sign bit).
+    F32x4Neg,
+    /// Pop V128, push lane-wise sqrt(x). IEEE-754 correct.
+    F32x4Sqrt,
     /// Copy local `n` onto the stack.
     LocalGet(u32),
     /// Pop stack top, store into local `n`.
@@ -975,6 +981,9 @@ impl Lowerer {
             WasmOp::F32x4HorizontalSum => self.lower_f32x4_horizontal_sum(),
             WasmOp::F32x4Max => self.lower_f32x4_max(),
             WasmOp::F32x4Min => self.lower_f32x4_min(),
+            WasmOp::F32x4Abs => self.lower_f32x4_unary(|e, d, s| e.fabs_4s(d, s)),
+            WasmOp::F32x4Neg => self.lower_f32x4_unary(|e, d, s| e.fneg_4s(d, s)),
+            WasmOp::F32x4Sqrt => self.lower_f32x4_unary(|e, d, s| e.fsqrt_4s(d, s)),
             // Phase 15 conversions.
             WasmOp::I32Extend8S => self.lower_i32_extend_narrow(true, false),
             WasmOp::I32Extend16S => self.lower_i32_extend_narrow(false, false),
@@ -1536,6 +1545,22 @@ impl Lowerer {
             "FMA should write back to the acc slot"
         );
         self.enc.fmla_4s(dst, a, b)?;
+        Ok(())
+    }
+
+    /// Generic unary f32x4 op dispatcher. `emit` takes an encoder
+    /// reference and the (dst, src) Vreg pair. Used for abs/neg/sqrt
+    /// — all share the same stack-transition shape (pop V128 →
+    /// push V128) and differ only in which NEON instruction they
+    /// emit.
+    fn lower_f32x4_unary<F>(&mut self, emit: F) -> Result<(), LowerError>
+    where
+        F: FnOnce(&mut Encoder, Vreg, Vreg) -> Result<(), EncodeError>,
+    {
+        let src = self.pop_v128_slot()?;
+        let dst = self.push_v128_slot()?;
+        debug_assert_eq!(dst.0, src.0, "unary f32x4 reuses the slot");
+        emit(&mut self.enc, dst, src)?;
         Ok(())
     }
 

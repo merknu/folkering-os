@@ -795,6 +795,33 @@ impl Encoder {
         Ok(())
     }
 
+    /// FABS Vd.4S, Vn.4S — lane-wise absolute value.
+    ///
+    /// Encoding (C6.2.90 AdvSIMD, U=0, sz=0, opcode=11111):
+    /// `0 Q 0 0 1 1 1 0 1 sz 1 0 0 0 0 0 1 1 1 1 1 0 Rn Rd`,
+    /// base 0x4EA0F800.
+    pub fn fabs_4s(&mut self, vd: Vreg, vn: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x4EA0_F800u32 | (vn.enc() << 5) | vd.enc());
+        Ok(())
+    }
+
+    /// FNEG Vd.4S, Vn.4S — lane-wise arithmetic negation.
+    ///
+    /// Encoding (same family as FABS, U=1): base 0x6EA0F800.
+    pub fn fneg_4s(&mut self, vd: Vreg, vn: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x6EA0_F800u32 | (vn.enc() << 5) | vd.enc());
+        Ok(())
+    }
+
+    /// FSQRT Vd.4S, Vn.4S — lane-wise square root.
+    /// Essential for L2-style normalization layers.
+    ///
+    /// Encoding (C6.2.127 AdvSIMD, U=1, sz=0): base 0x6EA1F800.
+    pub fn fsqrt_4s(&mut self, vd: Vreg, vn: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x6EA1_F800u32 | (vn.enc() << 5) | vd.enc());
+        Ok(())
+    }
+
     // ── Phase 15: conversions ───────────────────────────────────────
     //
     // Covers sign-extensions (WASM's extend8_s / extend16_s / extend32_s),
@@ -2064,6 +2091,27 @@ mod tests {
         // fmin v0.4s, v1.4s, v2.4s
         // base 0x4EA0F400 | (2<<16) | (1<<5) | 0 = 0x4EA2F420
         assert_eq!(one(|e| e.fmin_4s(Vreg::S0, Vreg::S1, Vreg::S2)), 0x4EA2F420);
+    }
+
+    #[test]
+    fn fabs_4s_basic() {
+        // fabs v0.4s, v1.4s
+        // base 0x4EA0F800 | (1<<5) | 0 = 0x4EA0F820
+        assert_eq!(one(|e| e.fabs_4s(Vreg::S0, Vreg::S1)), 0x4EA0F820);
+    }
+
+    #[test]
+    fn fneg_4s_basic() {
+        // fneg v0.4s, v1.4s
+        // base 0x6EA0F800 | (1<<5) | 0 = 0x6EA0F820
+        assert_eq!(one(|e| e.fneg_4s(Vreg::S0, Vreg::S1)), 0x6EA0F820);
+    }
+
+    #[test]
+    fn fsqrt_4s_basic() {
+        // fsqrt v0.4s, v1.4s
+        // base 0x6EA1F800 | (1<<5) | 0 = 0x6EA1F820
+        assert_eq!(one(|e| e.fsqrt_4s(Vreg::S0, Vreg::S1)), 0x6EA1F820);
     }
 
     // ── Phase 15 conversion encoders ────────────────────────────────

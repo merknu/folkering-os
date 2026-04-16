@@ -548,6 +548,78 @@ fn cases() -> Vec<Case> {
             ],
             expected: 1,
         },
+        // ── Unary: f32x4.abs ─────────────────────────────────────
+        // abs([-1.5, 2.5, -3.75, 4.0]) = [1.5, 2.5, 3.75, 4.0]
+        // Check lane 2 → 3.75 (negative flipped).
+        Case {
+            name: "f32x4.abs lane 2: |-3.75| = 3.75",
+            ops: vec![
+                WasmOp::V128Const(
+                    (((-1.5_f32).to_bits() as u128) <<   0)
+                  | (( 2.5_f32 .to_bits() as u128) <<  32)
+                  | (((-3.75_f32).to_bits() as u128) << 64)
+                  | (( 4.0_f32 .to_bits() as u128) <<  96),
+                ),
+                WasmOp::F32x4Abs,
+                WasmOp::F32x4ExtractLane(2),
+                WasmOp::F32Const(3.75),
+                WasmOp::F32Eq,
+                WasmOp::End,
+            ],
+            expected: 1,
+        },
+        // ── Unary: f32x4.neg ─────────────────────────────────────
+        // neg(splat(7.0)) lane 0 = -7.0.
+        Case {
+            name: "f32x4.neg splat(7.0) lane 0 = -7.0",
+            ops: vec![
+                WasmOp::F32Const(7.0),
+                WasmOp::F32x4Splat,
+                WasmOp::F32x4Neg,
+                WasmOp::F32x4ExtractLane(0),
+                WasmOp::F32Const(-7.0),
+                WasmOp::F32Eq,
+                WasmOp::End,
+            ],
+            expected: 1,
+        },
+        // ── f32x4.sqrt + horizontal_sum: L2 norm of [3, 4, 0, 0] = 5 ─
+        // L2 norm: sqrt(sum(x²))  = sqrt(9 + 16 + 0 + 0) = sqrt(25) = 5.
+        // Build as: x², horizontal_sum, scalar sqrt via x² trick
+        // (f32.mul self + f32.sqrt not directly in our scalar ISA —
+        // but f32x4.sqrt on a splat of the scalar works).
+        //
+        //   load [3,4,0,0], square via f32x4.mul self*self,
+        //   horizontal_sum → 25.0 (scalar),
+        //   f32x4.splat to get [25,25,25,25],
+        //   f32x4.sqrt → [5,5,5,5],
+        //   extract_lane 0 = 5.
+        Case {
+            name: "L2 norm via sqrt: ||[3,4,0,0]||₂ = 5",
+            ops: {
+                let mut ops = store_4_f32(0, [3.0, 4.0, 0.0, 0.0]);
+                ops.extend_from_slice(&[
+                    WasmOp::I32Const(0),
+                    WasmOp::V128Load(0),
+                    // x²: multiply vector by itself
+                    WasmOp::I32Const(0),
+                    WasmOp::V128Load(0),
+                    WasmOp::F32x4Mul,
+                    // Sum of squares
+                    WasmOp::F32x4HorizontalSum,
+                    // Splat scalar back to a vector so we can vector-sqrt
+                    WasmOp::F32x4Splat,
+                    WasmOp::F32x4Sqrt,
+                    // Extract lane 0 and compare to 5.0
+                    WasmOp::F32x4ExtractLane(0),
+                    WasmOp::F32Const(5.0),
+                    WasmOp::F32Eq,
+                    WasmOp::End,
+                ]);
+                ops
+            },
+            expected: 1,
+        },
         // ── v128.const — inline 16-byte literal ─────────────────────
         //
         // Materializes a 128-bit constant via the PC-relative literal
