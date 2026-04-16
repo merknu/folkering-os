@@ -29,7 +29,8 @@ cargo run --manifest-path tools/folk-pack/Cargo.toml -- create boot/iso_root/boo
   --add shell:elf:userspace/target/x86_64-folkering-userspace/release/shell \
   --add compositor:elf:userspace/target/x86_64-folkering-userspace/release/compositor \
   --add intent-service:elf:userspace/target/x86_64-folkering-userspace/release/intent-service \
-  --add inference:elf:userspace/target/x86_64-folkering-userspace/release/inference 2>&1 | tail -1
+  --add inference:elf:userspace/target/x86_64-folkering-userspace/release/inference \
+  --add draug-streamer:elf:userspace/target/x86_64-folkering-userspace/release/draug-streamer 2>&1 | tail -1
 py -3 tools/fat_inject.py 2>&1 | tail -1
 
 # ── Step 2: Deploy ──

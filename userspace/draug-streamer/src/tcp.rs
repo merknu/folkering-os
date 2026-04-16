@@ -43,18 +43,46 @@ pub struct TcpSession {
 const INVALID_SLOT: u64 = 0xFFFF;
 
 impl TcpSession {
+    /// Open a TCP session, **blocking until the handshake completes**.
+    ///
+    /// The kernel's `tcp_connect_async` is two-phase:
+    ///   * first call — allocates a slot, kicks off the SYN handshake,
+    ///     returns the slot id (state = Connecting)
+    ///   * subsequent calls on the same (ip, port) — find the still-
+    ///     connecting slot and either promote it to Connected
+    ///     (return slot id), report failure (`u64::MAX`), or say
+    ///     "still handshaking" (`TCP_EAGAIN`)
+    ///
+    /// Critically, `tcp_poll_recv` on a Connecting slot returns
+    /// `u64::MAX` — not EAGAIN. That means the client *must* wait
+    /// for the handshake to complete before reading anything.
+    /// Historically the compositor's draug_async handled this via
+    /// its state-machine "Sending" phase (tcp_send_async does auto-
+    /// promote Connecting → Connected), but a pure listen-first
+    /// protocol like ours needs an explicit connect-poll loop.
     pub fn connect(ip: [u8; 4], port: u16) -> Result<Self, TcpError> {
-        let slot = tcp_connect_async(ip, port);
-        if slot == u64::MAX {
+        let initial = tcp_connect_async(ip, port);
+        if initial == u64::MAX {
             return Err(TcpError::ConnectFailed);
         }
-        if slot == INVALID_SLOT {
-            // Paranoid — the kernel shouldn't return this as a success
-            // slot, but guard anyway so nothing downstream treats
-            // 0xFFFF as a real slot id.
+        if initial == TCP_EAGAIN {
+            // Unexpected — the *first* call should always allocate a
+            // slot. Treat as fatal so the client doesn't hang.
             return Err(TcpError::ConnectFailed);
         }
-        Ok(TcpSession { slot })
+        if initial == INVALID_SLOT {
+            return Err(TcpError::ConnectFailed);
+        }
+        // Spin until the handshake promotes the slot to Connected.
+        // Each iteration yields the CPU so we don't starve the
+        // scheduler while waiting for a network round-trip.
+        loop {
+            match tcp_connect_async(ip, port) {
+                TCP_EAGAIN => yield_cpu(),
+                v if v == u64::MAX => return Err(TcpError::ConnectFailed),
+                slot => return Ok(TcpSession { slot }),
+            }
+        }
     }
 
     /// Send every byte in `data`. Spins on `TCP_EAGAIN` via
