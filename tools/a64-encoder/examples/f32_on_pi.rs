@@ -92,6 +92,58 @@ fn cases() -> Vec<Case> {
             ops: vec![WasmOp::F32Const(0.0), WasmOp::End],
             expected: 0,
         },
+        // ── Phase 10: full f32 comparison suite ───────────────────
+        Case {
+            name: "1.5 != 2.5 → 1",
+            ops: vec![WasmOp::F32Const(1.5), WasmOp::F32Const(2.5), WasmOp::F32Ne, WasmOp::End],
+            expected: 1,
+        },
+        Case {
+            name: "1.5 != 1.5 → 0",
+            ops: vec![WasmOp::F32Const(1.5), WasmOp::F32Const(1.5), WasmOp::F32Ne, WasmOp::End],
+            expected: 0,
+        },
+        Case {
+            name: "1.5 < 2.5 → 1",
+            ops: vec![WasmOp::F32Const(1.5), WasmOp::F32Const(2.5), WasmOp::F32Lt, WasmOp::End],
+            expected: 1,
+        },
+        Case {
+            name: "3.0 > 2.5 → 1",
+            ops: vec![WasmOp::F32Const(3.0), WasmOp::F32Const(2.5), WasmOp::F32Gt, WasmOp::End],
+            expected: 1,
+        },
+        Case {
+            name: "2.5 ≤ 2.5 → 1",
+            ops: vec![WasmOp::F32Const(2.5), WasmOp::F32Const(2.5), WasmOp::F32Le, WasmOp::End],
+            expected: 1,
+        },
+        Case {
+            name: "2.5 ≥ 3.0 → 0",
+            ops: vec![WasmOp::F32Const(2.5), WasmOp::F32Const(3.0), WasmOp::F32Ge, WasmOp::End],
+            expected: 0,
+        },
+        Case {
+            name: "-1.5 < 0.0 → 1 (negative f32)",
+            ops: vec![WasmOp::F32Const(-1.5), WasmOp::F32Const(0.0), WasmOp::F32Lt, WasmOp::End],
+            expected: 1,
+        },
+        // Composition: integer result of f32 comparison feeds arithmetic.
+        //   (3.0 > 2.0) + (5.0 > 4.0) = 1 + 1 = 2
+        Case {
+            name: "sum of two f32.gt booleans (1+1) → 2",
+            ops: vec![
+                WasmOp::F32Const(3.0),
+                WasmOp::F32Const(2.0),
+                WasmOp::F32Gt,
+                WasmOp::F32Const(5.0),
+                WasmOp::F32Const(4.0),
+                WasmOp::F32Gt,
+                WasmOp::I32Add,
+                WasmOp::End,
+            ],
+            expected: 2,
+        },
         // 2.0 has bit pattern 0x40000000 — but SHR + AND would
         // give us a distinctive byte. For a single f32 end though,
         // we only see the low byte of its bit pattern.

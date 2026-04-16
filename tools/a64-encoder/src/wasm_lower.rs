@@ -122,6 +122,16 @@ pub enum WasmOp {
     /// this is the WASM comparison idiom, with the boolean result
     /// living on the stack as an integer.
     F32Eq,
+    /// Pop two F32s, push i32 1 if not equal (or unordered) else 0.
+    F32Ne,
+    /// Pop two F32s, push i32 1 if left < right (ordered) else 0.
+    F32Lt,
+    /// Pop two F32s, push i32 1 if left > right (ordered) else 0.
+    F32Gt,
+    /// Pop two F32s, push i32 1 if left ≤ right (ordered) else 0.
+    F32Le,
+    /// Pop two F32s, push i32 1 if left ≥ right (ordered) else 0.
+    F32Ge,
     /// Copy local `n` onto the stack.
     LocalGet(u32),
     /// Pop stack top, store into local `n`.
@@ -478,6 +488,16 @@ impl Lowerer {
             WasmOp::F32Mul => self.lower_f32_binop(FBinOp::Mul),
             WasmOp::F32Div => self.lower_f32_binop(FBinOp::Div),
             WasmOp::F32Eq => self.lower_f32_cmp(Condition::Eq),
+            WasmOp::F32Ne => self.lower_f32_cmp(Condition::Ne),
+            // For non-NaN operands, the FP flag encoding matches the
+            // signed-integer conditions: FCMP sets N for "less" and
+            // Z for "equal", same as a signed SUBS. NaN (unordered)
+            // sets V=1, which would make some conditions fire
+            // incorrectly — full WASM NaN semantics is Phase 11+.
+            WasmOp::F32Lt => self.lower_f32_cmp(Condition::Lt),
+            WasmOp::F32Gt => self.lower_f32_cmp(Condition::Gt),
+            WasmOp::F32Le => self.lower_f32_cmp(Condition::Le),
+            WasmOp::F32Ge => self.lower_f32_cmp(Condition::Ge),
             WasmOp::LocalGet(i) => self.lower_local_get(i),
             WasmOp::LocalSet(i) => self.lower_local_set(i),
             WasmOp::Block => self.lower_block(),
