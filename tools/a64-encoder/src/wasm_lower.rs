@@ -1085,8 +1085,20 @@ impl Lowerer {
         Ok(())
     }
 
-    /// Consume and return the emitted bytes.
+    /// Consume and return the emitted bytes after running the
+    /// peephole optimizer. Eliminates self-MOVs and self-ANDs
+    /// that the lowerer emits defensively (e.g., `AND W0, W0, W0`
+    /// after a call that already left the result in X0).
     pub fn finish(self) -> Vec<u8> {
+        let mut bytes = self.enc.into_bytes();
+        let _eliminated = crate::peephole::optimize(&mut bytes);
+        bytes
+    }
+
+    /// Consume and return the emitted bytes WITHOUT running the
+    /// peephole pass. Useful for byte-exact test assertions that
+    /// check the raw lowerer output.
+    pub fn finish_raw(self) -> Vec<u8> {
         self.enc.into_bytes()
     }
 
@@ -3394,17 +3406,16 @@ mod tests {
         let addr: u64 = 0x0000_1234_5678_ABCD;
         let mut lw = Lowerer::new_function(0, vec![addr]).unwrap();
         lw.lower_all(&[WasmOp::Call(0), WasmOp::End]).unwrap();
-        let words = bytes_as_u32s(&lw.finish());
+        // Use finish_raw to check the unoptimised emission.
+        // finish() would NOP the self-AND at word[5].
+        let words = bytes_as_u32s(&lw.finish_raw());
         // Word 0: prologue STP
         assert_eq!(words[0], 0xA9BF7BFD);
         // Word 1: movz x16, #0xABCD
-        //   0xD2800000 | (0xABCD << 5) | 16 = 0xD29579B0
         assert_eq!(words[1], 0xD29579B0);
         // Word 2: movk x16, #0x5678, LSL #16
-        //   0xF2800000 | (1 << 21) | (0x5678 << 5) | 16 = 0xF2AACF10
         assert_eq!(words[2], 0xF2AACF10);
         // Word 3: movk x16, #0x1234, LSL #32
-        //   0xF2800000 | (2 << 21) | (0x1234 << 5) | 16 = 0xF2C24690
         assert_eq!(words[3], 0xF2C24690);
         // Word 4: blr x16
         assert_eq!(words[4], 0xD63F0200);

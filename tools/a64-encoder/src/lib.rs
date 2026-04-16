@@ -35,6 +35,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+pub mod peephole;
 pub mod wasm_lower;
 pub mod wasm_module;
 pub mod wasm_parse;
