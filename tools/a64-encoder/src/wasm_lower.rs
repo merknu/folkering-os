@@ -294,6 +294,17 @@ pub enum WasmOp {
     I32x4Mul,
     /// Pop V128, push lane `N` as scalar I32 (`UMOV Wd, Vn.S[N]`).
     I32x4ExtractLane(u8),
+    /// Pop two V128s, push lane-wise f32 difference.
+    F32x4Sub,
+    /// Pop two V128s, push lane-wise f32 quotient.
+    F32x4Div,
+    /// Fused multiply-add: pops `acc, a, b` (stack top = `b`), pushes
+    /// `acc + a*b` lane-wise. Single rounding — matches WASM's
+    /// relaxed-SIMD `f32x4.relaxed_madd` semantics. No parser opcode
+    /// yet; constructed directly by the lowerer client (the relaxed-
+    /// SIMD proposal's 0xFD 0x85 0x01 multi-byte encoding will plug
+    /// in later when the parser grows support).
+    F32x4Fma,
     /// Copy local `n` onto the stack.
     LocalGet(u32),
     /// Pop stack top, store into local `n`.
@@ -938,6 +949,9 @@ impl Lowerer {
             WasmOp::I32x4Sub => self.lower_i32x4_sub(),
             WasmOp::I32x4Mul => self.lower_i32x4_mul(),
             WasmOp::I32x4ExtractLane(lane) => self.lower_i32x4_extract_lane(lane),
+            WasmOp::F32x4Sub => self.lower_f32x4_sub(),
+            WasmOp::F32x4Div => self.lower_f32x4_div(),
+            WasmOp::F32x4Fma => self.lower_f32x4_fma(),
             // Phase 15 conversions.
             WasmOp::I32Extend8S => self.lower_i32_extend_narrow(true, false),
             WasmOp::I32Extend16S => self.lower_i32_extend_narrow(false, false),
@@ -1412,6 +1426,42 @@ impl Lowerer {
         let src = self.pop_v128_slot()?;
         let dst = self.push_i32_slot()?;
         self.enc.umov_w_from_vs_lane(dst, src, lane)?;
+        Ok(())
+    }
+
+    fn lower_f32x4_sub(&mut self) -> Result<(), LowerError> {
+        let rhs = self.pop_v128_slot()?;
+        let lhs = self.pop_v128_slot()?;
+        let dst = self.push_v128_slot()?;
+        self.enc.fsub_4s(dst, lhs, rhs)?;
+        Ok(())
+    }
+
+    fn lower_f32x4_div(&mut self) -> Result<(), LowerError> {
+        let rhs = self.pop_v128_slot()?;
+        let lhs = self.pop_v128_slot()?;
+        let dst = self.push_v128_slot()?;
+        self.enc.fdiv_4s(dst, lhs, rhs)?;
+        Ok(())
+    }
+
+    /// Lower `f32x4.fma` — fused multiply-add. Operand stack order:
+    /// bottom `acc`, then `a`, then `b` (top). Each pop reveals the
+    /// next register index going down. FMLA Vd.4S, Vn.4S, Vm.4S does
+    /// `Vd += Vn * Vm` in-place; we emit it so Vd names the `acc`
+    /// register (deepest), Vn names `a`, Vm names `b`. After the op,
+    /// we push the result back at the `acc` slot position so the
+    /// caller sees one V128 on the stack where three were.
+    fn lower_f32x4_fma(&mut self) -> Result<(), LowerError> {
+        let b = self.pop_v128_slot()?;   // topmost
+        let a = self.pop_v128_slot()?;   // middle
+        let acc = self.pop_v128_slot()?; // deepest
+        let dst = self.push_v128_slot()?;
+        debug_assert_eq!(
+            dst.0, acc.0,
+            "FMA should write back to the acc slot"
+        );
+        self.enc.fmla_4s(dst, a, b)?;
         Ok(())
     }
 

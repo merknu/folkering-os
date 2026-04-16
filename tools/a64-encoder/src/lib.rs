@@ -689,6 +689,37 @@ impl Encoder {
         Ok(())
     }
 
+    /// FMLA Vd.4S, Vn.4S, Vm.4S — fused multiply-add:
+    /// `Vd = Vd + Vn * Vm`, per lane, single rounding.
+    /// This is the matmul primitive — one instruction per inner-
+    /// loop element, ~2× faster than separate FMUL + FADD and also
+    /// more accurate (no intermediate rounding).
+    ///
+    /// Encoding (C6.2.104 AdvSIMD 3-same, U=0, sz=0, opcode=11001):
+    /// `0 Q 0 0 1 1 1 0 0 sz 1 Rm 1 1 0 0 1 1 Rn Rd`, base 0x4E20CC00.
+    pub fn fmla_4s(&mut self, vd: Vreg, vn: Vreg, vm: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x4E20_CC00u32 | (vm.enc() << 16) | (vn.enc() << 5) | vd.enc());
+        Ok(())
+    }
+
+    /// FSUB Vd.4S, Vn.4S, Vm.4S — lane-wise f32 subtract.
+    ///
+    /// Encoding (C6.2.128 AdvSIMD vector, U=0, bit 23 set for sub):
+    /// base 0x4EA0D400.
+    pub fn fsub_4s(&mut self, vd: Vreg, vn: Vreg, vm: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x4EA0_D400u32 | (vm.enc() << 16) | (vn.enc() << 5) | vd.enc());
+        Ok(())
+    }
+
+    /// FDIV Vd.4S, Vn.4S, Vm.4S — lane-wise f32 divide.
+    ///
+    /// Encoding (C6.2.102 AdvSIMD vector, U=1, opcode=11111):
+    /// `0 Q 1 0 1 1 1 0 0 sz 1 Rm 1 1 1 1 1 1 Rn Rd`, base 0x6E20FC00.
+    pub fn fdiv_4s(&mut self, vd: Vreg, vn: Vreg, vm: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x6E20_FC00u32 | (vm.enc() << 16) | (vn.enc() << 5) | vd.enc());
+        Ok(())
+    }
+
     // ── Phase 15: conversions ───────────────────────────────────────
     //
     // Covers sign-extensions (WASM's extend8_s / extend16_s / extend32_s),
@@ -1887,6 +1918,27 @@ mod tests {
             one(|e| e.umov_w_from_vs_lane(Reg::X0, Vreg::S1, 3)),
             0x0E1C3C20
         );
+    }
+
+    #[test]
+    fn fmla_4s_basic() {
+        // fmla v0.4s, v1.4s, v2.4s
+        // base 0x4E20CC00 | (2<<16) | (1<<5) | 0 = 0x4E22CC20
+        assert_eq!(one(|e| e.fmla_4s(Vreg::S0, Vreg::S1, Vreg::S2)), 0x4E22CC20);
+    }
+
+    #[test]
+    fn fsub_4s_basic() {
+        // fsub v0.4s, v1.4s, v2.4s
+        // base 0x4EA0D400 | (2<<16) | (1<<5) | 0 = 0x4EA2D420
+        assert_eq!(one(|e| e.fsub_4s(Vreg::S0, Vreg::S1, Vreg::S2)), 0x4EA2D420);
+    }
+
+    #[test]
+    fn fdiv_4s_basic() {
+        // fdiv v0.4s, v1.4s, v2.4s
+        // base 0x6E20FC00 | (2<<16) | (1<<5) | 0 = 0x6E22FC20
+        assert_eq!(one(|e| e.fdiv_4s(Vreg::S0, Vreg::S1, Vreg::S2)), 0x6E22FC20);
     }
 
     // ── Phase 15 conversion encoders ────────────────────────────────

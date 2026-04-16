@@ -274,6 +274,97 @@ fn cases() -> Vec<Case> {
             },
             expected: 30,
         },
+        // ── f32x4.sub ─────────────────────────────────────────────
+        // splat(100) - splat(58) = 42.0 (each lane). Extract lane 0.
+        Case {
+            name: "f32x4.sub splat(100.0) - splat(58.0) → lane 0 = 42.0",
+            ops: vec![
+                WasmOp::F32Const(100.0),
+                WasmOp::F32x4Splat,
+                WasmOp::F32Const(58.0),
+                WasmOp::F32x4Splat,
+                WasmOp::F32x4Sub,
+                WasmOp::F32x4ExtractLane(0),
+                WasmOp::F32Const(42.0),
+                WasmOp::F32Eq,
+                WasmOp::End,
+            ],
+            expected: 1,
+        },
+        // ── f32x4.div ─────────────────────────────────────────────
+        // splat(42) / splat(2) = 21.0 per lane.
+        Case {
+            name: "f32x4.div splat(42.0) / splat(2.0) → lane 2 = 21.0",
+            ops: vec![
+                WasmOp::F32Const(42.0),
+                WasmOp::F32x4Splat,
+                WasmOp::F32Const(2.0),
+                WasmOp::F32x4Splat,
+                WasmOp::F32x4Div,
+                WasmOp::F32x4ExtractLane(2),
+                WasmOp::F32Const(21.0),
+                WasmOp::F32Eq,
+                WasmOp::End,
+            ],
+            expected: 1,
+        },
+        // ── f32x4.fma — the GEMM primitive ────────────────────────
+        // acc = splat(10), a = splat(3), b = splat(4) → acc + a*b = 22
+        // Per lane: 10 + 3 * 4 = 22.
+        Case {
+            name: "f32x4.fma: 10 + 3*4 = 22, lane 0",
+            ops: vec![
+                WasmOp::F32Const(10.0),
+                WasmOp::F32x4Splat,
+                WasmOp::F32Const(3.0),
+                WasmOp::F32x4Splat,
+                WasmOp::F32Const(4.0),
+                WasmOp::F32x4Splat,
+                WasmOp::F32x4Fma,
+                WasmOp::F32x4ExtractLane(0),
+                WasmOp::F32Const(22.0),
+                WasmOp::F32Eq,
+                WasmOp::End,
+            ],
+            expected: 1,
+        },
+        // ── f32x4.fma chain — mimics an inner GEMM loop ───────────
+        // acc = splat(0)
+        // acc = acc + splat(2) * splat(5)   = 10
+        // acc = acc + splat(3) * splat(7)   = 31
+        // acc = acc + splat(1) * splat(11)  = 42
+        // Extract lane 1, compare to 42.0.
+        Case {
+            name: "f32x4.fma chain: 2*5 + 3*7 + 1*11 + 0 = 42, lane 1",
+            ops: vec![
+                WasmOp::F32Const(0.0),
+                WasmOp::F32x4Splat,
+                // iter 1
+                WasmOp::F32Const(2.0),
+                WasmOp::F32x4Splat,
+                WasmOp::F32Const(5.0),
+                WasmOp::F32x4Splat,
+                WasmOp::F32x4Fma,
+                // iter 2
+                WasmOp::F32Const(3.0),
+                WasmOp::F32x4Splat,
+                WasmOp::F32Const(7.0),
+                WasmOp::F32x4Splat,
+                WasmOp::F32x4Fma,
+                // iter 3
+                WasmOp::F32Const(1.0),
+                WasmOp::F32x4Splat,
+                WasmOp::F32Const(11.0),
+                WasmOp::F32x4Splat,
+                WasmOp::F32x4Fma,
+                // extract + compare
+                WasmOp::F32x4ExtractLane(1),
+                WasmOp::F32Const(42.0),
+                WasmOp::F32Eq,
+                WasmOp::End,
+            ],
+            expected: 1,
+        },
         // ── v128.store round-trip ─────────────────────────────────
         // Load a vector from mem[0], store it to mem[48], then read
         // back mem[48] as v128, extract lane 1, compare to original.

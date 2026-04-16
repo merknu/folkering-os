@@ -360,7 +360,9 @@ pub fn parse_ops(bytes: &[u8], pos: &mut usize) -> Result<Vec<WasmOp>, ParseErro
                     0xB1 => ops.push(WasmOp::I32x4Sub),
                     0xB5 => ops.push(WasmOp::I32x4Mul),
                     0xE4 => ops.push(WasmOp::F32x4Add),
+                    0xE5 => ops.push(WasmOp::F32x4Sub),
                     0xE6 => ops.push(WasmOp::F32x4Mul),
+                    0xE7 => ops.push(WasmOp::F32x4Div),
                     _ => {
                         // Encode the unknown SIMD sub-opcode as a
                         // single byte for error reporting (lossy for
