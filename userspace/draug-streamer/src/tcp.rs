@@ -18,6 +18,12 @@ use libfolk::sys::{
     tcp_close_async, tcp_connect_async, tcp_poll_recv, tcp_send_async, yield_cpu, TCP_EAGAIN,
 };
 
+/// Zero-length slice to probe slot state via `tcp_send_async`.
+/// The kernel's `syscall_tcp_send` auto-promotes a `Connecting` slot
+/// to `Connected` once the handshake completes; sending 0 bytes is
+/// a side-effect-free way to drive that promotion.
+const EMPTY: &[u8] = &[];
+
 #[derive(Debug)]
 pub enum TcpError {
     /// `tcp_connect_async` returned `u64::MAX` — kernel out of slots
@@ -45,42 +51,40 @@ const INVALID_SLOT: u64 = 0xFFFF;
 impl TcpSession {
     /// Open a TCP session, **blocking until the handshake completes**.
     ///
-    /// The kernel's `tcp_connect_async` is two-phase:
-    ///   * first call — allocates a slot, kicks off the SYN handshake,
-    ///     returns the slot id (state = Connecting)
-    ///   * subsequent calls on the same (ip, port) — find the still-
-    ///     connecting slot and either promote it to Connected
-    ///     (return slot id), report failure (`u64::MAX`), or say
-    ///     "still handshaking" (`TCP_EAGAIN`)
+    /// Connection flow:
+    ///   1. `tcp_connect_async(ip, port)` allocates a slot and kicks
+    ///      off the SYN. Returns the slot id (state = Connecting).
+    ///   2. We drive the handshake to completion via
+    ///      `tcp_send_async(slot, &[])`. Empty-slice sends are
+    ///      side-effect-free and return `0` once the kernel has
+    ///      promoted the slot to Connected (or `TCP_EAGAIN` while
+    ///      still handshaking, or `u64::MAX` on failure).
     ///
-    /// Critically, `tcp_poll_recv` on a Connecting slot returns
-    /// `u64::MAX` — not EAGAIN. That means the client *must* wait
-    /// for the handshake to complete before reading anything.
-    /// Historically the compositor's draug_async handled this via
-    /// its state-machine "Sending" phase (tcp_send_async does auto-
-    /// promote Connecting → Connected), but a pure listen-first
-    /// protocol like ours needs an explicit connect-poll loop.
+    /// Why not loop on `tcp_connect_async`? The kernel's
+    /// `syscall_tcp_connect` only matches *Connecting* slots in its
+    /// re-poll path — once a slot is promoted to Connected, a
+    /// subsequent call allocates a brand-new slot (and socket) and
+    /// kicks off a second handshake. That means `tcp_poll_recv` on
+    /// the original slot never sees any data because the daemon's
+    /// bytes arrive on the new, unrelated connection. Using
+    /// `tcp_send_async` as the probe sidesteps that quirk.
     pub fn connect(ip: [u8; 4], port: u16) -> Result<Self, TcpError> {
-        let initial = tcp_connect_async(ip, port);
-        if initial == u64::MAX {
+        let slot = tcp_connect_async(ip, port);
+        if slot == u64::MAX {
             return Err(TcpError::ConnectFailed);
         }
-        if initial == TCP_EAGAIN {
-            // Unexpected — the *first* call should always allocate a
-            // slot. Treat as fatal so the client doesn't hang.
+        if slot == TCP_EAGAIN || slot == INVALID_SLOT {
             return Err(TcpError::ConnectFailed);
         }
-        if initial == INVALID_SLOT {
-            return Err(TcpError::ConnectFailed);
-        }
-        // Spin until the handshake promotes the slot to Connected.
-        // Each iteration yields the CPU so we don't starve the
-        // scheduler while waiting for a network round-trip.
+        // Drive the handshake to completion. `tcp_send_async` with a
+        // zero-length buffer auto-promotes Connecting → Connected
+        // once `socket.may_send()` is true — the first non-EAGAIN,
+        // non-MAX return value means we're fully connected.
         loop {
-            match tcp_connect_async(ip, port) {
+            match tcp_send_async(slot, EMPTY) {
                 TCP_EAGAIN => yield_cpu(),
                 v if v == u64::MAX => return Err(TcpError::ConnectFailed),
-                slot => return Ok(TcpSession { slot }),
+                _ => return Ok(TcpSession { slot }),
             }
         }
     }

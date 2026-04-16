@@ -78,18 +78,12 @@ static ALLOCATOR: BumpAllocator = BumpAllocator {
 
 // ── Target ──────────────────────────────────────────────────────────
 
-/// Daemon address. Folkering's guest networking uses SLIRP and can
-/// only reliably reach the gateway (10.0.2.2, which the SLIRP router
-/// maps to host loopback). We therefore route through a host-side
-/// relay (see `tools/tcp_relay.py`) that forwards the framed
-/// protocol to the real Pi-side `a64-stream-daemon` at
-/// 192.168.68.72:14712.
-///
-/// The relay listens on `0.0.0.0:14712` on the host, so the guest
-/// hits it via the SLIRP gateway. From the relay's perspective the
-/// guest is just another local client — bytes are piped untouched
-/// to the Pi in both directions.
-const DAEMON_IP: [u8; 4] = [10, 0, 2, 2];
+/// Pi-side `a64-stream-daemon` address. Smoltcp installs a default
+/// IPv4 route from the DHCP offer (gateway 10.0.2.2), so off-subnet
+/// destinations should NAT out through SLIRP automatically. If that
+/// proves unreliable, fall back to the host relay at `10.0.2.2:14712`
+/// (see `tools/a64-streamer/src/bin/relay.rs`).
+const DAEMON_IP: [u8; 4] = [192, 168, 68, 72];
 const DAEMON_PORT: u16 = 14712;
 
 entry!(main);
