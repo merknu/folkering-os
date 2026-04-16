@@ -305,6 +305,11 @@ pub enum WasmOp {
     /// SIMD proposal's 0xFD 0x85 0x01 multi-byte encoding will plug
     /// in later when the parser grows support).
     F32x4Fma,
+    /// Horizontal sum: pop one V128, push F32 equal to the sum of
+    /// all four lanes. Folkering-specific extension — WASM SIMD has
+    /// no portable reduction op. Implemented as two FADDPs
+    /// (pairwise vector + pairwise scalar).
+    F32x4HorizontalSum,
     /// Copy local `n` onto the stack.
     LocalGet(u32),
     /// Pop stack top, store into local `n`.
@@ -952,6 +957,7 @@ impl Lowerer {
             WasmOp::F32x4Sub => self.lower_f32x4_sub(),
             WasmOp::F32x4Div => self.lower_f32x4_div(),
             WasmOp::F32x4Fma => self.lower_f32x4_fma(),
+            WasmOp::F32x4HorizontalSum => self.lower_f32x4_horizontal_sum(),
             // Phase 15 conversions.
             WasmOp::I32Extend8S => self.lower_i32_extend_narrow(true, false),
             WasmOp::I32Extend16S => self.lower_i32_extend_narrow(false, false),
@@ -1462,6 +1468,33 @@ impl Lowerer {
             "FMA should write back to the acc slot"
         );
         self.enc.fmla_4s(dst, a, b)?;
+        Ok(())
+    }
+
+    /// Lower `f32x4.horizontal_sum` — reduce a 4-lane f32 vector to
+    /// a single f32 total. Two-stage FADDP (vector pairwise +
+    /// scalar pairwise):
+    ///
+    ///   input  Vn.4S = [a, b, c, d]
+    ///   FADDP Vn.4S, Vn.4S, Vn.4S  → Vn.4S = [a+b, c+d, a+b, c+d]
+    ///   FADDP Sd,    Vn.2S         → Sd    = (a+b) + (c+d)
+    ///
+    /// Pops V128, pushes F32 at the same slot index. The caller's
+    /// downstream F32 arith/cmp/store all see a normal f32 scalar.
+    fn lower_f32x4_horizontal_sum(&mut self) -> Result<(), LowerError> {
+        let src = self.pop_v128_slot()?;
+        let dst = self.push_f32_slot()?;
+        debug_assert_eq!(
+            dst.0, src.0,
+            "horizontal_sum reuses the V128 slot for the scalar result",
+        );
+        // Stage 1: pairwise vector — folds the 4 lanes into 2 pairs.
+        // Same src for Vn and Vm so the result's upper 64 bits are
+        // just a duplicate of the lower 64 (harmless; the second
+        // FADDP ignores them).
+        self.enc.faddp_4s(src, src, src)?;
+        // Stage 2: pairwise scalar — reduces the pair into one lane.
+        self.enc.faddp_s_from_2s_scalar(dst, src)?;
         Ok(())
     }
 

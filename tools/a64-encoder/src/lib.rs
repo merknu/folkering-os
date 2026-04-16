@@ -720,6 +720,30 @@ impl Encoder {
         Ok(())
     }
 
+    /// FADDP Vd.4S, Vn.4S, Vm.4S — pairwise f32 add across 4S
+    /// vectors. Result layout: [Vn[0]+Vn[1], Vn[2]+Vn[3],
+    /// Vm[0]+Vm[1], Vm[2]+Vm[3]]. Half of a horizontal reduction
+    /// (see `faddp_s_from_2s_scalar` for the second half).
+    ///
+    /// Encoding (AdvSIMD 3-same, U=1, sz=0, opcode=11010):
+    /// `0 Q 1 0 1 1 1 0 0 sz 1 Rm 1 1 0 1 0 1 Rn Rd`, base 0x6E20D400.
+    pub fn faddp_4s(&mut self, vd: Vreg, vn: Vreg, vm: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x6E20_D400u32 | (vm.enc() << 16) | (vn.enc() << 5) | vd.enc());
+        Ok(())
+    }
+
+    /// FADDP Sd, Vn.2S — scalar pair-wise add of the low two f32
+    /// lanes of Vn. Second stage of a horizontal reduction:
+    /// applied to a vector shaped [a+b, c+d, _, _] gives scalar
+    /// `(a+b) + (c+d)`.
+    ///
+    /// Encoding (AdvSIMD scalar pairwise, sz=0):
+    /// `01 1 11110 0 0 11000 0 110110 Rn Rd`, base 0x7E30D800.
+    pub fn faddp_s_from_2s_scalar(&mut self, sd: Vreg, vn: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x7E30_D800u32 | (vn.enc() << 5) | sd.enc());
+        Ok(())
+    }
+
     // ── Phase 15: conversions ───────────────────────────────────────
     //
     // Covers sign-extensions (WASM's extend8_s / extend16_s / extend32_s),
@@ -1939,6 +1963,23 @@ mod tests {
         // fdiv v0.4s, v1.4s, v2.4s
         // base 0x6E20FC00 | (2<<16) | (1<<5) | 0 = 0x6E22FC20
         assert_eq!(one(|e| e.fdiv_4s(Vreg::S0, Vreg::S1, Vreg::S2)), 0x6E22FC20);
+    }
+
+    #[test]
+    fn faddp_4s_basic() {
+        // faddp v0.4s, v1.4s, v2.4s
+        // base 0x6E20D400 | (2<<16) | (1<<5) | 0 = 0x6E22D420
+        assert_eq!(one(|e| e.faddp_4s(Vreg::S0, Vreg::S1, Vreg::S2)), 0x6E22D420);
+    }
+
+    #[test]
+    fn faddp_s_from_2s_scalar_basic() {
+        // faddp s0, v1.2s
+        // base 0x7E30D800 | (1<<5) | 0 = 0x7E30D820
+        assert_eq!(
+            one(|e| e.faddp_s_from_2s_scalar(Vreg::S0, Vreg::S1)),
+            0x7E30D820
+        );
     }
 
     // ── Phase 15 conversion encoders ────────────────────────────────

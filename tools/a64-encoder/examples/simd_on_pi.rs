@@ -365,6 +365,117 @@ fn cases() -> Vec<Case> {
             ],
             expected: 1,
         },
+        // ── f32x4.horizontal_sum (Folkering extension) ───────────
+        // splat(3.25) → 4 × 3.25 = 13.0. Use as baseline.
+        Case {
+            name: "f32x4.horizontal_sum splat(3.25) = 13.0",
+            ops: vec![
+                WasmOp::F32Const(3.25),
+                WasmOp::F32x4Splat,
+                WasmOp::F32x4HorizontalSum,
+                WasmOp::F32Const(13.0),
+                WasmOp::F32Eq,
+                WasmOp::End,
+            ],
+            expected: 1,
+        },
+        // Heterogeneous vector: [1, 2, 3, 4] → 10.
+        Case {
+            name: "f32x4.horizontal_sum [1,2,3,4] = 10.0",
+            ops: {
+                let mut ops = store_4_f32(0, [1.0, 2.0, 3.0, 4.0]);
+                ops.extend_from_slice(&[
+                    WasmOp::I32Const(0),
+                    WasmOp::V128Load(0),
+                    WasmOp::F32x4HorizontalSum,
+                    WasmOp::F32Const(10.0),
+                    WasmOp::F32Eq,
+                    WasmOp::End,
+                ]);
+                ops
+            },
+            expected: 1,
+        },
+        // ── Real matvec: 4×4 @ 4×1 via FMA accumulator ────────────
+        //
+        // This is the shape of a transformer attention step's
+        // inner loop — a micro-GEMM. Proves the full SIMD stack
+        // (load, splat, FMA, extract) composes into a real ML
+        // primitive on Cortex-A76 hardware.
+        //
+        // Matrix A (4×4, stored column-major in mem):
+        //   col0 @ mem[0..16]   = [1, 5,  9, 13]
+        //   col1 @ mem[16..32]  = [2, 6, 10, 14]
+        //   col2 @ mem[32..48]  = [3, 7, 11, 15]
+        //   col3 @ mem[48..64]  = [4, 8, 12, 16]
+        //
+        // x = [1, 1, 1, 1]  (implicit — we splat(1.0) for each col)
+        //
+        // y = A @ x = [10, 26, 42, 58] (sum of each row)
+        //
+        // Computed as:
+        //   acc = splat(0)
+        //   for j in 0..4:
+        //     acc += splat(x[j]) * A[:, j]   // FMA
+        //   return acc   (4-lane result)
+        //
+        // Extract lane 1 → 5+6+7+8 = 26.
+        Case {
+            name: "matvec 4x4 @ [1,1,1,1]: FMA accumulator → lane 1 = 26",
+            ops: {
+                // Store A column-major.
+                let mut ops = store_4_f32(0,  [1.0,  5.0,  9.0, 13.0]);
+                ops.extend(store_4_f32(16,   [2.0,  6.0, 10.0, 14.0]));
+                ops.extend(store_4_f32(32,   [3.0,  7.0, 11.0, 15.0]));
+                ops.extend(store_4_f32(48,   [4.0,  8.0, 12.0, 16.0]));
+                // acc = splat(0)
+                ops.push(WasmOp::F32Const(0.0));
+                ops.push(WasmOp::F32x4Splat);
+                // Fold in each column: acc += splat(x[j]) * A[:, j]
+                for j in 0..4u32 {
+                    // x[j] = 1.0 for every j in this test
+                    ops.push(WasmOp::F32Const(1.0));
+                    ops.push(WasmOp::F32x4Splat);
+                    // load column j
+                    ops.push(WasmOp::I32Const((16 * j) as i32));
+                    ops.push(WasmOp::V128Load(0));
+                    // FMA expects stack: [acc, a, b] with top=b. We
+                    // have [acc, splat(x[j]), col] — that's [acc, a, b]
+                    // correctly ordered.
+                    ops.push(WasmOp::F32x4Fma);
+                }
+                // Extract lane 1, compare to 26.0.
+                ops.push(WasmOp::F32x4ExtractLane(1));
+                ops.push(WasmOp::F32Const(26.0));
+                ops.push(WasmOp::F32Eq);
+                ops.push(WasmOp::End);
+                ops
+            },
+            expected: 1,
+        },
+        // Dot product of two 4-vectors via mul + horizontal_sum.
+        // u = [1, 2, 3, 4], v = [5, 6, 7, 8]
+        // dot(u, v) = 5 + 12 + 21 + 32 = 70.
+        Case {
+            name: "dot([1,2,3,4], [5,6,7,8]) = 70",
+            ops: {
+                let mut ops = store_4_f32(0,  [1.0, 2.0, 3.0, 4.0]);
+                ops.extend(store_4_f32(16,   [5.0, 6.0, 7.0, 8.0]));
+                ops.extend_from_slice(&[
+                    WasmOp::I32Const(0),
+                    WasmOp::V128Load(0),
+                    WasmOp::I32Const(16),
+                    WasmOp::V128Load(0),
+                    WasmOp::F32x4Mul,
+                    WasmOp::F32x4HorizontalSum,
+                    WasmOp::F32Const(70.0),
+                    WasmOp::F32Eq,
+                    WasmOp::End,
+                ]);
+                ops
+            },
+            expected: 1,
+        },
         // ── v128.store round-trip ─────────────────────────────────
         // Load a vector from mem[0], store it to mem[48], then read
         // back mem[48] as v128, extract lane 1, compare to original.
