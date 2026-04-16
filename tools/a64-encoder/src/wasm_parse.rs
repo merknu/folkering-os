@@ -150,10 +150,38 @@ pub fn parse_ops(bytes: &[u8], pos: &mut usize) -> Result<Vec<WasmOp>, ParseErro
             0x51 => ops.push(WasmOp::I64Eq),
             0x52 => ops.push(WasmOp::I64Ne),
             0x53 => ops.push(WasmOp::I64LtS),
+            0x54 => ops.push(WasmOp::I64LtU),
             0x55 => ops.push(WasmOp::I64GtS),
+            0x56 => ops.push(WasmOp::I64GtU),
+            0x57 => ops.push(WasmOp::I64LeS),
+            0x58 => ops.push(WasmOp::I64LeU),
+            0x59 => ops.push(WasmOp::I64GeS),
+            0x5A => ops.push(WasmOp::I64GeU),
             0x7C => ops.push(WasmOp::I64Add),
             0x7D => ops.push(WasmOp::I64Sub),
             0x7E => ops.push(WasmOp::I64Mul),
+            0x7F => ops.push(WasmOp::I64DivS),
+            0x80 => ops.push(WasmOp::I64DivU),
+            0x83 => ops.push(WasmOp::I64And),
+            0x84 => ops.push(WasmOp::I64Or),
+            0x85 => ops.push(WasmOp::I64Xor),
+            0x86 => ops.push(WasmOp::I64Shl),
+            0x87 => ops.push(WasmOp::I64ShrS),
+            0x88 => ops.push(WasmOp::I64ShrU),
+            0x29 => {
+                // i64.load memarg: align (uleb) then offset (uleb).
+                let _align = read_uleb128(bytes, pos)?;
+                let off = read_uleb128(bytes, pos)?;
+                if off > u32::MAX as u64 { return Err(ParseError::IntegerTooLarge); }
+                ops.push(WasmOp::I64Load(off as u32));
+            }
+            0x37 => {
+                // i64.store memarg.
+                let _align = read_uleb128(bytes, pos)?;
+                let off = read_uleb128(bytes, pos)?;
+                if off > u32::MAX as u64 { return Err(ParseError::IntegerTooLarge); }
+                ops.push(WasmOp::I64Store(off as u32));
+            }
             0xA7 => ops.push(WasmOp::I32WrapI64),
             0xAC => ops.push(WasmOp::I64ExtendI32S),
             0xAD => ops.push(WasmOp::I64ExtendI32U),

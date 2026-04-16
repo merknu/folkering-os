@@ -128,6 +128,38 @@ pub enum WasmOp {
     I64LtS,
     /// Pop two i64s, push i32 1 if left > right (signed) else 0.
     I64GtS,
+    /// Pop two i64s, push i32 1 if left < right (unsigned) else 0.
+    I64LtU,
+    /// Pop two i64s, push i32 1 if left > right (unsigned) else 0.
+    I64GtU,
+    /// Pop two i64s, push i32 1 if left ≤ right (signed) else 0.
+    I64LeS,
+    /// Pop two i64s, push i32 1 if left ≤ right (unsigned) else 0.
+    I64LeU,
+    /// Pop two i64s, push i32 1 if left ≥ right (signed) else 0.
+    I64GeS,
+    /// Pop two i64s, push i32 1 if left ≥ right (unsigned) else 0.
+    I64GeU,
+    /// Pop two i64s, push left / right (signed, trunc toward zero).
+    I64DivS,
+    /// Pop two i64s, push left / right (unsigned).
+    I64DivU,
+    /// Pop two i64s, push bitwise AND.
+    I64And,
+    /// Pop two i64s, push bitwise OR.
+    I64Or,
+    /// Pop two i64s, push bitwise XOR.
+    I64Xor,
+    /// Pop two i64s, push `left << (right mod 64)`.
+    I64Shl,
+    /// Pop two i64s, push `left >> (right mod 64)` — signed.
+    I64ShrS,
+    /// Pop two i64s, push `left >> (right mod 64)` — unsigned.
+    I64ShrU,
+    /// Load i64 from linear memory — offset must be 8-aligned.
+    I64Load(u32),
+    /// Store i64 to linear memory — offset must be 8-aligned.
+    I64Store(u32),
     /// Pop i64, push its low 32 bits as i32 (wrap semantics).
     I32WrapI64,
     /// Pop i32, push as i64 with signed extension.
@@ -287,11 +319,14 @@ enum BinOp {
 #[derive(Clone, Copy)]
 enum FBinOp { Add, Sub, Mul, Div }
 
-/// i64 arithmetic subset. Same ADD/SUB/MUL encoders as i32 (both
-/// are 64-bit X-width already), but the lowerer uses the typed
-/// i64 stack helpers so the operand-stack type tag stays correct.
+/// i64 arithmetic + bitwise ops. All route through 64-bit X-width
+/// instructions; the lowerer uses the typed i64 stack helpers so
+/// the operand-stack type tag stays correct.
 #[derive(Clone, Copy)]
-enum I64Op { Add, Sub, Mul }
+enum I64Op {
+    Add, Sub, Mul, DivS, DivU,
+    And, Or, Xor, Shl, ShrS, ShrU,
+}
 
 /// Maximum WASM operand-stack depth in i32 slots (X0..X15).
 const MAX_I32_STACK: usize = 16;
@@ -603,6 +638,22 @@ impl Lowerer {
             WasmOp::I64Ne => self.lower_i64_cmp(Condition::Ne),
             WasmOp::I64LtS => self.lower_i64_cmp(Condition::Lt),
             WasmOp::I64GtS => self.lower_i64_cmp(Condition::Gt),
+            WasmOp::I64LtU => self.lower_i64_cmp(Condition::Lo),
+            WasmOp::I64GtU => self.lower_i64_cmp(Condition::Hi),
+            WasmOp::I64LeS => self.lower_i64_cmp(Condition::Le),
+            WasmOp::I64LeU => self.lower_i64_cmp(Condition::Ls),
+            WasmOp::I64GeS => self.lower_i64_cmp(Condition::Ge),
+            WasmOp::I64GeU => self.lower_i64_cmp(Condition::Hs),
+            WasmOp::I64DivS => self.lower_i64_binop(I64Op::DivS),
+            WasmOp::I64DivU => self.lower_i64_binop(I64Op::DivU),
+            WasmOp::I64And => self.lower_i64_binop(I64Op::And),
+            WasmOp::I64Or => self.lower_i64_binop(I64Op::Or),
+            WasmOp::I64Xor => self.lower_i64_binop(I64Op::Xor),
+            WasmOp::I64Shl => self.lower_i64_binop(I64Op::Shl),
+            WasmOp::I64ShrS => self.lower_i64_binop(I64Op::ShrS),
+            WasmOp::I64ShrU => self.lower_i64_binop(I64Op::ShrU),
+            WasmOp::I64Load(off) => self.lower_i64_load(off),
+            WasmOp::I64Store(off) => self.lower_i64_store(off),
             WasmOp::I32WrapI64 => self.lower_wrap_i64(),
             WasmOp::I64ExtendI32S => self.lower_extend_i32(true),
             WasmOp::I64ExtendI32U => self.lower_extend_i32(false),
@@ -854,10 +905,48 @@ impl Lowerer {
         let lhs = self.pop_i64_slot()?;
         let dst = self.push_i64_slot()?;
         match op {
-            I64Op::Add => self.enc.add(dst, lhs, rhs)?,
-            I64Op::Sub => self.enc.sub(dst, lhs, rhs)?,
-            I64Op::Mul => self.enc.mul(dst, lhs, rhs)?,
+            I64Op::Add  => self.enc.add(dst, lhs, rhs)?,
+            I64Op::Sub  => self.enc.sub(dst, lhs, rhs)?,
+            I64Op::Mul  => self.enc.mul(dst, lhs, rhs)?,
+            I64Op::DivS => self.enc.sdiv(dst, lhs, rhs)?,
+            I64Op::DivU => self.enc.udiv(dst, lhs, rhs)?,
+            I64Op::And  => self.enc.and_x(dst, lhs, rhs)?,
+            I64Op::Or   => self.enc.orr_x(dst, lhs, rhs)?,
+            I64Op::Xor  => self.enc.eor_x(dst, lhs, rhs)?,
+            I64Op::Shl  => self.enc.lsl_x(dst, lhs, rhs)?,
+            I64Op::ShrS => self.enc.asr_x(dst, lhs, rhs)?,
+            I64Op::ShrU => self.enc.lsr_x(dst, lhs, rhs)?,
         }
+        Ok(())
+    }
+
+    /// Lower `i64.load off` — pop i32 addr, push i64 value from
+    /// `mem_base + addr + offset`. LDR Xt requires 8-aligned offset.
+    fn lower_i64_load(&mut self, offset: u32) -> Result<(), LowerError> {
+        if !self.has_memory {
+            return Err(LowerError::MemoryNotConfigured);
+        }
+        let addr = self.pop_i32_slot()?;
+        let dst = self.push_i64_slot()?;
+        // Effective-address computation into X16 (caller-saved IP)
+        // since `addr` was an i32 slot and `dst` is an i64 slot; they
+        // may alias physically but we need the full X register as the
+        // LDR destination, so compute separately.
+        self.enc.add_ext_uxtw(Reg::X16, MEM_BASE_REG, addr)?;
+        self.enc.ldr_imm(dst, Reg::X16, offset)?;
+        Ok(())
+    }
+
+    /// Lower `i64.store off` — pop i64 value, pop i32 addr, write the
+    /// full 64-bit value. STR Xt requires 8-aligned offset.
+    fn lower_i64_store(&mut self, offset: u32) -> Result<(), LowerError> {
+        if !self.has_memory {
+            return Err(LowerError::MemoryNotConfigured);
+        }
+        let val = self.pop_i64_slot()?;
+        let addr = self.pop_i32_slot()?;
+        self.enc.add_ext_uxtw(Reg::X16, MEM_BASE_REG, addr)?;
+        self.enc.str_imm(val, Reg::X16, offset)?;
         Ok(())
     }
 
