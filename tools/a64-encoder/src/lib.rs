@@ -943,6 +943,42 @@ impl Encoder {
         Ok(())
     }
 
+    /// B.cond — conditional branch to PC-relative offset.
+    ///
+    /// Encoding (C6.2.26): `0 1 0 1 0 1 0 0 imm19(19) 0 cond(4)`,
+    /// base 0x5400_0000. `offset` is in *bytes*, must be 4-aligned,
+    /// range ±1 MiB (signed 19-bit word offset). The condition is
+    /// the same enum used by `CSET` so callers can reuse the
+    /// signed/unsigned vocabulary (e.g. `Condition::Ls` for the
+    /// bounds-check skip branch).
+    pub fn b_cond(&mut self, cond: Condition, offset: i32) -> Result<(), EncodeError> {
+        if offset & 0x3 != 0 { return Err(EncodeError::OffsetMisaligned); }
+        let imm19 = offset >> 2;
+        if !(-(1 << 18)..(1 << 18)).contains(&imm19) {
+            return Err(EncodeError::ImmediateOutOfRange);
+        }
+        let word = 0x5400_0000u32
+            | (((imm19 as u32) & 0x0007_FFFF) << 5)
+            | (cond as u32);
+        self.emit(word);
+        Ok(())
+    }
+
+    /// Encode a B.cond instruction word directly (for patching).
+    /// Same encoding as [`Encoder::b_cond`] but returns the u32 word
+    /// instead of emitting it. Used by the lowerer to back-patch
+    /// forward branches once their target becomes known.
+    pub fn encode_b_cond(cond: Condition, offset: i32) -> Result<u32, EncodeError> {
+        if offset & 0x3 != 0 { return Err(EncodeError::OffsetMisaligned); }
+        let imm19 = offset >> 2;
+        if !(-(1 << 18)..(1 << 18)).contains(&imm19) {
+            return Err(EncodeError::ImmediateOutOfRange);
+        }
+        Ok(0x5400_0000u32
+            | (((imm19 as u32) & 0x0007_FFFF) << 5)
+            | (cond as u32))
+    }
+
     /// BR Xn (branch to register — no link, no return-prediction hint).
     ///
     /// Encoding (C6.2.33): `1101 0110 0 0 011111 000000 Rn(5) 00000`.
@@ -1227,6 +1263,32 @@ mod tests {
     fn b_rejects_misaligned() {
         let mut e = Encoder::new();
         assert_eq!(e.b(2), Err(EncodeError::OffsetMisaligned));
+    }
+
+    #[test]
+    fn b_cond_ls_forward_4() {
+        // b.ls +4  →  imm19 = 1, cond = Ls (0b1001 = 9)
+        // 0x54000000 | (1 << 5) | 9 = 0x54000029
+        assert_eq!(one(|e| e.b_cond(Condition::Ls, 4)), 0x54000029);
+    }
+
+    #[test]
+    fn b_cond_eq_zero() {
+        // b.eq 0 — imm19 = 0, cond = Eq (0)
+        assert_eq!(one(|e| e.b_cond(Condition::Eq, 0)), 0x54000000);
+    }
+
+    #[test]
+    fn b_cond_ne_backward_8() {
+        // b.ne -8 — imm19 = -2 (0x7FFFE in 19-bit), cond = Ne (1)
+        // 0x54000000 | ((0x7FFFE & 0x7FFFF) << 5) | 1 = 0x54FFFFC1
+        assert_eq!(one(|e| e.b_cond(Condition::Ne, -8)), 0x54FFFFC1);
+    }
+
+    #[test]
+    fn b_cond_rejects_misaligned() {
+        let mut e = Encoder::new();
+        assert_eq!(e.b_cond(Condition::Eq, 3), Err(EncodeError::OffsetMisaligned));
     }
 
     #[test]
