@@ -132,6 +132,15 @@ pub fn parse_ops(bytes: &[u8], pos: &mut usize) -> Result<Vec<WasmOp>, ParseErro
                 }
                 ops.push(WasmOp::I32Const(v as i32));
             }
+            0x43 => {
+                // f32.const — 4 bytes little-endian, NOT a varint.
+                // WASM spec encodes floats directly by bit pattern.
+                if *pos + 4 > bytes.len() { return Err(ParseError::UnexpectedEof); }
+                let b = &bytes[*pos..*pos + 4];
+                *pos += 4;
+                let bits = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                ops.push(WasmOp::F32Const(f32::from_bits(bits)));
+            }
             0x28 => {
                 // i32.load memarg: align (uleb) then offset (uleb).
                 let _align = read_uleb128(bytes, pos)?;
@@ -167,6 +176,11 @@ pub fn parse_ops(bytes: &[u8], pos: &mut usize) -> Result<Vec<WasmOp>, ParseErro
             0x74 => ops.push(WasmOp::I32Shl),
             0x75 => ops.push(WasmOp::I32ShrS),
             0x76 => ops.push(WasmOp::I32ShrU),
+            0x5B => ops.push(WasmOp::F32Eq),
+            0x92 => ops.push(WasmOp::F32Add),
+            0x93 => ops.push(WasmOp::F32Sub),
+            0x94 => ops.push(WasmOp::F32Mul),
+            0x95 => ops.push(WasmOp::F32Div),
             _ => return Err(ParseError::UnknownOpcode(opcode)),
         }
     }

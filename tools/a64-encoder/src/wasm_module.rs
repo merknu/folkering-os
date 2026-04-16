@@ -31,7 +31,9 @@ use crate::wasm_lower::WasmOp;
 
 /// Parsed body of a single function — all of the information the
 /// lowerer needs to emit machine code for it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Not `Eq` because `WasmOp::F32Const(f32)` only has `PartialEq`
+// (f32 NaN semantics). Not meaningful for current test usage.
+#[derive(Debug, Clone, PartialEq)]
 pub struct FunctionBody {
     /// Total local count, counting each individual slot (groups are
     /// already expanded). Does NOT include function parameters —

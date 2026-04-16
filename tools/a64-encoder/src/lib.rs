@@ -27,6 +27,38 @@ pub use wasm_lower::{LowerError, Lowerer, WasmOp};
 pub use wasm_module::{parse_module, FunctionBody};
 pub use wasm_parse::{parse_function_body, ParseError};
 
+/// A64 SIMD/FP register (V-bank, also known as S/D/Q depending on
+/// access width). We use it in the S0..S31 32-bit form for f32
+/// scalar arithmetic; wider accesses are Phase 10+ SIMD work.
+///
+/// Separate type from [`Reg`] because the V-bank is architecturally
+/// distinct from the X/W bank — the 5-bit encoding field is the
+/// same, but mixing them at the API level would silently produce
+/// meaningless instructions (e.g. `ADD X0, S0, S1` isn't a real
+/// instruction).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Vreg(pub u8);
+
+impl Vreg {
+    /// Construct a V-bank index 0..=31.
+    pub fn new(idx: u8) -> Option<Self> {
+        if idx <= 31 { Some(Vreg(idx)) } else { None }
+    }
+
+    #[inline(always)]
+    pub(crate) fn enc(self) -> u32 { (self.0 as u32) & 0x1F }
+
+    pub const S0:  Vreg = Vreg(0);
+    pub const S1:  Vreg = Vreg(1);
+    pub const S2:  Vreg = Vreg(2);
+    pub const S3:  Vreg = Vreg(3);
+    pub const S4:  Vreg = Vreg(4);
+    pub const S5:  Vreg = Vreg(5);
+    pub const S6:  Vreg = Vreg(6);
+    pub const S7:  Vreg = Vreg(7);
+    pub const S15: Vreg = Vreg(15);
+}
+
 /// A64 general-purpose register.
 ///
 /// Registers 0-30 are the normal GPRs (X0..X30, or W0..W30 in 32-bit
@@ -277,6 +309,74 @@ impl Encoder {
             | (rn.enc() << 5)
             | rd.enc();
         self.emit(word);
+        Ok(())
+    }
+
+    // ── Floating-point (single precision, Phase 9) ──────────────────
+    //
+    // All ops operate on the low 32 bits of a V-register (aka Sn).
+    // Encodings follow ARM ARM C6.2 — "Floating-point Data-processing"
+    // (1-source, 2-source) and "Floating-point<->Integer conversion".
+
+    /// FMOV Sd, Wn — move a 32-bit integer bit-pattern from a W
+    /// register into the low 32 bits of an S register. Bit-cast,
+    /// not numeric conversion — matches WASM `f32.reinterpret_i32`.
+    ///
+    /// Encoding (C6.2.108, "General ↔ FP"):
+    /// `0 0 011110 00 1 00 111 000000 Rn(5) Rd(5)`, base 0x1E270000.
+    pub fn fmov_s_from_w(&mut self, sd: Vreg, wn: Reg) -> Result<(), EncodeError> {
+        self.emit(0x1E27_0000u32 | (wn.enc() << 5) | sd.enc());
+        Ok(())
+    }
+
+    /// FMOV Wd, Sn — inverse of [`Encoder::fmov_s_from_w`]. Used at
+    /// function end to propagate an f32 result into X0 for AAPCS64
+    /// callers that expect integer return conventions (like our
+    /// Pi-side harness).
+    ///
+    /// Encoding (C6.2.108): base 0x1E260000.
+    pub fn fmov_w_from_s(&mut self, wd: Reg, sn: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x1E26_0000u32 | (sn.enc() << 5) | wd.enc());
+        Ok(())
+    }
+
+    /// FADD Sd, Sn, Sm — single-precision add.
+    /// Encoding (C6.2.95, 2-source, ftype=00): base 0x1E202800.
+    pub fn fadd_s(&mut self, sd: Vreg, sn: Vreg, sm: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x1E20_2800u32 | (sm.enc() << 16) | (sn.enc() << 5) | sd.enc());
+        Ok(())
+    }
+
+    /// FSUB Sd, Sn, Sm — single-precision subtract.
+    /// Encoding (C6.2.128): base 0x1E203800.
+    pub fn fsub_s(&mut self, sd: Vreg, sn: Vreg, sm: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x1E20_3800u32 | (sm.enc() << 16) | (sn.enc() << 5) | sd.enc());
+        Ok(())
+    }
+
+    /// FMUL Sd, Sn, Sm — single-precision multiply.
+    /// Encoding (C6.2.112): base 0x1E200800.
+    pub fn fmul_s(&mut self, sd: Vreg, sn: Vreg, sm: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x1E20_0800u32 | (sm.enc() << 16) | (sn.enc() << 5) | sd.enc());
+        Ok(())
+    }
+
+    /// FDIV Sd, Sn, Sm — single-precision divide.
+    /// Encoding (C6.2.102): base 0x1E201800.
+    pub fn fdiv_s(&mut self, sd: Vreg, sn: Vreg, sm: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x1E20_1800u32 | (sm.enc() << 16) | (sn.enc() << 5) | sd.enc());
+        Ok(())
+    }
+
+    /// FCMP Sn, Sm — compare two f32 values, set FPSR-propagated NZCV.
+    /// Sets Z=1 for equal; different flag combinations encode GT/LT/
+    /// unordered (NaN). CSET after FCMP yields the comparison result
+    /// as a 0/1 integer.
+    ///
+    /// Encoding (C6.2.96): `0 0 011110 00 1 Rm(5) 00 1000 Rn(5) 00000`,
+    /// base 0x1E202000.
+    pub fn fcmp_s(&mut self, sn: Vreg, sm: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x1E20_2000u32 | (sm.enc() << 16) | (sn.enc() << 5));
         Ok(())
     }
 
@@ -897,6 +997,68 @@ mod tests {
     }
 
     // ── Phase 5 comparisons ─────────────────────────────────────────
+
+    // ── Phase 9 FP encoders ─────────────────────────────────────────
+
+    #[test]
+    fn fmov_s_from_w_basic() {
+        // fmov s0, w1  →  1e270020
+        assert_eq!(
+            one(|e| e.fmov_s_from_w(Vreg::S0, Reg::X1)),
+            0x1E270020
+        );
+    }
+
+    #[test]
+    fn fmov_w_from_s_basic() {
+        // fmov w0, s1  →  1e260020
+        assert_eq!(
+            one(|e| e.fmov_w_from_s(Reg::X0, Vreg::S1)),
+            0x1E260020
+        );
+    }
+
+    #[test]
+    fn fadd_s_basic() {
+        // fadd s0, s0, s1  →  1e212800
+        assert_eq!(
+            one(|e| e.fadd_s(Vreg::S0, Vreg::S0, Vreg::S1)),
+            0x1E212800
+        );
+    }
+
+    #[test]
+    fn fsub_s_basic() {
+        // fsub s0, s0, s1  →  1e213800
+        assert_eq!(
+            one(|e| e.fsub_s(Vreg::S0, Vreg::S0, Vreg::S1)),
+            0x1E213800
+        );
+    }
+
+    #[test]
+    fn fmul_s_basic() {
+        // fmul s0, s0, s1  →  1e210800
+        assert_eq!(
+            one(|e| e.fmul_s(Vreg::S0, Vreg::S0, Vreg::S1)),
+            0x1E210800
+        );
+    }
+
+    #[test]
+    fn fdiv_s_basic() {
+        // fdiv s0, s0, s1  →  1e211800
+        assert_eq!(
+            one(|e| e.fdiv_s(Vreg::S0, Vreg::S0, Vreg::S1)),
+            0x1E211800
+        );
+    }
+
+    #[test]
+    fn fcmp_s_basic() {
+        // fcmp s0, s1  →  1e212000
+        assert_eq!(one(|e| e.fcmp_s(Vreg::S0, Vreg::S1)), 0x1E212000);
+    }
 
     // ── Phase 8 bitops ──────────────────────────────────────────────
 

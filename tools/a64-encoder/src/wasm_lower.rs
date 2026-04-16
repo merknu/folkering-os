@@ -34,12 +34,28 @@
 //!   know the block-end offset and rewrite every placeholder.
 
 use crate::{
-    encode_b, encode_cbnz_w, encode_cbz_w, Condition, Encoder, EncodeError, MovShift, Reg,
+    encode_b, encode_cbnz_w, encode_cbz_w, Condition, Encoder, EncodeError, MovShift, Reg, Vreg,
 };
+
+/// WASM value type carried on the operand stack. Each slot is tagged
+/// so the lowerer can pick the right register bank (X vs V) and the
+/// right instruction family (integer vs FP) for each op.
+///
+/// Phase 9 introduces F32 alongside I32; I64/F64/V128 are future
+/// phases and would slot in here the same way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValType {
+    I32,
+    F32,
+}
 
 /// Simplified WASM operator set.  Hand-constructed by callers, or
 /// produced by [`crate::wasm_parse::parse_function_body`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Note: `Eq` dropped because F32Const carries an f32, and f32 only
+// implements `PartialEq` due to NaN. Tests that compare `WasmOp`s
+// use `assert_eq!` via PartialEq — which handles Eq-less enums fine
+// as long as the test values aren't NaN.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum WasmOp {
     /// Push a 32-bit constant onto the stack.  Negative values are
     /// fine — we lower them as u32 bit-patterns, which is consistent
@@ -92,6 +108,20 @@ pub enum WasmOp {
     I32ShrS,
     /// Pop two, push `left >> (right mod 32)` — unsigned (zero-fill).
     I32ShrU,
+    /// Push a 32-bit IEEE-754 float constant onto the stack.
+    F32Const(f32),
+    /// Pop two F32s, push sum.
+    F32Add,
+    /// Pop two F32s, push (left - right).
+    F32Sub,
+    /// Pop two F32s, push (left × right).
+    F32Mul,
+    /// Pop two F32s, push (left / right).
+    F32Div,
+    /// Pop two F32s, push 1 (as i32) if equal else 0. Returns i32;
+    /// this is the WASM comparison idiom, with the boolean result
+    /// living on the stack as an integer.
+    F32Eq,
     /// Copy local `n` onto the stack.
     LocalGet(u32),
     /// Pop stack top, store into local `n`.
@@ -167,6 +197,18 @@ pub enum LowerError {
     /// i32.load / i32.store used on a lowerer without a configured
     /// memory base. Use `new_function_with_memory` instead.
     MemoryNotConfigured,
+    /// An op expected a particular stack-top type but saw a different
+    /// one — e.g. `i32.add` with an f32 on top, or `f32.add` with
+    /// an i32 argument. Catches WASM validation errors the lowerer
+    /// would otherwise silently miscompile.
+    TypeMismatch {
+        expected: ValType,
+        got: ValType,
+    },
+    /// Per-type stack capacity exceeded. The i32 bank is X0..X15
+    /// (16 slots); the f32 bank is S0..S15 (16 slots). Mixed stacks
+    /// are fine until *either* band fills up.
+    TypedStackOverflow(ValType),
     /// Underlying encoder rejected an instruction.
     Encode(EncodeError),
 }
@@ -187,8 +229,19 @@ enum BinOp {
     Cmp(Condition),
 }
 
-/// Maximum WASM stack depth we can hold in registers (X0..X15).
-const MAX_STACK: usize = 16;
+/// Subset of arithmetic binops that operate on F32 SIMD registers.
+#[derive(Clone, Copy)]
+enum FBinOp { Add, Sub, Mul, Div }
+
+/// Maximum WASM operand-stack depth in i32 slots (X0..X15).
+const MAX_I32_STACK: usize = 16;
+/// Maximum operand-stack depth in f32 slots (S0..S15).
+/// V0..V7 are caller-saved so we can clobber them freely; V8..V15
+/// are callee-saved, so using those at depth ≥ 8 would require
+/// saving them in the prologue. For Phase 9 MVP we cap at 16 but
+/// lowering only uses V0..V7 without a save/restore — good enough
+/// for every expression we can actually write today.
+const MAX_F32_STACK: usize = 16;
 /// Maximum number of locals we can host without spilling (X19..X27).
 /// One fewer than before — X28 is now reserved for the memory base.
 pub const MAX_LOCALS: usize = 9;
@@ -246,7 +299,15 @@ struct Label {
 #[derive(Debug)]
 pub struct Lowerer {
     enc: Encoder,
-    depth: usize,
+    /// Per-slot type tag, ordered bottom-first. `stack.len()` is the
+    /// total operand-stack depth; each element tells the lowerer
+    /// which register bank to reach for at that slot.
+    stack: Vec<ValType>,
+    /// Count of live I32 slots (= next free X index). Incremented on
+    /// `push_i32`, decremented on pop of an I32.
+    i32_depth: usize,
+    /// Count of live F32 slots (= next free S index).
+    f32_depth: usize,
     num_locals: usize,
     label_stack: Vec<Label>,
     /// Absolute addresses of callable functions, indexed by WASM
@@ -284,7 +345,9 @@ impl Lowerer {
         }
         Ok(Self {
             enc,
-            depth: 0,
+            stack: Vec::new(),
+            i32_depth: 0,
+            f32_depth: 0,
             num_locals: n,
             label_stack: Vec::new(),
             call_targets: Vec::new(),
@@ -323,7 +386,9 @@ impl Lowerer {
         }
         Ok(Self {
             enc,
-            depth: 0,
+            stack: Vec::new(),
+            i32_depth: 0,
+            f32_depth: 0,
             num_locals: n_locals,
             label_stack: Vec::new(),
             call_targets,
@@ -370,7 +435,9 @@ impl Lowerer {
         }
         Ok(Self {
             enc,
-            depth: 0,
+            stack: Vec::new(),
+            i32_depth: 0,
+            f32_depth: 0,
             num_locals: n_locals,
             label_stack: Vec::new(),
             call_targets,
@@ -405,6 +472,12 @@ impl Lowerer {
             WasmOp::I32Shl  => self.lower_binop(BinOp::Shl),
             WasmOp::I32ShrS => self.lower_binop(BinOp::ShrS),
             WasmOp::I32ShrU => self.lower_binop(BinOp::ShrU),
+            WasmOp::F32Const(f) => self.lower_f32_const(f),
+            WasmOp::F32Add => self.lower_f32_binop(FBinOp::Add),
+            WasmOp::F32Sub => self.lower_f32_binop(FBinOp::Sub),
+            WasmOp::F32Mul => self.lower_f32_binop(FBinOp::Mul),
+            WasmOp::F32Div => self.lower_f32_binop(FBinOp::Div),
+            WasmOp::F32Eq => self.lower_f32_cmp(Condition::Eq),
             WasmOp::LocalGet(i) => self.lower_local_get(i),
             WasmOp::LocalSet(i) => self.lower_local_set(i),
             WasmOp::Block => self.lower_block(),
@@ -446,28 +519,69 @@ impl Lowerer {
     }
 
     /// Current operand-stack depth.
-    pub fn stack_depth(&self) -> usize { self.depth }
+    pub fn stack_depth(&self) -> usize { self.stack.len() }
+
+    /// Current top-of-stack type, if any. Used by tests and by
+    /// function-end lowering to decide between RET-with-X0 and
+    /// RET-with-bitcast-from-S0.
+    pub fn stack_top_type(&self) -> Option<ValType> { self.stack.last().copied() }
 
     /// Currently open block/loop labels.
     pub fn open_labels(&self) -> usize { self.label_stack.len() }
 
     // ── Stack helpers ───────────────────────────────────────────────
 
-    fn push_slot(&mut self) -> Result<Reg, LowerError> {
-        if self.depth >= MAX_STACK {
-            return Err(LowerError::StackOverflow);
+    /// Push an I32 slot; returns the X-bank register that holds it.
+    fn push_i32_slot(&mut self) -> Result<Reg, LowerError> {
+        if self.i32_depth >= MAX_I32_STACK {
+            return Err(LowerError::TypedStackOverflow(ValType::I32));
         }
-        let r = Reg::new(self.depth as u8).ok_or(LowerError::StackOverflow)?;
-        self.depth += 1;
+        let r = Reg::new(self.i32_depth as u8)
+            .ok_or(LowerError::TypedStackOverflow(ValType::I32))?;
+        self.i32_depth += 1;
+        self.stack.push(ValType::I32);
         Ok(r)
     }
 
-    fn pop_slot(&mut self) -> Result<Reg, LowerError> {
-        if self.depth == 0 {
-            return Err(LowerError::StackUnderflow);
+    /// Pop an I32 from the top of the stack. Errors if the stack is
+    /// empty or the top isn't an I32.
+    fn pop_i32_slot(&mut self) -> Result<Reg, LowerError> {
+        let ty = self.stack.last().copied().ok_or(LowerError::StackUnderflow)?;
+        if ty != ValType::I32 {
+            return Err(LowerError::TypeMismatch {
+                expected: ValType::I32,
+                got: ty,
+            });
         }
-        self.depth -= 1;
-        Reg::new(self.depth as u8).ok_or(LowerError::StackUnderflow)
+        self.stack.pop();
+        self.i32_depth -= 1;
+        Reg::new(self.i32_depth as u8).ok_or(LowerError::StackUnderflow)
+    }
+
+    /// Push an F32 slot; returns the V-bank register.
+    fn push_f32_slot(&mut self) -> Result<Vreg, LowerError> {
+        if self.f32_depth >= MAX_F32_STACK {
+            return Err(LowerError::TypedStackOverflow(ValType::F32));
+        }
+        let v = Vreg::new(self.f32_depth as u8)
+            .ok_or(LowerError::TypedStackOverflow(ValType::F32))?;
+        self.f32_depth += 1;
+        self.stack.push(ValType::F32);
+        Ok(v)
+    }
+
+    /// Pop an F32 from the top of the stack.
+    fn pop_f32_slot(&mut self) -> Result<Vreg, LowerError> {
+        let ty = self.stack.last().copied().ok_or(LowerError::StackUnderflow)?;
+        if ty != ValType::F32 {
+            return Err(LowerError::TypeMismatch {
+                expected: ValType::F32,
+                got: ty,
+            });
+        }
+        self.stack.pop();
+        self.f32_depth -= 1;
+        Vreg::new(self.f32_depth as u8).ok_or(LowerError::StackUnderflow)
     }
 
     // ── Op-specific lowering ────────────────────────────────────────
@@ -480,7 +594,7 @@ impl Lowerer {
         let bits = c as u32;
         let lo = (bits & 0xFFFF) as u16;
         let hi = ((bits >> 16) & 0xFFFF) as u16;
-        let r = self.push_slot()?;
+        let r = self.push_i32_slot()?;
         self.enc.movz(r, lo, MovShift::Lsl0)?;
         if hi != 0 {
             self.enc.movk(r, hi, MovShift::Lsl16)?;
@@ -488,21 +602,71 @@ impl Lowerer {
         Ok(())
     }
 
+    /// Lower `f32.const c` — materialize the IEEE-754 bit pattern
+    /// into a W register via MOVZ/MOVK, then bit-cast into an S
+    /// register via FMOV. Two-step lowering keeps the encoder's FP
+    /// surface minimal (no need for a full immediate-encoding table
+    /// that handles only certain floats natively).
+    fn lower_f32_const(&mut self, c: f32) -> Result<(), LowerError> {
+        let bits = c.to_bits();
+        // Temporary X-bank register — use one beyond the i32 stack
+        // so we don't perturb i32 slots. X16 is AAPCS64 IP scratch;
+        // always safe to clobber here.
+        let tmp = Reg::X16;
+        let lo = (bits & 0xFFFF) as u16;
+        let hi = ((bits >> 16) & 0xFFFF) as u16;
+        self.enc.movz(tmp, lo, MovShift::Lsl0)?;
+        if hi != 0 {
+            self.enc.movk(tmp, hi, MovShift::Lsl16)?;
+        }
+        let dst = self.push_f32_slot()?;
+        self.enc.fmov_s_from_w(dst, tmp)?;
+        Ok(())
+    }
+
+    fn lower_f32_binop(&mut self, op: FBinOp) -> Result<(), LowerError> {
+        let rhs = self.pop_f32_slot()?;
+        let lhs = self.pop_f32_slot()?;
+        let dst = self.push_f32_slot()?;
+        debug_assert_eq!(dst.0, lhs.0);
+        match op {
+            FBinOp::Add => self.enc.fadd_s(dst, lhs, rhs)?,
+            FBinOp::Sub => self.enc.fsub_s(dst, lhs, rhs)?,
+            FBinOp::Mul => self.enc.fmul_s(dst, lhs, rhs)?,
+            FBinOp::Div => self.enc.fdiv_s(dst, lhs, rhs)?,
+        }
+        Ok(())
+    }
+
+    /// Lower `f32.<cmp>` — pops two F32 operands, pushes an I32
+    /// result. Note the *type transition*: FCMP sets flags, CSET
+    /// into an X register. This is the first op in the lowerer
+    /// that produces a different type than it consumes, and is
+    /// exactly the WASM model: comparisons of any type yield i32.
+    fn lower_f32_cmp(&mut self, cond: Condition) -> Result<(), LowerError> {
+        let rhs = self.pop_f32_slot()?;
+        let lhs = self.pop_f32_slot()?;
+        let dst = self.push_i32_slot()?;
+        self.enc.fcmp_s(lhs, rhs)?;
+        self.enc.cset(dst, cond)?;
+        Ok(())
+    }
+
     /// Lower `i32.eqz` — unary "is zero". `cmp_w` against WZR
     /// (register 31 in 32-bit form reads as zero) sets the Z flag,
     /// then `cset Xd, EQ` converts Z=1 to a 1 in Xd.
     fn lower_eqz(&mut self) -> Result<(), LowerError> {
-        let src = self.pop_slot()?;
-        let dst = self.push_slot()?;
+        let src = self.pop_i32_slot()?;
+        let dst = self.push_i32_slot()?;
         self.enc.cmp_w(src, Reg::ZR)?;
         self.enc.cset(dst, Condition::Eq)?;
         Ok(())
     }
 
     fn lower_binop(&mut self, op: BinOp) -> Result<(), LowerError> {
-        let rhs = self.pop_slot()?;
-        let lhs = self.pop_slot()?;
-        let dst = self.push_slot()?;
+        let rhs = self.pop_i32_slot()?;
+        let lhs = self.pop_i32_slot()?;
+        let dst = self.push_i32_slot()?;
         debug_assert_eq!(dst.0, lhs.0);
         match op {
             BinOp::Add  => self.enc.add(dst, lhs, rhs)?,
@@ -542,7 +706,7 @@ impl Lowerer {
 
     fn lower_local_get(&mut self, idx: u32) -> Result<(), LowerError> {
         let local = self.local_reg(idx)?;
-        let dst = self.push_slot()?;
+        let dst = self.push_i32_slot()?;
         // Copy local value to new stack slot. A64 has no "MOV Xd, Xn";
         // the idiomatic form is `ADD Xd, XZR, Xn` (or ORR Xd, XZR, Xn,
         // but we already have ADD in the encoder).
@@ -552,7 +716,7 @@ impl Lowerer {
 
     fn lower_local_set(&mut self, idx: u32) -> Result<(), LowerError> {
         let local = self.local_reg(idx)?;
-        let src = self.pop_slot()?;
+        let src = self.pop_i32_slot()?;
         self.enc.add(local, Reg::ZR, src)?;
         Ok(())
     }
@@ -562,7 +726,7 @@ impl Lowerer {
             kind: LabelKind::Block,
             loop_start: None,
             pending: Vec::new(),
-            entry_depth: self.depth,
+            entry_depth: self.stack.len(),
         });
         Ok(())
     }
@@ -572,7 +736,7 @@ impl Lowerer {
             kind: LabelKind::Loop,
             loop_start: Some(self.enc.pos()),
             pending: Vec::new(),
-            entry_depth: self.depth,
+            entry_depth: self.stack.len(),
         });
         Ok(())
     }
@@ -615,7 +779,7 @@ impl Lowerer {
 
     fn lower_br_if(&mut self, depth: u32) -> Result<(), LowerError> {
         // Pop condition (i32). We check the low 32 bits via CBNZ Wr.
-        let cond = self.pop_slot()?;
+        let cond = self.pop_i32_slot()?;
         let idx = self.label_index(depth)?;
         match self.label_stack[idx].kind {
             LabelKind::Loop => {
@@ -712,14 +876,14 @@ impl Lowerer {
         // Pop the i32 condition and emit a CBZ to the "false" target.
         // Placeholder offset; patched at `else` or `end` depending on
         // whether the block has an else-branch.
-        let cond = self.pop_slot()?;
+        let cond = self.pop_i32_slot()?;
         let pos = self.enc.pos();
         self.enc.cbz_w(cond, 0)?;
         self.label_stack.push(Label {
             kind: LabelKind::If { cond_branch_pos: pos },
             loop_start: None,
             pending: Vec::new(),
-            entry_depth: self.depth,
+            entry_depth: self.stack.len(),
         });
         Ok(())
     }
@@ -751,14 +915,25 @@ impl Lowerer {
         self.enc.patch_word(cond_branch_pos, word);
 
         // Update the label to IfElse so `end` knows to patch the B.
-        // Also reset the operand stack depth to the if-entry depth:
-        // WASM semantics say the else-branch sees the same stack as
-        // the then-branch entry, not whatever the then-branch left.
+        // Also reset the operand stack to the if-entry depth: WASM
+        // semantics say the else-branch sees the same stack as the
+        // then-branch entry, not whatever the then-branch left.
         let label = self.label_stack.last_mut().unwrap();
         let entry = label.entry_depth;
         label.kind = LabelKind::IfElse { else_skip_pos: skip_pos };
-        self.depth = entry;
+        self.truncate_stack_to(entry);
         Ok(())
+    }
+
+    /// Pop slots until `stack.len() == target`, updating per-type
+    /// counters along the way. Used for `else` depth-reset.
+    fn truncate_stack_to(&mut self, target: usize) {
+        while self.stack.len() > target {
+            match self.stack.pop().unwrap() {
+                ValType::I32 => self.i32_depth -= 1,
+                ValType::F32 => self.f32_depth -= 1,
+            }
+        }
     }
 
     fn lower_call(&mut self, idx: u32) -> Result<(), LowerError> {
@@ -797,23 +972,31 @@ impl Lowerer {
         // push a slot at depth > 0, we need to move X0 to the new
         // slot's register. For Phase 2.3 MVP we require the pre-call
         // stack to be empty so X0 naturally holds the result.
-        if self.depth != 0 {
+        if self.stack.len() != 0 {
             // Copy X0 to the new slot register.
-            let dst = self.push_slot()?;
+            let dst = self.push_i32_slot()?;
             self.enc.add(dst, Reg::ZR, Reg::X0)?;
         } else {
             // Fast path — X0 is already stack[0].
-            let _ = self.push_slot()?;
+            let _ = self.push_i32_slot()?;
         }
         Ok(())
     }
 
     fn lower_function_end(&mut self) -> Result<(), LowerError> {
-        match self.depth {
-            1 => {
-                // Result is in X0 by design.
-                self.pop_slot()?;
-            }
+        // Function returns exactly one value. If it's an F32, bit-
+        // cast into W0 so callers see the float's bit pattern as
+        // a 32-bit integer in X0 (useful for exit-code harnesses).
+        match self.stack.len() {
+            1 => match self.stack_top_type().unwrap() {
+                ValType::I32 => {
+                    self.pop_i32_slot()?;
+                }
+                ValType::F32 => {
+                    let s = self.pop_f32_slot()?;
+                    self.enc.fmov_w_from_s(Reg::X0, s)?;
+                }
+            },
             _ => return Err(LowerError::StackNotSingleton),
         }
         if self.has_frame {
@@ -839,8 +1022,8 @@ impl Lowerer {
         if !self.has_memory {
             return Err(LowerError::MemoryNotConfigured);
         }
-        let addr = self.pop_slot()?;
-        let dst = self.push_slot()?;
+        let addr = self.pop_i32_slot()?;
+        let dst = self.push_i32_slot()?;
         // Xdst = X28 + UXTW(Waddr). Safe to use dst as the effective-
         // address register because we don't touch its upper bits
         // after the LDR (which itself zero-extends).
@@ -857,8 +1040,8 @@ impl Lowerer {
         if !self.has_memory {
             return Err(LowerError::MemoryNotConfigured);
         }
-        let val = self.pop_slot()?;
-        let addr = self.pop_slot()?;
+        let val = self.pop_i32_slot()?;
+        let addr = self.pop_i32_slot()?;
         self.enc.add_ext_uxtw(addr, MEM_BASE_REG, addr)?;
         self.enc.str_w_imm(val, addr, offset)?;
         Ok(())
@@ -866,14 +1049,21 @@ impl Lowerer {
 
     fn lower_explicit_return(&mut self) -> Result<(), LowerError> {
         // `return` exits the function immediately. Move the top-of-
-        // stack value to X0 if it isn't there already, then RET. We
-        // don't pop — subsequent code on the stack is unreachable.
-        if self.depth == 0 {
-            return Err(LowerError::StackNotSingleton);
-        }
-        let top = Reg::new((self.depth - 1) as u8).unwrap();
-        if top.0 != 0 {
-            self.enc.add(Reg::X0, Reg::ZR, top)?;
+        // stack value into X0 (bit-casting from S if needed), then
+        // RET. We don't pop — subsequent code on the stack is
+        // unreachable.
+        match self.stack_top_type() {
+            None => return Err(LowerError::StackNotSingleton),
+            Some(ValType::I32) => {
+                let top = Reg::new((self.i32_depth - 1) as u8).unwrap();
+                if top.0 != 0 {
+                    self.enc.add(Reg::X0, Reg::ZR, top)?;
+                }
+            }
+            Some(ValType::F32) => {
+                let s = Vreg::new((self.f32_depth - 1) as u8).unwrap();
+                self.enc.fmov_w_from_s(Reg::X0, s)?;
+            }
         }
         self.enc.ret(Reg::X30)?;
         Ok(())
@@ -1220,7 +1410,7 @@ mod tests {
         }
         assert_eq!(
             lw.lower_op(WasmOp::I32Const(0)),
-            Err(LowerError::StackOverflow)
+            Err(LowerError::TypedStackOverflow(ValType::I32))
         );
     }
 
