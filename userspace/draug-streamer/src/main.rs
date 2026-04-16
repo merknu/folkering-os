@@ -25,7 +25,7 @@ use core::cell::UnsafeCell;
 use alloc::vec::Vec;
 
 use libfolk::{entry, println};
-use libfolk::sys::{get_pid, yield_cpu};
+use libfolk::sys::{get_pid, uptime, yield_cpu};
 
 use a64_encoder::{Lowerer, WasmOp};
 
@@ -142,23 +142,55 @@ fn run() -> Result<(), StreamError> {
     println!("[DRAUG-STREAMER] JIT produced {} bytes", code.len());
     send_frame(&mut sess, FRAME_CODE, &code)?;
 
-    // ── Stream 5 samples through DATA + EXEC ──────────────────────
-    for sample in &[1i32, 2, 3, 7, 21] {
+    // ── Live sensor stream — uptime_ms in an infinite loop ────────
+    //
+    // Each iteration reads the kernel's monotonic uptime counter
+    // (libfolk::sys::uptime — backed by TSC via SYS_UPTIME),
+    // truncates to i32, ships it via DATA + EXEC, and prints the
+    // Pi-side RESULT. The JIT model is still "load × 2" so the
+    // result should always be exactly 2× the sample, and the fact
+    // that every cycle's sample is larger than the last is the
+    // proof that we're looking at real-time data.
+    //
+    // Cadence control: `yield_cpu` between cycles hands the CPU
+    // back to the scheduler so we don't hog a core. At ~60 Hz
+    // scheduler tick, that puts the stream rate around the tick
+    // frequency — fast enough to feel "live" on the serial log,
+    // slow enough that the Pi daemon and relay/LAN aren't
+    // saturated. Adjust by inserting more yields if needed.
+    //
+    // This is an **infinite** stream — the function never returns
+    // Ok. Process termination only happens on a TCP error (peer
+    // reset, daemon restart, kernel net stack reset) which bubbles
+    // up as a StreamError and gets logged by main().
+    println!("[DRAUG-STREAMER] streaming live uptime_ms (∞ — Ctrl+Alt+G to halt QEMU)");
+    let mut cycle: u64 = 0;
+    loop {
+        // Truncating a u64 uptime to i32 gives wrap-around after
+        // ~24.8 days (2^31 ms) which is well beyond any plausible
+        // demo. For shorter demos the low 32 bits are monotonic and
+        // visibly incrementing between cycles.
+        let sample = uptime() as i32;
         let data = build_data_payload(0, &sample.to_le_bytes());
         send_frame(&mut sess, FRAME_DATA, &data)?;
         send_frame(&mut sess, FRAME_EXEC, &[])?;
         let rv = recv_result(&mut sess)?;
+        let ok = rv == sample.wrapping_mul(2);
         println!(
-            "[DRAUG-STREAMER]   sample {:>3} → result {:>3} (expected {})",
+            "[DRAUG-STREAMER]   t+{:>8} ms   sample={:>10}   result={:>10}   {}",
+            sample as u32,
             sample,
             rv,
-            sample.wrapping_mul(2)
+            if ok { "OK" } else { "MISMATCH" }
         );
+        cycle = cycle.wrapping_add(1);
+        // Occasional heartbeat so even if the print stream is busy
+        // we know draug-streamer is alive.
+        if cycle % 64 == 0 {
+            println!("[DRAUG-STREAMER] heartbeat — {} cycles streamed", cycle);
+        }
+        yield_cpu();
     }
-
-    // ── BYE — tell daemon we're done ──────────────────────────────
-    send_frame(&mut sess, FRAME_BYE, &[])?;
-    Ok(())
 }
 
 /// JIT the "load mem[0], multiply by 2, return" program. Takes
