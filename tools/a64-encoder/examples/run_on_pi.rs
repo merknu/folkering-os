@@ -88,6 +88,51 @@ fn cases() -> Vec<Case> {
             ],
             expected: 20,
         },
+        Case {
+            name: "mul: 6 * 7",
+            ops: vec![
+                WasmOp::I32Const(6),
+                WasmOp::I32Const(7),
+                WasmOp::I32Mul,
+                WasmOp::End,
+            ],
+            expected: 42,
+        },
+        Case {
+            name: "sdiv: 84 / 2",
+            ops: vec![
+                WasmOp::I32Const(84),
+                WasmOp::I32Const(2),
+                WasmOp::I32DivS,
+                WasmOp::End,
+            ],
+            expected: 42,
+        },
+        Case {
+            name: "udiv: 126 / 3",
+            ops: vec![
+                WasmOp::I32Const(126),
+                WasmOp::I32Const(3),
+                WasmOp::I32DivU,
+                WasmOp::End,
+            ],
+            expected: 42,
+        },
+        Case {
+            name: "chained: (10 * 3) / 2 + 27",
+            // (10 * 3) / 2 = 15; 15 + 27 = 42
+            ops: vec![
+                WasmOp::I32Const(10),
+                WasmOp::I32Const(3),
+                WasmOp::I32Mul,
+                WasmOp::I32Const(2),
+                WasmOp::I32DivS,
+                WasmOp::I32Const(27),
+                WasmOp::I32Add,
+                WasmOp::End,
+            ],
+            expected: 42,
+        },
     ]
 }
 

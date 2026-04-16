@@ -190,6 +190,86 @@ impl Encoder {
         Ok(())
     }
 
+    /// MUL Xd, Xn, Xm — 64-bit multiply.
+    ///
+    /// A64 has no dedicated MUL; it's an alias for `MADD Xd, Xn, Xm, XZR`
+    /// (multiply-add with the zero register as accumulator).
+    ///
+    /// Encoding (C6.2.173 — MADD): `1 0011011 000 Rm(5) 0 Ra(5) Rn(5) Rd(5)`.
+    /// We hardcode `Ra = XZR = 31` and `o0 = 0` to get plain multiply.
+    pub fn mul(&mut self, rd: Reg, rn: Reg, rm: Reg) -> Result<(), EncodeError> {
+        let word = 0x9B00_0000u32
+            | (rm.enc() << 16)
+            | (31u32 << 10) // Ra = XZR
+            | (rn.enc() << 5)
+            | rd.enc();
+        self.emit(word);
+        Ok(())
+    }
+
+    /// SDIV Xd, Xn, Xm — signed 64-bit divide (rounds toward zero).
+    ///
+    /// Encoding (C6.2.294): `1 0011010110 Rm(5) 000011 Rn(5) Rd(5)`.
+    /// Divide-by-zero returns 0 (no trap on A64); INT_MIN / -1 wraps
+    /// to INT_MIN without trapping. WASM spec requires *trapping* on
+    /// both — that's the lowerer's problem, not the encoder's.
+    pub fn sdiv(&mut self, rd: Reg, rn: Reg, rm: Reg) -> Result<(), EncodeError> {
+        let word = 0x9AC0_0C00u32
+            | (rm.enc() << 16)
+            | (rn.enc() << 5)
+            | rd.enc();
+        self.emit(word);
+        Ok(())
+    }
+
+    /// UDIV Xd, Xn, Xm — unsigned 64-bit divide.
+    ///
+    /// Encoding (C6.2.351): `1 0011010110 Rm(5) 000010 Rn(5) Rd(5)`.
+    /// Differs from SDIV only in bit 10 (0 vs 1).  Same divide-by-zero
+    /// behaviour (returns 0, no trap).
+    pub fn udiv(&mut self, rd: Reg, rn: Reg, rm: Reg) -> Result<(), EncodeError> {
+        let word = 0x9AC0_0800u32
+            | (rm.enc() << 16)
+            | (rn.enc() << 5)
+            | rd.enc();
+        self.emit(word);
+        Ok(())
+    }
+
+    /// LDR Wt, [Xn, #imm] — 32-bit load, unsigned immediate offset.
+    ///
+    /// Encoding (C6.2.131, 32-bit variant): `10 111 0 01 01 imm12(12) Rn(5) Rt(5)`.
+    /// imm is bytes, must be a multiple of 4 (scaled by 4), range 0..=16380.
+    /// Zeroes the upper 32 bits of the X register — matches WASM
+    /// `i32.load` semantics.
+    pub fn ldr_w_imm(&mut self, rt: Reg, rn: Reg, offset: u32) -> Result<(), EncodeError> {
+        if offset & 0x3 != 0 { return Err(EncodeError::OffsetMisaligned); }
+        let imm12 = offset >> 2;
+        if imm12 > 0xFFF { return Err(EncodeError::ImmediateOutOfRange); }
+        let word = 0xB940_0000u32
+            | (imm12 << 10)
+            | (rn.enc() << 5)
+            | rt.enc();
+        self.emit(word);
+        Ok(())
+    }
+
+    /// STR Wt, [Xn, #imm] — 32-bit store, unsigned immediate offset.
+    ///
+    /// Encoding (C6.2.340, 32-bit variant): `10 111 0 01 00 imm12(12) Rn(5) Rt(5)`.
+    /// Same scaling and range as [`Encoder::ldr_w_imm`].
+    pub fn str_w_imm(&mut self, rt: Reg, rn: Reg, offset: u32) -> Result<(), EncodeError> {
+        if offset & 0x3 != 0 { return Err(EncodeError::OffsetMisaligned); }
+        let imm12 = offset >> 2;
+        if imm12 > 0xFFF { return Err(EncodeError::ImmediateOutOfRange); }
+        let word = 0xB900_0000u32
+            | (imm12 << 10)
+            | (rn.enc() << 5)
+            | rt.enc();
+        self.emit(word);
+        Ok(())
+    }
+
     // ── Loads and stores — unsigned immediate offset ────────────────
 
     /// LDR Xt, [Xn, #imm]
@@ -621,5 +701,58 @@ mod tests {
     fn blr_x16() {
         // blr x16 → d63f0200
         assert_eq!(one(|e| e.blr(Reg::X16)), 0xD63F0200);
+    }
+
+    // ── Phase 4B encoders ───────────────────────────────────────────
+
+    #[test]
+    fn mul_x0_x0_x1() {
+        // mul x0, x0, x1  →  9b017c00  (MADD Rd=0, Rn=0, Rm=1, Ra=XZR)
+        assert_eq!(one(|e| e.mul(Reg::X0, Reg::X0, Reg::X1)), 0x9B017C00);
+    }
+
+    #[test]
+    fn mul_x3_x4_x5() {
+        // mul x3, x4, x5  →  9b057c83
+        assert_eq!(one(|e| e.mul(Reg::X3, Reg::X4, Reg::X5)), 0x9B057C83);
+    }
+
+    #[test]
+    fn sdiv_x0_x0_x1() {
+        // sdiv x0, x0, x1  →  9ac10c00
+        assert_eq!(one(|e| e.sdiv(Reg::X0, Reg::X0, Reg::X1)), 0x9AC10C00);
+    }
+
+    #[test]
+    fn udiv_x0_x0_x1() {
+        // udiv x0, x0, x1  →  9ac10800
+        assert_eq!(one(|e| e.udiv(Reg::X0, Reg::X0, Reg::X1)), 0x9AC10800);
+    }
+
+    #[test]
+    fn ldr_w_x0_x1_0() {
+        // ldr w0, [x1]  →  b9400020
+        assert_eq!(one(|e| e.ldr_w_imm(Reg::X0, Reg::X1, 0)), 0xB9400020);
+    }
+
+    #[test]
+    fn ldr_w_x0_x1_4() {
+        // ldr w0, [x1, #4]  →  b9400420
+        assert_eq!(one(|e| e.ldr_w_imm(Reg::X0, Reg::X1, 4)), 0xB9400420);
+    }
+
+    #[test]
+    fn str_w_x2_x3_8() {
+        // str w2, [x3, #8]  →  b9000862
+        assert_eq!(one(|e| e.str_w_imm(Reg::X2, Reg::X3, 8)), 0xB9000862);
+    }
+
+    #[test]
+    fn ldr_w_rejects_misaligned() {
+        let mut e = Encoder::new();
+        assert_eq!(
+            e.ldr_w_imm(Reg::X0, Reg::X1, 2),
+            Err(EncodeError::OffsetMisaligned)
+        );
     }
 }

@@ -116,6 +116,9 @@ pub fn parse_ops(bytes: &[u8], pos: &mut usize) -> Result<Vec<WasmOp>, ParseErro
             }
             0x6A => ops.push(WasmOp::I32Add),
             0x6B => ops.push(WasmOp::I32Sub),
+            0x6C => ops.push(WasmOp::I32Mul),
+            0x6D => ops.push(WasmOp::I32DivS),
+            0x6E => ops.push(WasmOp::I32DivU),
             _ => return Err(ParseError::UnknownOpcode(opcode)),
         }
     }
@@ -229,6 +232,28 @@ mod tests {
         //   0x41 0x2A 0x0B
         let ops = parse_function_body(&[0x41, 0x2A, 0x0B]).unwrap();
         assert_eq!(ops, vec![WasmOp::I32Const(42), WasmOp::End]);
+    }
+
+    #[test]
+    fn parse_mul_div() {
+        // i32.const 6 ; i32.const 7 ; i32.mul ; i32.const 3 ; i32.div_s ; end
+        //   0x41 0x06 0x41 0x07 0x6C 0x41 0x03 0x6D 0x0B
+        let ops = parse_function_body(&[
+            0x41, 0x06, 0x41, 0x07, 0x6C,
+            0x41, 0x03, 0x6D, 0x0B,
+        ])
+        .unwrap();
+        assert_eq!(
+            ops,
+            vec![
+                WasmOp::I32Const(6),
+                WasmOp::I32Const(7),
+                WasmOp::I32Mul,
+                WasmOp::I32Const(3),
+                WasmOp::I32DivS,
+                WasmOp::End,
+            ]
+        );
     }
 
     #[test]

@@ -49,6 +49,14 @@ pub enum WasmOp {
     I32Add,
     /// Pop two, push (left − right).
     I32Sub,
+    /// Pop two, push (left × right).
+    I32Mul,
+    /// Pop two, push (left ÷ right) — signed. Divide-by-zero and
+    /// INT_MIN / -1 both return 0 on A64; WASM spec says trap, but
+    /// we defer trap semantics to Phase 4C+ when we have a runtime.
+    I32DivS,
+    /// Pop two, push (left ÷ right) — unsigned. Divide-by-zero returns 0.
+    I32DivU,
     /// Copy local `n` onto the stack.
     LocalGet(u32),
     /// Pop stack top, store into local `n`.
@@ -120,6 +128,12 @@ pub enum LowerError {
 impl From<EncodeError> for LowerError {
     fn from(e: EncodeError) -> Self { LowerError::Encode(e) }
 }
+
+/// Tag used by the lowerer to pick the right A64 instruction for
+/// an arithmetic WASM op. Keeps `lower_binop` single-shape while
+/// giving each WASM opcode its own compile-time constant.
+#[derive(Clone, Copy)]
+enum BinOp { Add, Sub, Mul, DivS, DivU }
 
 /// Maximum WASM stack depth we can hold in registers (X0..X15).
 const MAX_STACK: usize = 16;
@@ -259,8 +273,11 @@ impl Lowerer {
     pub fn lower_op(&mut self, op: WasmOp) -> Result<(), LowerError> {
         match op {
             WasmOp::I32Const(c) => self.lower_const(c),
-            WasmOp::I32Add => self.lower_binop(false),
-            WasmOp::I32Sub => self.lower_binop(true),
+            WasmOp::I32Add => self.lower_binop(BinOp::Add),
+            WasmOp::I32Sub => self.lower_binop(BinOp::Sub),
+            WasmOp::I32Mul => self.lower_binop(BinOp::Mul),
+            WasmOp::I32DivS => self.lower_binop(BinOp::DivS),
+            WasmOp::I32DivU => self.lower_binop(BinOp::DivU),
             WasmOp::LocalGet(i) => self.lower_local_get(i),
             WasmOp::LocalSet(i) => self.lower_local_set(i),
             WasmOp::Block => self.lower_block(),
@@ -342,15 +359,17 @@ impl Lowerer {
         Ok(())
     }
 
-    fn lower_binop(&mut self, is_sub: bool) -> Result<(), LowerError> {
+    fn lower_binop(&mut self, op: BinOp) -> Result<(), LowerError> {
         let rhs = self.pop_slot()?;
         let lhs = self.pop_slot()?;
         let dst = self.push_slot()?;
         debug_assert_eq!(dst.0, lhs.0);
-        if is_sub {
-            self.enc.sub(dst, lhs, rhs)?;
-        } else {
-            self.enc.add(dst, lhs, rhs)?;
+        match op {
+            BinOp::Add  => self.enc.add(dst, lhs, rhs)?,
+            BinOp::Sub  => self.enc.sub(dst, lhs, rhs)?,
+            BinOp::Mul  => self.enc.mul(dst, lhs, rhs)?,
+            BinOp::DivS => self.enc.sdiv(dst, lhs, rhs)?,
+            BinOp::DivU => self.enc.udiv(dst, lhs, rhs)?,
         }
         Ok(())
     }
@@ -1005,6 +1024,51 @@ mod tests {
             lw.lower_op(WasmOp::I32Const(0)),
             Err(LowerError::StackOverflow)
         );
+    }
+
+    // ── Phase 4B: MUL / SDIV / UDIV ─────────────────────────────────
+
+    #[test]
+    fn mul_basic() {
+        // (func (result i32) i32.const 6 i32.const 7 i32.mul end) → 42
+        let bytes = compile(&[
+            WasmOp::I32Const(6),
+            WasmOp::I32Const(7),
+            WasmOp::I32Mul,
+            WasmOp::End,
+        ]);
+        let words = bytes_as_u32s(&bytes);
+        assert_eq!(words[0], 0xD28000C0); // movz x0, #6
+        assert_eq!(words[1], 0xD28000E1); // movz x1, #7
+        assert_eq!(words[2], 0x9B017C00); // mul x0, x0, x1
+        assert_eq!(words[3], 0xD65F03C0); // ret
+    }
+
+    #[test]
+    fn sdiv_basic() {
+        let bytes = compile(&[
+            WasmOp::I32Const(20),
+            WasmOp::I32Const(4),
+            WasmOp::I32DivS,
+            WasmOp::End,
+        ]);
+        let words = bytes_as_u32s(&bytes);
+        assert_eq!(words[0], 0xD2800280); // movz x0, #20
+        assert_eq!(words[1], 0xD2800081); // movz x1, #4
+        assert_eq!(words[2], 0x9AC10C00); // sdiv x0, x0, x1
+        assert_eq!(words[3], 0xD65F03C0); // ret
+    }
+
+    #[test]
+    fn udiv_basic() {
+        let bytes = compile(&[
+            WasmOp::I32Const(100),
+            WasmOp::I32Const(7),
+            WasmOp::I32DivU,
+            WasmOp::End,
+        ]);
+        let words = bytes_as_u32s(&bytes);
+        assert_eq!(words[2], 0x9AC10800); // udiv x0, x0, x1
     }
 
     // ── Phase 2.4: If / Else ────────────────────────────────────────
