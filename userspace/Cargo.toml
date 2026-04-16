@@ -12,6 +12,7 @@ members = [
     "compositor",
     "intent-service",
     "inference-server",
+    "draug-streamer",
 ]
 resolver = "2"
 
