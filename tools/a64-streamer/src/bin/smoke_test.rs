@@ -267,6 +267,59 @@ fn main() {
         );
     }
 
+    // ── SIMD through the HMAC-signed pipeline ─────────────────────
+    //
+    // The SIMD stack has been verified via the raw SSH `run_bytes`
+    // harness (see tools/a64-encoder/examples/simd_on_pi.rs). This
+    // case proves the same code also executes through our full
+    // secure pipeline: HMAC-signed CODE, fork-timeout EXEC,
+    // MAP_SHARED linear memory. The JIT program is the same dot-
+    // product kernel used in the raw-harness suite:
+    //
+    //   u = [1, 2, 3, 4]  (written as 4 × i32.store)
+    //   v = [5, 6, 7, 8]
+    //   dot(u, v) = 1×5 + 2×6 + 3×7 + 4×8 = 70
+    //
+    // The f32.eq at the end returns 1 on match — 1 fits in the
+    // 8-bit exit code without ambiguity.
+    {
+        let mut lw = Lowerer::new_function_with_memory(0, Vec::new(), hello.mem_base).unwrap();
+        let u = [1.0f32, 2.0, 3.0, 4.0];
+        let v = [5.0f32, 6.0, 7.0, 8.0];
+        let mut ops = Vec::new();
+        for (i, val) in u.iter().enumerate() {
+            ops.push(WasmOp::I32Const((4 * i) as i32));
+            ops.push(WasmOp::I32Const(val.to_bits() as i32));
+            ops.push(WasmOp::I32Store(0));
+        }
+        for (i, val) in v.iter().enumerate() {
+            ops.push(WasmOp::I32Const(16 + 4 * i as i32));
+            ops.push(WasmOp::I32Const(val.to_bits() as i32));
+            ops.push(WasmOp::I32Store(0));
+        }
+        ops.extend_from_slice(&[
+            WasmOp::I32Const(0),
+            WasmOp::V128Load(0),
+            WasmOp::I32Const(16),
+            WasmOp::V128Load(0),
+            WasmOp::F32x4Mul,
+            WasmOp::F32x4HorizontalSum,
+            WasmOp::F32Const(70.0),
+            WasmOp::F32Eq,
+            WasmOp::End,
+        ]);
+        lw.lower_all(&ops).unwrap();
+        let bytes = lw.finish();
+        let rv = send_code_and_exec(&mut sock, &bytes);
+        report(
+            "SIMD dot([1..4],[5..8]) = 70 via HMAC+timeout pipeline",
+            rv,
+            1,
+            &mut passed,
+            &mut failed,
+        );
+    }
+
     // ── Case 3: DATA → JIT reads → EXEC (sensor-stream flow) ──────
     //
     // Write i32 = 19 at mem[0]. JIT program:
