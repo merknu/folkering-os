@@ -65,6 +65,21 @@ pub enum WasmOp {
     I32LtS,
     /// Pop two, push 1 if `left > right` (signed) else 0.
     I32GtS,
+    /// Pop two, push 1 if `left ≤ right` (signed) else 0.
+    I32LeS,
+    /// Pop two, push 1 if `left ≥ right` (signed) else 0.
+    I32GeS,
+    /// Pop two, push 1 if `left < right` (unsigned) else 0.
+    I32LtU,
+    /// Pop two, push 1 if `left > right` (unsigned) else 0.
+    I32GtU,
+    /// Pop two, push 1 if `left ≤ right` (unsigned) else 0.
+    I32LeU,
+    /// Pop two, push 1 if `left ≥ right` (unsigned) else 0.
+    I32GeU,
+    /// Pop one, push 1 if value is zero else 0. Unary version of
+    /// `I32Eq` with implicit zero right-hand side.
+    I32Eqz,
     /// Copy local `n` onto the stack.
     LocalGet(u32),
     /// Pop stack top, store into local `n`.
@@ -364,6 +379,13 @@ impl Lowerer {
             WasmOp::I32Ne   => self.lower_binop(BinOp::Cmp(Condition::Ne)),
             WasmOp::I32LtS  => self.lower_binop(BinOp::Cmp(Condition::Lt)),
             WasmOp::I32GtS  => self.lower_binop(BinOp::Cmp(Condition::Gt)),
+            WasmOp::I32LeS  => self.lower_binop(BinOp::Cmp(Condition::Le)),
+            WasmOp::I32GeS  => self.lower_binop(BinOp::Cmp(Condition::Ge)),
+            WasmOp::I32LtU  => self.lower_binop(BinOp::Cmp(Condition::Lo)),
+            WasmOp::I32GtU  => self.lower_binop(BinOp::Cmp(Condition::Hi)),
+            WasmOp::I32LeU  => self.lower_binop(BinOp::Cmp(Condition::Ls)),
+            WasmOp::I32GeU  => self.lower_binop(BinOp::Cmp(Condition::Hs)),
+            WasmOp::I32Eqz  => self.lower_eqz(),
             WasmOp::LocalGet(i) => self.lower_local_get(i),
             WasmOp::LocalSet(i) => self.lower_local_set(i),
             WasmOp::Block => self.lower_block(),
@@ -444,6 +466,17 @@ impl Lowerer {
         if hi != 0 {
             self.enc.movk(r, hi, MovShift::Lsl16)?;
         }
+        Ok(())
+    }
+
+    /// Lower `i32.eqz` — unary "is zero". `cmp_w` against WZR
+    /// (register 31 in 32-bit form reads as zero) sets the Z flag,
+    /// then `cset Xd, EQ` converts Z=1 to a 1 in Xd.
+    fn lower_eqz(&mut self) -> Result<(), LowerError> {
+        let src = self.pop_slot()?;
+        let dst = self.push_slot()?;
+        self.enc.cmp_w(src, Reg::ZR)?;
+        self.enc.cset(dst, Condition::Eq)?;
         Ok(())
     }
 

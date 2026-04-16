@@ -21,8 +21,10 @@
 //! buffers (for JIT code caches, test harnesses, etc).
 
 pub mod wasm_lower;
+pub mod wasm_module;
 pub mod wasm_parse;
 pub use wasm_lower::{LowerError, Lowerer, WasmOp};
+pub use wasm_module::{parse_module, FunctionBody};
 pub use wasm_parse::{parse_function_body, ParseError};
 
 /// A64 general-purpose register.

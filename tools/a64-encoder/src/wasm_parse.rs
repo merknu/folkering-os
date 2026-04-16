@@ -76,6 +76,24 @@ pub fn parse_ops(bytes: &[u8], pos: &mut usize) -> Result<Vec<WasmOp>, ParseErro
                 ops.push(WasmOp::Loop);
                 depth += 1;
             }
+            0x04 => {
+                // if — pops condition at run time, skip block type byte
+                read_u8(bytes, pos)?;
+                ops.push(WasmOp::If);
+                depth += 1;
+            }
+            0x05 => {
+                // else — delimits then/else; does NOT open a new block
+                // (it's an inline marker within the current if block),
+                // so don't touch `depth`.
+                ops.push(WasmOp::Else);
+            }
+            0x10 => {
+                // call funcidx
+                let idx = read_uleb128(bytes, pos)?;
+                if idx > u32::MAX as u64 { return Err(ParseError::IntegerTooLarge); }
+                ops.push(WasmOp::Call(idx as u32));
+            }
             0x0B => {
                 ops.push(WasmOp::End);
                 if depth == 0 {
@@ -127,10 +145,17 @@ pub fn parse_ops(bytes: &[u8], pos: &mut usize) -> Result<Vec<WasmOp>, ParseErro
                 if off > u32::MAX as u64 { return Err(ParseError::IntegerTooLarge); }
                 ops.push(WasmOp::I32Store(off as u32));
             }
+            0x45 => ops.push(WasmOp::I32Eqz),
             0x46 => ops.push(WasmOp::I32Eq),
             0x47 => ops.push(WasmOp::I32Ne),
             0x48 => ops.push(WasmOp::I32LtS),
+            0x49 => ops.push(WasmOp::I32LtU),
             0x4A => ops.push(WasmOp::I32GtS),
+            0x4B => ops.push(WasmOp::I32GtU),
+            0x4C => ops.push(WasmOp::I32LeS),
+            0x4D => ops.push(WasmOp::I32LeU),
+            0x4E => ops.push(WasmOp::I32GeS),
+            0x4F => ops.push(WasmOp::I32GeU),
             0x6A => ops.push(WasmOp::I32Add),
             0x6B => ops.push(WasmOp::I32Sub),
             0x6C => ops.push(WasmOp::I32Mul),

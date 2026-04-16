@@ -96,6 +96,47 @@ fn cases() -> Vec<Case> {
             ],
             expected: 7,
         },
+        // ── Phase 6: remaining comparisons + eqz ─────────────────
+        Case {
+            name: "5 ≤ 5 → 1 (le_s)",
+            ops: vec![WasmOp::I32Const(5), WasmOp::I32Const(5), WasmOp::I32LeS, WasmOp::End],
+            expected: 1,
+        },
+        Case {
+            name: "5 ≥ 3 → 1 (ge_s)",
+            ops: vec![WasmOp::I32Const(5), WasmOp::I32Const(3), WasmOp::I32GeS, WasmOp::End],
+            expected: 1,
+        },
+        Case {
+            name: "-1 lt_u 1 → 0 (unsigned: -1 is huge)",
+            ops: vec![WasmOp::I32Const(-1), WasmOp::I32Const(1), WasmOp::I32LtU, WasmOp::End],
+            expected: 0,
+        },
+        Case {
+            name: "-1 gt_u 1 → 1 (unsigned: -1 is huge)",
+            ops: vec![WasmOp::I32Const(-1), WasmOp::I32Const(1), WasmOp::I32GtU, WasmOp::End],
+            expected: 1,
+        },
+        Case {
+            name: "3 le_u 5 → 1",
+            ops: vec![WasmOp::I32Const(3), WasmOp::I32Const(5), WasmOp::I32LeU, WasmOp::End],
+            expected: 1,
+        },
+        Case {
+            name: "5 ge_u 3 → 1",
+            ops: vec![WasmOp::I32Const(5), WasmOp::I32Const(3), WasmOp::I32GeU, WasmOp::End],
+            expected: 1,
+        },
+        Case {
+            name: "eqz(0) → 1",
+            ops: vec![WasmOp::I32Const(0), WasmOp::I32Eqz, WasmOp::End],
+            expected: 1,
+        },
+        Case {
+            name: "eqz(42) → 0",
+            ops: vec![WasmOp::I32Const(42), WasmOp::I32Eqz, WasmOp::End],
+            expected: 0,
+        },
     ]
 }
 
