@@ -19,6 +19,21 @@
 //! matching how the ARMv8 memory system loads instruction words.
 //! The builder API is a thin struct so callers can own their own
 //! buffers (for JIT code caches, test harnesses, etc).
+//!
+//! # `no_std` mode
+//!
+//! The crate is `no_std`-compatible when built with
+//! `--no-default-features`. This is used by Folkering OS userspace /
+//! kernel integrations that don't link the Rust standard library.
+//! All allocations go through `alloc` (which requires a global
+//! allocator in the consuming crate). Under the default `std`
+//! feature (tests, examples, host-side JIT tools) nothing changes.
+
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
+
+use alloc::vec::Vec;
 
 pub mod wasm_lower;
 pub mod wasm_module;
@@ -165,13 +180,7 @@ pub enum EncodeError {
 /// and appends each opcode as four little-endian bytes.
 #[derive(Debug, Default, Clone)]
 pub struct Encoder {
-    buf: alloc_placeholder::Vec<u8>,
-}
-
-/// Tiny module so the file reads without pulling alloc publicly — we
-/// re-export std's Vec under the same path in tests.
-mod alloc_placeholder {
-    pub use std::vec::Vec;
+    buf: Vec<u8>,
 }
 
 impl Encoder {

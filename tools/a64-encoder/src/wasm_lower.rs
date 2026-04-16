@@ -33,6 +33,8 @@
 //!   instructions emitted with placeholder offsets.  At `end` we
 //!   know the block-end offset and rewrite every placeholder.
 
+use alloc::{vec, vec::Vec};
+
 use crate::{
     encode_b, encode_cbnz_w, encode_cbz_w, Condition, Encoder, EncodeError, MovShift, Reg, Vreg,
 };

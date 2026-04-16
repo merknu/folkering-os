@@ -26,6 +26,8 @@
 //! - Data and Element sections.
 //! - Multi-byte SIMD / reference-type opcodes.
 
+use alloc::{vec, vec::Vec};
+
 use crate::wasm_parse::{parse_ops, read_uleb128, ParseError};
 use crate::wasm_lower::WasmOp;
 

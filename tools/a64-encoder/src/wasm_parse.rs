@@ -28,6 +28,8 @@
 //! "empty" sentinel; we ignore because our control-flow lowering
 //! doesn't track block signatures yet.
 
+use alloc::vec::Vec;
+
 use crate::wasm_lower::WasmOp;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
