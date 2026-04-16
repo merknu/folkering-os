@@ -235,6 +235,32 @@ pub enum WasmOp {
     F64Load(u32),
     /// Store f64 to linear memory (8-aligned offset required).
     F64Store(u32),
+    // ── Phase 15: conversions ─────────────────────────────────────
+    // Sign-extensions (same-type, narrows then re-sign-extends).
+    I32Extend8S,
+    I32Extend16S,
+    I64Extend8S,
+    I64Extend16S,
+    I64Extend32S,
+    // FP → INT (round toward zero). `_s` = signed target, `_u` = unsigned.
+    I32TruncF32S, I32TruncF32U,
+    I32TruncF64S, I32TruncF64U,
+    I64TruncF32S, I64TruncF32U,
+    I64TruncF64S, I64TruncF64U,
+    // INT → FP.
+    F32ConvertI32S, F32ConvertI32U,
+    F32ConvertI64S, F32ConvertI64U,
+    F64ConvertI32S, F64ConvertI32U,
+    F64ConvertI64S, F64ConvertI64U,
+    // FP ↔ FP width conversions.
+    F32DemoteF64,
+    F64PromoteF32,
+    // Bit-cast reinterprets — no numeric conversion, just register bank
+    // swap via the existing FMOV encoders.
+    I32ReinterpretF32,
+    I64ReinterpretF64,
+    F32ReinterpretI32,
+    F64ReinterpretI64,
     /// Copy local `n` onto the stack.
     LocalGet(u32),
     /// Pop stack top, store into local `n`.
@@ -354,6 +380,10 @@ enum I64Op {
     Add, Sub, Mul, DivS, DivU,
     And, Or, Xor, Shl, ShrS, ShrU,
 }
+
+/// Narrow-source width for `i64.extend{8,16,32}_s` lowering.
+#[derive(Clone, Copy)]
+enum ExtendWidth { B8, B16, B32 }
 
 /// Maximum WASM operand-stack depth in i32 slots (X0..X15).
 const MAX_I32_STACK: usize = 16;
@@ -732,6 +762,34 @@ impl Lowerer {
             WasmOp::F64Ge => self.lower_f64_cmp(Condition::Ge),
             WasmOp::F64Load(off) => self.lower_f64_load(off),
             WasmOp::F64Store(off) => self.lower_f64_store(off),
+            // Phase 15 conversions.
+            WasmOp::I32Extend8S => self.lower_i32_extend_narrow(true, false),
+            WasmOp::I32Extend16S => self.lower_i32_extend_narrow(false, false),
+            WasmOp::I64Extend8S => self.lower_i64_extend_narrow(ExtendWidth::B8),
+            WasmOp::I64Extend16S => self.lower_i64_extend_narrow(ExtendWidth::B16),
+            WasmOp::I64Extend32S => self.lower_i64_extend_narrow(ExtendWidth::B32),
+            WasmOp::I32TruncF32S => self.lower_trunc_f32_i32(true),
+            WasmOp::I32TruncF32U => self.lower_trunc_f32_i32(false),
+            WasmOp::I32TruncF64S => self.lower_trunc_f64_i32(true),
+            WasmOp::I32TruncF64U => self.lower_trunc_f64_i32(false),
+            WasmOp::I64TruncF32S => self.lower_trunc_f32_i64(true),
+            WasmOp::I64TruncF32U => self.lower_trunc_f32_i64(false),
+            WasmOp::I64TruncF64S => self.lower_trunc_f64_i64(true),
+            WasmOp::I64TruncF64U => self.lower_trunc_f64_i64(false),
+            WasmOp::F32ConvertI32S => self.lower_convert_i32_f32(true),
+            WasmOp::F32ConvertI32U => self.lower_convert_i32_f32(false),
+            WasmOp::F32ConvertI64S => self.lower_convert_i64_f32(true),
+            WasmOp::F32ConvertI64U => self.lower_convert_i64_f32(false),
+            WasmOp::F64ConvertI32S => self.lower_convert_i32_f64(true),
+            WasmOp::F64ConvertI32U => self.lower_convert_i32_f64(false),
+            WasmOp::F64ConvertI64S => self.lower_convert_i64_f64(true),
+            WasmOp::F64ConvertI64U => self.lower_convert_i64_f64(false),
+            WasmOp::F32DemoteF64 => self.lower_f32_demote_f64(),
+            WasmOp::F64PromoteF32 => self.lower_f64_promote_f32(),
+            WasmOp::I32ReinterpretF32 => self.lower_i32_reinterpret_f32(),
+            WasmOp::I64ReinterpretF64 => self.lower_i64_reinterpret_f64(),
+            WasmOp::F32ReinterpretI32 => self.lower_f32_reinterpret_i32(),
+            WasmOp::F64ReinterpretI64 => self.lower_f64_reinterpret_i64(),
             WasmOp::LocalGet(i) => self.lower_local_get(i),
             WasmOp::LocalSet(i) => self.lower_local_set(i),
             WasmOp::Block => self.lower_block(),
@@ -1141,6 +1199,178 @@ impl Lowerer {
             // `mov wd, wn` via 32-bit AND — zero-extends to X.
             self.enc.and_w(dst, src, src)?;
         }
+        Ok(())
+    }
+
+    // ── Phase 15 conversion lowerings ───────────────────────────────
+
+    /// `i32.extend8_s` / `i32.extend16_s` — sign-extend narrow view
+    /// of an i32 back to a full i32. Same register slot (stack type
+    /// unchanged), just rewrites the upper bits.
+    fn lower_i32_extend_narrow(&mut self, is_8: bool, _unused: bool) -> Result<(), LowerError> {
+        let src = self.pop_i32_slot()?;
+        let dst = self.push_i32_slot()?;
+        debug_assert_eq!(dst.0, src.0);
+        if is_8 {
+            self.enc.sxtb_w(dst, src)?;
+        } else {
+            self.enc.sxth_w(dst, src)?;
+        }
+        Ok(())
+    }
+
+    /// `i64.extend{8,16,32}_s` — sign-extend narrow view of an i64.
+    fn lower_i64_extend_narrow(&mut self, width: ExtendWidth) -> Result<(), LowerError> {
+        let src = self.pop_i64_slot()?;
+        let dst = self.push_i64_slot()?;
+        debug_assert_eq!(dst.0, src.0);
+        match width {
+            ExtendWidth::B8 => self.enc.sxtb_x(dst, src)?,
+            ExtendWidth::B16 => self.enc.sxth_x(dst, src)?,
+            ExtendWidth::B32 => self.enc.sxtw(dst, src)?,
+        }
+        Ok(())
+    }
+
+    /// `i32.trunc_f32_{s,u}` — pop f32, push i32. FCVTZS/FCVTZU round
+    /// toward zero (WASM's trunc semantics). Cross-bank: V → X slot.
+    fn lower_trunc_f32_i32(&mut self, signed: bool) -> Result<(), LowerError> {
+        let src = self.pop_f32_slot()?;
+        let dst = self.push_i32_slot()?;
+        if signed {
+            self.enc.fcvtzs_w_s(dst, src)?;
+        } else {
+            self.enc.fcvtzu_w_s(dst, src)?;
+        }
+        Ok(())
+    }
+
+    fn lower_trunc_f64_i32(&mut self, signed: bool) -> Result<(), LowerError> {
+        let src = self.pop_f64_slot()?;
+        let dst = self.push_i32_slot()?;
+        if signed {
+            self.enc.fcvtzs_w_d(dst, src)?;
+        } else {
+            self.enc.fcvtzu_w_d(dst, src)?;
+        }
+        Ok(())
+    }
+
+    fn lower_trunc_f32_i64(&mut self, signed: bool) -> Result<(), LowerError> {
+        let src = self.pop_f32_slot()?;
+        let dst = self.push_i64_slot()?;
+        if signed {
+            self.enc.fcvtzs_x_s(dst, src)?;
+        } else {
+            self.enc.fcvtzu_x_s(dst, src)?;
+        }
+        Ok(())
+    }
+
+    fn lower_trunc_f64_i64(&mut self, signed: bool) -> Result<(), LowerError> {
+        let src = self.pop_f64_slot()?;
+        let dst = self.push_i64_slot()?;
+        if signed {
+            self.enc.fcvtzs_x_d(dst, src)?;
+        } else {
+            self.enc.fcvtzu_x_d(dst, src)?;
+        }
+        Ok(())
+    }
+
+    /// `f32.convert_i32_{s,u}` — pop i32, push f32. SCVTF/UCVTF.
+    fn lower_convert_i32_f32(&mut self, signed: bool) -> Result<(), LowerError> {
+        let src = self.pop_i32_slot()?;
+        let dst = self.push_f32_slot()?;
+        if signed {
+            self.enc.scvtf_s_w(dst, src)?;
+        } else {
+            self.enc.ucvtf_s_w(dst, src)?;
+        }
+        Ok(())
+    }
+
+    fn lower_convert_i64_f32(&mut self, signed: bool) -> Result<(), LowerError> {
+        let src = self.pop_i64_slot()?;
+        let dst = self.push_f32_slot()?;
+        if signed {
+            self.enc.scvtf_s_x(dst, src)?;
+        } else {
+            self.enc.ucvtf_s_x(dst, src)?;
+        }
+        Ok(())
+    }
+
+    fn lower_convert_i32_f64(&mut self, signed: bool) -> Result<(), LowerError> {
+        let src = self.pop_i32_slot()?;
+        let dst = self.push_f64_slot()?;
+        if signed {
+            self.enc.scvtf_d_w(dst, src)?;
+        } else {
+            self.enc.ucvtf_d_w(dst, src)?;
+        }
+        Ok(())
+    }
+
+    fn lower_convert_i64_f64(&mut self, signed: bool) -> Result<(), LowerError> {
+        let src = self.pop_i64_slot()?;
+        let dst = self.push_f64_slot()?;
+        if signed {
+            self.enc.scvtf_d_x(dst, src)?;
+        } else {
+            self.enc.ucvtf_d_x(dst, src)?;
+        }
+        Ok(())
+    }
+
+    /// `f32.demote_f64` — pop f64, push f32. Same V-register slot
+    /// physically; lossy rounding from double to single precision.
+    fn lower_f32_demote_f64(&mut self) -> Result<(), LowerError> {
+        let src = self.pop_f64_slot()?;
+        let dst = self.push_f32_slot()?;
+        debug_assert_eq!(dst.0, src.0);
+        self.enc.fcvt_s_d(dst, src)?;
+        Ok(())
+    }
+
+    /// `f64.promote_f32` — pop f32, push f64. Exact (f32 values are
+    /// a subset of f64).
+    fn lower_f64_promote_f32(&mut self) -> Result<(), LowerError> {
+        let src = self.pop_f32_slot()?;
+        let dst = self.push_f64_slot()?;
+        debug_assert_eq!(dst.0, src.0);
+        self.enc.fcvt_d_s(dst, src)?;
+        Ok(())
+    }
+
+    /// Bit-cast reinterprets — no numeric conversion, only a bank swap.
+    /// All four use FMOV under the hood; free as far as the hardware
+    /// is concerned.
+    fn lower_i32_reinterpret_f32(&mut self) -> Result<(), LowerError> {
+        let src = self.pop_f32_slot()?;
+        let dst = self.push_i32_slot()?;
+        self.enc.fmov_w_from_s(dst, src)?;
+        Ok(())
+    }
+
+    fn lower_i64_reinterpret_f64(&mut self) -> Result<(), LowerError> {
+        let src = self.pop_f64_slot()?;
+        let dst = self.push_i64_slot()?;
+        self.enc.fmov_x_from_d(dst, src)?;
+        Ok(())
+    }
+
+    fn lower_f32_reinterpret_i32(&mut self) -> Result<(), LowerError> {
+        let src = self.pop_i32_slot()?;
+        let dst = self.push_f32_slot()?;
+        self.enc.fmov_s_from_w(dst, src)?;
+        Ok(())
+    }
+
+    fn lower_f64_reinterpret_i64(&mut self) -> Result<(), LowerError> {
+        let src = self.pop_i64_slot()?;
+        let dst = self.push_f64_slot()?;
+        self.enc.fmov_d_from_x(dst, src)?;
         Ok(())
     }
 

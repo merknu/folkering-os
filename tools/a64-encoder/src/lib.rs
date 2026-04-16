@@ -509,6 +509,148 @@ impl Encoder {
         Ok(())
     }
 
+    // ── Phase 15: conversions ───────────────────────────────────────
+    //
+    // Covers sign-extensions (WASM's extend8_s / extend16_s / extend32_s),
+    // FP↔FP conversions (f32.demote_f64, f64.promote_f32), FP↔INT
+    // conversions (FCVTZS/FCVTZU: round-toward-zero FP→INT; SCVTF/UCVTF:
+    // INT→FP), and bit-cast reinterprets (reuse existing fmov_* pairs).
+    //
+    // Sign-extensions are SBFM aliases; FP-conversion encodings follow
+    // ARM ARM C6.2.77–82 (sf + ftype selects width, rmode=11 = toward
+    // zero, opcode picks signed/unsigned + direction).
+
+    /// SXTB Wd, Wn — sign-extend low 8 bits of a W source into Wd.
+    /// Alias for SBFM Wd, Wn, #0, #7. Encoding (C6.2.276): 0x13001C00.
+    pub fn sxtb_w(&mut self, rd: Reg, rn: Reg) -> Result<(), EncodeError> {
+        self.emit(0x1300_1C00u32 | (rn.enc() << 5) | rd.enc());
+        Ok(())
+    }
+
+    /// SXTH Wd, Wn — sign-extend low 16 bits. Alias for SBFM Wd, Wn, #0, #15.
+    /// Encoding (C6.2.277): 0x13003C00.
+    pub fn sxth_w(&mut self, rd: Reg, rn: Reg) -> Result<(), EncodeError> {
+        self.emit(0x1300_3C00u32 | (rn.enc() << 5) | rd.enc());
+        Ok(())
+    }
+
+    /// SXTB Xd, Wn — sign-extend low 8 bits into full 64-bit Xd.
+    /// Alias for SBFM Xd, Wn, #0, #7. Encoding: 0x93401C00.
+    pub fn sxtb_x(&mut self, rd: Reg, rn: Reg) -> Result<(), EncodeError> {
+        self.emit(0x9340_1C00u32 | (rn.enc() << 5) | rd.enc());
+        Ok(())
+    }
+
+    /// SXTH Xd, Wn — sign-extend low 16 bits into Xd.
+    /// Alias for SBFM Xd, Wn, #0, #15. Encoding: 0x93403C00.
+    pub fn sxth_x(&mut self, rd: Reg, rn: Reg) -> Result<(), EncodeError> {
+        self.emit(0x9340_3C00u32 | (rn.enc() << 5) | rd.enc());
+        Ok(())
+    }
+
+    // Note: `sxtw` (sign-extend low 32 bits → Xd) already exists for
+    // the Phase 12 i64.extend_i32_s lowering.
+
+    /// FCVT Sd, Dn — f64 → f32 (WASM `f32.demote_f64`).
+    /// Encoding (C6.2.77, ftype=01, opc=00): 0x1E624000.
+    pub fn fcvt_s_d(&mut self, sd: Vreg, dn: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x1E62_4000u32 | (dn.enc() << 5) | sd.enc());
+        Ok(())
+    }
+
+    /// FCVT Dd, Sn — f32 → f64 (WASM `f64.promote_f32`).
+    /// Encoding (C6.2.77, ftype=00, opc=01): 0x1E22C000.
+    pub fn fcvt_d_s(&mut self, dd: Vreg, sn: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x1E22_C000u32 | (sn.enc() << 5) | dd.enc());
+        Ok(())
+    }
+
+    /// FCVTZS Wd, Sn — f32 → i32, round toward zero, signed.
+    /// Encoding (C6.2.79, sf=0, ftype=00, rmode=11, opcode=000): 0x1E380000.
+    pub fn fcvtzs_w_s(&mut self, rd: Reg, sn: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x1E38_0000u32 | (sn.enc() << 5) | rd.enc());
+        Ok(())
+    }
+    /// FCVTZS Wd, Dn — f64 → i32, toward zero. ftype=01: 0x1E780000.
+    pub fn fcvtzs_w_d(&mut self, rd: Reg, dn: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x1E78_0000u32 | (dn.enc() << 5) | rd.enc());
+        Ok(())
+    }
+    /// FCVTZS Xd, Sn — f32 → i64, toward zero. sf=1, ftype=00: 0x9E380000.
+    pub fn fcvtzs_x_s(&mut self, rd: Reg, sn: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x9E38_0000u32 | (sn.enc() << 5) | rd.enc());
+        Ok(())
+    }
+    /// FCVTZS Xd, Dn — f64 → i64, toward zero. sf=1, ftype=01: 0x9E780000.
+    pub fn fcvtzs_x_d(&mut self, rd: Reg, dn: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x9E78_0000u32 | (dn.enc() << 5) | rd.enc());
+        Ok(())
+    }
+
+    /// FCVTZU Wd, Sn — f32 → u32 (unsigned). Opcode=001: 0x1E390000.
+    pub fn fcvtzu_w_s(&mut self, rd: Reg, sn: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x1E39_0000u32 | (sn.enc() << 5) | rd.enc());
+        Ok(())
+    }
+    /// FCVTZU Wd, Dn — f64 → u32: 0x1E790000.
+    pub fn fcvtzu_w_d(&mut self, rd: Reg, dn: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x1E79_0000u32 | (dn.enc() << 5) | rd.enc());
+        Ok(())
+    }
+    /// FCVTZU Xd, Sn — f32 → u64: 0x9E390000.
+    pub fn fcvtzu_x_s(&mut self, rd: Reg, sn: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x9E39_0000u32 | (sn.enc() << 5) | rd.enc());
+        Ok(())
+    }
+    /// FCVTZU Xd, Dn — f64 → u64: 0x9E790000.
+    pub fn fcvtzu_x_d(&mut self, rd: Reg, dn: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x9E79_0000u32 | (dn.enc() << 5) | rd.enc());
+        Ok(())
+    }
+
+    /// SCVTF Sd, Wn — signed i32 → f32.
+    /// Encoding (C6.2.259, sf=0, ftype=00, rmode=00, opcode=010): 0x1E220000.
+    pub fn scvtf_s_w(&mut self, sd: Vreg, rn: Reg) -> Result<(), EncodeError> {
+        self.emit(0x1E22_0000u32 | (rn.enc() << 5) | sd.enc());
+        Ok(())
+    }
+    /// SCVTF Dd, Wn — signed i32 → f64. ftype=01: 0x1E620000.
+    pub fn scvtf_d_w(&mut self, dd: Vreg, rn: Reg) -> Result<(), EncodeError> {
+        self.emit(0x1E62_0000u32 | (rn.enc() << 5) | dd.enc());
+        Ok(())
+    }
+    /// SCVTF Sd, Xn — signed i64 → f32. sf=1: 0x9E220000.
+    pub fn scvtf_s_x(&mut self, sd: Vreg, rn: Reg) -> Result<(), EncodeError> {
+        self.emit(0x9E22_0000u32 | (rn.enc() << 5) | sd.enc());
+        Ok(())
+    }
+    /// SCVTF Dd, Xn — signed i64 → f64: 0x9E620000.
+    pub fn scvtf_d_x(&mut self, dd: Vreg, rn: Reg) -> Result<(), EncodeError> {
+        self.emit(0x9E62_0000u32 | (rn.enc() << 5) | dd.enc());
+        Ok(())
+    }
+
+    /// UCVTF Sd, Wn — unsigned u32 → f32. Opcode=011: 0x1E230000.
+    pub fn ucvtf_s_w(&mut self, sd: Vreg, rn: Reg) -> Result<(), EncodeError> {
+        self.emit(0x1E23_0000u32 | (rn.enc() << 5) | sd.enc());
+        Ok(())
+    }
+    /// UCVTF Dd, Wn — unsigned u32 → f64: 0x1E630000.
+    pub fn ucvtf_d_w(&mut self, dd: Vreg, rn: Reg) -> Result<(), EncodeError> {
+        self.emit(0x1E63_0000u32 | (rn.enc() << 5) | dd.enc());
+        Ok(())
+    }
+    /// UCVTF Sd, Xn — unsigned u64 → f32: 0x9E230000.
+    pub fn ucvtf_s_x(&mut self, sd: Vreg, rn: Reg) -> Result<(), EncodeError> {
+        self.emit(0x9E23_0000u32 | (rn.enc() << 5) | sd.enc());
+        Ok(())
+    }
+    /// UCVTF Dd, Xn — unsigned u64 → f64: 0x9E630000.
+    pub fn ucvtf_d_x(&mut self, dd: Vreg, rn: Reg) -> Result<(), EncodeError> {
+        self.emit(0x9E63_0000u32 | (rn.enc() << 5) | dd.enc());
+        Ok(())
+    }
+
     /// AND Wd, Wn, Wm — 32-bit bitwise AND.
     ///
     /// Encoding (C6.2.13, sf=0): `0 00 01010 00 0 Rm(5) 000000 Rn(5) Rd(5)`.
@@ -1369,6 +1511,97 @@ mod tests {
     #[test]
     fn ldr_d_misaligned_offset_errors() {
         assert!(Encoder::new().ldr_d_imm(Vreg::S0, Reg::X1, 4).is_err());
+    }
+
+    // ── Phase 15 conversion encoders ────────────────────────────────
+
+    #[test]
+    fn sxtb_w_basic() {
+        // sxtb w0, w1  →  13001c20
+        assert_eq!(one(|e| e.sxtb_w(Reg::X0, Reg::X1)), 0x13001C20);
+    }
+    #[test]
+    fn sxth_w_basic() {
+        // sxth w0, w1  →  13003c20
+        assert_eq!(one(|e| e.sxth_w(Reg::X0, Reg::X1)), 0x13003C20);
+    }
+    #[test]
+    fn sxtb_x_basic() {
+        // sxtb x0, w1  →  93401c20
+        assert_eq!(one(|e| e.sxtb_x(Reg::X0, Reg::X1)), 0x93401C20);
+    }
+    #[test]
+    fn sxth_x_basic() {
+        // sxth x0, w1  →  93403c20
+        assert_eq!(one(|e| e.sxth_x(Reg::X0, Reg::X1)), 0x93403C20);
+    }
+
+    #[test]
+    fn fcvt_s_d_basic() {
+        // fcvt s0, d1  →  1e624020
+        assert_eq!(one(|e| e.fcvt_s_d(Vreg::S0, Vreg::S1)), 0x1E624020);
+    }
+    #[test]
+    fn fcvt_d_s_basic() {
+        // fcvt d0, s1  →  1e22c020
+        assert_eq!(one(|e| e.fcvt_d_s(Vreg::S0, Vreg::S1)), 0x1E22C020);
+    }
+
+    #[test]
+    fn fcvtzs_w_s_basic() {
+        // fcvtzs w0, s1  →  1e380020
+        assert_eq!(one(|e| e.fcvtzs_w_s(Reg::X0, Vreg::S1)), 0x1E380020);
+    }
+    #[test]
+    fn fcvtzs_w_d_basic() {
+        // fcvtzs w0, d1  →  1e780020
+        assert_eq!(one(|e| e.fcvtzs_w_d(Reg::X0, Vreg::S1)), 0x1E780020);
+    }
+    #[test]
+    fn fcvtzs_x_s_basic() {
+        // fcvtzs x0, s1  →  9e380020
+        assert_eq!(one(|e| e.fcvtzs_x_s(Reg::X0, Vreg::S1)), 0x9E380020);
+    }
+    #[test]
+    fn fcvtzs_x_d_basic() {
+        // fcvtzs x0, d1  →  9e780020
+        assert_eq!(one(|e| e.fcvtzs_x_d(Reg::X0, Vreg::S1)), 0x9E780020);
+    }
+    #[test]
+    fn fcvtzu_w_s_basic() {
+        // fcvtzu w0, s1  →  1e390020
+        assert_eq!(one(|e| e.fcvtzu_w_s(Reg::X0, Vreg::S1)), 0x1E390020);
+    }
+    #[test]
+    fn fcvtzu_x_d_basic() {
+        // fcvtzu x0, d1  →  9e790020
+        assert_eq!(one(|e| e.fcvtzu_x_d(Reg::X0, Vreg::S1)), 0x9E790020);
+    }
+
+    #[test]
+    fn scvtf_s_w_basic() {
+        // scvtf s0, w1  →  1e220020
+        assert_eq!(one(|e| e.scvtf_s_w(Vreg::S0, Reg::X1)), 0x1E220020);
+    }
+    #[test]
+    fn scvtf_d_w_basic() {
+        // scvtf d0, w1  →  1e620020
+        assert_eq!(one(|e| e.scvtf_d_w(Vreg::S0, Reg::X1)), 0x1E620020);
+    }
+    #[test]
+    fn scvtf_d_x_basic() {
+        // scvtf d0, x1  →  9e620020
+        assert_eq!(one(|e| e.scvtf_d_x(Vreg::S0, Reg::X1)), 0x9E620020);
+    }
+    #[test]
+    fn ucvtf_s_x_basic() {
+        // ucvtf s0, x1  →  9e230020
+        assert_eq!(one(|e| e.ucvtf_s_x(Vreg::S0, Reg::X1)), 0x9E230020);
+    }
+    #[test]
+    fn ucvtf_d_x_basic() {
+        // ucvtf d0, x1  →  9e630020
+        assert_eq!(one(|e| e.ucvtf_d_x(Vreg::S0, Reg::X1)), 0x9E630020);
     }
 
     // ── Phase 12 i64 encoders ───────────────────────────────────────
