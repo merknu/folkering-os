@@ -1371,6 +1371,57 @@ impl Encoder {
         Ok(())
     }
 
+    /// STP Xt1, Xt2, [Xn, #imm] (signed offset, no writeback).
+    /// For saving callee-saved registers at fixed slots within
+    /// a pre-allocated frame. Same alignment/range as pre-indexed.
+    ///
+    /// Encoding (C6.2.340 signed offset): base 0xA9000000.
+    pub fn stp_offset_64(
+        &mut self,
+        rt: Reg,
+        rt2: Reg,
+        rn: Reg,
+        imm: i16,
+    ) -> Result<(), EncodeError> {
+        if imm & 0x7 != 0 { return Err(EncodeError::OffsetMisaligned); }
+        let imm7 = imm >> 3;
+        if !(-64..64).contains(&imm7) {
+            return Err(EncodeError::ImmediateOutOfRange);
+        }
+        let word = 0xA900_0000u32
+            | (((imm7 as u32) & 0x7F) << 15)
+            | (rt2.enc() << 10)
+            | (rn.enc() << 5)
+            | rt.enc();
+        self.emit(word);
+        Ok(())
+    }
+
+    /// LDP Xt1, Xt2, [Xn, #imm] (signed offset, no writeback).
+    /// For restoring callee-saved registers from fixed slots.
+    ///
+    /// Encoding (C6.2.133 signed offset): base 0xA9400000.
+    pub fn ldp_offset_64(
+        &mut self,
+        rt: Reg,
+        rt2: Reg,
+        rn: Reg,
+        imm: i16,
+    ) -> Result<(), EncodeError> {
+        if imm & 0x7 != 0 { return Err(EncodeError::OffsetMisaligned); }
+        let imm7 = imm >> 3;
+        if !(-64..64).contains(&imm7) {
+            return Err(EncodeError::ImmediateOutOfRange);
+        }
+        let word = 0xA940_0000u32
+            | (((imm7 as u32) & 0x7F) << 15)
+            | (rt2.enc() << 10)
+            | (rn.enc() << 5)
+            | rt.enc();
+        self.emit(word);
+        Ok(())
+    }
+
     /// LDP Xt1, Xt2, [Xn], #imm (post-indexed, 64-bit load pair).
     ///
     /// Encoding (C6.2.133 — Post-index): `1010 1000 11 imm7(7) Rt2(5) Rn(5) Rt(5)`.

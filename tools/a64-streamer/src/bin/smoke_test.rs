@@ -386,6 +386,83 @@ fn main() {
         );
     }
 
+    // ── Real-world WASM: loop + locals + conditional branch ──────
+    //
+    // Harder test — exercises the full structured-control-flow
+    // machinery (block/loop/br_if) and locals (2 × i32) through
+    // the parser → lowerer → execute pipeline. Equivalent to:
+    //
+    //   (func (result i32)
+    //     (local $sum i32) (local $i i32)
+    //     i32.const 1  local.set $i
+    //     block
+    //       loop
+    //         local.get $i  i32.const 11  i32.ge_s  br_if 1
+    //         local.get $sum  local.get $i  i32.add  local.set $sum
+    //         local.get $i  i32.const 1  i32.add  local.set $i
+    //         br 0
+    //       end
+    //     end
+    //     local.get $sum)
+    //
+    // Sum 1+2+...+10 = 55. The loop iterates 10 times before the
+    // i >= 11 check breaks out.
+    {
+        let wasm_module: Vec<u8> = [
+            // Magic + version
+            0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
+            // Type section: 1 functype, 0 params, 1 i32 result
+            0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7F,
+            // Function section: 1 function of type 0
+            0x03, 0x02, 0x01, 0x00,
+            // Code section: id 0A, size 0x29 (41), 1 entry of size 0x27 (39)
+            0x0A, 0x29, 0x01, 0x27,
+            // Locals: 1 group of 2 × i32
+            0x01, 0x02, 0x7F,
+            //
+            // Body ops:
+            //   i32.const 1 ; local.set $i (index 1)
+            0x41, 0x01, 0x21, 0x01,
+            //   block  (void type)
+            0x02, 0x40,
+            //     loop  (void)
+            0x03, 0x40,
+            //       local.get $i ; i32.const 11 ; i32.ge_s ; br_if 1
+            0x20, 0x01, 0x41, 0x0B, 0x4E, 0x0D, 0x01,
+            //       local.get $sum ; local.get $i ; i32.add ; local.set $sum
+            0x20, 0x00, 0x20, 0x01, 0x6A, 0x21, 0x00,
+            //       local.get $i ; i32.const 1 ; i32.add ; local.set $i
+            0x20, 0x01, 0x41, 0x01, 0x6A, 0x21, 0x01,
+            //       br 0 (back to loop header)
+            0x0C, 0x00,
+            //     end (close loop)
+            0x0B,
+            //   end (close block)
+            0x0B,
+            //   local.get $sum ; end (function)
+            0x20, 0x00, 0x0B,
+        ]
+        .to_vec();
+
+        let bodies = parse_module(&wasm_module).expect("parse sum-of-10 module");
+        assert_eq!(bodies.len(), 1);
+        let body = &bodies[0];
+        assert_eq!(body.num_locals, 2, "sum + i");
+
+        let mut lw = Lowerer::new_function(body.num_locals as usize, Vec::new()).unwrap();
+        lw.lower_all(&body.ops).expect("lower sum-of-10 body");
+        let bytes = lw.finish();
+
+        let rv = send_code_and_exec_or_error(&mut sock, &bytes);
+        report(
+            "WASM loop: Σ(1..10) = 55 via block+loop+br_if + locals",
+            rv,
+            55,
+            &mut passed,
+            &mut failed,
+        );
+    }
+
     // ── Case 3: DATA → JIT reads → EXEC (sensor-stream flow) ──────
     //
     // Write i32 = 19 at mem[0]. JIT program:
@@ -467,6 +544,27 @@ fn send_code_and_exec(sock: &mut TcpStream, bytes: &[u8]) -> i32 {
     let (ty, payload) = read_frame(sock).expect("read RESULT");
     assert_eq!(ty, FRAME_RESULT, "expected RESULT, got 0x{ty:02x}");
     parse_result(&payload).expect("parse RESULT")
+}
+
+/// Send CODE + EXEC and get result OR error. Like send_code_and_exec
+/// but tolerates ERROR frames (returns -1 and prints the reason
+/// instead of panicking). Useful for test cases that might crash
+/// the forked child (e.g., a buggy JIT loop).
+fn send_code_and_exec_or_error(sock: &mut TcpStream, bytes: &[u8]) -> i32 {
+    send_code_signed(sock, bytes).expect("write CODE");
+    write_frame(sock, FRAME_EXEC, &[]).expect("write EXEC");
+    let (ty, payload) = read_frame(sock).expect("read response");
+    if ty == FRAME_RESULT {
+        parse_result(&payload).expect("parse RESULT")
+    } else if ty == a64_streamer::FRAME_ERROR {
+        let code_val = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        let msg = String::from_utf8_lossy(&payload[4..]);
+        eprintln!("  [note] daemon error code {code_val}: {msg}");
+        -1
+    } else {
+        eprintln!("  [note] unexpected frame type 0x{ty:02x}");
+        -1
+    }
 }
 
 /// Send a CODE frame with its HMAC-SHA256 tag appended. The Pi-side

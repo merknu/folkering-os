@@ -611,6 +611,13 @@ pub struct Lowerer {
     /// the prologue loaded the linear-memory base into X28. When set,
     /// `i32.load` and `i32.store` compile; otherwise they error.
     has_memory: bool,
+    /// Number of callee-saved STP pairs saved in the prologue
+    /// (X19..X27, pairs of 2). Used by the epilogue + trap handler
+    /// to emit the matching LDP restore sequence.
+    saved_int_pairs: usize,
+    /// Frame size in bytes (without memory-base save). Derived from
+    /// 16 (X29+X30) + saved_int_pairs * 16.
+    frame_size_base: i16,
     /// Size of the linear-memory buffer in bytes, as reported by the
     /// host (e.g. Pi daemon HELLO frame). The lowerer emits a runtime
     /// bounds check on every load/store that compares the dynamic
@@ -670,6 +677,8 @@ impl Lowerer {
             call_targets: Vec::new(),
             has_frame: false,
             has_memory: false,
+            saved_int_pairs: 0,
+            frame_size_base: 0,
             mem_size: 64 * 1024,
             table_base: None,
             indirect_sigs: Vec::new(),
@@ -766,7 +775,24 @@ impl Lowerer {
         call_targets: Vec<u64>,
     ) -> Result<Self, LowerError> {
         let mut enc = Encoder::new();
-        enc.stp_pre_indexed_64(Reg::X29, Reg::X30, Reg::SP, -16)?;
+        // Count callee-saved integer registers we need (X19..X27).
+        let n_int_locals = local_types.iter().filter(|t| t.is_int()).count();
+        // Frame: 16 (X29+X30) + ceil_pair(n_int) * 16 for local saves.
+        let save_pairs = (n_int_locals + 1) / 2;
+        let frame_size = (16 + save_pairs * 16) as i16;
+        enc.stp_pre_indexed_64(Reg::X29, Reg::X30, Reg::SP, -frame_size)?;
+        // Save callee-saved registers used for locals at fixed offsets
+        // within the frame, starting at SP+16. STP handles pairs.
+        for pair in 0..save_pairs {
+            let r1 = Reg(LOCAL_I32_BASE_REG + (pair * 2) as u8);
+            let r2 = if pair * 2 + 1 < n_int_locals {
+                Reg(LOCAL_I32_BASE_REG + (pair * 2 + 1) as u8)
+            } else {
+                Reg::ZR
+            };
+            let off = (16 + pair * 16) as i16;
+            enc.stp_offset_64(r1, r2, Reg::SP, off)?;
+        }
         let locals = Self::allocate_locals(&mut enc, local_types, true)?;
         Ok(Self {
             enc,
@@ -778,6 +804,8 @@ impl Lowerer {
             call_targets,
             has_frame: true,
             has_memory: false,
+            saved_int_pairs: save_pairs,
+            frame_size_base: frame_size,
             mem_size: 64 * 1024,
             table_base: None,
             indirect_sigs: Vec::new(),
@@ -829,6 +857,8 @@ impl Lowerer {
             call_targets,
             has_frame: true,
             has_memory: true,
+            saved_int_pairs: 0,
+            frame_size_base: 32, // X29+X30 (16) + X28 save (16)
             mem_size: 64 * 1024,
             table_base: None,
             indirect_sigs: Vec::new(),
@@ -2549,18 +2579,50 @@ impl Lowerer {
             },
             _ => return Err(LowerError::StackNotSingleton),
         }
-        if self.has_frame {
-            // Epilogue mirrors the prologue: if we saved X28 too
-            // (memory mode), restore it and pop a 32-byte frame;
-            // otherwise just pop the 16-byte frame.
-            if self.has_memory {
-                self.enc.ldr_imm(MEM_BASE_REG, Reg::SP, 16)?;
-                self.enc.ldp_post_indexed_64(Reg::X29, Reg::X30, Reg::SP, 32)?;
-            } else {
-                self.enc.ldp_post_indexed_64(Reg::X29, Reg::X30, Reg::SP, 16)?;
-            }
-        }
+        self.emit_epilogue()?;
         self.enc.ret(Reg::X30)?;
+        Ok(())
+    }
+
+    /// Shared epilogue: restore callee-saved local registers, then
+    /// X29/X30, then pop the frame. Used by both the normal function
+    /// end and the trap handler.
+    fn emit_epilogue(&mut self) -> Result<(), LowerError> {
+        if !self.has_frame {
+            return Ok(());
+        }
+        // Restore callee-saved integer locals (X19..X27) in reverse
+        // pair order — matches the STP save order in new_function_typed.
+        for pair in 0..self.saved_int_pairs {
+            let r1 = Reg(LOCAL_I32_BASE_REG + (pair * 2) as u8);
+            let n_int = self.saved_int_pairs * 2; // upper bound
+            let r2 = if pair * 2 + 1 < n_int {
+                Reg(LOCAL_I32_BASE_REG + (pair * 2 + 1) as u8)
+            } else {
+                Reg::ZR
+            };
+            let off = (16 + pair * 16) as i16;
+            self.enc.ldp_offset_64(r1, r2, Reg::SP, off)?;
+        }
+        // Restore frame pointer + LR, pop the frame.
+        if self.has_memory {
+            // Memory mode has X28 saved too — the total frame is
+            // frame_size_base + 16 (for X28 + padding).
+            self.enc.ldr_imm(MEM_BASE_REG, Reg::SP, self.frame_size_base as u32)?;
+            self.enc.ldp_post_indexed_64(
+                Reg::X29,
+                Reg::X30,
+                Reg::SP,
+                self.frame_size_base + 16,
+            )?;
+        } else {
+            self.enc.ldp_post_indexed_64(
+                Reg::X29,
+                Reg::X30,
+                Reg::SP,
+                self.frame_size_base,
+            )?;
+        }
         Ok(())
     }
 
@@ -2633,15 +2695,8 @@ impl Lowerer {
         // 8 bits (0xFF) show up as the process exit code on the Pi
         // harness — distinctive signature that's easy to grep for.
         self.enc.movn(Reg::X0, 0, MovShift::Lsl0)?;
-        if self.has_memory {
-            // Restore the caller's X28 from the frame save slot.
-            self.enc.ldr_imm(MEM_BASE_REG, Reg::SP, 16)?;
-        }
-        if self.has_frame {
-            let frame_size = if self.has_memory { 32 } else { 16 };
-            self.enc
-                .ldp_post_indexed_64(Reg::X29, Reg::X30, Reg::SP, frame_size)?;
-        }
+        // Shared epilogue handles callee-saved restore + frame pop.
+        self.emit_epilogue()?;
         self.enc.ret(Reg::X30)?;
         Ok(())
     }
