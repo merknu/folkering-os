@@ -23,7 +23,7 @@
 pub mod wasm_lower;
 pub mod wasm_module;
 pub mod wasm_parse;
-pub use wasm_lower::{LowerError, Lowerer, WasmOp};
+pub use wasm_lower::{LowerError, Lowerer, ValType, WasmOp};
 pub use wasm_module::{parse_module, FunctionBody};
 pub use wasm_parse::{parse_function_body, ParseError};
 
@@ -365,6 +365,39 @@ impl Encoder {
     /// Encoding (C6.2.102): base 0x1E201800.
     pub fn fdiv_s(&mut self, sd: Vreg, sn: Vreg, sm: Vreg) -> Result<(), EncodeError> {
         self.emit(0x1E20_1800u32 | (sm.enc() << 16) | (sn.enc() << 5) | sd.enc());
+        Ok(())
+    }
+
+    /// FMOV Sd, Sn — SIMD/FP register-to-register move (single-precision).
+    /// Used for `local.get` / `local.set` on f32 locals.
+    ///
+    /// Encoding (C6.2.106, FP register, ftype=00, opcode=0000):
+    /// `0 0 011110 00 1 00000 010000 Rn Rd`, base 0x1E204000.
+    pub fn fmov_s_s(&mut self, sd: Vreg, sn: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x1E20_4000u32 | (sn.enc() << 5) | sd.enc());
+        Ok(())
+    }
+
+    /// LDR Si, [Xn, #imm] — 32-bit SIMD/FP load (single-precision).
+    /// `imm` is bytes, must be a multiple of 4; range 0..=16380.
+    ///
+    /// Encoding (C6.2.132, 32-bit FP variant, size=10, V=1, opc=01):
+    /// `10 111 1 01 01 imm12(12) Rn(5) Rt(5)`, base 0xBD400000.
+    pub fn ldr_s_imm(&mut self, sd: Vreg, xn: Reg, offset: u32) -> Result<(), EncodeError> {
+        if offset & 0x3 != 0 { return Err(EncodeError::OffsetMisaligned); }
+        let imm12 = offset >> 2;
+        if imm12 > 0xFFF { return Err(EncodeError::ImmediateOutOfRange); }
+        self.emit(0xBD40_0000u32 | (imm12 << 10) | (xn.enc() << 5) | sd.enc());
+        Ok(())
+    }
+
+    /// STR Si, [Xn, #imm] — 32-bit SIMD/FP store.
+    /// Encoding (C6.2.341): base 0xBD000000.
+    pub fn str_s_imm(&mut self, sd: Vreg, xn: Reg, offset: u32) -> Result<(), EncodeError> {
+        if offset & 0x3 != 0 { return Err(EncodeError::OffsetMisaligned); }
+        let imm12 = offset >> 2;
+        if imm12 > 0xFFF { return Err(EncodeError::ImmediateOutOfRange); }
+        self.emit(0xBD00_0000u32 | (imm12 << 10) | (xn.enc() << 5) | sd.enc());
         Ok(())
     }
 
@@ -1052,6 +1085,30 @@ mod tests {
             one(|e| e.fdiv_s(Vreg::S0, Vreg::S0, Vreg::S1)),
             0x1E211800
         );
+    }
+
+    #[test]
+    fn fmov_s_s_basic() {
+        // fmov s0, s1  →  1e204020
+        assert_eq!(one(|e| e.fmov_s_s(Vreg::S0, Vreg::S1)), 0x1E204020);
+    }
+
+    #[test]
+    fn ldr_s_basic() {
+        // ldr s0, [x1]  →  bd400020
+        assert_eq!(one(|e| e.ldr_s_imm(Vreg::S0, Reg::X1, 0)), 0xBD400020);
+    }
+
+    #[test]
+    fn ldr_s_with_offset() {
+        // ldr s2, [x3, #4]  →  bd400462
+        assert_eq!(one(|e| e.ldr_s_imm(Vreg::S2, Reg::X3, 4)), 0xBD400462);
+    }
+
+    #[test]
+    fn str_s_basic() {
+        // str s0, [x1]  →  bd000020
+        assert_eq!(one(|e| e.str_s_imm(Vreg::S0, Reg::X1, 0)), 0xBD000020);
     }
 
     #[test]

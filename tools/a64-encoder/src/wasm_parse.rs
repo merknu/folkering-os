@@ -148,11 +148,25 @@ pub fn parse_ops(bytes: &[u8], pos: &mut usize) -> Result<Vec<WasmOp>, ParseErro
                 if off > u32::MAX as u64 { return Err(ParseError::IntegerTooLarge); }
                 ops.push(WasmOp::I32Load(off as u32));
             }
+            0x2A => {
+                // f32.load — same memarg shape as i32.load.
+                let _align = read_uleb128(bytes, pos)?;
+                let off = read_uleb128(bytes, pos)?;
+                if off > u32::MAX as u64 { return Err(ParseError::IntegerTooLarge); }
+                ops.push(WasmOp::F32Load(off as u32));
+            }
             0x36 => {
                 let _align = read_uleb128(bytes, pos)?;
                 let off = read_uleb128(bytes, pos)?;
                 if off > u32::MAX as u64 { return Err(ParseError::IntegerTooLarge); }
                 ops.push(WasmOp::I32Store(off as u32));
+            }
+            0x38 => {
+                // f32.store
+                let _align = read_uleb128(bytes, pos)?;
+                let off = read_uleb128(bytes, pos)?;
+                if off > u32::MAX as u64 { return Err(ParseError::IntegerTooLarge); }
+                ops.push(WasmOp::F32Store(off as u32));
             }
             0x45 => ops.push(WasmOp::I32Eqz),
             0x46 => ops.push(WasmOp::I32Eq),

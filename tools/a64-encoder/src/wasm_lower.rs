@@ -132,6 +132,12 @@ pub enum WasmOp {
     F32Le,
     /// Pop two F32s, push i32 1 if left ≥ right (ordered) else 0.
     F32Ge,
+    /// Load f32 from linear memory: pop addr, push
+    /// `*(mem_base + addr + offset)` as F32.
+    F32Load(u32),
+    /// Store f32 to linear memory: pop value (f32), pop addr (i32),
+    /// write value to `mem_base + addr + offset`.
+    F32Store(u32),
     /// Copy local `n` onto the stack.
     LocalGet(u32),
     /// Pop stack top, store into local `n`.
@@ -252,15 +258,31 @@ const MAX_I32_STACK: usize = 16;
 /// lowering only uses V0..V7 without a save/restore — good enough
 /// for every expression we can actually write today.
 const MAX_F32_STACK: usize = 16;
-/// Maximum number of locals we can host without spilling (X19..X27).
-/// One fewer than before — X28 is now reserved for the memory base.
-pub const MAX_LOCALS: usize = 9;
-/// Register number where the locals band begins.
-const LOCAL_BASE_REG: u8 = 19;
+/// Maximum number of I32 locals hosted without spilling (X19..X27).
+/// One fewer than pre-Phase-4C — X28 is reserved for memory base.
+pub const MAX_I32_LOCALS: usize = 9;
+/// Maximum number of F32 locals hosted without spilling (V16..V23).
+/// V16..V31 are caller-saved under AAPCS64 so we can clobber them
+/// without adding prologue save code. Cap at 8 to leave scratch room.
+pub const MAX_F32_LOCALS: usize = 8;
+/// Alias kept for existing i32-only callers and docs.
+pub const MAX_LOCALS: usize = MAX_I32_LOCALS;
+/// Register number where the I32 locals band begins (X19).
+const LOCAL_I32_BASE_REG: u8 = 19;
+/// Register number where the F32 locals band begins (V16).
+const LOCAL_F32_BASE_REG: u8 = 16;
 /// Register reserved for the linear-memory base pointer when a
 /// memory-aware function is built. Callee-saved under AAPCS64, so
 /// we save/restore it in the function's extended prologue.
 const MEM_BASE_REG: Reg = Reg(28);
+
+/// Mapping from a WASM local index to its host register. The
+/// lowerer holds one of these per local, populated at construction.
+#[derive(Debug, Clone, Copy)]
+enum LocalLoc {
+    I32(Reg),
+    F32(Vreg),
+}
 
 #[derive(Debug, Clone, Copy)]
 enum LabelKind {
@@ -318,7 +340,8 @@ pub struct Lowerer {
     i32_depth: usize,
     /// Count of live F32 slots (= next free S index).
     f32_depth: usize,
-    num_locals: usize,
+    /// Per-local host-register mapping, indexed by WASM local index.
+    locals: Vec<LocalLoc>,
     label_stack: Vec<Label>,
     /// Absolute addresses of callable functions, indexed by WASM
     /// function index. Empty when `Call` is not expected.
@@ -345,25 +368,66 @@ impl Lowerer {
     /// zero before the body runs).  Returns `TooManyLocals` if
     /// `n > MAX_LOCALS`.
     pub fn new_with_locals(n: usize) -> Result<Self, LowerError> {
-        if n > MAX_LOCALS {
-            return Err(LowerError::TooManyLocals);
-        }
+        let types = vec![ValType::I32; n];
+        Self::new_with_typed_locals(&types)
+    }
+
+    /// Build a lowerer with per-local type information. Each i32
+    /// local gets a fresh X19..X27 slot; each f32 local gets V16..V23.
+    /// Both banks zero-initialize so locals start at 0 per WASM.
+    pub fn new_with_typed_locals(types: &[ValType]) -> Result<Self, LowerError> {
         let mut enc = Encoder::new();
-        for i in 0..n {
-            let r = Reg(LOCAL_BASE_REG + i as u8);
-            enc.movz(r, 0, MovShift::Lsl0)?;
-        }
+        let locals = Self::allocate_locals(&mut enc, types, false)?;
         Ok(Self {
             enc,
             stack: Vec::new(),
             i32_depth: 0,
             f32_depth: 0,
-            num_locals: n,
+            locals,
             label_stack: Vec::new(),
             call_targets: Vec::new(),
             has_frame: false,
             has_memory: false,
         })
+    }
+
+    /// Internal: walk a list of local types, allocating per-bank
+    /// register indices (X19..X27 for I32, V16..V23 for F32) and
+    /// emitting zero-initialization for each. Used by every lowerer
+    /// constructor.
+    fn allocate_locals(
+        enc: &mut Encoder,
+        types: &[ValType],
+        _frame: bool,
+    ) -> Result<Vec<LocalLoc>, LowerError> {
+        let mut i32_idx: u8 = 0;
+        let mut f32_idx: u8 = 0;
+        let mut out = Vec::with_capacity(types.len());
+        for &ty in types {
+            match ty {
+                ValType::I32 => {
+                    if (i32_idx as usize) >= MAX_I32_LOCALS {
+                        return Err(LowerError::TooManyLocals);
+                    }
+                    let r = Reg(LOCAL_I32_BASE_REG + i32_idx);
+                    enc.movz(r, 0, MovShift::Lsl0)?;
+                    out.push(LocalLoc::I32(r));
+                    i32_idx += 1;
+                }
+                ValType::F32 => {
+                    if (f32_idx as usize) >= MAX_F32_LOCALS {
+                        return Err(LowerError::TooManyLocals);
+                    }
+                    let v = Vreg(LOCAL_F32_BASE_REG + f32_idx);
+                    // Zero-init: FMOV Sv, WZR (bit-casts the zero
+                    // register's low 32 into the S register).
+                    enc.fmov_s_from_w(v, Reg::ZR)?;
+                    out.push(LocalLoc::F32(v));
+                    f32_idx += 1;
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Build a lowerer with a standard AAPCS64 function frame: the
@@ -379,27 +443,24 @@ impl Lowerer {
         n_locals: usize,
         call_targets: Vec<u64>,
     ) -> Result<Self, LowerError> {
-        if n_locals > MAX_LOCALS {
-            return Err(LowerError::TooManyLocals);
-        }
+        let types = vec![ValType::I32; n_locals];
+        Self::new_function_typed(&types, call_targets)
+    }
+
+    /// Variant of `new_function` with per-local types.
+    pub fn new_function_typed(
+        local_types: &[ValType],
+        call_targets: Vec<u64>,
+    ) -> Result<Self, LowerError> {
         let mut enc = Encoder::new();
-        // Prologue: stp x29, x30, [sp, #-16]!  ; mov x29, sp
         enc.stp_pre_indexed_64(Reg::X29, Reg::X30, Reg::SP, -16)?;
-        // `MOV X29, SP` is encoded as `ADD X29, SP, #0` in the
-        // immediate form, which we don't have yet. Skip the frame-
-        // pointer set — the prologue's X29/X30 save is the key
-        // ABI-preserving step and callers that don't walk the frame
-        // chain don't care about X29.
-        for i in 0..n_locals {
-            let r = Reg(LOCAL_BASE_REG + i as u8);
-            enc.movz(r, 0, MovShift::Lsl0)?;
-        }
+        let locals = Self::allocate_locals(&mut enc, local_types, true)?;
         Ok(Self {
             enc,
             stack: Vec::new(),
             i32_depth: 0,
             f32_depth: 0,
-            num_locals: n_locals,
+            locals,
             label_stack: Vec::new(),
             call_targets,
             has_frame: true,
@@ -426,7 +487,7 @@ impl Lowerer {
         call_targets: Vec<u64>,
         mem_base: u64,
     ) -> Result<Self, LowerError> {
-        if n_locals > MAX_LOCALS {
+        if n_locals > MAX_I32_LOCALS {
             return Err(LowerError::TooManyLocals);
         }
         let mut enc = Encoder::new();
@@ -439,16 +500,14 @@ impl Lowerer {
         if h2 != 0 { enc.movk(MEM_BASE_REG, h2, MovShift::Lsl32)?; }
         let h3 = ((mem_base >> 48) & 0xFFFF) as u16;
         if h3 != 0 { enc.movk(MEM_BASE_REG, h3, MovShift::Lsl48)?; }
-        for i in 0..n_locals {
-            let r = Reg(LOCAL_BASE_REG + i as u8);
-            enc.movz(r, 0, MovShift::Lsl0)?;
-        }
+        let types = vec![ValType::I32; n_locals];
+        let locals = Self::allocate_locals(&mut enc, &types, true)?;
         Ok(Self {
             enc,
             stack: Vec::new(),
             i32_depth: 0,
             f32_depth: 0,
-            num_locals: n_locals,
+            locals,
             label_stack: Vec::new(),
             call_targets,
             has_frame: true,
@@ -498,6 +557,8 @@ impl Lowerer {
             WasmOp::F32Gt => self.lower_f32_cmp(Condition::Gt),
             WasmOp::F32Le => self.lower_f32_cmp(Condition::Le),
             WasmOp::F32Ge => self.lower_f32_cmp(Condition::Ge),
+            WasmOp::F32Load(off) => self.lower_f32_load(off),
+            WasmOp::F32Store(off) => self.lower_f32_store(off),
             WasmOp::LocalGet(i) => self.lower_local_get(i),
             WasmOp::LocalSet(i) => self.lower_local_set(i),
             WasmOp::Block => self.lower_block(),
@@ -716,28 +777,39 @@ impl Lowerer {
         Ok(())
     }
 
-    fn local_reg(&self, idx: u32) -> Result<Reg, LowerError> {
+    /// Look up a local's storage, returning its type-erased handle.
+    /// Callers dispatch on the variant to pick ADD/MOV vs FMOV.
+    fn local_loc(&self, idx: u32) -> Result<LocalLoc, LowerError> {
         let i = idx as usize;
-        if i >= self.num_locals {
-            return Err(LowerError::LocalOutOfRange);
-        }
-        Ok(Reg(LOCAL_BASE_REG + i as u8))
+        self.locals.get(i).copied().ok_or(LowerError::LocalOutOfRange)
     }
 
     fn lower_local_get(&mut self, idx: u32) -> Result<(), LowerError> {
-        let local = self.local_reg(idx)?;
-        let dst = self.push_i32_slot()?;
-        // Copy local value to new stack slot. A64 has no "MOV Xd, Xn";
-        // the idiomatic form is `ADD Xd, XZR, Xn` (or ORR Xd, XZR, Xn,
-        // but we already have ADD in the encoder).
-        self.enc.add(dst, Reg::ZR, local)?;
+        match self.local_loc(idx)? {
+            LocalLoc::I32(local) => {
+                let dst = self.push_i32_slot()?;
+                // A64 has no "MOV Xd, Xn"; idiom is `ADD Xd, XZR, Xn`.
+                self.enc.add(dst, Reg::ZR, local)?;
+            }
+            LocalLoc::F32(local) => {
+                let dst = self.push_f32_slot()?;
+                self.enc.fmov_s_s(dst, local)?;
+            }
+        }
         Ok(())
     }
 
     fn lower_local_set(&mut self, idx: u32) -> Result<(), LowerError> {
-        let local = self.local_reg(idx)?;
-        let src = self.pop_i32_slot()?;
-        self.enc.add(local, Reg::ZR, src)?;
+        match self.local_loc(idx)? {
+            LocalLoc::I32(local) => {
+                let src = self.pop_i32_slot()?;
+                self.enc.add(local, Reg::ZR, src)?;
+            }
+            LocalLoc::F32(local) => {
+                let src = self.pop_f32_slot()?;
+                self.enc.fmov_s_s(local, src)?;
+            }
+        }
         Ok(())
     }
 
@@ -1049,6 +1121,36 @@ impl Lowerer {
         // after the LDR (which itself zero-extends).
         self.enc.add_ext_uxtw(dst, MEM_BASE_REG, addr)?;
         self.enc.ldr_w_imm(dst, dst, offset)?;
+        Ok(())
+    }
+
+    /// Lower `f32.load off` — pop i32 addr, push f32 value from
+    /// `mem_base + addr + offset`. Uses a scratch X-bank register
+    /// (X16 = IP) to compute the effective address, then LDR Si.
+    fn lower_f32_load(&mut self, offset: u32) -> Result<(), LowerError> {
+        if !self.has_memory {
+            return Err(LowerError::MemoryNotConfigured);
+        }
+        let addr = self.pop_i32_slot()?;
+        let dst = self.push_f32_slot()?;
+        // Can't reuse dst (V-bank) as the effective-address reg —
+        // those are different banks. Use X16 (caller-saved IP).
+        self.enc.add_ext_uxtw(Reg::X16, MEM_BASE_REG, addr)?;
+        self.enc.ldr_s_imm(dst, Reg::X16, offset)?;
+        Ok(())
+    }
+
+    /// Lower `f32.store off` — pop f32 value, pop i32 addr, write
+    /// the 32-bit bit pattern into memory. X16 holds the computed
+    /// effective address.
+    fn lower_f32_store(&mut self, offset: u32) -> Result<(), LowerError> {
+        if !self.has_memory {
+            return Err(LowerError::MemoryNotConfigured);
+        }
+        let val = self.pop_f32_slot()?;
+        let addr = self.pop_i32_slot()?;
+        self.enc.add_ext_uxtw(Reg::X16, MEM_BASE_REG, addr)?;
+        self.enc.str_s_imm(val, Reg::X16, offset)?;
         Ok(())
     }
 
