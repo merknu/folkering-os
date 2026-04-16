@@ -294,6 +294,13 @@ pub enum WasmOp {
     /// The function's i32 return value lands in X0; we push that
     /// onto the stack as the call's result.
     Call(u32),
+    /// Indirect call through a function-reference table. The operand
+    /// stack holds the args (shallowest = rightmost) followed by an
+    /// i32 table index on top. `type_id` selects the signature in the
+    /// lowerer's `indirect_sigs` list — it determines how many params
+    /// to marshal and what result type (if any) to push after the
+    /// call. See [`Lowerer::new_function_with_table`] for table setup.
+    CallIndirect(u32),
     /// Explicit `return` — always jumps to the function end, regardless
     /// of the label stack.  Moves stack top into X0 if needed.
     Return,
@@ -336,6 +343,19 @@ pub enum LowerError {
     /// i32.load / i32.store used on a lowerer without a configured
     /// memory base. Use `new_function_with_memory` instead.
     MemoryNotConfigured,
+    /// `call_indirect` used on a lowerer without a configured table.
+    /// Use `new_function_with_table` instead.
+    TableNotConfigured,
+    /// `call_indirect` referenced a type index not present in the
+    /// signature list.
+    IndirectTypeMissing,
+    /// `call_indirect` signature has more integer parameters than the
+    /// AAPCS64 integer argument-register band (X0..X7) can hold. Float
+    /// params aren't supported in this phase at all.
+    IndirectArityUnsupported,
+    /// `call_indirect` signature uses a param or result type the MVP
+    /// marshalling doesn't support (today: f32/f64 params and results).
+    IndirectTypeUnsupported,
     /// An op expected a particular stack-top type but saw a different
     /// one — e.g. `i32.add` with an f32 on top, or `f32.add` with
     /// an i32 argument. Catches WASM validation errors the lowerer
@@ -495,6 +515,24 @@ pub struct Lowerer {
     /// the prologue loaded the linear-memory base into X28. When set,
     /// `i32.load` and `i32.store` compile; otherwise they error.
     has_memory: bool,
+    /// Absolute address of the function-reference table, or `None` if
+    /// `call_indirect` is not configured. Each 16-byte entry holds
+    /// `addr: u64` at offset 0 and `type_id: u32` at offset 8 (with
+    /// 4 bytes of reserved padding). Typically placed in the caller-
+    /// visible linear-memory region, but can be any valid pointer.
+    table_base: Option<u64>,
+    /// Signatures indexed by WASM type index, used at `call_indirect`
+    /// lowering to determine how many params to marshal and what
+    /// return type to push. Empty when table-based calls aren't in use.
+    indirect_sigs: Vec<FnSig>,
+}
+
+/// Function signature used for `call_indirect` marshalling. WASM MVP
+/// allows at most one return; multi-value results are a follow-up.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FnSig {
+    pub params: Vec<ValType>,
+    pub result: Option<ValType>,
 }
 
 impl Lowerer {
@@ -529,6 +567,8 @@ impl Lowerer {
             call_targets: Vec::new(),
             has_frame: false,
             has_memory: false,
+            table_base: None,
+            indirect_sigs: Vec::new(),
         })
     }
 
@@ -627,6 +667,8 @@ impl Lowerer {
             call_targets,
             has_frame: true,
             has_memory: false,
+            table_base: None,
+            indirect_sigs: Vec::new(),
         })
     }
 
@@ -674,7 +716,35 @@ impl Lowerer {
             call_targets,
             has_frame: true,
             has_memory: true,
+            table_base: None,
+            indirect_sigs: Vec::new(),
         })
+    }
+
+    /// Build a lowerer for a function that uses `call_indirect`.
+    /// Extends [`Self::new_function_with_memory`] by also wiring up a
+    /// function-reference table at `table_base`. `sigs` is indexed by
+    /// WASM type index; each `CallIndirect(type_id)` op looks up the
+    /// corresponding signature to drive param/result marshalling.
+    ///
+    /// The table layout is 16 bytes per entry:
+    /// ```text
+    ///   bytes 0..8   addr: u64   // callable function address
+    ///   bytes 8..12  type_id: u32 // (reserved for runtime type-check;
+    ///                              ignored by this lowering today)
+    ///   bytes 12..16 padding
+    /// ```
+    pub fn new_function_with_table(
+        n_locals: usize,
+        call_targets: Vec<u64>,
+        mem_base: u64,
+        table_base: u64,
+        sigs: Vec<FnSig>,
+    ) -> Result<Self, LowerError> {
+        let mut lw = Self::new_function_with_memory(n_locals, call_targets, mem_base)?;
+        lw.table_base = Some(table_base);
+        lw.indirect_sigs = sigs;
+        Ok(lw)
     }
 
     /// Lower a single op.
@@ -799,6 +869,7 @@ impl Lowerer {
             WasmOp::If => self.lower_if(),
             WasmOp::Else => self.lower_else(),
             WasmOp::Call(n) => self.lower_call(n),
+            WasmOp::CallIndirect(t) => self.lower_call_indirect(t),
             WasmOp::I32Load(off) => self.lower_load(off),
             WasmOp::I32Store(off) => self.lower_store(off),
             WasmOp::Return => self.lower_explicit_return(),
@@ -1731,6 +1802,126 @@ impl Lowerer {
         } else {
             // Fast path — X0 is already stack[0].
             let _ = self.push_i32_slot()?;
+        }
+        Ok(())
+    }
+
+    /// Lower `call_indirect type_id`. The operand stack must hold the
+    /// args for the signature identified by `type_id` followed by an
+    /// i32 table index at the top. This lowering:
+    ///
+    ///   1. Pops the table index.
+    ///   2. Computes entry address = `table_base + (idx << 4)` in X17
+    ///      with a single `ADD X17, X17, Widx, UXTW #4`.
+    ///   3. Loads the callable address from `[X17]` into X16.
+    ///   4. Pops the args and stages them through X9..X(8+N) scratch
+    ///      (avoiding clobbers when arg sources overlap X0..X(N-1)),
+    ///      then moves into X0..X(N-1) per AAPCS64.
+    ///   5. BLR X16.
+    ///   6. Pushes a result slot of the signature's result type,
+    ///      moving from X0 if the new slot's register isn't X0.
+    ///
+    /// Bounds checking and runtime type-checking are deliberately
+    /// out of scope for this phase — they require a trap epilogue and
+    /// a dedicated test-harness signature. Hosts that build the table
+    /// must supply valid entries matching the compile-time `type_id`.
+    fn lower_call_indirect(&mut self, type_id: u32) -> Result<(), LowerError> {
+        let table_base = self.table_base.ok_or(LowerError::TableNotConfigured)?;
+        let sig = self
+            .indirect_sigs
+            .get(type_id as usize)
+            .ok_or(LowerError::IndirectTypeMissing)?
+            .clone();
+
+        // Only integer params supported in this phase; FP args would
+        // need separate AAPCS64 slots (V0..V7) and multi-bank
+        // scratch staging. Add later once there's a test case.
+        for p in &sig.params {
+            if !p.is_int() {
+                return Err(LowerError::IndirectTypeUnsupported);
+            }
+        }
+        let n_args = sig.params.len();
+        if n_args > 8 {
+            return Err(LowerError::IndirectArityUnsupported);
+        }
+
+        // Step 1: pop the table index.
+        let idx_reg = self.pop_i32_slot()?;
+
+        // Step 2: synthesize table_base into X17 (IP1 scratch), then
+        // add the scaled index.
+        let x17 = Reg::X17;
+        self.enc.movz(x17, (table_base & 0xFFFF) as u16, MovShift::Lsl0)?;
+        let h1 = ((table_base >> 16) & 0xFFFF) as u16;
+        if h1 != 0 { self.enc.movk(x17, h1, MovShift::Lsl16)?; }
+        let h2 = ((table_base >> 32) & 0xFFFF) as u16;
+        if h2 != 0 { self.enc.movk(x17, h2, MovShift::Lsl32)?; }
+        let h3 = ((table_base >> 48) & 0xFFFF) as u16;
+        if h3 != 0 { self.enc.movk(x17, h3, MovShift::Lsl48)?; }
+        // X17 = X17 + UXTW(Widx) << 4  (idx * 16-byte entries)
+        self.enc.add_ext_uxtw_shifted(x17, x17, idx_reg, 4)?;
+
+        // Step 3: load the callable address.
+        self.enc.ldr_imm(Reg::X16, x17, 0)?;
+
+        // Step 4: pop args, stage into X9..X(8+N), then move to
+        // X0..X(N-1). Stage-then-copy avoids source-clobber aliasing
+        // when the arg source regs overlap the target register band.
+        // Arg order in WASM: deepest is arg 0. Pop pops top (last arg
+        // first); record in reverse and re-reverse for calling order.
+        let mut arg_src: Vec<Reg> = Vec::with_capacity(n_args);
+        for p in sig.params.iter().rev() {
+            let src = match p {
+                ValType::I32 => self.pop_i32_slot()?,
+                ValType::I64 => self.pop_i64_slot()?,
+                _ => unreachable!("filtered above"),
+            };
+            arg_src.push(src);
+        }
+        arg_src.reverse();
+
+        // Stage: X(9+i) ← arg_src[i].  Use 64-bit MOV (ADD X, XZR, X)
+        // to preserve the full width — if the callee expects a W
+        // param the upper bits are ignored by the W instructions it
+        // uses, and if it expects an X everything is already there.
+        for (i, src) in arg_src.iter().enumerate() {
+            let scratch = Reg((9 + i) as u8);
+            self.enc.add(scratch, Reg::ZR, *src)?;
+        }
+        // Copy scratch into AAPCS64 arg regs.
+        for i in 0..n_args {
+            let scratch = Reg((9 + i) as u8);
+            let target = Reg(i as u8);
+            self.enc.add(target, Reg::ZR, scratch)?;
+        }
+
+        // Step 5: indirect call.
+        self.enc.blr(Reg::X16)?;
+
+        // Step 6: push result slot and move X0 into it if needed.
+        match sig.result {
+            None => {}
+            Some(ValType::I32) => {
+                let dst = self.push_i32_slot()?;
+                if dst.0 != 0 {
+                    // AND W zeros upper 32 so the i32 slot matches WASM
+                    // i32 semantics regardless of what the callee left
+                    // in the high half of X0.
+                    self.enc.and_w(dst, Reg::X0, Reg::X0)?;
+                } else {
+                    // Slot IS X0; still mask the upper 32 bits to keep
+                    // consistency with other i32-producing lowerings.
+                    self.enc.and_w(Reg::X0, Reg::X0, Reg::X0)?;
+                }
+            }
+            Some(ValType::I64) => {
+                let dst = self.push_i64_slot()?;
+                if dst.0 != 0 {
+                    self.enc.add(dst, Reg::ZR, Reg::X0)?;
+                }
+            }
+            Some(_) => return Err(LowerError::IndirectTypeUnsupported),
         }
         Ok(())
     }

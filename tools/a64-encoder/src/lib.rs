@@ -23,7 +23,7 @@
 pub mod wasm_lower;
 pub mod wasm_module;
 pub mod wasm_parse;
-pub use wasm_lower::{LowerError, Lowerer, ValType, WasmOp};
+pub use wasm_lower::{FnSig, LowerError, Lowerer, ValType, WasmOp};
 pub use wasm_module::{parse_module, FunctionBody};
 pub use wasm_parse::{parse_function_body, ParseError};
 
@@ -306,6 +306,28 @@ impl Encoder {
     pub fn add_ext_uxtw(&mut self, rd: Reg, rn: Reg, rm: Reg) -> Result<(), EncodeError> {
         let word = 0x8B20_4000u32
             | (rm.enc() << 16)
+            | (rn.enc() << 5)
+            | rd.enc();
+        self.emit(word);
+        Ok(())
+    }
+
+    /// ADD Xd, Xn, Wm, UXTW #shift — same as [`Encoder::add_ext_uxtw`]
+    /// but with an optional left shift on the extended value
+    /// (shift ∈ 0..=4). Used by `call_indirect` to compute a table
+    /// entry address as `table_base + idx*16` in a single instruction
+    /// (with `shift=4`).
+    pub fn add_ext_uxtw_shifted(
+        &mut self,
+        rd: Reg,
+        rn: Reg,
+        rm: Reg,
+        shift: u32,
+    ) -> Result<(), EncodeError> {
+        if shift > 4 { return Err(EncodeError::ImmediateOutOfRange); }
+        let word = 0x8B20_4000u32
+            | (rm.enc() << 16)
+            | ((shift & 0x7) << 10)
             | (rn.enc() << 5)
             | rd.enc();
         self.emit(word);
@@ -1730,6 +1752,29 @@ mod tests {
             one(|e| e.add_ext_uxtw(Reg::X0, Reg(28), Reg::X1)),
             0x8B214380
         );
+    }
+
+    #[test]
+    fn add_ext_uxtw_shifted_shift4() {
+        // add x0, x28, w1, uxtw #4  →  8b215380
+        assert_eq!(
+            one(|e| e.add_ext_uxtw_shifted(Reg::X0, Reg(28), Reg::X1, 4)),
+            0x8B215380
+        );
+    }
+
+    #[test]
+    fn add_ext_uxtw_shifted_shift0_matches_plain() {
+        // shift=0 should produce identical bytes to add_ext_uxtw.
+        assert_eq!(
+            one(|e| e.add_ext_uxtw_shifted(Reg::X0, Reg(28), Reg::X1, 0)),
+            one(|e| e.add_ext_uxtw(Reg::X0, Reg(28), Reg::X1)),
+        );
+    }
+
+    #[test]
+    fn add_ext_uxtw_shifted_rejects_overlarge() {
+        assert!(Encoder::new().add_ext_uxtw_shifted(Reg::X0, Reg::X0, Reg::X0, 5).is_err());
     }
 
     #[test]

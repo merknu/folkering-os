@@ -94,6 +94,15 @@ pub fn parse_ops(bytes: &[u8], pos: &mut usize) -> Result<Vec<WasmOp>, ParseErro
                 if idx > u32::MAX as u64 { return Err(ParseError::IntegerTooLarge); }
                 ops.push(WasmOp::Call(idx as u32));
             }
+            0x11 => {
+                // call_indirect typeidx tableidx
+                // (MVP: tableidx is always 0 — we only honour one
+                // table; discard but still parse it.)
+                let typeidx = read_uleb128(bytes, pos)?;
+                if typeidx > u32::MAX as u64 { return Err(ParseError::IntegerTooLarge); }
+                let _tableidx = read_uleb128(bytes, pos)?;
+                ops.push(WasmOp::CallIndirect(typeidx as u32));
+            }
             0x0B => {
                 ops.push(WasmOp::End);
                 if depth == 0 {
