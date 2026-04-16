@@ -301,6 +301,16 @@ pub enum WasmOp {
     I32x4Mul,
     /// Pop V128, push lane `N` as scalar I32 (`UMOV Wd, Vn.S[N]`).
     I32x4ExtractLane(u8),
+    // ── f64x2 (double-precision SIMD, 2 lanes) ───────────────────
+    F64x2Add, F64x2Sub, F64x2Mul, F64x2Div,
+    F64x2Min, F64x2Max,
+    F64x2Sqrt, F64x2Abs, F64x2Neg,
+    F64x2Splat,
+    F64x2ExtractLane(u8),
+    // ── i8x16 (16 packed bytes) ──────────────────────────────────
+    I8x16Add, I8x16Sub, I8x16Splat, I8x16ExtractLaneU(u8),
+    // ── i16x8 (8 packed halfwords) ───────────────────────────────
+    I16x8Add, I16x8Sub, I16x8Mul, I16x8Splat, I16x8ExtractLaneU(u8),
     /// Pop two V128s, push lane-wise f32 difference.
     F32x4Sub,
     /// Pop two V128s, push lane-wise f32 quotient.
@@ -635,6 +645,11 @@ pub struct Lowerer {
     /// lowering to determine how many params to marshal and what
     /// return type to push. Empty when table-based calls aren't in use.
     indirect_sigs: Vec<FnSig>,
+    /// Byte ranges in the encoder buffer that contain literal-pool
+    /// data (from v128.const). The peephole optimizer skips these
+    /// so it doesn't corrupt data that happens to match an
+    /// instruction pattern.
+    data_regions: Vec<crate::peephole::DataRegion>,
 }
 
 /// Function signature used for `call_indirect` marshalling. WASM MVP
@@ -683,6 +698,7 @@ impl Lowerer {
             table_base: None,
             indirect_sigs: Vec::new(),
             call_sigs: Vec::new(),
+            data_regions: Vec::new(),
         })
     }
 
@@ -810,6 +826,7 @@ impl Lowerer {
             table_base: None,
             indirect_sigs: Vec::new(),
             call_sigs: Vec::new(),
+            data_regions: Vec::new(),
         })
     }
 
@@ -863,6 +880,7 @@ impl Lowerer {
             table_base: None,
             indirect_sigs: Vec::new(),
             call_sigs: Vec::new(),
+            data_regions: Vec::new(),
         })
     }
 
@@ -1014,6 +1032,29 @@ impl Lowerer {
             WasmOp::I32x4Sub => self.lower_i32x4_sub(),
             WasmOp::I32x4Mul => self.lower_i32x4_mul(),
             WasmOp::I32x4ExtractLane(lane) => self.lower_i32x4_extract_lane(lane),
+            // f64x2
+            WasmOp::F64x2Add => self.lower_v128_binop(|e, d, l, r| e.fadd_2d(d, l, r)),
+            WasmOp::F64x2Sub => self.lower_v128_binop(|e, d, l, r| e.fsub_2d(d, l, r)),
+            WasmOp::F64x2Mul => self.lower_v128_binop(|e, d, l, r| e.fmul_2d(d, l, r)),
+            WasmOp::F64x2Div => self.lower_v128_binop(|e, d, l, r| e.fdiv_2d(d, l, r)),
+            WasmOp::F64x2Min => self.lower_v128_binop(|e, d, l, r| e.fmin_2d(d, l, r)),
+            WasmOp::F64x2Max => self.lower_v128_binop(|e, d, l, r| e.fmax_2d(d, l, r)),
+            WasmOp::F64x2Sqrt => self.lower_f32x4_unary(|e, d, s| e.fsqrt_2d(d, s)),
+            WasmOp::F64x2Abs => self.lower_f32x4_unary(|e, d, s| e.fabs_2d(d, s)),
+            WasmOp::F64x2Neg => self.lower_f32x4_unary(|e, d, s| e.fneg_2d(d, s)),
+            WasmOp::F64x2Splat => self.lower_f64x2_splat(),
+            WasmOp::F64x2ExtractLane(lane) => self.lower_f64x2_extract_lane(lane),
+            // i8x16
+            WasmOp::I8x16Add => self.lower_v128_binop(|e, d, l, r| e.add_16b_vector(d, l, r)),
+            WasmOp::I8x16Sub => self.lower_v128_binop(|e, d, l, r| e.sub_16b_vector(d, l, r)),
+            WasmOp::I8x16Splat => { let s = self.pop_i32_slot()?; let d = self.push_v128_slot()?; self.enc.dup_16b_from_w(d, s)?; Ok(()) }
+            WasmOp::I8x16ExtractLaneU(lane) => { let s = self.pop_v128_slot()?; let d = self.push_i32_slot()?; self.enc.umov_w_from_vb_lane(d, s, lane)?; Ok(()) }
+            // i16x8
+            WasmOp::I16x8Add => self.lower_v128_binop(|e, d, l, r| e.add_8h_vector(d, l, r)),
+            WasmOp::I16x8Sub => self.lower_v128_binop(|e, d, l, r| e.sub_8h_vector(d, l, r)),
+            WasmOp::I16x8Mul => self.lower_v128_binop(|e, d, l, r| e.mul_8h_vector(d, l, r)),
+            WasmOp::I16x8Splat => { let s = self.pop_i32_slot()?; let d = self.push_v128_slot()?; self.enc.dup_8h_from_w(d, s)?; Ok(()) }
+            WasmOp::I16x8ExtractLaneU(lane) => { let s = self.pop_v128_slot()?; let d = self.push_i32_slot()?; self.enc.umov_w_from_vh_lane(d, s, lane)?; Ok(()) }
             WasmOp::F32x4Sub => self.lower_f32x4_sub(),
             WasmOp::F32x4Div => self.lower_f32x4_div(),
             WasmOp::F32x4Fma => self.lower_f32x4_fma(),
@@ -1091,7 +1132,7 @@ impl Lowerer {
     /// after a call that already left the result in X0).
     pub fn finish(self) -> Vec<u8> {
         let mut bytes = self.enc.into_bytes();
-        let _eliminated = crate::peephole::optimize(&mut bytes);
+        let _eliminated = crate::peephole::optimize(&mut bytes, &self.data_regions);
         bytes
     }
 
@@ -1431,13 +1472,18 @@ impl Lowerer {
         }
 
         // Emit the 16-byte constant as 4 little-endian u32 words.
-        // Same byte-order as the Encoder's normal emission, so the
-        // constant's u128 little-endian layout is preserved.
+        // Register the byte range as a data region so the peephole
+        // optimizer doesn't mistake constant bytes for instructions.
+        let data_start = self.enc.pos();
         let le = bits.to_le_bytes();
         for chunk in le.chunks_exact(4) {
             let w = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
             self.enc.emit_raw_word(w);
         }
+        self.data_regions.push(crate::peephole::DataRegion {
+            start: data_start,
+            end: self.enc.pos(),
+        });
 
         // LDR Q_dst, [PC, #-16] — the data is now 16 bytes before
         // the current PC (which points at the LDR we're about to emit).
@@ -1615,6 +1661,41 @@ impl Lowerer {
         let dst = self.push_v128_slot()?;
         debug_assert_eq!(dst.0, src.0, "unary f32x4 reuses the slot");
         emit(&mut self.enc, dst, src)?;
+        Ok(())
+    }
+
+    /// Generic binary v128 → v128 op. Used by f64x2 arith to avoid
+    /// duplicating the pop-pop-push-emit pattern for each opcode.
+    fn lower_v128_binop<F>(&mut self, emit: F) -> Result<(), LowerError>
+    where
+        F: FnOnce(&mut Encoder, Vreg, Vreg, Vreg) -> Result<(), EncodeError>,
+    {
+        let rhs = self.pop_v128_slot()?;
+        let lhs = self.pop_v128_slot()?;
+        let dst = self.push_v128_slot()?;
+        emit(&mut self.enc, dst, lhs, rhs)?;
+        Ok(())
+    }
+
+    /// f64x2.splat — pop F64 scalar, broadcast to both lanes.
+    /// The scalar lives in a D register (low 64 of V). We use
+    /// DUP Vd.2D, Xn to broadcast from the X bank, so first
+    /// FMOV Xn, Dn to get the bits into an X register.
+    fn lower_f64x2_splat(&mut self) -> Result<(), LowerError> {
+        let src = self.pop_f64_slot()?;
+        let dst = self.push_v128_slot()?;
+        // FMOV X17, Dn — move the f64 bits to an X scratch
+        self.enc.fmov_x_from_d(Reg::X17, src)?;
+        // DUP Vd.2D, X17
+        self.enc.dup_2d_from_x(dst, Reg::X17)?;
+        Ok(())
+    }
+
+    /// f64x2.extract_lane N — pop V128, push F64 from lane N (0 or 1).
+    fn lower_f64x2_extract_lane(&mut self, lane: u8) -> Result<(), LowerError> {
+        let src = self.pop_v128_slot()?;
+        let dst = self.push_f64_slot()?;
+        self.enc.dup_d_from_v_d_lane(dst, src, lane)?;
         Ok(())
     }
 

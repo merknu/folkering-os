@@ -344,8 +344,20 @@ pub fn parse_ops(bytes: &[u8], pos: &mut usize) -> Result<Vec<WasmOp>, ParseErro
                         *pos += 16;
                         ops.push(WasmOp::V128Const(u128::from_le_bytes(lit)));
                     }
+                    0x0F => ops.push(WasmOp::I8x16Splat),
+                    0x10 => ops.push(WasmOp::I16x8Splat),
                     0x11 => ops.push(WasmOp::I32x4Splat),
                     0x13 => ops.push(WasmOp::F32x4Splat),
+                    0x15 => {
+                        if *pos >= bytes.len() { return Err(ParseError::UnexpectedEof); }
+                        let lane = bytes[*pos]; *pos += 1;
+                        ops.push(WasmOp::I8x16ExtractLaneU(lane));
+                    }
+                    0x19 => {
+                        if *pos >= bytes.len() { return Err(ParseError::UnexpectedEof); }
+                        let lane = bytes[*pos]; *pos += 1;
+                        ops.push(WasmOp::I16x8ExtractLaneU(lane));
+                    }
                     0x41 => ops.push(WasmOp::F32x4Eq),
                     0x44 => ops.push(WasmOp::F32x4Gt),
                     0x52 => ops.push(WasmOp::V128Bitselect),
@@ -367,6 +379,11 @@ pub fn parse_ops(bytes: &[u8], pos: &mut usize) -> Result<Vec<WasmOp>, ParseErro
                         }
                         ops.push(WasmOp::F32x4ExtractLane(lane));
                     }
+                    0x6E => ops.push(WasmOp::I8x16Add),
+                    0x71 => ops.push(WasmOp::I8x16Sub),
+                    0x8E => ops.push(WasmOp::I16x8Add),
+                    0x91 => ops.push(WasmOp::I16x8Sub),
+                    0x95 => ops.push(WasmOp::I16x8Mul),
                     0xAE => ops.push(WasmOp::I32x4Add),
                     0xB1 => ops.push(WasmOp::I32x4Sub),
                     0xB5 => ops.push(WasmOp::I32x4Mul),
@@ -379,6 +396,22 @@ pub fn parse_ops(bytes: &[u8], pos: &mut usize) -> Result<Vec<WasmOp>, ParseErro
                     0xE7 => ops.push(WasmOp::F32x4Div),
                     0xE8 => ops.push(WasmOp::F32x4Min),
                     0xE9 => ops.push(WasmOp::F32x4Max),
+                    // f64x2 arith
+                    0x12 => ops.push(WasmOp::F64x2Splat),
+                    0x1D => {
+                        // f64x2.extract_lane laneidx (0 or 1)
+                        if *pos >= bytes.len() { return Err(ParseError::UnexpectedEof); }
+                        let lane = bytes[*pos];
+                        *pos += 1;
+                        if lane > 1 { return Err(ParseError::UnknownOpcode(lane)); }
+                        ops.push(WasmOp::F64x2ExtractLane(lane));
+                    }
+                    0xF0 => ops.push(WasmOp::F64x2Add),
+                    0xF1 => ops.push(WasmOp::F64x2Sub),
+                    0xF2 => ops.push(WasmOp::F64x2Mul),
+                    0xF3 => ops.push(WasmOp::F64x2Div),
+                    0xF4 => ops.push(WasmOp::F64x2Min),
+                    0xF5 => ops.push(WasmOp::F64x2Max),
                     _ => {
                         // Encode the unknown SIMD sub-opcode as a
                         // single byte for error reporting (lossy for

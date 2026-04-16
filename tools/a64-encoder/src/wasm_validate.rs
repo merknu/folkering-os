@@ -308,14 +308,19 @@ pub fn validate(
             WasmOp::F32x4Add | WasmOp::F32x4Sub | WasmOp::F32x4Mul
             | WasmOp::F32x4Div | WasmOp::F32x4Max | WasmOp::F32x4Min
             | WasmOp::I32x4Add | WasmOp::I32x4Sub | WasmOp::I32x4Mul
-            | WasmOp::F32x4Eq | WasmOp::F32x4Gt => {
+            | WasmOp::F32x4Eq | WasmOp::F32x4Gt
+            | WasmOp::F64x2Add | WasmOp::F64x2Sub | WasmOp::F64x2Mul
+            | WasmOp::F64x2Div | WasmOp::F64x2Min | WasmOp::F64x2Max 
+            | WasmOp::I8x16Add | WasmOp::I8x16Sub
+            | WasmOp::I16x8Add | WasmOp::I16x8Sub | WasmOp::I16x8Mul => {
                 pop_expect(&mut stack, ValType::V128, &err)?;
                 pop_expect(&mut stack, ValType::V128, &err)?;
                 stack.push(ValType::V128);
             }
 
             // ── SIMD unary v128 → v128 ────────────────────────────
-            WasmOp::F32x4Abs | WasmOp::F32x4Neg | WasmOp::F32x4Sqrt => {
+            WasmOp::F32x4Abs | WasmOp::F32x4Neg | WasmOp::F32x4Sqrt
+            | WasmOp::F64x2Abs | WasmOp::F64x2Neg | WasmOp::F64x2Sqrt => {
                 pop_expect(&mut stack, ValType::V128, &err)?;
                 stack.push(ValType::V128);
             }
@@ -337,6 +342,14 @@ pub fn validate(
             }
 
             // ── SIMD splat ────────────────────────────────────────
+            WasmOp::F64x2Splat => {
+                pop_expect(&mut stack, ValType::F64, &err)?;
+                stack.push(ValType::V128);
+            }
+            WasmOp::I8x16Splat | WasmOp::I16x8Splat => {
+                pop_expect(&mut stack, ValType::I32, &err)?;
+                stack.push(ValType::V128);
+            }
             WasmOp::F32x4Splat => {
                 pop_expect(&mut stack, ValType::F32, &err)?;
                 stack.push(ValType::V128);
@@ -347,9 +360,17 @@ pub fn validate(
             }
 
             // ── SIMD extract_lane ─────────────────────────────────
+            WasmOp::F64x2ExtractLane(_) => {
+                pop_expect(&mut stack, ValType::V128, &err)?;
+                stack.push(ValType::F64);
+            }
             WasmOp::F32x4ExtractLane(_) => {
                 pop_expect(&mut stack, ValType::V128, &err)?;
                 stack.push(ValType::F32);
+            }
+            WasmOp::I8x16ExtractLaneU(_) | WasmOp::I16x8ExtractLaneU(_) => {
+                pop_expect(&mut stack, ValType::V128, &err)?;
+                stack.push(ValType::I32);
             }
             WasmOp::I32x4ExtractLane(_) => {
                 pop_expect(&mut stack, ValType::V128, &err)?;

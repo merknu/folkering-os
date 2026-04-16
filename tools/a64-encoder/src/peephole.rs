@@ -29,10 +29,23 @@ use alloc::vec::Vec;
 /// NOP encoding on AArch64.
 const NOP: u32 = 0xD503_201F;
 
+/// A byte range in the encoder buffer that contains data (literal
+/// pool entries), not instructions. The peephole MUST skip these
+/// ranges — a random data pattern that happens to match
+/// `AND Wd, Wd, Wd` would be corrupted if NOP'd.
+#[derive(Debug, Clone, Copy)]
+pub struct DataRegion {
+    /// Byte offset of the start of the data region.
+    pub start: usize,
+    /// Byte offset one past the end of the data region.
+    pub end: usize,
+}
+
 /// Run the peephole optimizer over a mutable instruction buffer.
-/// Each entry is a 32-bit A64 word in native (little-endian) order.
-/// Returns the count of instructions replaced with NOPs.
-pub fn optimize(buf: &mut [u8]) -> usize {
+/// `data_regions` marks byte ranges that contain literal-pool data
+/// and must not be touched. Returns the count of instructions
+/// replaced with NOPs.
+pub fn optimize(buf: &mut [u8], data_regions: &[DataRegion]) -> usize {
     if buf.len() < 4 {
         return 0;
     }
@@ -41,6 +54,12 @@ pub fn optimize(buf: &mut [u8]) -> usize {
 
     for i in 0..n_words {
         let off = i * 4;
+
+        // Skip data regions (literal pools from v128.const etc.)
+        if data_regions.iter().any(|r| off >= r.start && off < r.end) {
+            continue;
+        }
+
         let word = u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
 
         // Pattern 1: ADD Xd, XZR, Xd (self-MOV)
@@ -127,7 +146,7 @@ mod tests {
         let word = 0x8B00_03E0u32;
         assert!(is_self_add_x(word));
         let mut buf = word_to_bytes(word).to_vec();
-        assert_eq!(optimize(&mut buf), 1);
+        assert_eq!(optimize(&mut buf, &[]), 1);
         assert_eq!(
             u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
             NOP
@@ -140,7 +159,7 @@ mod tests {
         let word = 0x8B00_03E1u32;
         assert!(!is_self_add_x(word));
         let mut buf = word_to_bytes(word).to_vec();
-        assert_eq!(optimize(&mut buf), 0);
+        assert_eq!(optimize(&mut buf, &[]), 0);
     }
 
     #[test]
@@ -149,7 +168,7 @@ mod tests {
         let word = 0x0A00_0000u32;
         assert!(is_self_and_w(word));
         let mut buf = word_to_bytes(word).to_vec();
-        assert_eq!(optimize(&mut buf), 1);
+        assert_eq!(optimize(&mut buf, &[]), 1);
     }
 
     #[test]
@@ -169,7 +188,7 @@ mod tests {
         // AND W5, W5, W5 (self-AND) → NOP
         let and_w5 = 0x0A05_00A5u32;
         buf.extend_from_slice(&and_w5.to_le_bytes());
-        assert_eq!(optimize(&mut buf), 2);
+        assert_eq!(optimize(&mut buf, &[]), 2);
         // First word → NOP
         assert_eq!(
             u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),

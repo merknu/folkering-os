@@ -798,6 +798,143 @@ impl Encoder {
         Ok(())
     }
 
+    // ── f64x2 (double-precision SIMD, 2 lanes) ─────────────────────
+    //
+    // Same AdvSIMD 3-same family as f32x4 but with sz=1 (bit 22 set).
+    // This adds 0x00400000 to each f32x4 base encoding.
+
+    /// FADD Vd.2D, Vn.2D, Vm.2D
+    pub fn fadd_2d(&mut self, vd: Vreg, vn: Vreg, vm: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x4E60_D400u32 | (vm.enc() << 16) | (vn.enc() << 5) | vd.enc());
+        Ok(())
+    }
+    /// FSUB Vd.2D, Vn.2D, Vm.2D
+    pub fn fsub_2d(&mut self, vd: Vreg, vn: Vreg, vm: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x4EE0_D400u32 | (vm.enc() << 16) | (vn.enc() << 5) | vd.enc());
+        Ok(())
+    }
+    /// FMUL Vd.2D, Vn.2D, Vm.2D
+    pub fn fmul_2d(&mut self, vd: Vreg, vn: Vreg, vm: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x6E60_DC00u32 | (vm.enc() << 16) | (vn.enc() << 5) | vd.enc());
+        Ok(())
+    }
+    /// FDIV Vd.2D, Vn.2D, Vm.2D
+    pub fn fdiv_2d(&mut self, vd: Vreg, vn: Vreg, vm: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x6E60_FC00u32 | (vm.enc() << 16) | (vn.enc() << 5) | vd.enc());
+        Ok(())
+    }
+    /// FMIN Vd.2D, Vn.2D, Vm.2D
+    pub fn fmin_2d(&mut self, vd: Vreg, vn: Vreg, vm: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x4EE0_F400u32 | (vm.enc() << 16) | (vn.enc() << 5) | vd.enc());
+        Ok(())
+    }
+    /// FMAX Vd.2D, Vn.2D, Vm.2D
+    pub fn fmax_2d(&mut self, vd: Vreg, vn: Vreg, vm: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x4E60_F400u32 | (vm.enc() << 16) | (vn.enc() << 5) | vd.enc());
+        Ok(())
+    }
+    /// FSQRT Vd.2D, Vn.2D
+    pub fn fsqrt_2d(&mut self, vd: Vreg, vn: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x6EE1_F800u32 | (vn.enc() << 5) | vd.enc());
+        Ok(())
+    }
+    /// FABS Vd.2D, Vn.2D
+    pub fn fabs_2d(&mut self, vd: Vreg, vn: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x4EE0_F800u32 | (vn.enc() << 5) | vd.enc());
+        Ok(())
+    }
+    /// FNEG Vd.2D, Vn.2D
+    pub fn fneg_2d(&mut self, vd: Vreg, vn: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x6EE0_F800u32 | (vn.enc() << 5) | vd.enc());
+        Ok(())
+    }
+
+    // ── i8x16 (16 packed bytes, size=00) ──────────────────────────
+
+    /// ADD Vd.16B, Vn.16B, Vm.16B — lane-wise i8 add.
+    /// Encoding: ADD vector, Q=1, size=00. Base 0x4E208400.
+    pub fn add_16b_vector(&mut self, vd: Vreg, vn: Vreg, vm: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x4E20_8400u32 | (vm.enc() << 16) | (vn.enc() << 5) | vd.enc());
+        Ok(())
+    }
+    /// SUB Vd.16B, Vn.16B, Vm.16B — lane-wise i8 subtract.
+    pub fn sub_16b_vector(&mut self, vd: Vreg, vn: Vreg, vm: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x6E20_8400u32 | (vm.enc() << 16) | (vn.enc() << 5) | vd.enc());
+        Ok(())
+    }
+    /// DUP Vd.16B, Wn — splat low byte of W to all 16 lanes.
+    /// imm5=00001 (8-bit element). Base 0x4E010C00.
+    pub fn dup_16b_from_w(&mut self, vd: Vreg, wn: Reg) -> Result<(), EncodeError> {
+        self.emit(0x4E01_0C00u32 | (wn.enc() << 5) | vd.enc());
+        Ok(())
+    }
+    /// UMOV Wd, Vn.B[lane] — extract one byte as u32.
+    /// imm5 = lane<<1 | 1. Base 0x0E003C00.
+    pub fn umov_w_from_vb_lane(&mut self, wd: Reg, vn: Vreg, lane: u8) -> Result<(), EncodeError> {
+        if lane >= 16 { return Err(EncodeError::ImmediateOutOfRange); }
+        let imm5 = ((lane as u32) << 1) | 1;
+        self.emit(0x0E00_3C00u32 | (imm5 << 16) | (vn.enc() << 5) | wd.enc());
+        Ok(())
+    }
+
+    // ── i16x8 (8 packed halfwords, size=01) ─────────────────────
+
+    /// ADD Vd.8H, Vn.8H, Vm.8H — lane-wise i16 add.
+    /// Encoding: ADD vector, Q=1, size=01. Base 0x4E608400.
+    pub fn add_8h_vector(&mut self, vd: Vreg, vn: Vreg, vm: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x4E60_8400u32 | (vm.enc() << 16) | (vn.enc() << 5) | vd.enc());
+        Ok(())
+    }
+    /// SUB Vd.8H, Vn.8H, Vm.8H
+    pub fn sub_8h_vector(&mut self, vd: Vreg, vn: Vreg, vm: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x6E60_8400u32 | (vm.enc() << 16) | (vn.enc() << 5) | vd.enc());
+        Ok(())
+    }
+    /// MUL Vd.8H, Vn.8H, Vm.8H — lane-wise i16 multiply (low 16 bits).
+    /// Base 0x4E609C00.
+    pub fn mul_8h_vector(&mut self, vd: Vreg, vn: Vreg, vm: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x4E60_9C00u32 | (vm.enc() << 16) | (vn.enc() << 5) | vd.enc());
+        Ok(())
+    }
+    /// DUP Vd.8H, Wn — splat low 16 bits of W to all 8 lanes.
+    /// imm5=00010 (16-bit element). Base 0x4E020C00.
+    pub fn dup_8h_from_w(&mut self, vd: Vreg, wn: Reg) -> Result<(), EncodeError> {
+        self.emit(0x4E02_0C00u32 | (wn.enc() << 5) | vd.enc());
+        Ok(())
+    }
+    /// UMOV Wd, Vn.H[lane] — extract one halfword as u32.
+    /// imm5 = lane<<2 | 2. Base 0x0E003C00.
+    pub fn umov_w_from_vh_lane(&mut self, wd: Reg, vn: Vreg, lane: u8) -> Result<(), EncodeError> {
+        if lane >= 8 { return Err(EncodeError::ImmediateOutOfRange); }
+        let imm5 = ((lane as u32) << 2) | 2;
+        self.emit(0x0E00_3C00u32 | (imm5 << 16) | (vn.enc() << 5) | wd.enc());
+        Ok(())
+    }
+
+    /// DUP Vd.2D, Xn — broadcast a 64-bit integer to both lanes.
+    /// Used for f64x2.splat (via bit-cast from f64→u64 in X reg).
+    ///
+    /// Encoding (AdvSIMD DUP general, Q=1, imm5=01000):
+    /// base 0x4E080C00.
+    pub fn dup_2d_from_x(&mut self, vd: Vreg, xn: Reg) -> Result<(), EncodeError> {
+        self.emit(0x4E08_0C00u32 | (xn.enc() << 5) | vd.enc());
+        Ok(())
+    }
+
+    /// DUP Dd, Vn.D[lane] — extract one 64-bit lane as scalar.
+    /// lane = 0 or 1. imm5 = lane:1 1000.
+    pub fn dup_d_from_v_d_lane(
+        &mut self,
+        dd: Vreg,
+        vn: Vreg,
+        lane: u8,
+    ) -> Result<(), EncodeError> {
+        if lane >= 2 { return Err(EncodeError::ImmediateOutOfRange); }
+        let imm5 = ((lane as u32) << 4) | 0b01000;
+        self.emit(0x5E00_0400u32 | (imm5 << 16) | (vn.enc() << 5) | dd.enc());
+        Ok(())
+    }
+
     /// FABS Vd.4S, Vn.4S — lane-wise absolute value.
     ///
     /// Encoding (C6.2.90 AdvSIMD, U=0, sz=0, opcode=11111):
@@ -2197,9 +2334,33 @@ mod tests {
 
     #[test]
     fn fmin_4s_basic() {
-        // fmin v0.4s, v1.4s, v2.4s
-        // base 0x4EA0F400 | (2<<16) | (1<<5) | 0 = 0x4EA2F420
         assert_eq!(one(|e| e.fmin_4s(Vreg::S0, Vreg::S1, Vreg::S2)), 0x4EA2F420);
+    }
+
+    // f64x2 — sz=1 variants (adds 0x400000 to f32x4 bases)
+    #[test]
+    fn fadd_2d_basic() {
+        // fadd v0.2d, v1.2d, v2.2d: 0x4E60D400 | (2<<16)|(1<<5)
+        assert_eq!(one(|e| e.fadd_2d(Vreg::S0, Vreg::S1, Vreg::S2)), 0x4E62D420);
+    }
+    #[test]
+    fn fmul_2d_basic() {
+        assert_eq!(one(|e| e.fmul_2d(Vreg::S0, Vreg::S1, Vreg::S2)), 0x6E62DC20);
+    }
+    #[test]
+    fn dup_2d_from_x_basic() {
+        // dup v0.2d, x1: 0x4E080C00 | (1<<5) = 0x4E080C20
+        assert_eq!(one(|e| e.dup_2d_from_x(Vreg::S0, Reg::X1)), 0x4E080C20);
+    }
+    #[test]
+    fn dup_d_lane0() {
+        // dup d0, v1.d[0]: imm5=01000=8, base 0x5E000400
+        assert_eq!(one(|e| e.dup_d_from_v_d_lane(Vreg::S0, Vreg::S1, 0)), 0x5E080420);
+    }
+    #[test]
+    fn dup_d_lane1() {
+        // dup d0, v1.d[1]: imm5=11000=24
+        assert_eq!(one(|e| e.dup_d_from_v_d_lane(Vreg::S0, Vreg::S1, 1)), 0x5E180420);
     }
 
     #[test]
