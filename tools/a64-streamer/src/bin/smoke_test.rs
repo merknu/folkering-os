@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::net::TcpStream;
 
-use a64_encoder::{FnSig, Lowerer, ValType, WasmOp};
+use a64_encoder::{parse_module, FnSig, Lowerer, ValType, WasmOp};
 use a64_streamer::{
     auth, parse_hello, parse_result, read_frame, serialize_data, write_frame, DEFAULT_PORT,
     FRAME_BYE, FRAME_CODE, FRAME_DATA, FRAME_EXEC, FRAME_HELLO, FRAME_RESULT,
@@ -315,6 +315,72 @@ fn main() {
             "SIMD dot([1..4],[5..8]) = 70 via HMAC+timeout pipeline",
             rv,
             1,
+            &mut passed,
+            &mut failed,
+        );
+    }
+
+    // ── Real-world WASM module: parse → JIT → execute ────────────
+    //
+    // Proves the full compiler→binary→JIT→native-exec roundtrip
+    // through the secure pipeline. We hand-encode a minimal WASM
+    // binary here (what `rustc --target wasm32-unknown-unknown`
+    // would emit for a trivial function), parse it with
+    // `wasm_module::parse_module`, take the extracted FunctionBody,
+    // lower its ops to A64, sign the result with HMAC, and ship it
+    // through the TCP protocol to the Pi daemon.
+    //
+    // Module contents (equivalent WAT):
+    //   (module
+    //     (func (result i32)
+    //       i32.const 3
+    //       i32.const 4
+    //       i32.add
+    //       i32.const 5
+    //       i32.mul
+    //       i32.const 7
+    //       i32.add))
+    //
+    // Computes (3 + 4) * 5 + 7 = 42.
+    //
+    // Binary layout (36 bytes):
+    //   8 B  header:     \0asm + version 1
+    //   7 B  type sec:   1 functype (no params, 1 i32 result)
+    //   4 B  func sec:   1 function of type 0
+    //  17 B  code sec:   1 body (12 B of ops + prologue/epilogue bytes)
+    {
+        let wasm_module: [u8; 36] = [
+            // Magic + version
+            0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
+            // Type section: id 01, size 5, 1 functype, 0 params, 1 i32 result
+            0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7F,
+            // Function section: id 03, size 2, 1 function of type 0
+            0x03, 0x02, 0x01, 0x00,
+            // Code section: id 0A, size 15 (0x0F), 1 entry
+            //   entry size 13 (0x0D): 0 local decls + 12 bytes of ops + end
+            //   ops: i32.const 3; i32.const 4; i32.add; i32.const 5;
+            //        i32.mul; i32.const 7; i32.add; end
+            0x0A, 0x0F, 0x01, 0x0D, 0x00,
+            0x41, 0x03, 0x41, 0x04, 0x6A, 0x41, 0x05, 0x6C, 0x41, 0x07, 0x6A, 0x0B,
+        ];
+
+        let bodies = parse_module(&wasm_module).expect("parse WASM module");
+        assert_eq!(bodies.len(), 1, "module has exactly one function");
+        let body = &bodies[0];
+        assert_eq!(body.num_locals, 0);
+
+        // Lower the function body. new_function gives us a proper
+        // AAPCS64 prologue/epilogue so the daemon can call it via
+        // a plain `extern "C" fn() -> i32` pointer.
+        let mut lw = Lowerer::new_function(body.num_locals as usize, Vec::new()).unwrap();
+        lw.lower_all(&body.ops).unwrap();
+        let bytes = lw.finish();
+
+        let rv = send_code_and_exec(&mut sock, &bytes);
+        report(
+            "WASM module (3+4)*5+7 → parsed → JIT'd → executed = 42",
+            rv,
+            42,
             &mut passed,
             &mut failed,
         );
