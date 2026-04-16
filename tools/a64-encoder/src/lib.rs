@@ -540,6 +540,84 @@ impl Encoder {
         Ok(())
     }
 
+    // ── SIMD / v128 (NEON) — Phase SIMD/1 ───────────────────────────
+    //
+    // These touch the 128-bit Q view of the V register file (Q0-Q31).
+    // The S-width (low 32) and D-width (low 64) encoders above
+    // address the SAME physical registers; a Q write overwrites both
+    // halves. That matches WASM's v128 semantics, where v128.load to
+    // Vn clobbers any scalar f32/f64 you thought was there.
+
+    /// LDR Qt, [Xn, #imm] — 128-bit SIMD/FP load.
+    /// `imm` is bytes, must be a multiple of 16; range 0..=65520.
+    ///
+    /// Encoding (C6.2.132, 128-bit FP variant, size=00, V=1, opc=11):
+    /// `00 111 1 01 11 imm12(12) Rn(5) Rt(5)`, base 0x3DC00000.
+    pub fn ldr_q_imm(&mut self, qt: Vreg, xn: Reg, offset: u32) -> Result<(), EncodeError> {
+        if offset & 0xF != 0 { return Err(EncodeError::OffsetMisaligned); }
+        let imm12 = offset >> 4;
+        if imm12 > 0xFFF { return Err(EncodeError::ImmediateOutOfRange); }
+        self.emit(0x3DC0_0000u32 | (imm12 << 10) | (xn.enc() << 5) | qt.enc());
+        Ok(())
+    }
+
+    /// STR Qt, [Xn, #imm] — 128-bit SIMD/FP store.
+    /// Same alignment rules as [`Encoder::ldr_q_imm`].
+    ///
+    /// Encoding (C6.2.341, size=00, V=1, opc=10): base 0x3D800000.
+    pub fn str_q_imm(&mut self, qt: Vreg, xn: Reg, offset: u32) -> Result<(), EncodeError> {
+        if offset & 0xF != 0 { return Err(EncodeError::OffsetMisaligned); }
+        let imm12 = offset >> 4;
+        if imm12 > 0xFFF { return Err(EncodeError::ImmediateOutOfRange); }
+        self.emit(0x3D80_0000u32 | (imm12 << 10) | (xn.enc() << 5) | qt.enc());
+        Ok(())
+    }
+
+    /// FADD Vd.4S, Vn.4S, Vm.4S — 4-lane f32 add.
+    ///
+    /// Encoding (C6.2.95 AdvSIMD vector, U=0, Q=1, sz=0):
+    /// `0 Q 0 0 1 1 1 0 0 sz 1 Rm 1 1 0 1 0 1 Rn Rd`, base 0x4E20D400.
+    /// Matches WASM `f32x4.add` exactly — element-wise, IEEE-754 per
+    /// lane, no cross-lane carry.
+    pub fn fadd_4s(&mut self, vd: Vreg, vn: Vreg, vm: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x4E20_D400u32 | (vm.enc() << 16) | (vn.enc() << 5) | vd.enc());
+        Ok(())
+    }
+
+    /// FMUL Vd.4S, Vn.4S, Vm.4S — 4-lane f32 multiply.
+    ///
+    /// Encoding (C6.2.112 AdvSIMD vector, U=1, Q=1, sz=0):
+    /// `0 Q 1 0 1 1 1 0 0 sz 1 Rm 1 1 0 1 1 1 Rn Rd`, base 0x6E20DC00.
+    /// Matches WASM `f32x4.mul` — the building block for GEMM
+    /// inner loops once we stitch in enough of the SIMD ISA.
+    pub fn fmul_4s(&mut self, vd: Vreg, vn: Vreg, vm: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x6E20_DC00u32 | (vm.enc() << 16) | (vn.enc() << 5) | vd.enc());
+        Ok(())
+    }
+
+    /// DUP Sd, Vn.S[lane] — pull one 32-bit lane of Vn into a scalar
+    /// Sd. Upper bits of Vd are zeroed. This is the lowering for
+    /// WASM `f32x4.extract_lane N` — consumes a V128 slot, produces
+    /// an F32 slot that the existing f32 arith / cmp / store paths
+    /// consume unchanged.
+    ///
+    /// Encoding (C6.2.73 DUP (element, scalar)):
+    /// `01 0111110 imm5(5) 00000 1 Rn(5) Rd(5)`, base 0x5E000400.
+    /// For 32-bit lanes, imm5 = `lane:2 100` (low 3 bits fixed to
+    /// 100, bits 4:3 hold the lane index). `lane` is 0..=3.
+    pub fn dup_s_from_v_s_lane(
+        &mut self,
+        sd: Vreg,
+        vn: Vreg,
+        lane: u8,
+    ) -> Result<(), EncodeError> {
+        if lane >= 4 { return Err(EncodeError::ImmediateOutOfRange); }
+        // imm5 = (lane << 3) | 0b100
+        let imm5 = ((lane as u32) << 3) | 0b100;
+        self.emit(0x5E00_0400u32 | (imm5 << 16) | (vn.enc() << 5) | sd.enc());
+        Ok(())
+    }
+
     // ── Phase 15: conversions ───────────────────────────────────────
     //
     // Covers sign-extensions (WASM's extend8_s / extend16_s / extend32_s),
@@ -1604,6 +1682,71 @@ mod tests {
     #[test]
     fn ldr_d_misaligned_offset_errors() {
         assert!(Encoder::new().ldr_d_imm(Vreg::S0, Reg::X1, 4).is_err());
+    }
+
+    // ── SIMD / v128 encoders ────────────────────────────────────────
+
+    #[test]
+    fn ldr_q_basic() {
+        // ldr q0, [x1]  →  3dc00020
+        assert_eq!(one(|e| e.ldr_q_imm(Vreg::S0, Reg::X1, 0)), 0x3DC00020);
+    }
+
+    #[test]
+    fn ldr_q_offset_16() {
+        // ldr q2, [x3, #16]  →  imm12 = 1, so base | (1<<10) | (3<<5) | 2
+        // 0x3DC00000 | 0x400 | 0x60 | 2 = 0x3DC00462
+        assert_eq!(one(|e| e.ldr_q_imm(Vreg::S2, Reg::X3, 16)), 0x3DC00462);
+    }
+
+    #[test]
+    fn str_q_basic() {
+        // str q0, [x1]  →  3d800020
+        assert_eq!(one(|e| e.str_q_imm(Vreg::S0, Reg::X1, 0)), 0x3D800020);
+    }
+
+    #[test]
+    fn ldr_q_misaligned_offset_errors() {
+        assert!(Encoder::new().ldr_q_imm(Vreg::S0, Reg::X1, 8).is_err());
+    }
+
+    #[test]
+    fn fadd_4s_basic() {
+        // fadd v0.4s, v1.4s, v2.4s
+        // base 0x4E20D400 | (2<<16) | (1<<5) | 0 = 0x4E22D420
+        assert_eq!(one(|e| e.fadd_4s(Vreg::S0, Vreg::S1, Vreg::S2)), 0x4E22D420);
+    }
+
+    #[test]
+    fn fmul_4s_basic() {
+        // fmul v0.4s, v1.4s, v2.4s
+        // base 0x6E20DC00 | (2<<16) | (1<<5) | 0 = 0x6E22DC20
+        assert_eq!(one(|e| e.fmul_4s(Vreg::S0, Vreg::S1, Vreg::S2)), 0x6E22DC20);
+    }
+
+    #[test]
+    fn dup_s_from_v_s_lane_0() {
+        // dup s0, v1.s[0]  →  imm5 = 0b00100 = 4
+        // 0x5E000400 | (4<<16) | (1<<5) | 0 = 0x5E040420
+        assert_eq!(
+            one(|e| e.dup_s_from_v_s_lane(Vreg::S0, Vreg::S1, 0)),
+            0x5E040420
+        );
+    }
+
+    #[test]
+    fn dup_s_from_v_s_lane_3() {
+        // dup s0, v1.s[3]  →  imm5 = 0b11100 = 28
+        // 0x5E000400 | (28<<16) | (1<<5) | 0 = 0x5E1C0420
+        assert_eq!(
+            one(|e| e.dup_s_from_v_s_lane(Vreg::S0, Vreg::S1, 3)),
+            0x5E1C0420
+        );
+    }
+
+    #[test]
+    fn dup_s_lane_out_of_range_rejected() {
+        assert!(Encoder::new().dup_s_from_v_s_lane(Vreg::S0, Vreg::S0, 4).is_err());
     }
 
     // ── Phase 15 conversion encoders ────────────────────────────────

@@ -314,6 +314,48 @@ pub fn parse_ops(bytes: &[u8], pos: &mut usize) -> Result<Vec<WasmOp>, ParseErro
             0xA1 => ops.push(WasmOp::F64Sub),
             0xA2 => ops.push(WasmOp::F64Mul),
             0xA3 => ops.push(WasmOp::F64Div),
+            0xFD => {
+                // SIMD prefix — second byte is a ULEB128 sub-opcode.
+                // The current WASM SIMD proposal has ~235 ops; we
+                // handle a minimal subset and return UnknownOpcode
+                // for everything else. The sub-opcode can exceed
+                // 127 so it's parsed as uleb128, not a raw byte.
+                let sub = read_uleb128(bytes, pos)?;
+                match sub {
+                    0x00 => {
+                        // v128.load memarg
+                        let _align = read_uleb128(bytes, pos)?;
+                        let off = read_uleb128(bytes, pos)?;
+                        if off > u32::MAX as u64 { return Err(ParseError::IntegerTooLarge); }
+                        ops.push(WasmOp::V128Load(off as u32));
+                    }
+                    0x0B => {
+                        // v128.store memarg
+                        let _align = read_uleb128(bytes, pos)?;
+                        let off = read_uleb128(bytes, pos)?;
+                        if off > u32::MAX as u64 { return Err(ParseError::IntegerTooLarge); }
+                        ops.push(WasmOp::V128Store(off as u32));
+                    }
+                    0x1F => {
+                        // f32x4.extract_lane laneidx
+                        if *pos >= bytes.len() { return Err(ParseError::UnexpectedEof); }
+                        let lane = bytes[*pos];
+                        *pos += 1;
+                        if lane > 3 {
+                            return Err(ParseError::UnknownOpcode(lane));
+                        }
+                        ops.push(WasmOp::F32x4ExtractLane(lane));
+                    }
+                    0xE4 => ops.push(WasmOp::F32x4Add),
+                    0xE6 => ops.push(WasmOp::F32x4Mul),
+                    _ => {
+                        // Encode the unknown SIMD sub-opcode as a
+                        // single byte for error reporting (lossy for
+                        // >255 but catches the common case).
+                        return Err(ParseError::UnknownOpcode(sub.min(0xFF) as u8));
+                    }
+                }
+            }
             _ => return Err(ParseError::UnknownOpcode(opcode)),
         }
     }

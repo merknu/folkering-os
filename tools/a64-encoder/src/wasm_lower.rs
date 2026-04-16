@@ -53,6 +53,13 @@ pub enum ValType {
     I64,
     F32,
     F64,
+    /// WASM SIMD 128-bit vector. Lives in the V-register bank (as
+    /// Qn, the 128-bit view of Vn). Sharing the same physical file
+    /// as F32 and F64: all three claim a slot via `fp_depth`. A
+    /// V128 write to Vn clobbers any lower-width scalar that might
+    /// have been there — which matches WASM semantics (v128 ops
+    /// redefine the full register anyway).
+    V128,
 }
 
 impl ValType {
@@ -60,9 +67,9 @@ impl ValType {
     fn is_int(self) -> bool {
         matches!(self, ValType::I32 | ValType::I64)
     }
-    /// True for SIMD/FP-bank types (V/S/D register views).
+    /// True for SIMD/FP-bank types (V/S/D/Q register views).
     fn is_fp(self) -> bool {
-        matches!(self, ValType::F32 | ValType::F64)
+        matches!(self, ValType::F32 | ValType::F64 | ValType::V128)
     }
 }
 
@@ -263,6 +270,18 @@ pub enum WasmOp {
     I64ReinterpretF64,
     F32ReinterpretI32,
     F64ReinterpretI64,
+    // ── SIMD / v128 (Phase SIMD/1 — minimal set) ───────────────────
+    /// Load 16 bytes from linear memory as a v128 — pops i32 addr,
+    /// pushes a V128 slot. Offset must be 16-aligned for LDR Q.
+    V128Load(u32),
+    /// Pop v128 value, pop i32 addr, store 16 bytes. 16-aligned.
+    V128Store(u32),
+    /// Pop two V128s, push their lane-wise f32 sum (`FADD Vd.4S`).
+    F32x4Add,
+    /// Pop two V128s, push their lane-wise f32 product.
+    F32x4Mul,
+    /// Pop one V128, push lane `N` (0..=3) as a scalar F32.
+    F32x4ExtractLane(u8),
     /// Copy local `n` onto the stack.
     LocalGet(u32),
     /// Pop stack top, store into local `n`.
@@ -365,6 +384,11 @@ pub enum LowerError {
     /// `call` signature uses a param or result type the MVP
     /// marshalling doesn't support (today: f32/f64 params and results).
     CallTypeUnsupported,
+    /// V128 locals not supported in this phase of the SIMD lowering.
+    V128LocalsUnsupported,
+    /// Attempted to return a V128 value from a function. Callers
+    /// must extract a lane (or store to memory) before `end`.
+    V128ReturnUnsupported,
     /// An op expected a particular stack-top type but saw a different
     /// one — e.g. `i32.add` with an f32 on top, or `f32.add` with
     /// an i32 argument. Catches WASM validation errors the lowerer
@@ -651,6 +675,12 @@ impl Lowerer {
                     out.push(LocalLoc::F64(v));
                     fp_idx += 1;
                 }
+                ValType::V128 => {
+                    // V128 locals would need a 128-bit zero-init
+                    // (MOVI Vd.2D, #0). Not wired in this sprint —
+                    // v128 values live on the operand stack only.
+                    return Err(LowerError::V128LocalsUnsupported);
+                }
             }
         }
         Ok(out)
@@ -884,6 +914,12 @@ impl Lowerer {
             WasmOp::F64Ge => self.lower_f64_cmp(Condition::Ge),
             WasmOp::F64Load(off) => self.lower_f64_load(off),
             WasmOp::F64Store(off) => self.lower_f64_store(off),
+            // ── SIMD ─────────────────────────────────────────────
+            WasmOp::V128Load(off) => self.lower_v128_load(off),
+            WasmOp::V128Store(off) => self.lower_v128_store(off),
+            WasmOp::F32x4Add => self.lower_f32x4_add(),
+            WasmOp::F32x4Mul => self.lower_f32x4_mul(),
+            WasmOp::F32x4ExtractLane(lane) => self.lower_f32x4_extract_lane(lane),
             // Phase 15 conversions.
             WasmOp::I32Extend8S => self.lower_i32_extend_narrow(true, false),
             WasmOp::I32Extend16S => self.lower_i32_extend_narrow(false, false),
@@ -1037,6 +1073,37 @@ impl Lowerer {
         if ty != ValType::F64 {
             return Err(LowerError::TypeMismatch {
                 expected: ValType::F64,
+                got: ty,
+            });
+        }
+        self.stack.pop();
+        self.fp_depth -= 1;
+        Vreg::new(self.fp_depth as u8).ok_or(LowerError::StackUnderflow)
+    }
+
+    /// Push a V128 slot — NEON 128-bit (Qn). Shares the V-register
+    /// file with F32/F64 via `fp_depth`; a single Vreg index names
+    /// the same physical register whether we touch it as Sn, Dn, or
+    /// Qn. A V128 write clobbers all 128 bits — any prior scalar
+    /// content at the same index is toast, which matches WASM's
+    /// type-system guarantee that you can't hold a v128 and an f32
+    /// in the same slot simultaneously.
+    fn push_v128_slot(&mut self) -> Result<Vreg, LowerError> {
+        if self.fp_depth >= MAX_F32_STACK {
+            return Err(LowerError::TypedStackOverflow(ValType::V128));
+        }
+        let v = Vreg::new(self.fp_depth as u8)
+            .ok_or(LowerError::TypedStackOverflow(ValType::V128))?;
+        self.fp_depth += 1;
+        self.stack.push(ValType::V128);
+        Ok(v)
+    }
+
+    fn pop_v128_slot(&mut self) -> Result<Vreg, LowerError> {
+        let ty = self.stack.last().copied().ok_or(LowerError::StackUnderflow)?;
+        if ty != ValType::V128 {
+            return Err(LowerError::TypeMismatch {
+                expected: ValType::V128,
                 got: ty,
             });
         }
@@ -1205,6 +1272,71 @@ impl Lowerer {
         self.emit_bounds_check(addr, 8, offset)?;
         self.enc.add_ext_uxtw(Reg::X16, MEM_BASE_REG, addr)?;
         self.enc.str_d_imm(val, Reg::X16, offset)?;
+        Ok(())
+    }
+
+    // ── SIMD / v128 lowerings ───────────────────────────────────────
+
+    /// Lower `v128.load off` — pop i32 addr, push a V128 slot loaded
+    /// from `mem_base + addr + offset`. 16-byte access needs
+    /// 16-byte-aligned offset (LDR Q requires `offset % 16 == 0`).
+    fn lower_v128_load(&mut self, offset: u32) -> Result<(), LowerError> {
+        if !self.has_memory {
+            return Err(LowerError::MemoryNotConfigured);
+        }
+        let addr = self.pop_i32_slot()?;
+        self.emit_bounds_check(addr, 16, offset)?;
+        let dst = self.push_v128_slot()?;
+        self.enc.add_ext_uxtw(Reg::X16, MEM_BASE_REG, addr)?;
+        self.enc.ldr_q_imm(dst, Reg::X16, offset)?;
+        Ok(())
+    }
+
+    fn lower_v128_store(&mut self, offset: u32) -> Result<(), LowerError> {
+        if !self.has_memory {
+            return Err(LowerError::MemoryNotConfigured);
+        }
+        let val = self.pop_v128_slot()?;
+        let addr = self.pop_i32_slot()?;
+        self.emit_bounds_check(addr, 16, offset)?;
+        self.enc.add_ext_uxtw(Reg::X16, MEM_BASE_REG, addr)?;
+        self.enc.str_q_imm(val, Reg::X16, offset)?;
+        Ok(())
+    }
+
+    /// Lower `f32x4.add` / `f32x4.mul` — pop two V128, push one V128
+    /// with element-wise sum/product across the 4 f32 lanes.
+    fn lower_f32x4_add(&mut self) -> Result<(), LowerError> {
+        let rhs = self.pop_v128_slot()?;
+        let lhs = self.pop_v128_slot()?;
+        let dst = self.push_v128_slot()?;
+        self.enc.fadd_4s(dst, lhs, rhs)?;
+        Ok(())
+    }
+
+    fn lower_f32x4_mul(&mut self) -> Result<(), LowerError> {
+        let rhs = self.pop_v128_slot()?;
+        let lhs = self.pop_v128_slot()?;
+        let dst = self.push_v128_slot()?;
+        self.enc.fmul_4s(dst, lhs, rhs)?;
+        Ok(())
+    }
+
+    /// Lower `f32x4.extract_lane N` — pop V128, push F32 holding
+    /// lane N as a scalar. `DUP Sd, Vn.S[N]` copies the lane into a
+    /// scalar S register (zeroing upper bits of Vd), which is what
+    /// F32-consuming downstream ops expect.
+    fn lower_f32x4_extract_lane(&mut self, lane: u8) -> Result<(), LowerError> {
+        let src = self.pop_v128_slot()?;
+        let dst = self.push_f32_slot()?;
+        // Same physical register by construction — source V and dest
+        // F share the bank and the slot counter. Using explicit DUP
+        // still makes sense: if the extracted lane is N != 0, the
+        // instruction actually moves bits. Lane 0 happens to
+        // degenerate to a no-op on top of a V128 write (low S is the
+        // first lane), but we emit the DUP unconditionally so the
+        // semantics are obvious from the disassembly.
+        self.enc.dup_s_from_v_s_lane(dst, src, lane)?;
         Ok(())
     }
 
@@ -2074,6 +2206,14 @@ impl Lowerer {
                     let d = self.pop_f64_slot()?;
                     self.enc.fmov_x_from_d(Reg::X0, d)?;
                 }
+                ValType::V128 => {
+                    // X0 is 64-bit — can't return a full v128 to a
+                    // scalar caller. Programs that want to surface a
+                    // vector must extract a lane first (see
+                    // `f32x4.extract_lane`) or store to memory that
+                    // the host reads after exec.
+                    return Err(LowerError::V128ReturnUnsupported);
+                }
             },
             _ => return Err(LowerError::StackNotSingleton),
         }
@@ -2261,6 +2401,9 @@ impl Lowerer {
             Some(ValType::F64) => {
                 let d = Vreg::new((self.fp_depth - 1) as u8).unwrap();
                 self.enc.fmov_x_from_d(Reg::X0, d)?;
+            }
+            Some(ValType::V128) => {
+                return Err(LowerError::V128ReturnUnsupported);
             }
         }
         self.enc.ret(Reg::X30)?;
