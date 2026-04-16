@@ -201,6 +201,15 @@ impl Encoder {
         self.buf.extend_from_slice(&word.to_le_bytes());
     }
 
+    /// Embed a raw 32-bit word in the code buffer as data (not an
+    /// instruction). Used for literal pools — e.g. a v128.const
+    /// materializes as 16 bytes of constant sandwiched between a
+    /// forward B and a PC-relative LDR Q. Callers are responsible
+    /// for branching over the data so it's never executed as code.
+    pub fn emit_raw_word(&mut self, word: u32) {
+        self.emit(word);
+    }
+
     // ── Data-processing — immediate ──────────────────────────────────
 
     /// MOVZ Xd, #imm16 {, LSL #shift}
@@ -570,6 +579,29 @@ impl Encoder {
         let imm12 = offset >> 4;
         if imm12 > 0xFFF { return Err(EncodeError::ImmediateOutOfRange); }
         self.emit(0x3D80_0000u32 | (imm12 << 10) | (xn.enc() << 5) | qt.enc());
+        Ok(())
+    }
+
+    /// LDR Qt, [PC, #byte_offset] — 128-bit SIMD/FP PC-relative
+    /// literal load. `byte_offset` is from the LDR instruction's
+    /// own address to the 16-byte literal. Must be 4-aligned and
+    /// fit in the signed 19-bit word-offset field (±1 MiB range).
+    ///
+    /// Used by the v128.const lowering to pull an arbitrary
+    /// 16-byte constant out of a local literal pool emitted in the
+    /// function body (jumped over at runtime via a preceding `B`).
+    ///
+    /// Encoding (C6.2.133 LDR literal, SIMD&FP, 128-bit):
+    /// `10 011 1 0 0 imm19(19) Rt(5)`, base 0x9C000000.
+    /// `imm19` is the byte_offset scaled by 4 (word-relative).
+    pub fn ldr_q_literal(&mut self, qt: Vreg, byte_offset: i32) -> Result<(), EncodeError> {
+        if byte_offset & 0x3 != 0 { return Err(EncodeError::OffsetMisaligned); }
+        let imm19 = byte_offset >> 2;
+        if !(-(1 << 18)..(1 << 18)).contains(&imm19) {
+            return Err(EncodeError::ImmediateOutOfRange);
+        }
+        let imm19_enc = (imm19 as u32) & 0x7_FFFF;
+        self.emit(0x9C00_0000u32 | (imm19_enc << 5) | qt.enc());
         Ok(())
     }
 
@@ -1834,6 +1866,25 @@ mod tests {
     #[test]
     fn ldr_q_misaligned_offset_errors() {
         assert!(Encoder::new().ldr_q_imm(Vreg::S0, Reg::X1, 8).is_err());
+    }
+
+    #[test]
+    fn ldr_q_literal_back_16() {
+        // ldr q0, [pc, #-16]  →  imm19 = -4 (two's complement 19-bit 0x7FFFC)
+        // base 0x9C000000 | (0x7FFFC << 5) | 0 = 0x9CFFFF80
+        assert_eq!(one(|e| e.ldr_q_literal(Vreg::S0, -16)), 0x9CFFFF80);
+    }
+
+    #[test]
+    fn ldr_q_literal_forward_20() {
+        // ldr q1, [pc, #20]  →  imm19 = 5
+        // base 0x9C000000 | (5 << 5) | 1 = 0x9C0000A1
+        assert_eq!(one(|e| e.ldr_q_literal(Vreg::S1, 20)), 0x9C0000A1);
+    }
+
+    #[test]
+    fn ldr_q_literal_misaligned_rejected() {
+        assert!(Encoder::new().ldr_q_literal(Vreg::S0, 3).is_err());
     }
 
     #[test]

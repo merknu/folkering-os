@@ -271,6 +271,13 @@ pub enum WasmOp {
     F32ReinterpretI32,
     F64ReinterpretI64,
     // ── SIMD / v128 (Phase SIMD/1 — minimal set) ───────────────────
+    /// Push an inline 16-byte v128 constant. The 128-bit value is
+    /// materialized via a tiny literal pool embedded in the code
+    /// stream: a forward `B` jumps over the data, which is emitted
+    /// 16-byte-aligned, then a PC-relative `LDR Q` pulls it into the
+    /// destination register. One lowered v128.const costs roughly
+    /// 32 bytes (4 B + up to 12 B pad + 16 B data + 4 B LDR).
+    V128Const(u128),
     /// Load 16 bytes from linear memory as a v128 — pops i32 addr,
     /// pushes a V128 slot. Offset must be 16-aligned for LDR Q.
     V128Load(u32),
@@ -943,6 +950,7 @@ impl Lowerer {
             WasmOp::F64Load(off) => self.lower_f64_load(off),
             WasmOp::F64Store(off) => self.lower_f64_store(off),
             // ── SIMD ─────────────────────────────────────────────
+            WasmOp::V128Const(bits) => self.lower_v128_const(bits),
             WasmOp::V128Load(off) => self.lower_v128_load(off),
             WasmOp::V128Store(off) => self.lower_v128_store(off),
             WasmOp::F32x4Add => self.lower_f32x4_add(),
@@ -1314,6 +1322,57 @@ impl Lowerer {
     }
 
     // ── SIMD / v128 lowerings ───────────────────────────────────────
+
+    /// Lower `v128.const <16 bytes>` — materialize an inline 128-bit
+    /// literal via a tiny PC-relative literal pool:
+    ///
+    /// ```text
+    ///   B  skip_pool          ; 4 bytes, jumps past the data
+    ///   (NOP padding to 16-align the data, 0..12 bytes)
+    ///   <16 bytes of the constant, little-endian>
+    /// skip_pool:
+    ///   LDR Q_dst, [PC, #-16] ; 4 bytes, loads the data we just passed
+    /// ```
+    ///
+    /// Cost: 4 B (B) + 0-12 B (pad) + 16 B (data) + 4 B (LDR) = 24-36
+    /// bytes per v128.const. Single-shot, no shared pool across
+    /// multiple constants yet — a later sprint can dedup by
+    /// collecting all constants and emitting one pool at function end.
+    fn lower_v128_const(&mut self, bits: u128) -> Result<(), LowerError> {
+        let dst = self.push_v128_slot()?;
+
+        // LDR Q requires its source to be 16-byte-aligned. The B is
+        // 4 bytes; after B the position is (pos + 4). Compute the
+        // NOP padding needed to 16-align the constant's start.
+        let pos_after_b = self.enc.pos() + 4;
+        let padding = (16 - (pos_after_b % 16)) % 16;
+
+        // B jumps over the pad + 16-byte data, landing directly on
+        // the LDR. Forward branch offset (from B's own address) =
+        // 4 (size of B) + padding + 16 (data) bytes.
+        let branch_bytes = 4 + padding as i32 + 16;
+        self.enc.b(branch_bytes)?;
+
+        // Emit NOP padding to push the position to 16-byte alignment.
+        for _ in 0..(padding / 4) {
+            self.enc.nop();
+        }
+
+        // Emit the 16-byte constant as 4 little-endian u32 words.
+        // Same byte-order as the Encoder's normal emission, so the
+        // constant's u128 little-endian layout is preserved.
+        let le = bits.to_le_bytes();
+        for chunk in le.chunks_exact(4) {
+            let w = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            self.enc.emit_raw_word(w);
+        }
+
+        // LDR Q_dst, [PC, #-16] — the data is now 16 bytes before
+        // the current PC (which points at the LDR we're about to emit).
+        self.enc.ldr_q_literal(dst, -16)?;
+
+        Ok(())
+    }
 
     /// Lower `v128.load off` — pop i32 addr, push a V128 slot loaded
     /// from `mem_base + addr + offset`. 16-byte access needs

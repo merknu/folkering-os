@@ -336,6 +336,14 @@ pub fn parse_ops(bytes: &[u8], pos: &mut usize) -> Result<Vec<WasmOp>, ParseErro
                         if off > u32::MAX as u64 { return Err(ParseError::IntegerTooLarge); }
                         ops.push(WasmOp::V128Store(off as u32));
                     }
+                    0x0C => {
+                        // v128.const — 16 raw little-endian bytes
+                        if *pos + 16 > bytes.len() { return Err(ParseError::UnexpectedEof); }
+                        let mut lit = [0u8; 16];
+                        lit.copy_from_slice(&bytes[*pos..*pos + 16]);
+                        *pos += 16;
+                        ops.push(WasmOp::V128Const(u128::from_le_bytes(lit)));
+                    }
                     0x11 => ops.push(WasmOp::I32x4Splat),
                     0x13 => ops.push(WasmOp::F32x4Splat),
                     0x1B => {

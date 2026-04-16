@@ -476,6 +476,63 @@ fn cases() -> Vec<Case> {
             },
             expected: 1,
         },
+        // ── v128.const — inline 16-byte literal ─────────────────────
+        //
+        // Materializes a 128-bit constant via the PC-relative literal
+        // pool. The f32 lanes [1.0, 2.0, 3.0, 4.0] encoded as u128
+        // (little-endian byte order):
+        //   lane 0 bits = 0x3F800000 (1.0)
+        //   lane 1 bits = 0x40000000 (2.0)
+        //   lane 2 bits = 0x40400000 (3.0)
+        //   lane 3 bits = 0x40800000 (4.0)
+        // Concatenated LE: 00_00_80_3F 00_00_00_40 00_00_40_40 00_00_80_40
+        // As u128 (LSB first): 0x40800000_40400000_40000000_3F800000
+        Case {
+            name: "v128.const [1,2,3,4] extract lane 2 = 3.0",
+            ops: vec![
+                WasmOp::V128Const(
+                    ((1.0_f32.to_bits() as u128) <<   0)
+                  | ((2.0_f32.to_bits() as u128) <<  32)
+                  | ((3.0_f32.to_bits() as u128) <<  64)
+                  | ((4.0_f32.to_bits() as u128) <<  96),
+                ),
+                WasmOp::F32x4ExtractLane(2),
+                WasmOp::F32Const(3.0),
+                WasmOp::F32Eq,
+                WasmOp::End,
+            ],
+            expected: 1,
+        },
+        // Combine two const vectors via FMA:
+        //   acc = const [0,0,0,0]
+        //   a   = const [2,2,2,2]
+        //   b   = const [3,3,3,3]
+        //   acc += a * b  →  [6,6,6,6]
+        //   extract lane 1 → 6.
+        Case {
+            name: "v128.const × 3 + FMA: 0 + 2*3 → lane 1 = 6",
+            ops: vec![
+                WasmOp::V128Const(0), // [0,0,0,0]
+                WasmOp::V128Const(
+                    ((2.0_f32.to_bits() as u128) <<   0)
+                  | ((2.0_f32.to_bits() as u128) <<  32)
+                  | ((2.0_f32.to_bits() as u128) <<  64)
+                  | ((2.0_f32.to_bits() as u128) <<  96),
+                ),
+                WasmOp::V128Const(
+                    ((3.0_f32.to_bits() as u128) <<   0)
+                  | ((3.0_f32.to_bits() as u128) <<  32)
+                  | ((3.0_f32.to_bits() as u128) <<  64)
+                  | ((3.0_f32.to_bits() as u128) <<  96),
+                ),
+                WasmOp::F32x4Fma,
+                WasmOp::F32x4ExtractLane(1),
+                WasmOp::F32Const(6.0),
+                WasmOp::F32Eq,
+                WasmOp::End,
+            ],
+            expected: 1,
+        },
         // ── v128.store round-trip ─────────────────────────────────
         // Load a vector from mem[0], store it to mem[48], then read
         // back mem[48] as v128, extract lane 1, compare to original.
