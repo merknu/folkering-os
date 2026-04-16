@@ -50,6 +50,7 @@ pub enum ValType {
     I32,
     I64,
     F32,
+    F64,
 }
 
 impl ValType {
@@ -59,7 +60,7 @@ impl ValType {
     }
     /// True for SIMD/FP-bank types (V/S/D register views).
     fn is_fp(self) -> bool {
-        matches!(self, ValType::F32)
+        matches!(self, ValType::F32 | ValType::F64)
     }
 }
 
@@ -208,6 +209,32 @@ pub enum WasmOp {
     /// Store f32 to linear memory: pop value (f32), pop addr (i32),
     /// write value to `mem_base + addr + offset`.
     F32Store(u32),
+    /// Push a 64-bit IEEE-754 float constant onto the stack.
+    F64Const(f64),
+    /// Pop two F64s, push sum.
+    F64Add,
+    /// Pop two F64s, push (left − right).
+    F64Sub,
+    /// Pop two F64s, push (left × right).
+    F64Mul,
+    /// Pop two F64s, push (left / right).
+    F64Div,
+    /// Pop two F64s, push i32 1 if equal else 0.
+    F64Eq,
+    /// Pop two F64s, push i32 1 if not equal (or unordered) else 0.
+    F64Ne,
+    /// Pop two F64s, push i32 1 if left < right (ordered) else 0.
+    F64Lt,
+    /// Pop two F64s, push i32 1 if left > right (ordered) else 0.
+    F64Gt,
+    /// Pop two F64s, push i32 1 if left ≤ right (ordered) else 0.
+    F64Le,
+    /// Pop two F64s, push i32 1 if left ≥ right (ordered) else 0.
+    F64Ge,
+    /// Load f64 from linear memory (8-aligned offset required).
+    F64Load(u32),
+    /// Store f64 to linear memory (8-aligned offset required).
+    F64Store(u32),
     /// Copy local `n` onto the stack.
     LocalGet(u32),
     /// Pop stack top, store into local `n`.
@@ -364,6 +391,7 @@ enum LocalLoc {
     I32(Reg),
     I64(Reg),
     F32(Vreg),
+    F64(Vreg),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -517,6 +545,16 @@ impl Lowerer {
                     // Zero-init: FMOV Sv, WZR.
                     enc.fmov_s_from_w(v, Reg::ZR)?;
                     out.push(LocalLoc::F32(v));
+                    fp_idx += 1;
+                }
+                ValType::F64 => {
+                    if (fp_idx as usize) >= MAX_F32_LOCALS {
+                        return Err(LowerError::TooManyLocals);
+                    }
+                    let v = Vreg(LOCAL_F32_BASE_REG + fp_idx);
+                    // Zero-init: FMOV Dv, XZR — clears all 64 bits.
+                    enc.fmov_d_from_x(v, Reg::ZR)?;
+                    out.push(LocalLoc::F64(v));
                     fp_idx += 1;
                 }
             }
@@ -681,6 +719,19 @@ impl Lowerer {
             WasmOp::F32Ge => self.lower_f32_cmp(Condition::Ge),
             WasmOp::F32Load(off) => self.lower_f32_load(off),
             WasmOp::F32Store(off) => self.lower_f32_store(off),
+            WasmOp::F64Const(f) => self.lower_f64_const(f),
+            WasmOp::F64Add => self.lower_f64_binop(FBinOp::Add),
+            WasmOp::F64Sub => self.lower_f64_binop(FBinOp::Sub),
+            WasmOp::F64Mul => self.lower_f64_binop(FBinOp::Mul),
+            WasmOp::F64Div => self.lower_f64_binop(FBinOp::Div),
+            WasmOp::F64Eq => self.lower_f64_cmp(Condition::Eq),
+            WasmOp::F64Ne => self.lower_f64_cmp(Condition::Ne),
+            WasmOp::F64Lt => self.lower_f64_cmp(Condition::Lt),
+            WasmOp::F64Gt => self.lower_f64_cmp(Condition::Gt),
+            WasmOp::F64Le => self.lower_f64_cmp(Condition::Le),
+            WasmOp::F64Ge => self.lower_f64_cmp(Condition::Ge),
+            WasmOp::F64Load(off) => self.lower_f64_load(off),
+            WasmOp::F64Store(off) => self.lower_f64_store(off),
             WasmOp::LocalGet(i) => self.lower_local_get(i),
             WasmOp::LocalSet(i) => self.lower_local_set(i),
             WasmOp::Block => self.lower_block(),
@@ -787,6 +838,32 @@ impl Lowerer {
         Vreg::new(self.fp_depth as u8).ok_or(LowerError::StackUnderflow)
     }
 
+    /// Push an F64 slot. Shares the V-bank with F32 — the instruction
+    /// width picks which half (low-32 Si vs full-64 Di) the op touches.
+    fn push_f64_slot(&mut self) -> Result<Vreg, LowerError> {
+        if self.fp_depth >= MAX_F32_STACK {
+            return Err(LowerError::TypedStackOverflow(ValType::F64));
+        }
+        let v = Vreg::new(self.fp_depth as u8)
+            .ok_or(LowerError::TypedStackOverflow(ValType::F64))?;
+        self.fp_depth += 1;
+        self.stack.push(ValType::F64);
+        Ok(v)
+    }
+
+    fn pop_f64_slot(&mut self) -> Result<Vreg, LowerError> {
+        let ty = self.stack.last().copied().ok_or(LowerError::StackUnderflow)?;
+        if ty != ValType::F64 {
+            return Err(LowerError::TypeMismatch {
+                expected: ValType::F64,
+                got: ty,
+            });
+        }
+        self.stack.pop();
+        self.fp_depth -= 1;
+        Vreg::new(self.fp_depth as u8).ok_or(LowerError::StackUnderflow)
+    }
+
     /// Push an I64 slot; returns the X-bank register. Shares the
     /// `int_depth` counter with I32 since both types live in the
     /// same physical register file — the width distinction is in
@@ -880,6 +957,71 @@ impl Lowerer {
         let dst = self.push_i32_slot()?;
         self.enc.fcmp_s(lhs, rhs)?;
         self.enc.cset(dst, cond)?;
+        Ok(())
+    }
+
+    /// Lower `f64.const c` — materialize the 64-bit IEEE-754 bit pattern
+    /// into X16 via MOVZ + MOVK×3, then bit-cast into a D register via
+    /// FMOV Dd, Xn. Mirrors `lower_f32_const` but with 64-bit width.
+    fn lower_f64_const(&mut self, c: f64) -> Result<(), LowerError> {
+        let bits = c.to_bits();
+        let tmp = Reg::X16;
+        self.enc.movz(tmp, (bits & 0xFFFF) as u16, MovShift::Lsl0)?;
+        let h1 = ((bits >> 16) & 0xFFFF) as u16;
+        if h1 != 0 { self.enc.movk(tmp, h1, MovShift::Lsl16)?; }
+        let h2 = ((bits >> 32) & 0xFFFF) as u16;
+        if h2 != 0 { self.enc.movk(tmp, h2, MovShift::Lsl32)?; }
+        let h3 = ((bits >> 48) & 0xFFFF) as u16;
+        if h3 != 0 { self.enc.movk(tmp, h3, MovShift::Lsl48)?; }
+        let dst = self.push_f64_slot()?;
+        self.enc.fmov_d_from_x(dst, tmp)?;
+        Ok(())
+    }
+
+    fn lower_f64_binop(&mut self, op: FBinOp) -> Result<(), LowerError> {
+        let rhs = self.pop_f64_slot()?;
+        let lhs = self.pop_f64_slot()?;
+        let dst = self.push_f64_slot()?;
+        debug_assert_eq!(dst.0, lhs.0);
+        match op {
+            FBinOp::Add => self.enc.fadd_d(dst, lhs, rhs)?,
+            FBinOp::Sub => self.enc.fsub_d(dst, lhs, rhs)?,
+            FBinOp::Mul => self.enc.fmul_d(dst, lhs, rhs)?,
+            FBinOp::Div => self.enc.fdiv_d(dst, lhs, rhs)?,
+        }
+        Ok(())
+    }
+
+    /// Lower `f64.<cmp>` — pops two F64s, pushes i32 boolean.
+    /// Same cross-type pattern as `lower_f32_cmp`.
+    fn lower_f64_cmp(&mut self, cond: Condition) -> Result<(), LowerError> {
+        let rhs = self.pop_f64_slot()?;
+        let lhs = self.pop_f64_slot()?;
+        let dst = self.push_i32_slot()?;
+        self.enc.fcmp_d(lhs, rhs)?;
+        self.enc.cset(dst, cond)?;
+        Ok(())
+    }
+
+    fn lower_f64_load(&mut self, offset: u32) -> Result<(), LowerError> {
+        if !self.has_memory {
+            return Err(LowerError::MemoryNotConfigured);
+        }
+        let addr = self.pop_i32_slot()?;
+        let dst = self.push_f64_slot()?;
+        self.enc.add_ext_uxtw(Reg::X16, MEM_BASE_REG, addr)?;
+        self.enc.ldr_d_imm(dst, Reg::X16, offset)?;
+        Ok(())
+    }
+
+    fn lower_f64_store(&mut self, offset: u32) -> Result<(), LowerError> {
+        if !self.has_memory {
+            return Err(LowerError::MemoryNotConfigured);
+        }
+        let val = self.pop_f64_slot()?;
+        let addr = self.pop_i32_slot()?;
+        self.enc.add_ext_uxtw(Reg::X16, MEM_BASE_REG, addr)?;
+        self.enc.str_d_imm(val, Reg::X16, offset)?;
         Ok(())
     }
 
@@ -1069,6 +1211,10 @@ impl Lowerer {
                 let dst = self.push_f32_slot()?;
                 self.enc.fmov_s_s(dst, local)?;
             }
+            LocalLoc::F64(local) => {
+                let dst = self.push_f64_slot()?;
+                self.enc.fmov_d_d(dst, local)?;
+            }
         }
         Ok(())
     }
@@ -1086,6 +1232,10 @@ impl Lowerer {
             LocalLoc::F32(local) => {
                 let src = self.pop_f32_slot()?;
                 self.enc.fmov_s_s(local, src)?;
+            }
+            LocalLoc::F64(local) => {
+                let src = self.pop_f64_slot()?;
+                self.enc.fmov_d_d(local, src)?;
             }
         }
         Ok(())
@@ -1373,6 +1523,10 @@ impl Lowerer {
                     let s = self.pop_f32_slot()?;
                     self.enc.fmov_w_from_s(Reg::X0, s)?;
                 }
+                ValType::F64 => {
+                    let d = self.pop_f64_slot()?;
+                    self.enc.fmov_x_from_d(Reg::X0, d)?;
+                }
             },
             _ => return Err(LowerError::StackNotSingleton),
         }
@@ -1470,6 +1624,10 @@ impl Lowerer {
             Some(ValType::F32) => {
                 let s = Vreg::new((self.fp_depth - 1) as u8).unwrap();
                 self.enc.fmov_w_from_s(Reg::X0, s)?;
+            }
+            Some(ValType::F64) => {
+                let d = Vreg::new((self.fp_depth - 1) as u8).unwrap();
+                self.enc.fmov_x_from_d(Reg::X0, d)?;
             }
         }
         self.enc.ret(Reg::X30)?;

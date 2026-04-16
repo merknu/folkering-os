@@ -141,6 +141,14 @@ pub fn parse_ops(bytes: &[u8], pos: &mut usize) -> Result<Vec<WasmOp>, ParseErro
                 let bits = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
                 ops.push(WasmOp::F32Const(f32::from_bits(bits)));
             }
+            0x44 => {
+                // f64.const — 8 bytes little-endian bit pattern.
+                if *pos + 8 > bytes.len() { return Err(ParseError::UnexpectedEof); }
+                let b = &bytes[*pos..*pos + 8];
+                *pos += 8;
+                let bits = u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
+                ops.push(WasmOp::F64Const(f64::from_bits(bits)));
+            }
             0x42 => {
                 // i64.const — signed LEB128, full 64-bit range.
                 let v = read_sleb128(bytes, pos)?;
@@ -212,6 +220,20 @@ pub fn parse_ops(bytes: &[u8], pos: &mut usize) -> Result<Vec<WasmOp>, ParseErro
                 if off > u32::MAX as u64 { return Err(ParseError::IntegerTooLarge); }
                 ops.push(WasmOp::F32Store(off as u32));
             }
+            0x2B => {
+                // f64.load
+                let _align = read_uleb128(bytes, pos)?;
+                let off = read_uleb128(bytes, pos)?;
+                if off > u32::MAX as u64 { return Err(ParseError::IntegerTooLarge); }
+                ops.push(WasmOp::F64Load(off as u32));
+            }
+            0x39 => {
+                // f64.store
+                let _align = read_uleb128(bytes, pos)?;
+                let off = read_uleb128(bytes, pos)?;
+                if off > u32::MAX as u64 { return Err(ParseError::IntegerTooLarge); }
+                ops.push(WasmOp::F64Store(off as u32));
+            }
             0x45 => ops.push(WasmOp::I32Eqz),
             0x46 => ops.push(WasmOp::I32Eq),
             0x47 => ops.push(WasmOp::I32Ne),
@@ -244,6 +266,16 @@ pub fn parse_ops(bytes: &[u8], pos: &mut usize) -> Result<Vec<WasmOp>, ParseErro
             0x93 => ops.push(WasmOp::F32Sub),
             0x94 => ops.push(WasmOp::F32Mul),
             0x95 => ops.push(WasmOp::F32Div),
+            0x61 => ops.push(WasmOp::F64Eq),
+            0x62 => ops.push(WasmOp::F64Ne),
+            0x63 => ops.push(WasmOp::F64Lt),
+            0x64 => ops.push(WasmOp::F64Gt),
+            0x65 => ops.push(WasmOp::F64Le),
+            0x66 => ops.push(WasmOp::F64Ge),
+            0xA0 => ops.push(WasmOp::F64Add),
+            0xA1 => ops.push(WasmOp::F64Sub),
+            0xA2 => ops.push(WasmOp::F64Mul),
+            0xA3 => ops.push(WasmOp::F64Div),
             _ => return Err(ParseError::UnknownOpcode(opcode)),
         }
     }

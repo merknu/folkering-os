@@ -413,6 +413,102 @@ impl Encoder {
         Ok(())
     }
 
+    // ── Floating-point (double precision, Phase 14) ─────────────────
+    //
+    // Uses the SAME V-register file as f32, but the full 64 bits (aka
+    // Dn). Encoding identical to the f32 ops except `ftype = 01`
+    // (bit 22 set), which selects double-precision math. INT↔FP moves
+    // use `sf = 1` (64-bit int) + `ftype = 01`.
+
+    /// FMOV Dd, Xn — move a 64-bit integer bit-pattern from an X
+    /// register into a D register. Bit-cast, not numeric conversion —
+    /// matches WASM `f64.reinterpret_i64`.
+    ///
+    /// Encoding (C6.2.108, sf=1, type=01, rmode=00, opcode=111):
+    /// `1 0 011110 01 1 00 111 000000 Rn Rd`, base 0x9E670000.
+    pub fn fmov_d_from_x(&mut self, dd: Vreg, xn: Reg) -> Result<(), EncodeError> {
+        self.emit(0x9E67_0000u32 | (xn.enc() << 5) | dd.enc());
+        Ok(())
+    }
+
+    /// FMOV Xd, Dn — inverse of [`Encoder::fmov_d_from_x`]. Used at
+    /// function end to propagate an f64 result into X0 for AAPCS64
+    /// callers that expect integer return conventions.
+    ///
+    /// Encoding (C6.2.108, sf=1, type=01, rmode=00, opcode=110):
+    /// base 0x9E660000.
+    pub fn fmov_x_from_d(&mut self, xd: Reg, dn: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x9E66_0000u32 | (dn.enc() << 5) | xd.enc());
+        Ok(())
+    }
+
+    /// FADD Dd, Dn, Dm — double-precision add.
+    /// Encoding (C6.2.95, ftype=01): base 0x1E602800.
+    pub fn fadd_d(&mut self, dd: Vreg, dn: Vreg, dm: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x1E60_2800u32 | (dm.enc() << 16) | (dn.enc() << 5) | dd.enc());
+        Ok(())
+    }
+
+    /// FSUB Dd, Dn, Dm — double-precision subtract.
+    /// Encoding (C6.2.128, ftype=01): base 0x1E603800.
+    pub fn fsub_d(&mut self, dd: Vreg, dn: Vreg, dm: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x1E60_3800u32 | (dm.enc() << 16) | (dn.enc() << 5) | dd.enc());
+        Ok(())
+    }
+
+    /// FMUL Dd, Dn, Dm — double-precision multiply.
+    /// Encoding (C6.2.112, ftype=01): base 0x1E600800.
+    pub fn fmul_d(&mut self, dd: Vreg, dn: Vreg, dm: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x1E60_0800u32 | (dm.enc() << 16) | (dn.enc() << 5) | dd.enc());
+        Ok(())
+    }
+
+    /// FDIV Dd, Dn, Dm — double-precision divide.
+    /// Encoding (C6.2.102, ftype=01): base 0x1E601800.
+    pub fn fdiv_d(&mut self, dd: Vreg, dn: Vreg, dm: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x1E60_1800u32 | (dm.enc() << 16) | (dn.enc() << 5) | dd.enc());
+        Ok(())
+    }
+
+    /// FMOV Dd, Dn — SIMD/FP register-to-register move (double).
+    /// Used for `local.get` / `local.set` on f64 locals.
+    ///
+    /// Encoding (C6.2.106, ftype=01): base 0x1E604000.
+    pub fn fmov_d_d(&mut self, dd: Vreg, dn: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x1E60_4000u32 | (dn.enc() << 5) | dd.enc());
+        Ok(())
+    }
+
+    /// LDR Di, [Xn, #imm] — 64-bit SIMD/FP load.
+    /// `imm` is bytes, must be a multiple of 8; range 0..=32760.
+    ///
+    /// Encoding (C6.2.132, 64-bit FP variant, size=11, V=1, opc=01):
+    /// `11 111 1 01 01 imm12(12) Rn(5) Rt(5)`, base 0xFD400000.
+    pub fn ldr_d_imm(&mut self, dd: Vreg, xn: Reg, offset: u32) -> Result<(), EncodeError> {
+        if offset & 0x7 != 0 { return Err(EncodeError::OffsetMisaligned); }
+        let imm12 = offset >> 3;
+        if imm12 > 0xFFF { return Err(EncodeError::ImmediateOutOfRange); }
+        self.emit(0xFD40_0000u32 | (imm12 << 10) | (xn.enc() << 5) | dd.enc());
+        Ok(())
+    }
+
+    /// STR Di, [Xn, #imm] — 64-bit SIMD/FP store.
+    /// Encoding (C6.2.341, size=11, V=1, opc=00): base 0xFD000000.
+    pub fn str_d_imm(&mut self, dd: Vreg, xn: Reg, offset: u32) -> Result<(), EncodeError> {
+        if offset & 0x7 != 0 { return Err(EncodeError::OffsetMisaligned); }
+        let imm12 = offset >> 3;
+        if imm12 > 0xFFF { return Err(EncodeError::ImmediateOutOfRange); }
+        self.emit(0xFD00_0000u32 | (imm12 << 10) | (xn.enc() << 5) | dd.enc());
+        Ok(())
+    }
+
+    /// FCMP Dn, Dm — compare two f64 values, set NZCV.
+    /// Encoding (C6.2.96, ftype=01): base 0x1E602000.
+    pub fn fcmp_d(&mut self, dn: Vreg, dm: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x1E60_2000u32 | (dm.enc() << 16) | (dn.enc() << 5));
+        Ok(())
+    }
+
     /// AND Wd, Wn, Wm — 32-bit bitwise AND.
     ///
     /// Encoding (C6.2.13, sf=0): `0 00 01010 00 0 Rm(5) 000000 Rn(5) Rd(5)`.
@@ -1182,6 +1278,97 @@ mod tests {
     fn fcmp_s_basic() {
         // fcmp s0, s1  →  1e212000
         assert_eq!(one(|e| e.fcmp_s(Vreg::S0, Vreg::S1)), 0x1E212000);
+    }
+
+    // ── Phase 14 f64 encoders ───────────────────────────────────────
+
+    #[test]
+    fn fmov_d_from_x_basic() {
+        // fmov d0, x1  →  9e670020
+        assert_eq!(
+            one(|e| e.fmov_d_from_x(Vreg::S0, Reg::X1)),
+            0x9E670020
+        );
+    }
+
+    #[test]
+    fn fmov_x_from_d_basic() {
+        // fmov x0, d1  →  9e660020
+        assert_eq!(
+            one(|e| e.fmov_x_from_d(Reg::X0, Vreg::S1)),
+            0x9E660020
+        );
+    }
+
+    #[test]
+    fn fadd_d_basic() {
+        // fadd d0, d0, d1  →  1e612800
+        assert_eq!(
+            one(|e| e.fadd_d(Vreg::S0, Vreg::S0, Vreg::S1)),
+            0x1E612800
+        );
+    }
+
+    #[test]
+    fn fsub_d_basic() {
+        // fsub d0, d0, d1  →  1e613800
+        assert_eq!(
+            one(|e| e.fsub_d(Vreg::S0, Vreg::S0, Vreg::S1)),
+            0x1E613800
+        );
+    }
+
+    #[test]
+    fn fmul_d_basic() {
+        // fmul d0, d0, d1  →  1e610800
+        assert_eq!(
+            one(|e| e.fmul_d(Vreg::S0, Vreg::S0, Vreg::S1)),
+            0x1E610800
+        );
+    }
+
+    #[test]
+    fn fdiv_d_basic() {
+        // fdiv d0, d0, d1  →  1e611800
+        assert_eq!(
+            one(|e| e.fdiv_d(Vreg::S0, Vreg::S0, Vreg::S1)),
+            0x1E611800
+        );
+    }
+
+    #[test]
+    fn fmov_d_d_basic() {
+        // fmov d0, d1  →  1e604020
+        assert_eq!(one(|e| e.fmov_d_d(Vreg::S0, Vreg::S1)), 0x1E604020);
+    }
+
+    #[test]
+    fn ldr_d_basic() {
+        // ldr d0, [x1]  →  fd400020
+        assert_eq!(one(|e| e.ldr_d_imm(Vreg::S0, Reg::X1, 0)), 0xFD400020);
+    }
+
+    #[test]
+    fn ldr_d_with_offset() {
+        // ldr d2, [x3, #8]  →  fd400462
+        assert_eq!(one(|e| e.ldr_d_imm(Vreg::S2, Reg::X3, 8)), 0xFD400462);
+    }
+
+    #[test]
+    fn str_d_basic() {
+        // str d0, [x1]  →  fd000020
+        assert_eq!(one(|e| e.str_d_imm(Vreg::S0, Reg::X1, 0)), 0xFD000020);
+    }
+
+    #[test]
+    fn fcmp_d_basic() {
+        // fcmp d0, d1  →  1e612000
+        assert_eq!(one(|e| e.fcmp_d(Vreg::S0, Vreg::S1)), 0x1E612000);
+    }
+
+    #[test]
+    fn ldr_d_misaligned_offset_errors() {
+        assert!(Encoder::new().ldr_d_imm(Vreg::S0, Reg::X1, 4).is_err());
     }
 
     // ── Phase 12 i64 encoders ───────────────────────────────────────
