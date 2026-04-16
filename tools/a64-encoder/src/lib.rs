@@ -822,6 +822,61 @@ impl Encoder {
         Ok(())
     }
 
+    /// FCMEQ Vd.4S, Vn.4S, Vm.4S — lane-wise FP equality compare.
+    /// Writes all-one-bits to each lane where `Vn[i] == Vm[i]`, and
+    /// all-zero-bits elsewhere. The result is a proper bitmask
+    /// usable with BSL / bitselect.
+    ///
+    /// Encoding (AdvSIMD 3-same, U=0, sz=0, opcode=11100):
+    /// `0 Q 0 0 1 1 1 0 0 sz 1 Rm 1 1 1 0 0 1 Rn Rd`, base 0x4E20E400.
+    pub fn fcmeq_4s(&mut self, vd: Vreg, vn: Vreg, vm: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x4E20_E400u32 | (vm.enc() << 16) | (vn.enc() << 5) | vd.enc());
+        Ok(())
+    }
+
+    /// FCMGT Vd.4S, Vn.4S, Vm.4S — lane-wise FP greater-than.
+    /// All-one-bits in each lane where `Vn[i] > Vm[i]`, else zero.
+    /// (For `<`, swap the operands at the lowerer level.)
+    ///
+    /// Encoding (U=1, bit 23 set): base 0x6EA0E400.
+    pub fn fcmgt_4s(&mut self, vd: Vreg, vn: Vreg, vm: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x6EA0_E400u32 | (vm.enc() << 16) | (vn.enc() << 5) | vd.enc());
+        Ok(())
+    }
+
+    /// BSL Vd.16B, Vn.16B, Vm.16B — bitwise select:
+    /// `Vd[i] = (Vd[i] AND Vn[i]) OR (NOT Vd[i] AND Vm[i])`.
+    /// Vd is BOTH an input (the mask) and the result. When Vd's
+    /// bit is 1, the output takes Vn's bit; when Vd's bit is 0,
+    /// the output takes Vm's bit. Building block for every masked
+    /// conditional computation.
+    ///
+    /// Encoding (AdvSIMD 3-same, U=1, size=01, opcode=00011):
+    /// `0 Q 1 0 1 1 1 0 0 1 1 Rm 0 0 0 1 1 1 Rn Rd`, base 0x6E601C00.
+    pub fn bsl_16b(&mut self, vd: Vreg, vn: Vreg, vm: Vreg) -> Result<(), EncodeError> {
+        self.emit(0x6E60_1C00u32 | (vm.enc() << 16) | (vn.enc() << 5) | vd.enc());
+        Ok(())
+    }
+
+    /// ORR Vd.16B, Vn.16B, Vn.16B — bitwise OR of a register with
+    /// itself = register copy. The canonical AdvSIMD `MOV Vd, Vn`
+    /// instruction. Used by the bitselect lowering to move the
+    /// BSL result from the mask's slot into the push slot where
+    /// the operand stack expects it.
+    ///
+    /// Encoding (AdvSIMD 3-same, U=0, size=10, opcode=00011):
+    /// `0 Q 0 0 1 1 1 0 1 0 1 Rm 0 0 0 1 1 1 Rn Rd`, base 0x4EA01C00.
+    /// For MOV semantics, set Rm = Rn.
+    pub fn orr_16b_vec(
+        &mut self,
+        vd: Vreg,
+        vn: Vreg,
+        vm: Vreg,
+    ) -> Result<(), EncodeError> {
+        self.emit(0x4EA0_1C00u32 | (vm.enc() << 16) | (vn.enc() << 5) | vd.enc());
+        Ok(())
+    }
+
     // ── Phase 15: conversions ───────────────────────────────────────
     //
     // Covers sign-extensions (WASM's extend8_s / extend16_s / extend32_s),
@@ -2112,6 +2167,37 @@ mod tests {
         // fsqrt v0.4s, v1.4s
         // base 0x6EA1F800 | (1<<5) | 0 = 0x6EA1F820
         assert_eq!(one(|e| e.fsqrt_4s(Vreg::S0, Vreg::S1)), 0x6EA1F820);
+    }
+
+    #[test]
+    fn fcmeq_4s_basic() {
+        // fcmeq v0.4s, v1.4s, v2.4s
+        // base 0x4E20E400 | (2<<16) | (1<<5) | 0 = 0x4E22E420
+        assert_eq!(one(|e| e.fcmeq_4s(Vreg::S0, Vreg::S1, Vreg::S2)), 0x4E22E420);
+    }
+
+    #[test]
+    fn fcmgt_4s_basic() {
+        // fcmgt v0.4s, v1.4s, v2.4s
+        // base 0x6EA0E400 | (2<<16) | (1<<5) | 0 = 0x6EA2E420
+        assert_eq!(one(|e| e.fcmgt_4s(Vreg::S0, Vreg::S1, Vreg::S2)), 0x6EA2E420);
+    }
+
+    #[test]
+    fn bsl_16b_basic() {
+        // bsl v0.16b, v1.16b, v2.16b
+        // base 0x6E601C00 | (2<<16) | (1<<5) | 0 = 0x6E621C20
+        assert_eq!(one(|e| e.bsl_16b(Vreg::S0, Vreg::S1, Vreg::S2)), 0x6E621C20);
+    }
+
+    #[test]
+    fn orr_16b_vec_mov() {
+        // mov v0.16b, v1.16b  (disassembles as orr v0, v1, v1)
+        // base 0x4EA01C00 | (1<<16) | (1<<5) | 0 = 0x4EA11C20
+        assert_eq!(
+            one(|e| e.orr_16b_vec(Vreg::S0, Vreg::S1, Vreg::S1)),
+            0x4EA11C20
+        );
     }
 
     // ── Phase 15 conversion encoders ────────────────────────────────

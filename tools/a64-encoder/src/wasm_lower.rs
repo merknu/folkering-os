@@ -330,6 +330,15 @@ pub enum WasmOp {
     F32x4Neg,
     /// Pop V128, push lane-wise sqrt(x). IEEE-754 correct.
     F32x4Sqrt,
+    /// Pop two V128s, push a bitmask: each lane is all-one-bits
+    /// when `lhs == rhs`, else all-zero-bits. Suitable for BSL.
+    F32x4Eq,
+    /// Pop two V128s, push a bitmask for `lhs > rhs` (IEEE-754).
+    F32x4Gt,
+    /// Pop (v1, v2, mask) — stack top is `mask`. Push the bitwise
+    /// select: `result[bit] = mask[bit] ? v1[bit] : v2[bit]`.
+    /// Matches WASM's `v128.bitselect` semantics.
+    V128Bitselect,
     /// Copy local `n` onto the stack.
     LocalGet(u32),
     /// Pop stack top, store into local `n`.
@@ -984,6 +993,9 @@ impl Lowerer {
             WasmOp::F32x4Abs => self.lower_f32x4_unary(|e, d, s| e.fabs_4s(d, s)),
             WasmOp::F32x4Neg => self.lower_f32x4_unary(|e, d, s| e.fneg_4s(d, s)),
             WasmOp::F32x4Sqrt => self.lower_f32x4_unary(|e, d, s| e.fsqrt_4s(d, s)),
+            WasmOp::F32x4Eq => self.lower_f32x4_eq(),
+            WasmOp::F32x4Gt => self.lower_f32x4_gt(),
+            WasmOp::V128Bitselect => self.lower_v128_bitselect(),
             // Phase 15 conversions.
             WasmOp::I32Extend8S => self.lower_i32_extend_narrow(true, false),
             WasmOp::I32Extend16S => self.lower_i32_extend_narrow(false, false),
@@ -1561,6 +1573,59 @@ impl Lowerer {
         let dst = self.push_v128_slot()?;
         debug_assert_eq!(dst.0, src.0, "unary f32x4 reuses the slot");
         emit(&mut self.enc, dst, src)?;
+        Ok(())
+    }
+
+    fn lower_f32x4_eq(&mut self) -> Result<(), LowerError> {
+        let rhs = self.pop_v128_slot()?;
+        let lhs = self.pop_v128_slot()?;
+        let dst = self.push_v128_slot()?;
+        self.enc.fcmeq_4s(dst, lhs, rhs)?;
+        Ok(())
+    }
+
+    fn lower_f32x4_gt(&mut self) -> Result<(), LowerError> {
+        let rhs = self.pop_v128_slot()?;
+        let lhs = self.pop_v128_slot()?;
+        let dst = self.push_v128_slot()?;
+        self.enc.fcmgt_4s(dst, lhs, rhs)?;
+        Ok(())
+    }
+
+    /// Lower `v128.bitselect` — the canonical masked-choose op.
+    ///
+    /// Stack discipline: bottom `v1`, middle `v2`, top `mask`.
+    /// WASM semantics: `result = (v1 AND mask) OR (v2 AND NOT mask)`.
+    /// That is — where `mask[bit]=1`, take v1; else take v2.
+    ///
+    /// AArch64 `BSL Vd, Vn, Vm` does
+    /// `Vd = (Vd AND Vn) OR (NOT Vd AND Vm)`, with **Vd as the
+    /// mask register, both read and written**. For our stack
+    /// layout, that means the result lands at the mask's slot
+    /// (fp_depth − 1) — *above* where we need it (fp_depth − 3
+    /// after popping all three).
+    ///
+    /// Solution: emit BSL in place, then MOV the result down to
+    /// the push slot via `ORR Vdst, Vmask, Vmask` (the canonical
+    /// AdvSIMD register copy). Two instructions; neither fights
+    /// the register file because mask and dst live on the same
+    /// V bank.
+    fn lower_v128_bitselect(&mut self) -> Result<(), LowerError> {
+        let mask = self.pop_v128_slot()?;
+        let v2 = self.pop_v128_slot()?;
+        let v1 = self.pop_v128_slot()?;
+        let dst = self.push_v128_slot()?;
+        // BSL Vmask, Vv1, Vv2 — writes the selected result into the
+        // mask register (Vd). Vn selected where Vd=1, Vm where Vd=0.
+        self.enc.bsl_16b(mask, v1, v2)?;
+        // Copy mask's now-result contents to the push slot, unless
+        // they're the same physical register (i.e., dst == mask).
+        // For our slot allocator the push slot after pop(3) + push(1)
+        // is at the bottom — Vreg(fp_depth - 1) = v1's old position,
+        // NOT mask's. So the registers differ and the MOV is real.
+        if dst.0 != mask.0 {
+            self.enc.orr_16b_vec(dst, mask, mask)?;
+        }
         Ok(())
     }
 

@@ -346,6 +346,9 @@ pub fn parse_ops(bytes: &[u8], pos: &mut usize) -> Result<Vec<WasmOp>, ParseErro
                     }
                     0x11 => ops.push(WasmOp::I32x4Splat),
                     0x13 => ops.push(WasmOp::F32x4Splat),
+                    0x41 => ops.push(WasmOp::F32x4Eq),
+                    0x44 => ops.push(WasmOp::F32x4Gt),
+                    0x52 => ops.push(WasmOp::V128Bitselect),
                     0x1B => {
                         // i32x4.extract_lane laneidx
                         if *pos >= bytes.len() { return Err(ParseError::UnexpectedEof); }

@@ -620,6 +620,102 @@ fn cases() -> Vec<Case> {
             },
             expected: 1,
         },
+        // ── Compare + bitselect — emulated max via mask ──────────
+        //
+        // Reimplement f32x4.max(a, b) as:
+        //   mask = f32x4.gt(a, b)           // bitmask: 1s where a>b
+        //   result = v128.bitselect(a, b, mask)
+        //                                   // where mask=1 → a; else b
+        //
+        // Input: a = [1, 5, 3, 7], b = [2, 4, 10, 0]
+        //   gt(a, b)          = [0, 1, 0, 1]  (all-0/all-1 masks)
+        //   select(a, b, mask) = [2, 5, 10, 7]
+        // Check lane 0 → 2 (a < b, should pick b since mask=0 → v2).
+        Case {
+            name: "bitselect as max: lane 0 where a=1 < b=2 → 2",
+            ops: {
+                let mut ops = store_4_f32(0,  [1.0, 5.0,  3.0, 7.0]);
+                ops.extend(store_4_f32(16,   [2.0, 4.0, 10.0, 0.0]));
+                ops.extend_from_slice(&[
+                    // Push v1 = a
+                    WasmOp::I32Const(0),
+                    WasmOp::V128Load(0),
+                    // Push v2 = b
+                    WasmOp::I32Const(16),
+                    WasmOp::V128Load(0),
+                    // Build mask on top: push a and b again, compare.
+                    WasmOp::I32Const(0),
+                    WasmOp::V128Load(0),
+                    WasmOp::I32Const(16),
+                    WasmOp::V128Load(0),
+                    WasmOp::F32x4Gt,        // top = a > b mask
+                    // Stack: [a, b, mask]
+                    WasmOp::V128Bitselect,  // → max(a, b) per lane
+                    WasmOp::F32x4ExtractLane(0),
+                    WasmOp::F32Const(2.0),
+                    WasmOp::F32Eq,
+                    WasmOp::End,
+                ]);
+                ops
+            },
+            expected: 1,
+        },
+        // Same pattern, lane 1 where a > b → picks a = 5.
+        Case {
+            name: "bitselect as max: lane 1 where a=5 > b=4 → 5",
+            ops: {
+                let mut ops = store_4_f32(0,  [1.0, 5.0,  3.0, 7.0]);
+                ops.extend(store_4_f32(16,   [2.0, 4.0, 10.0, 0.0]));
+                ops.extend_from_slice(&[
+                    WasmOp::I32Const(0),
+                    WasmOp::V128Load(0),
+                    WasmOp::I32Const(16),
+                    WasmOp::V128Load(0),
+                    WasmOp::I32Const(0),
+                    WasmOp::V128Load(0),
+                    WasmOp::I32Const(16),
+                    WasmOp::V128Load(0),
+                    WasmOp::F32x4Gt,
+                    WasmOp::V128Bitselect,
+                    WasmOp::F32x4ExtractLane(1),
+                    WasmOp::F32Const(5.0),
+                    WasmOp::F32Eq,
+                    WasmOp::End,
+                ]);
+                ops
+            },
+            expected: 1,
+        },
+        // f32x4.eq as equality mask. Splat(3.0) vs [3, 0, 3, 0] →
+        // mask lanes = [-1, 0, -1, 0] (as i32 bitmask). Use bitselect
+        // with splat(100), splat(0) → [100, 0, 100, 0]. Extract lane 2 → 100.
+        Case {
+            name: "f32x4.eq + bitselect: splat(100) where lane==3, else 0; lane 2 = 100",
+            ops: {
+                let mut ops = store_4_f32(0, [3.0, 0.0, 3.0, 0.0]);
+                ops.extend_from_slice(&[
+                    // Push v1 = splat(100), v2 = splat(0)
+                    WasmOp::F32Const(100.0),
+                    WasmOp::F32x4Splat,
+                    WasmOp::F32Const(0.0),
+                    WasmOp::F32x4Splat,
+                    // mask = eq(load(0), splat(3))
+                    WasmOp::I32Const(0),
+                    WasmOp::V128Load(0),
+                    WasmOp::F32Const(3.0),
+                    WasmOp::F32x4Splat,
+                    WasmOp::F32x4Eq,
+                    // Stack: [splat(100), splat(0), mask]
+                    WasmOp::V128Bitselect,
+                    WasmOp::F32x4ExtractLane(2),
+                    WasmOp::F32Const(100.0),
+                    WasmOp::F32Eq,
+                    WasmOp::End,
+                ]);
+                ops
+            },
+            expected: 1,
+        },
         // ── v128.const — inline 16-byte literal ─────────────────────
         //
         // Materializes a 128-bit constant via the PC-relative literal
