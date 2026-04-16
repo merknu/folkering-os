@@ -38,9 +38,11 @@ use alloc::vec::Vec;
 pub mod wasm_lower;
 pub mod wasm_module;
 pub mod wasm_parse;
+pub mod wasm_validate;
 pub use wasm_lower::{FnSig, LowerError, Lowerer, ValType, WasmOp};
 pub use wasm_module::{parse_module, FunctionBody};
 pub use wasm_parse::{parse_function_body, ParseError};
+pub use wasm_validate::{validate, ValidationError};
 
 /// A64 SIMD/FP register (V-bank, also known as S/D/Q depending on
 /// access width). We use it in the S0..S31 32-bit form for f32
