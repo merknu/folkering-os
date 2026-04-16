@@ -96,6 +96,14 @@ pub enum WasmOp {
     /// Structural end — matches `block`/`loop`/`if` when the label
     /// stack is non-empty, or ends the function body when empty.
     End,
+    /// Load 32-bit int from linear memory: pop addr, push
+    /// `*(mem_base + addr + offset)`. Requires the lowerer to be
+    /// built with `new_function_with_memory`.
+    I32Load(u32),
+    /// Store 32-bit int to linear memory: pop value, pop addr, write
+    /// `value` to `mem_base + addr + offset`. Same memory-aware
+    /// lowerer requirement.
+    I32Store(u32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +129,9 @@ pub enum LowerError {
     ElseWithoutIf,
     /// Call referenced a function index not present in the call table.
     CallTargetMissing,
+    /// i32.load / i32.store used on a lowerer without a configured
+    /// memory base. Use `new_function_with_memory` instead.
+    MemoryNotConfigured,
     /// Underlying encoder rejected an instruction.
     Encode(EncodeError),
 }
@@ -137,10 +148,15 @@ enum BinOp { Add, Sub, Mul, DivS, DivU }
 
 /// Maximum WASM stack depth we can hold in registers (X0..X15).
 const MAX_STACK: usize = 16;
-/// Maximum number of locals we can host without spilling (X19..X28).
-pub const MAX_LOCALS: usize = 10;
+/// Maximum number of locals we can host without spilling (X19..X27).
+/// One fewer than before — X28 is now reserved for the memory base.
+pub const MAX_LOCALS: usize = 9;
 /// Register number where the locals band begins.
 const LOCAL_BASE_REG: u8 = 19;
+/// Register reserved for the linear-memory base pointer when a
+/// memory-aware function is built. Callee-saved under AAPCS64, so
+/// we save/restore it in the function's extended prologue.
+const MEM_BASE_REG: Reg = Reg(28);
 
 #[derive(Debug, Clone, Copy)]
 enum LabelKind {
@@ -199,6 +215,10 @@ pub struct Lowerer {
     /// function-level `End` emits an epilogue (`LDP X29/X30` + RET)
     /// or just RET.
     has_frame: bool,
+    /// True if the function frame includes a save slot for X28 and
+    /// the prologue loaded the linear-memory base into X28. When set,
+    /// `i32.load` and `i32.store` compile; otherwise they error.
+    has_memory: bool,
 }
 
 impl Lowerer {
@@ -228,6 +248,7 @@ impl Lowerer {
             label_stack: Vec::new(),
             call_targets: Vec::new(),
             has_frame: false,
+            has_memory: false,
         })
     }
 
@@ -266,6 +287,54 @@ impl Lowerer {
             label_stack: Vec::new(),
             call_targets,
             has_frame: true,
+            has_memory: false,
+        })
+    }
+
+    /// Build a lowerer with the standard function frame PLUS a linear-
+    /// memory base pinned in X28. Prologue layout:
+    ///
+    /// ```text
+    /// STP  X29, X30, [SP, #-32]!     ; 32-byte frame, save X29/X30 at offset 0
+    /// STR  X28,      [SP, #16]       ; save caller's X28 at offset 16
+    /// MOVZ X28, #<lo>                ; load `mem_base` into X28 (up to 4 movs)
+    /// MOVK X28, #<hi1>, LSL #16
+    /// MOVK X28, #<hi2>, LSL #32
+    /// MOVK X28, #<hi3>, LSL #48
+    /// ```
+    ///
+    /// Every subsequent `i32.load`/`i32.store` computes its effective
+    /// address as `X28 + zero_ext(Waddr) + offset`.
+    pub fn new_function_with_memory(
+        n_locals: usize,
+        call_targets: Vec<u64>,
+        mem_base: u64,
+    ) -> Result<Self, LowerError> {
+        if n_locals > MAX_LOCALS {
+            return Err(LowerError::TooManyLocals);
+        }
+        let mut enc = Encoder::new();
+        enc.stp_pre_indexed_64(Reg::X29, Reg::X30, Reg::SP, -32)?;
+        enc.str_imm(MEM_BASE_REG, Reg::SP, 16)?;
+        enc.movz(MEM_BASE_REG, (mem_base & 0xFFFF) as u16, MovShift::Lsl0)?;
+        let h1 = ((mem_base >> 16) & 0xFFFF) as u16;
+        if h1 != 0 { enc.movk(MEM_BASE_REG, h1, MovShift::Lsl16)?; }
+        let h2 = ((mem_base >> 32) & 0xFFFF) as u16;
+        if h2 != 0 { enc.movk(MEM_BASE_REG, h2, MovShift::Lsl32)?; }
+        let h3 = ((mem_base >> 48) & 0xFFFF) as u16;
+        if h3 != 0 { enc.movk(MEM_BASE_REG, h3, MovShift::Lsl48)?; }
+        for i in 0..n_locals {
+            let r = Reg(LOCAL_BASE_REG + i as u8);
+            enc.movz(r, 0, MovShift::Lsl0)?;
+        }
+        Ok(Self {
+            enc,
+            depth: 0,
+            num_locals: n_locals,
+            label_stack: Vec::new(),
+            call_targets,
+            has_frame: true,
+            has_memory: true,
         })
     }
 
@@ -287,6 +356,8 @@ impl Lowerer {
             WasmOp::If => self.lower_if(),
             WasmOp::Else => self.lower_else(),
             WasmOp::Call(n) => self.lower_call(n),
+            WasmOp::I32Load(off) => self.lower_load(off),
+            WasmOp::I32Store(off) => self.lower_store(off),
             WasmOp::Return => self.lower_explicit_return(),
             WasmOp::End => {
                 if self.label_stack.is_empty() {
@@ -659,10 +730,50 @@ impl Lowerer {
             _ => return Err(LowerError::StackNotSingleton),
         }
         if self.has_frame {
-            // Epilogue: restore X29/X30 from the prologue's slot.
-            self.enc.ldp_post_indexed_64(Reg::X29, Reg::X30, Reg::SP, 16)?;
+            // Epilogue mirrors the prologue: if we saved X28 too
+            // (memory mode), restore it and pop a 32-byte frame;
+            // otherwise just pop the 16-byte frame.
+            if self.has_memory {
+                self.enc.ldr_imm(MEM_BASE_REG, Reg::SP, 16)?;
+                self.enc.ldp_post_indexed_64(Reg::X29, Reg::X30, Reg::SP, 32)?;
+            } else {
+                self.enc.ldp_post_indexed_64(Reg::X29, Reg::X30, Reg::SP, 16)?;
+            }
         }
         self.enc.ret(Reg::X30)?;
+        Ok(())
+    }
+
+    /// Lower `i32.load off` — pop addr, compute effective address as
+    /// `X28 + zero_ext(addr) + off`, load 32-bit word into a fresh
+    /// stack slot. LDR Wt automatically zero-extends the upper 32
+    /// bits of the hosting X register, matching WASM i32 semantics.
+    fn lower_load(&mut self, offset: u32) -> Result<(), LowerError> {
+        if !self.has_memory {
+            return Err(LowerError::MemoryNotConfigured);
+        }
+        let addr = self.pop_slot()?;
+        let dst = self.push_slot()?;
+        // Xdst = X28 + UXTW(Waddr). Safe to use dst as the effective-
+        // address register because we don't touch its upper bits
+        // after the LDR (which itself zero-extends).
+        self.enc.add_ext_uxtw(dst, MEM_BASE_REG, addr)?;
+        self.enc.ldr_w_imm(dst, dst, offset)?;
+        Ok(())
+    }
+
+    /// Lower `i32.store off` — pop value, pop addr, write value at
+    /// `X28 + zero_ext(addr) + off`. Repurposes the addr register
+    /// as the effective-address scratch; that's safe because it's
+    /// already been popped from the operand stack.
+    fn lower_store(&mut self, offset: u32) -> Result<(), LowerError> {
+        if !self.has_memory {
+            return Err(LowerError::MemoryNotConfigured);
+        }
+        let val = self.pop_slot()?;
+        let addr = self.pop_slot()?;
+        self.enc.add_ext_uxtw(addr, MEM_BASE_REG, addr)?;
+        self.enc.str_w_imm(val, addr, offset)?;
         Ok(())
     }
 
@@ -1057,6 +1168,63 @@ mod tests {
         assert_eq!(words[1], 0xD2800081); // movz x1, #4
         assert_eq!(words[2], 0x9AC10C00); // sdiv x0, x0, x1
         assert_eq!(words[3], 0xD65F03C0); // ret
+    }
+
+    // ── Phase 4C: memory (I32Load / I32Store) ──────────────────────
+
+    #[test]
+    fn store_then_load_roundtrip() {
+        // Builds: write 42 to mem[0], read it back, return it.
+        //   i32.const 0    ; addr for store
+        //   i32.const 42   ; value
+        //   i32.store 0
+        //   i32.const 0    ; addr for load
+        //   i32.load 0
+        //   end
+        let mut lw = Lowerer::new_function_with_memory(0, Vec::new(), 0xCAFEBABE).unwrap();
+        lw.lower_all(&[
+            WasmOp::I32Const(0),
+            WasmOp::I32Const(42),
+            WasmOp::I32Store(0),
+            WasmOp::I32Const(0),
+            WasmOp::I32Load(0),
+            WasmOp::End,
+        ])
+        .unwrap();
+        // Not checking every word; just sanity-check the prologue
+        // saves X28 and the mem-base MOVZ/MOVK chain is emitted.
+        let words = bytes_as_u32s(&lw.as_bytes());
+        // Word 0: stp x29, x30, [sp, #-32]!  →  a9be7bfd
+        assert_eq!(words[0], 0xA9BE7BFD);
+        // Word 1: str x28, [sp, #16]         →  f90013fc  (imm12=2, Rn=31, Rt=28)
+        //   base 0xF9000000 | (2<<10) | (31<<5) | 28
+        //   = 0xF9000000 | 0x800 | 0x3E0 | 0x1C = 0xF9000BFC
+        assert_eq!(words[1], 0xF9000BFC);
+        // Word 2: movz x28, #0xBABE (low halfword of 0xCAFEBABE)
+        //   base 0xD2800000 | (0xBABE << 5) | 28
+        //   = 0xD2800000 | 0x17D7C0 | 0x1C = 0xD29757DC
+        assert_eq!(words[2], 0xD29757DC);
+    }
+
+    #[test]
+    fn load_without_memory_rejected() {
+        let mut lw = Lowerer::new();
+        lw.lower_op(WasmOp::I32Const(0)).unwrap();
+        assert_eq!(
+            lw.lower_op(WasmOp::I32Load(0)),
+            Err(LowerError::MemoryNotConfigured)
+        );
+    }
+
+    #[test]
+    fn store_without_memory_rejected() {
+        let mut lw = Lowerer::new();
+        lw.lower_op(WasmOp::I32Const(0)).unwrap();
+        lw.lower_op(WasmOp::I32Const(0)).unwrap();
+        assert_eq!(
+            lw.lower_op(WasmOp::I32Store(0)),
+            Err(LowerError::MemoryNotConfigured)
+        );
     }
 
     #[test]

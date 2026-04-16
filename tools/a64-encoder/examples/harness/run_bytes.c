@@ -58,11 +58,24 @@ int helper_multiply_two(int x) {
     return x * 2;
 }
 
+/* ── Linear memory (Phase 4C) ───────────────────────────────────────
+ *
+ * A 64 KiB buffer used as the WASM linear-memory region. Lives in
+ * BSS so it gets a stable address (with `-no-pie`) that the host can
+ * query once via `--addrs` and bake into the JIT's MOVZ/MOVK chain
+ * for X28 (the memory-base register).
+ *
+ * 64 KiB matches the WASM page size, which is enough for any test
+ * we'll write in this phase.
+ */
+unsigned char mem_buffer[65536] __attribute__((aligned(8)));
+
 int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "--addrs") == 0) {
         printf("helper_return_42=%p\n",     (void *)helper_return_42);
         printf("helper_add_five=%p\n",      (void *)helper_add_five);
         printf("helper_multiply_two=%p\n",  (void *)helper_multiply_two);
+        printf("mem_base=%p\n",             (void *)mem_buffer);
         return 0;
     }
 

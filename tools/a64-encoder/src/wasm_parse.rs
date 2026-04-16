@@ -114,6 +114,19 @@ pub fn parse_ops(bytes: &[u8], pos: &mut usize) -> Result<Vec<WasmOp>, ParseErro
                 }
                 ops.push(WasmOp::I32Const(v as i32));
             }
+            0x28 => {
+                // i32.load memarg: align (uleb) then offset (uleb).
+                let _align = read_uleb128(bytes, pos)?;
+                let off = read_uleb128(bytes, pos)?;
+                if off > u32::MAX as u64 { return Err(ParseError::IntegerTooLarge); }
+                ops.push(WasmOp::I32Load(off as u32));
+            }
+            0x36 => {
+                let _align = read_uleb128(bytes, pos)?;
+                let off = read_uleb128(bytes, pos)?;
+                if off > u32::MAX as u64 { return Err(ParseError::IntegerTooLarge); }
+                ops.push(WasmOp::I32Store(off as u32));
+            }
             0x6A => ops.push(WasmOp::I32Add),
             0x6B => ops.push(WasmOp::I32Sub),
             0x6C => ops.push(WasmOp::I32Mul),
@@ -232,6 +245,30 @@ mod tests {
         //   0x41 0x2A 0x0B
         let ops = parse_function_body(&[0x41, 0x2A, 0x0B]).unwrap();
         assert_eq!(ops, vec![WasmOp::I32Const(42), WasmOp::End]);
+    }
+
+    #[test]
+    fn parse_load_store() {
+        // Body: i32.const 0 ; i32.const 42 ; i32.store align=2 offset=0
+        //       ; i32.const 0 ; i32.load align=2 offset=4 ; end
+        //   0x41 0x00 0x41 0x2A 0x36 0x02 0x00
+        //   0x41 0x00 0x28 0x02 0x04 0x0B
+        let ops = parse_function_body(&[
+            0x41, 0x00, 0x41, 0x2A, 0x36, 0x02, 0x00,
+            0x41, 0x00, 0x28, 0x02, 0x04, 0x0B,
+        ])
+        .unwrap();
+        assert_eq!(
+            ops,
+            vec![
+                WasmOp::I32Const(0),
+                WasmOp::I32Const(42),
+                WasmOp::I32Store(0),
+                WasmOp::I32Const(0),
+                WasmOp::I32Load(4),
+                WasmOp::End,
+            ]
+        );
     }
 
     #[test]

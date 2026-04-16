@@ -222,6 +222,23 @@ impl Encoder {
         Ok(())
     }
 
+    /// ADD Xd, Xn, Wm, UXTW — 64-bit add where Wm is zero-extended
+    /// from 32 to 64 bits before the add. The canonical form for
+    /// computing an effective memory address from a WASM i32 index
+    /// plus a 64-bit base: upper 32 of the index are zeroed so stray
+    /// bits from prior arithmetic don't perturb the base.
+    ///
+    /// Encoding (C6.2.5, Extended register): `1 0 0 01011 00 1 Rm(5) 010 000 Rn(5) Rd(5)`.
+    /// The `010` field is the `option` for UXTW; `000` is imm3 (no shift).
+    pub fn add_ext_uxtw(&mut self, rd: Reg, rn: Reg, rm: Reg) -> Result<(), EncodeError> {
+        let word = 0x8B20_4000u32
+            | (rm.enc() << 16)
+            | (rn.enc() << 5)
+            | rd.enc();
+        self.emit(word);
+        Ok(())
+    }
+
     /// UDIV Xd, Xn, Xm — unsigned 64-bit divide.
     ///
     /// Encoding (C6.2.351): `1 0011010110 Rm(5) 000010 Rn(5) Rd(5)`.
@@ -745,6 +762,15 @@ mod tests {
     fn str_w_x2_x3_8() {
         // str w2, [x3, #8]  →  b9000862
         assert_eq!(one(|e| e.str_w_imm(Reg::X2, Reg::X3, 8)), 0xB9000862);
+    }
+
+    #[test]
+    fn add_ext_uxtw_x0_x28_w1() {
+        // add x0, x28, w1, uxtw  →  8b214380
+        assert_eq!(
+            one(|e| e.add_ext_uxtw(Reg::X0, Reg(28), Reg::X1)),
+            0x8B214380
+        );
     }
 
     #[test]
