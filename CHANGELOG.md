@@ -450,6 +450,77 @@ folkering-daq (1 commit):
 
 ---
 
+## 16. april 2026 (forts.)
+**AArch64 JIT — Phase 4A-D: ekte maskinvare-verifisering**
+
+### Phase 4A — `Call()` end-to-end på Cortex-A76
+- Utvidet `run_bytes.c` med `helper_return_42`, `helper_add_five`,
+  `helper_multiply_two` + `--addrs`-flagg for adresse-queries
+- Host-side `call_on_pi.rs` spør harness for runtime-adresser, emitterer
+  JIT med Call(0) som peker dit, verifiserer exit code
+- Fix: `-no-pie`-flagg på harness — ASLR flytter helpers mellom
+  invocations, ikke-PIE gir stabile link-time-adresser
+- 1/1 case passerer: `Call(helper_return_42) → 42`
+
+### Phase 4B — MUL, SDIV, UDIV, 32-bit LDR/STR
+- 4 nye encoders: MUL (via MADD med XZR som akumulator), SDIV, UDIV,
+  LDR W / STR W (32-bit varianter med imm12 scaled by 4)
+- 3 nye WasmOp-varianter: `I32Mul`, `I32DivS`, `I32DivU`
+- Refactor: `lower_binop` bruker nå `BinOp`-enum istedenfor boolean
+- Parser: 0x6C / 0x6D / 0x6E
+- 10/10 caser på Pi inkluderer chained `(10*3)/2 + 27 = 42`
+
+### Phase 4C — Lineært minne + `i32.load` / `i32.store`
+- Ny encoder: `add_ext_uxtw` (ADD med UXTW-zero-extend av 32-bit index)
+- `Lowerer::new_function_with_memory(n_locals, targets, mem_base)`
+  med utvidet 32-byte prologue: STP X29/X30, STR X28, MOVZ+MOVK chain
+  for memory-base i X28
+- `I32Load(offset)` / `I32Store(offset)` lowering via ADD X28+Waddr+UXTW
+  → LDR/STR W
+- `MAX_LOCALS`: 10 → 9 (X28 reservert for memory-base)
+- Harness: 64 KiB BSS `mem_buffer`, eksponert via `mem_base=...`
+  i --addrs
+- 4/4 caser: single store/load, multi-address, static offset,
+  computed-value round-trip
+
+### Phase 4D — Iterativ Fibonacci på ekte silicon
+- Full ikke-trivielt program: 4 locals (a, b, tmp, n), if + loop +
+  br_if backward-branch, const/add/sub, 104 bytes JIT per invocation
+- Verifisert 8 N-verdier mot Rust-referansen: fib(0..=12) — alle riktige
+- Gjennom 10 iterasjoner av fib(10) utfører JIT'en ~120 register-
+  renamings, 12 CBNZ-backward-branches, og preserverer X30 korrekt
+
+### Testdekning (totalt a64-encoder)
+- 81 host-tester (encoder + lowerer + parser), alle grønne
+- 23 Pi-caser totalt:
+  - 6 stack+arith+if/else (Phase 3)
+  - 1 Call (Phase 4A)
+  - 4 MUL/DIV (Phase 4B)
+  - 4 memory load/store (Phase 4C)
+  - 8 Fibonacci (Phase 4D)
+
+```
+3f6d5a0  Phase 3     JIT output runs on real Cortex-A76
+2de5636  Phase 4A    Call() verified on real Cortex-A76
+cc71988  Phase 4B    MUL / SDIV / UDIV + 32-bit LDR/STR
+65e6467  Phase 4C    linear memory + i32.load / i32.store
+d23b417  Phase 4D    iterative Fibonacci runs on Cortex-A76
+```
+
+### Lærdom underveis
+- **ASLR + cross-invocation adresser**: Debians gcc defaulter til PIE,
+  som gir ny adresse per run. `-no-pie` gir stabile link-time-adresser
+  — kritisk når JIT baker absolutte adresser inn i MOVZ/MOVK-kjeder.
+- **`pause`-instruksjonen på QEMU** (irrelevant på bare metal) genererer
+  VM-exits, så lengre spin-budsjett er IKKE universelt raskere.
+- **ARM A64 har ingen plain MUL** — encodet som MADD med XZR som
+  accumulator (inst-set kondenserings-trick).
+- **D-cache og I-cache er ikke koherente på aarch64** — skrev JIT-kode
+  må flushes med `__builtin___clear_cache` før kall, ellers fetcher
+  CPU-en stale bytes (crash eller stille feil).
+
+---
+
 ## Nøkkeltall (oppdatert 16. april 2026)
 
 | Metrikk | Verdi |
@@ -461,7 +532,7 @@ folkering-daq (1 commit):
 | Storage backends | NVMe (primary) + VirtIO-blk (fallback), swappable via MVFS dispatcher |
 | NVMe throughput | 455 MB/s write, 432 MB/s read, 42 μs random (1 MiB, 512 B sectors) |
 | Interrupts | MSI-X vektor 64 (VirtIO-blk) + 65 (NVMe), legacy IOAPIC behold for keyboard/mouse |
-| Cross-arch JIT | a64-encoder: WasmOp → AArch64 bytes, 64 host-tester + 6/6 kjørende på Pi 5 Cortex-A76 |
+| Cross-arch JIT | a64-encoder: WasmOp → AArch64 bytes, 81 host-tester + 23/23 kjørende på Pi 5 Cortex-A76 (inkl. iterativ Fibonacci) |
 | Syscalls | 100+ (inkl. async TCP 0xE0-E3, W^X 0x32, Draug bridge 0xD0-D1) |
 | Modell (on-device) | SmolLM2-135M, Q4_0 kvantisering |
 | Modell (Draug) | qwen2.5-coder:7b (L1), gemma4:31b-cloud (L2+) via Ollama |
