@@ -79,6 +79,45 @@ pub enum MovShift {
     Lsl48 = 3,
 }
 
+/// A64 condition codes (4-bit field used by CSET/B.cond/CSEL/etc).
+/// Values match the architectural encoding from ARM ARM table C1-1
+/// so they can be written straight into the instruction word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Condition {
+    Eq = 0b0000,  // Equal (Z=1)
+    Ne = 0b0001,  // Not equal
+    Hs = 0b0010,  // Unsigned higher or same (aka CS)
+    Lo = 0b0011,  // Unsigned lower (aka CC)
+    Hi = 0b1000,  // Unsigned higher
+    Ls = 0b1001,  // Unsigned lower or same
+    Ge = 0b1010,  // Signed greater than or equal
+    Lt = 0b1011,  // Signed less than
+    Gt = 0b1100,  // Signed greater than
+    Le = 0b1101,  // Signed less than or equal
+}
+
+impl Condition {
+    /// Logical inverse of the condition. Each cond-pair in the ARM ARM
+    /// differs only in bit 0, so the table is compact and symmetric.
+    /// Used by CSET's underlying CSINC encoding, which takes the
+    /// *inverted* condition compared to the assembly mnemonic.
+    pub fn invert(self) -> Self {
+        match self {
+            Condition::Eq => Condition::Ne,
+            Condition::Ne => Condition::Eq,
+            Condition::Hs => Condition::Lo,
+            Condition::Lo => Condition::Hs,
+            Condition::Hi => Condition::Ls,
+            Condition::Ls => Condition::Hi,
+            Condition::Ge => Condition::Lt,
+            Condition::Lt => Condition::Ge,
+            Condition::Gt => Condition::Le,
+            Condition::Le => Condition::Gt,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncodeError {
     /// Immediate doesn't fit in the instruction's field width.
@@ -234,6 +273,46 @@ impl Encoder {
         let word = 0x8B20_4000u32
             | (rm.enc() << 16)
             | (rn.enc() << 5)
+            | rd.enc();
+        self.emit(word);
+        Ok(())
+    }
+
+    /// CMP Wn, Wm — 32-bit compare (alias for `SUBS WZR, Wn, Wm`).
+    ///
+    /// Subtracts Wm from Wn on the low 32 bits and updates the NZCV
+    /// flags; discards the numerical result.  32-bit form matches
+    /// WASM i32 comparison semantics — upper 32 bits of the hosting
+    /// X register are ignored, so stale sign-extension from prior
+    /// ops doesn't affect the flag outcome.
+    ///
+    /// Encoding (C6.2.340 — SUBS shifted register, sf=0, Rd=WZR):
+    /// `0 1 1 01011 00 0 Rm(5) 000000 Rn(5) 11111`.
+    pub fn cmp_w(&mut self, rn: Reg, rm: Reg) -> Result<(), EncodeError> {
+        let word = 0x6B00_0000u32
+            | (rm.enc() << 16)
+            | (rn.enc() << 5)
+            | 31u32; // Rd = WZR
+        self.emit(word);
+        Ok(())
+    }
+
+    /// CSET Xd, cond — set Xd to 1 if `cond` holds, else 0.
+    ///
+    /// Canonical A64 idiom for converting an NZCV flag state into a
+    /// boolean integer.  Assembler alias for `CSINC Xd, XZR, XZR,
+    /// invert(cond)`: when the inverted condition is false (i.e. the
+    /// original cond holds), CSINC picks `XZR + 1 = 1`; otherwise
+    /// it picks `XZR = 0`.
+    ///
+    /// Encoding (C6.2.49 — CSINC, sf=1, Rm=Rn=XZR):
+    /// `1 0 0 11010100 11111 cond(4) 01 11111 Rd(5)`.
+    pub fn cset(&mut self, rd: Reg, cond: Condition) -> Result<(), EncodeError> {
+        let inv = cond.invert() as u32;
+        let word = 0x9A80_0400u32
+            | (31u32 << 16)   // Rm = XZR
+            | (inv << 12)
+            | (31u32 << 5)    // Rn = XZR
             | rd.enc();
         self.emit(word);
         Ok(())
@@ -762,6 +841,51 @@ mod tests {
     fn str_w_x2_x3_8() {
         // str w2, [x3, #8]  →  b9000862
         assert_eq!(one(|e| e.str_w_imm(Reg::X2, Reg::X3, 8)), 0xB9000862);
+    }
+
+    // ── Phase 5 comparisons ─────────────────────────────────────────
+
+    #[test]
+    fn cmp_w_x0_x1() {
+        // cmp w0, w1  →  6b01001f
+        assert_eq!(one(|e| e.cmp_w(Reg::X0, Reg::X1)), 0x6B01001F);
+    }
+
+    #[test]
+    fn cset_x0_eq() {
+        // cset x0, eq  →  9a9f17e0
+        assert_eq!(one(|e| e.cset(Reg::X0, Condition::Eq)), 0x9A9F17E0);
+    }
+
+    #[test]
+    fn cset_x0_ne() {
+        // cset x0, ne  →  9a9f07e0
+        assert_eq!(one(|e| e.cset(Reg::X0, Condition::Ne)), 0x9A9F07E0);
+    }
+
+    #[test]
+    fn cset_x0_lt() {
+        // cset x0, lt  →  9a9fa7e0
+        assert_eq!(one(|e| e.cset(Reg::X0, Condition::Lt)), 0x9A9FA7E0);
+    }
+
+    #[test]
+    fn cset_x0_gt() {
+        // cset x0, gt  →  9a9fd7e0
+        assert_eq!(one(|e| e.cset(Reg::X0, Condition::Gt)), 0x9A9FD7E0);
+    }
+
+    #[test]
+    fn condition_invert_roundtrips() {
+        for c in [
+            Condition::Eq, Condition::Ne,
+            Condition::Hs, Condition::Lo,
+            Condition::Hi, Condition::Ls,
+            Condition::Ge, Condition::Lt,
+            Condition::Gt, Condition::Le,
+        ] {
+            assert_eq!(c.invert().invert(), c);
+        }
     }
 
     #[test]

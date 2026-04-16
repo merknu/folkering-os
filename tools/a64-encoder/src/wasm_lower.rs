@@ -34,7 +34,7 @@
 //!   know the block-end offset and rewrite every placeholder.
 
 use crate::{
-    encode_b, encode_cbnz_w, encode_cbz_w, Encoder, EncodeError, MovShift, Reg,
+    encode_b, encode_cbnz_w, encode_cbz_w, Condition, Encoder, EncodeError, MovShift, Reg,
 };
 
 /// Simplified WASM operator set.  Hand-constructed by callers, or
@@ -57,6 +57,14 @@ pub enum WasmOp {
     I32DivS,
     /// Pop two, push (left ÷ right) — unsigned. Divide-by-zero returns 0.
     I32DivU,
+    /// Pop two, push 1 if equal else 0.
+    I32Eq,
+    /// Pop two, push 1 if not equal else 0.
+    I32Ne,
+    /// Pop two, push 1 if `left < right` (signed) else 0.
+    I32LtS,
+    /// Pop two, push 1 if `left > right` (signed) else 0.
+    I32GtS,
     /// Copy local `n` onto the stack.
     LocalGet(u32),
     /// Pop stack top, store into local `n`.
@@ -144,7 +152,12 @@ impl From<EncodeError> for LowerError {
 /// an arithmetic WASM op. Keeps `lower_binop` single-shape while
 /// giving each WASM opcode its own compile-time constant.
 #[derive(Clone, Copy)]
-enum BinOp { Add, Sub, Mul, DivS, DivU }
+enum BinOp {
+    Add, Sub, Mul, DivS, DivU,
+    /// Comparison op — the inner Condition is the "result is true"
+    /// predicate (e.g. `Cmp(Eq)` sets result=1 when operands equal).
+    Cmp(Condition),
+}
 
 /// Maximum WASM stack depth we can hold in registers (X0..X15).
 const MAX_STACK: usize = 16;
@@ -347,6 +360,10 @@ impl Lowerer {
             WasmOp::I32Mul => self.lower_binop(BinOp::Mul),
             WasmOp::I32DivS => self.lower_binop(BinOp::DivS),
             WasmOp::I32DivU => self.lower_binop(BinOp::DivU),
+            WasmOp::I32Eq   => self.lower_binop(BinOp::Cmp(Condition::Eq)),
+            WasmOp::I32Ne   => self.lower_binop(BinOp::Cmp(Condition::Ne)),
+            WasmOp::I32LtS  => self.lower_binop(BinOp::Cmp(Condition::Lt)),
+            WasmOp::I32GtS  => self.lower_binop(BinOp::Cmp(Condition::Gt)),
             WasmOp::LocalGet(i) => self.lower_local_get(i),
             WasmOp::LocalSet(i) => self.lower_local_set(i),
             WasmOp::Block => self.lower_block(),
@@ -441,6 +458,13 @@ impl Lowerer {
             BinOp::Mul  => self.enc.mul(dst, lhs, rhs)?,
             BinOp::DivS => self.enc.sdiv(dst, lhs, rhs)?,
             BinOp::DivU => self.enc.udiv(dst, lhs, rhs)?,
+            // 32-bit compare: use CMP W (low 32 bits) so i32-semantic
+            // comparisons ignore any upper-bit residue left by prior
+            // arithmetic. CSET converts the flag result into 0 or 1.
+            BinOp::Cmp(cond) => {
+                self.enc.cmp_w(lhs, rhs)?;
+                self.enc.cset(dst, cond)?;
+            }
         }
         Ok(())
     }
@@ -1225,6 +1249,62 @@ mod tests {
             lw.lower_op(WasmOp::I32Store(0)),
             Err(LowerError::MemoryNotConfigured)
         );
+    }
+
+    // ── Phase 5: comparisons ────────────────────────────────────────
+
+    #[test]
+    fn eq_basic() {
+        // i32.const 5 ; i32.const 5 ; i32.eq ; end  →  1
+        let bytes = compile(&[
+            WasmOp::I32Const(5),
+            WasmOp::I32Const(5),
+            WasmOp::I32Eq,
+            WasmOp::End,
+        ]);
+        let words = bytes_as_u32s(&bytes);
+        assert_eq!(words[0], 0xD28000A0); // movz x0, #5
+        assert_eq!(words[1], 0xD28000A1); // movz x1, #5
+        assert_eq!(words[2], 0x6B01001F); // cmp w0, w1
+        assert_eq!(words[3], 0x9A9F17E0); // cset x0, eq
+        assert_eq!(words[4], 0xD65F03C0); // ret
+    }
+
+    #[test]
+    fn lt_s_basic() {
+        let bytes = compile(&[
+            WasmOp::I32Const(3),
+            WasmOp::I32Const(5),
+            WasmOp::I32LtS,
+            WasmOp::End,
+        ]);
+        let words = bytes_as_u32s(&bytes);
+        // movz x0, #3 ; movz x1, #5 ; cmp w0, w1 ; cset x0, lt ; ret
+        assert_eq!(words[3], 0x9A9FA7E0); // cset x0, lt
+    }
+
+    #[test]
+    fn gt_s_basic() {
+        let bytes = compile(&[
+            WasmOp::I32Const(5),
+            WasmOp::I32Const(3),
+            WasmOp::I32GtS,
+            WasmOp::End,
+        ]);
+        let words = bytes_as_u32s(&bytes);
+        assert_eq!(words[3], 0x9A9FD7E0); // cset x0, gt
+    }
+
+    #[test]
+    fn ne_basic() {
+        let bytes = compile(&[
+            WasmOp::I32Const(5),
+            WasmOp::I32Const(3),
+            WasmOp::I32Ne,
+            WasmOp::End,
+        ]);
+        let words = bytes_as_u32s(&bytes);
+        assert_eq!(words[3], 0x9A9F07E0); // cset x0, ne
     }
 
     #[test]

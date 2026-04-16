@@ -127,6 +127,10 @@ pub fn parse_ops(bytes: &[u8], pos: &mut usize) -> Result<Vec<WasmOp>, ParseErro
                 if off > u32::MAX as u64 { return Err(ParseError::IntegerTooLarge); }
                 ops.push(WasmOp::I32Store(off as u32));
             }
+            0x46 => ops.push(WasmOp::I32Eq),
+            0x47 => ops.push(WasmOp::I32Ne),
+            0x48 => ops.push(WasmOp::I32LtS),
+            0x4A => ops.push(WasmOp::I32GtS),
             0x6A => ops.push(WasmOp::I32Add),
             0x6B => ops.push(WasmOp::I32Sub),
             0x6C => ops.push(WasmOp::I32Mul),
@@ -266,6 +270,32 @@ mod tests {
                 WasmOp::I32Store(0),
                 WasmOp::I32Const(0),
                 WasmOp::I32Load(4),
+                WasmOp::End,
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_comparisons() {
+        // i32.const 3 ; i32.const 5 ; i32.lt_s ;
+        // i32.const 5 ; i32.const 5 ; i32.eq ;
+        // end
+        //   0x41 0x03 0x41 0x05 0x48 0x41 0x05 0x41 0x05 0x46 0x0B
+        let ops = parse_function_body(&[
+            0x41, 0x03, 0x41, 0x05, 0x48,
+            0x41, 0x05, 0x41, 0x05, 0x46,
+            0x0B,
+        ])
+        .unwrap();
+        assert_eq!(
+            ops,
+            vec![
+                WasmOp::I32Const(3),
+                WasmOp::I32Const(5),
+                WasmOp::I32LtS,
+                WasmOp::I32Const(5),
+                WasmOp::I32Const(5),
+                WasmOp::I32Eq,
                 WasmOp::End,
             ]
         );
