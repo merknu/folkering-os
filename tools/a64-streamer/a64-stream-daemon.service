@@ -1,0 +1,47 @@
+[Unit]
+Description=a64-stream-daemon — WASM Streaming Service (Pi-side JIT executor)
+Documentation=https://github.com/merknu/folkering-os
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Run as the regular user that owns the binary. The daemon only needs
+# PROT_EXEC mmaps (any unprivileged process can do that on Linux) and
+# a TCP listen socket above the privileged-port range (14712) — no
+# root required.
+User=knut
+Group=knut
+
+# Absolute path so systemd resolves it regardless of the working
+# directory. Update `ExecStart` if the binary moves.
+ExecStart=/home/knut/folkering-jit/tools/a64-streamer/target/release/a64-stream-daemon 0.0.0.0:14712
+
+# Keep the stream flowing if the process panics or is killed. The
+# daemon is stateless across connections (a new client gets a fresh
+# HELLO), so restart-without-backoff is safe.
+Restart=on-failure
+RestartSec=2s
+
+# Lock the service down the way you'd lock down any userspace daemon
+# that executes downloaded machine code. NoNewPrivileges prevents the
+# JIT'd bytes from doing anything escalatable; the other knobs are
+# cheap belt-and-suspenders against accidents.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+
+# The daemon writes code to mmap'd anonymous pages — no filesystem
+# writes needed. ReadOnlyPaths keeps the binary/library tree readable.
+ReadWritePaths=
+
+# Log via journald. `journalctl -u a64-stream-daemon -f` is the
+# equivalent of the old /tmp/daemon.log.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

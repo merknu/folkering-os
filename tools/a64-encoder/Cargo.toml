@@ -1,0 +1,14 @@
+[package]
+name = "a64-encoder"
+version = "0.1.0"
+edition = "2021"
+description = "AArch64 (A64) instruction encoder — emits 32-bit little-endian opcodes for JIT code generation"
+
+[features]
+default = ["std"]
+# When `std` is off, the crate compiles as `no_std` against `alloc`.
+# Used by Folkering OS userspace / kernel integrations that don't
+# link the Rust standard library.
+std = []
+
+[dependencies]

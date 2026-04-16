@@ -1,0 +1,29 @@
+[package]
+name = "a64-streamer"
+version = "0.1.0"
+edition = "2021"
+description = "WASM Streaming Service — Pi-side TCP daemon + test client that replace the SSH+run_bytes umbilical between Folkering OS (x86) and the AArch64 JIT worker"
+
+[lib]
+name = "a64_streamer"
+path = "src/lib.rs"
+
+[[bin]]
+name = "a64-stream-daemon"
+path = "src/bin/daemon.rs"
+
+[[bin]]
+name = "a64-stream-smoke-test"
+path = "src/bin/smoke_test.rs"
+
+[[bin]]
+name = "a64-stream-relay"
+path = "src/bin/relay.rs"
+
+[dependencies]
+libc = "0.2"
+a64-encoder = { path = "../a64-encoder" }
+# HMAC-SHA256 for CODE-frame authentication. No-std-capable so the
+# same module can be shared with the Folkering userspace client.
+hmac = { version = "0.12", default-features = false }
+sha2 = { version = "0.10", default-features = false }

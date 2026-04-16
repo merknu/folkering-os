@@ -337,14 +337,202 @@ folkering-daq (1 commit):
 
 ---
 
-## Nøkkeltall (oppdatert 13. april 2026)
+## 15. april 2026
+**Hardware sprint: MSI-X, NVMe, DMA-pool, MVFS-på-NVMe**
+
+### MSI-X interrupt routing
+- `drivers/msix.rs` — capability walker (PCI cap 0x11), vector allocator
+  for IDT 64-95, MMIO-mapping table locator (NO_CACHE flags), entry
+  programmer. VirtIO-blk migrated from IRQ11/IOAPIC til MSI-X vektor 64.
+- Self-test + KGraph + MVFS-round-trip bekreftet end-to-end på MSI-X-banen.
+- Oppdaget + fikset: `arch/x86_64/idt.rs`'s lazy_static IDT er inaktiv
+  (kernel bruker main.rs' manuelt oppsatte IDT). Naked asm-stubs for vektor
+  64 + 65 lagt til der.
+
+### NVMe driver (`drivers/nvme.rs`)
+- PCI class-0x01/0x08/0x02 detect, BAR0 MMIO (NO_CACHE), CAP/VS/CC/CSTS
+  handshake, admin + I/O queue pair med phase-tag polling.
+- Identify Controller + Namespace (QEMU: 32768 LBAs × 512 B = 16 MiB).
+- PRP1 / PRP1+PRP2 / PRP-list transfers opp til 63 datasider per kommando
+  (~252 KiB). Alle tre moduser verifisert med self-test.
+- Write/read round-trip (0xDEADBEEF på LBA 1) + flerblokk multi-PRP-test
+  (8/16/32 blokker).
+
+### DMA-side-pool (Phase 4)
+- 64 forhåndsallokerte 4 KiB-sider med `AtomicU64` fri-bitmap (CAS-basert
+  acquire, fetch_or release). Zero allocations på hot path.
+- `lease_pages()` med error-unwind — partielle leases slippes ved feil.
+- Leak-sjekk: 64/64 sider frie etter self-test bekrefter korrekt release.
+
+### Completion-timeout + CSTS.CFS watchdog
+- `submit_and_wait` bundet til 500M iter med periodisk Controller Fatal
+  Status-sjekk. Wedget controller → ren feil, aldri kernel-hang.
+
+### Interrupt-drevet completion (hybrid wait)
+- 1M-iter spin-pause budsjett (~300 μs) deretter `hlt` mellom fase-sjekker.
+- MSI-X eller timer-tick vekker CPU. Fast commands beholder tight-loop-ytelse.
+- Empirisk: 5M budsjett var verre under QEMU/whpx fordi `pause`-VM-exit
+  dominerer — på bare-metal inverterer tradeoff. Dokumentert i kildekoden.
+
+### MVFS-på-NVMe (pluggable backend)
+- `Backend` enum + `AtomicU8` selector + `use_nvme_backend()` switch i
+  `fs/mvfs.rs`. Alle `virtio_blk::*` call-sites routet gjennom dispatcher.
+- Boot-order endret: NVMe init før MVFS load; foretrekker NVMe når tilgjengelig.
+- Persistens-bevis: `boot_counter = 1` (fersk disk) → full QEMU reboot →
+  `boot_counter = 2` fra `[MVFS] loaded 1 entries from disk`.
+
+### Storage throughput baseline (`drivers/storage_bench.rs`)
+- TSC-timet 1 MiB sekvensiell write/read + 100 random 512 B reads.
+- NVMe: **455 MB/s write, 432 MB/s read, 42 μs random**.
+- VirtIO-blk ekskludert — KVM VirtIO status=0xFF quirk kontaminerer tallene
+  (retry-workarounden ville blitt målt, ikke enheten).
+
+```
+1bbca04  feat: MSI-X + NVMe driver with MVFS-on-NVMe persistence
+         10 files changed, 2838 insertions(+), 24 deletions(-)
+```
+
+---
+
+## 16. april 2026
+**AArch64 JIT emitter — Phase 1–3 komplett**
+
+### Phase 1 — A64 instruksjons-encoder
+- Ny crate `tools/a64-encoder/` (host-testbar, ingen no_std-begrensninger)
+- `Reg` type (X0–X30, XZR/SP alias for 31), `MovShift` enum
+- Opcodes emittert: `MOVZ`, `MOVN`, `MOVK`, `ADD/SUB` shifted reg, `LDR`/`STR`
+  unsigned immediate (64-bit), `B` (±128 MiB), `BR`, `RET`, `NOP`
+- Alle opcodes dokumentert med spec-seksjon fra ARM ARM (DDI 0487 C6.2)
+- 20 byte-eksakte tester mot håndregnede gullverdier
+
+### Phase 2 — WASM → A64 lowering
+- Stack-til-register-mapping: `stack[i] → Xi` (X0 som bunn → AAPCS64 retur)
+- Phase 2.0: `i32.const`, `i32.add`, `i32.sub`, `End`
+- Phase 2.1: negative konstanter (via MOVZ+MOVK på u32), lokale variabler
+  (`LocalGet`/`LocalSet` i X19..X28), LEB128-basert WASM bytecode parser
+- Phase 2.2: `CBZ`/`CBNZ` W-register encoders, `Block`/`Loop`/`Br`/`BrIf`
+  med label-stakk og forward-branch-patching
+- Phase 2.3: `STP` pre-indexed + `LDP` post-indexed (AAPCS64 prologue/
+  epilogue), `BL` (PC-relativ) + `BLR` (register-indirekte), `Call(n)`
+  opcode med extern funksjon-adresse-tabell, `new_function()` konstruktør
+- Phase 2.4: `If`/`Else` med `LabelKind::If` → `IfElse` transisjon, CBZ
+  patchet til else-eller-end, B patchet til end, stack-reset ved else
+- 44 lowerer- og parser-tester, all input-validering dekket
+
+### Phase 3 — Kjøring på ekte aarch64-hardware
+- Raspberry Pi 5 (Cortex-A76, Debian 13 trixie) som aarch64-testmiljø
+- `examples/harness/run_bytes.c`: C-harness som `mmap`er RWX-side, leser
+  bytes fra stdin, `__builtin___clear_cache`-flusher, caster til
+  `int (*)(void)`, returnerer exit code
+- `examples/run_on_pi.rs`: host-side runner som lowerer 6 testprogrammer,
+  pipes via SSH stdin, sammenligner exit code
+- **6/6 programmer kjører korrekt på ekte silicon:**
+  - `return 42` → 42
+  - `10 + 20` → 30
+  - `100 - 58` → 42
+  - `1 + 2 + 3` (nested) → 6
+  - if-else truthy → 10
+  - if-else falsy → 20
+
+### Verdifullt underveis
+- Oppdaget og fikset MOVK-bit-rotasjon (0xABCD << 5 → 0xD29579A0, ikke
+  0xD21579A0 som jeg først regnet)
+- Oppdaget at `Else` manglet stakk-reset til entry_depth (WASM-semantikk)
+- Bekreftet at folkering-daq-SD-kortet har både Pi OS rootfs (ext4) og
+  custom folkering-daq-kjerne — bytter mellom dem via enkel config.txt-swap
+
+```
+1bbca04  feat: MSI-X + NVMe driver with MVFS-on-NVMe persistence
+6c11210  docs: CHANGELOG entry for MSI-X + NVMe + MVFS-på-NVMe sprint
+529e911  feat: a64-encoder — AArch64 JIT foundation (Phase 1+2)
+3f6d5a0  feat(a64-encoder): Phase 3 — JIT output runs on real Cortex-A76
+```
+
+---
+
+## 16. april 2026 (forts.)
+**AArch64 JIT — Phase 4A-D: ekte maskinvare-verifisering**
+
+### Phase 4A — `Call()` end-to-end på Cortex-A76
+- Utvidet `run_bytes.c` med `helper_return_42`, `helper_add_five`,
+  `helper_multiply_two` + `--addrs`-flagg for adresse-queries
+- Host-side `call_on_pi.rs` spør harness for runtime-adresser, emitterer
+  JIT med Call(0) som peker dit, verifiserer exit code
+- Fix: `-no-pie`-flagg på harness — ASLR flytter helpers mellom
+  invocations, ikke-PIE gir stabile link-time-adresser
+- 1/1 case passerer: `Call(helper_return_42) → 42`
+
+### Phase 4B — MUL, SDIV, UDIV, 32-bit LDR/STR
+- 4 nye encoders: MUL (via MADD med XZR som akumulator), SDIV, UDIV,
+  LDR W / STR W (32-bit varianter med imm12 scaled by 4)
+- 3 nye WasmOp-varianter: `I32Mul`, `I32DivS`, `I32DivU`
+- Refactor: `lower_binop` bruker nå `BinOp`-enum istedenfor boolean
+- Parser: 0x6C / 0x6D / 0x6E
+- 10/10 caser på Pi inkluderer chained `(10*3)/2 + 27 = 42`
+
+### Phase 4C — Lineært minne + `i32.load` / `i32.store`
+- Ny encoder: `add_ext_uxtw` (ADD med UXTW-zero-extend av 32-bit index)
+- `Lowerer::new_function_with_memory(n_locals, targets, mem_base)`
+  med utvidet 32-byte prologue: STP X29/X30, STR X28, MOVZ+MOVK chain
+  for memory-base i X28
+- `I32Load(offset)` / `I32Store(offset)` lowering via ADD X28+Waddr+UXTW
+  → LDR/STR W
+- `MAX_LOCALS`: 10 → 9 (X28 reservert for memory-base)
+- Harness: 64 KiB BSS `mem_buffer`, eksponert via `mem_base=...`
+  i --addrs
+- 4/4 caser: single store/load, multi-address, static offset,
+  computed-value round-trip
+
+### Phase 4D — Iterativ Fibonacci på ekte silicon
+- Full ikke-trivielt program: 4 locals (a, b, tmp, n), if + loop +
+  br_if backward-branch, const/add/sub, 104 bytes JIT per invocation
+- Verifisert 8 N-verdier mot Rust-referansen: fib(0..=12) — alle riktige
+- Gjennom 10 iterasjoner av fib(10) utfører JIT'en ~120 register-
+  renamings, 12 CBNZ-backward-branches, og preserverer X30 korrekt
+
+### Testdekning (totalt a64-encoder)
+- 81 host-tester (encoder + lowerer + parser), alle grønne
+- 23 Pi-caser totalt:
+  - 6 stack+arith+if/else (Phase 3)
+  - 1 Call (Phase 4A)
+  - 4 MUL/DIV (Phase 4B)
+  - 4 memory load/store (Phase 4C)
+  - 8 Fibonacci (Phase 4D)
+
+```
+3f6d5a0  Phase 3     JIT output runs on real Cortex-A76
+2de5636  Phase 4A    Call() verified on real Cortex-A76
+cc71988  Phase 4B    MUL / SDIV / UDIV + 32-bit LDR/STR
+65e6467  Phase 4C    linear memory + i32.load / i32.store
+d23b417  Phase 4D    iterative Fibonacci runs on Cortex-A76
+```
+
+### Lærdom underveis
+- **ASLR + cross-invocation adresser**: Debians gcc defaulter til PIE,
+  som gir ny adresse per run. `-no-pie` gir stabile link-time-adresser
+  — kritisk når JIT baker absolutte adresser inn i MOVZ/MOVK-kjeder.
+- **`pause`-instruksjonen på QEMU** (irrelevant på bare metal) genererer
+  VM-exits, så lengre spin-budsjett er IKKE universelt raskere.
+- **ARM A64 har ingen plain MUL** — encodet som MADD med XZR som
+  accumulator (inst-set kondenserings-trick).
+- **D-cache og I-cache er ikke koherente på aarch64** — skrev JIT-kode
+  må flushes med `__builtin___clear_cache` før kall, ellers fetcher
+  CPU-en stale bytes (crash eller stille feil).
+
+---
+
+## Nøkkeltall (oppdatert 16. april 2026)
 
 | Metrikk | Verdi |
 |---------|-------|
-| Total commits | 95+ (4 repos) |
-| Utviklingsperiode | 23. januar – 13. april 2026 |
+| Total commits | 98+ (4 repos) |
+| Utviklingsperiode | 23. januar – 16. april 2026 |
 | Kernel | Rust no_std, x86-64, Limine bootloader |
-| Kernel size | 2211 KB |
+| Kernel size | 2400 KB |
+| Storage backends | NVMe (primary) + VirtIO-blk (fallback), swappable via MVFS dispatcher |
+| NVMe throughput | 455 MB/s write, 432 MB/s read, 42 μs random (1 MiB, 512 B sectors) |
+| Interrupts | MSI-X vektor 64 (VirtIO-blk) + 65 (NVMe), legacy IOAPIC behold for keyboard/mouse |
+| Cross-arch JIT | a64-encoder: WasmOp → AArch64 bytes, 81 host-tester + 23/23 kjørende på Pi 5 Cortex-A76 (inkl. iterativ Fibonacci) |
 | Syscalls | 100+ (inkl. async TCP 0xE0-E3, W^X 0x32, Draug bridge 0xD0-D1) |
 | Modell (on-device) | SmolLM2-135M, Q4_0 kvantisering |
 | Modell (Draug) | qwen2.5-coder:7b (L1), gemma4:31b-cloud (L2+) via Ollama |

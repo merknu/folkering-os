@@ -206,20 +206,23 @@ pub fn filter_packet(frame: &[u8]) -> FirewallAction {
             return FirewallAction::Drop;
         }
 
-        // Rule 5.1: Stateful-ish — allow non-SYN TCP from known sources.
-        // Under SLIRP, all legitimate traffic comes from the gateway
-        // (10.0.2.2) or is to a whitelisted local port (2222).
-        let from_gateway = src_ip == [10, 0, 2, 2];
-        let to_shell = dst_port == 2222;
-
-        if from_gateway || to_shell {
-            ALLOWS.fetch_add(1, Ordering::Relaxed);
-            return FirewallAction::Allow;
-        }
-
-        // Non-SYN TCP from non-gateway source → spoofed or unknown
-        DROPS.fetch_add(1, Ordering::Relaxed);
-        return FirewallAction::Drop;
+        // Rule 5.1: Allow non-SYN TCP (i.e. packets with ACK set).
+        // These are replies to traffic *we* initiated — SYN-ACK for
+        // outbound connects, ACK + data for established sessions,
+        // FIN/RST for tear-downs. Smoltcp's per-connection state
+        // machine rejects any stray packets that don't match an open
+        // 4-tuple, so the firewall doesn't need to re-check source
+        // IP here. Previously this branch only allowed src_ip =
+        // 10.0.2.2 (SLIRP gateway), which silently dropped every
+        // reply from arbitrary LAN addresses — breaking outbound
+        // connections to anything the gateway proxies for us.
+        //
+        // The SYN-only check above already blocks unsolicited
+        // inbound connection attempts from any non-whitelisted port,
+        // so this relaxed rule preserves the ingress policy while
+        // unblocking legitimate replies.
+        ALLOWS.fetch_add(1, Ordering::Relaxed);
+        return FirewallAction::Allow;
     }
 
     // Default: allow unknown protocols
@@ -274,6 +277,29 @@ fn record_syn_attempt(ip: [u8; 4]) {
         if idx < MAX_BLOCKLIST {
             list.0[idx] = (ip, 1);
             list.1 = idx + 1;
+            return;
+        }
+        // Table full. Without eviction an attacker could spoof 16
+        // source IPs with one SYN each (16 packets, well under the
+        // block threshold of 3) to fill the slot array, after which
+        // their real attack IP slips through without tracking.
+        //
+        // Evict the lowest-count entry that ISN'T yet blocked
+        // (count < 3). A blocked entry is load-bearing — we keep
+        // dropping that IP's traffic on every frame — so we refuse
+        // to evict it. If every slot is blocked, the table is doing
+        // its job; the new IP just isn't tracked this round.
+        let mut victim: Option<usize> = None;
+        let mut victim_count: u8 = u8::MAX;
+        for i in 0..MAX_BLOCKLIST {
+            let c = list.0[i].1;
+            if c < 3 && c < victim_count {
+                victim_count = c;
+                victim = Some(i);
+            }
+        }
+        if let Some(i) = victim {
+            list.0[i] = (ip, 1);
         }
     }
 }

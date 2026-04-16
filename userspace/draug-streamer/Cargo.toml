@@ -1,0 +1,22 @@
+[package]
+name = "draug-streamer"
+version = "0.1.0"
+edition = "2021"
+description = "WASM Streaming Service client — JITs AArch64 machine code on x86 and streams CODE + sensor data to the Pi-side a64-stream-daemon over Folkering's async TCP."
+
+[[bin]]
+name = "draug-streamer"
+path = "src/main.rs"
+
+[dependencies]
+libfolk = { path = "../libfolk" }
+# a64-encoder lives outside the userspace workspace because it's also
+# used as a host-side library. Point at the repo-relative path and
+# disable the default `std` feature so it compiles under no_std here.
+a64-encoder = { path = "../../tools/a64-encoder", default-features = false }
+# HMAC-SHA256 for signing CODE frames before shipping them to the
+# Pi-side daemon. The daemon only mmaps+executes CODE that verifies
+# against the shared secret — this is the gate that stops anyone on
+# the LAN from shipping arbitrary A64 machine code to our worker.
+hmac = { version = "0.12", default-features = false }
+sha2 = { version = "0.10", default-features = false }
