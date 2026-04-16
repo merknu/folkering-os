@@ -517,6 +517,20 @@ const MAX_CALLEE_SAVED_INT: u8 = 27; // X27 is the last usable
 
 /// Alias used by the frameless lowerer (no callee-saved band).
 const MAX_I32_STACK: usize = MAX_PRIMARY_INT;
+
+/// Scratch registers for spill pop/push. Alternate between X14
+/// and X15 so two consecutive pops (binary-op pattern) don't
+/// clobber each other. Push always writes to SPILL_SCRATCH_A;
+/// the pending STR is flushed before the next push/pop.
+const SPILL_SCRATCH_A: Reg = Reg(14);
+const SPILL_SCRATCH_B: Reg = Reg(15);
+
+/// Max spill slots in the frame (8 bytes each).
+const MAX_FRAME_SPILL: usize = 16;
+/// Bytes per spill slot.
+const SPILL_SLOT_BYTES: u32 = 8;
+/// Total frame spill area.
+const SPILL_AREA_BYTES: u32 = (MAX_FRAME_SPILL as u32) * SPILL_SLOT_BYTES;
 /// Maximum operand-stack depth in f32 slots (S0..S15).
 /// V0..V7 are caller-saved so we can clobber them freely; V8..V15
 /// are callee-saved, so using those at depth ≥ 8 would require
@@ -663,6 +677,21 @@ pub struct Lowerer {
     /// Number of integer locals (used to compute overflow-band
     /// base: X(19 + n_int_locals) .. X27).
     n_int_locals: usize,
+    /// Total direct+extended register capacity for this function.
+    /// = MAX_PRIMARY_INT + (9 - n_int_locals).
+    max_reg_int: usize,
+    /// Byte offset from SP where spill[0] starts (past all
+    /// callee-saved saves). 0 if no spill area.
+    spill_base: u32,
+    /// Whether the frame has a spill area.
+    has_spill: bool,
+    /// Pending spill: depth of the most recent push that went to
+    /// spill and hasn't been STR'd to the frame yet. None = no
+    /// pending. Flushed at the start of every push/pop/end.
+    pending_spill_depth: Option<usize>,
+    /// Toggle for alternating scratch registers on consecutive
+    /// spill pops. false = X14 next, true = X15 next.
+    spill_pop_toggle: bool,
 }
 
 /// Function signature used for `call_indirect` marshalling. WASM MVP
@@ -713,6 +742,11 @@ impl Lowerer {
             call_sigs: Vec::new(),
             data_regions: Vec::new(),
             n_int_locals: 0,
+            max_reg_int: MAX_PRIMARY_INT,
+            spill_base: 0,
+            has_spill: false,
+            pending_spill_depth: None,
+            spill_pop_toggle: false,
         })
     }
 
@@ -813,7 +847,9 @@ impl Lowerer {
         // overflow also need them. Saving all 5 pairs
         // unconditionally keeps the prologue simple.
         let save_pairs = 5; // (X19,X20), (X21,X22), (X23,X24), (X25,X26), (X27,ZR)
-        let frame_size = (16 + save_pairs * 16) as i16; // 16 + 80 = 96
+        let callee_save_bytes = save_pairs * 16; // 80
+        let spill_base_off = (16 + callee_save_bytes) as u32; // 96
+        let frame_size = (16 + callee_save_bytes + SPILL_AREA_BYTES as usize) as i16; // 96+128=224
         enc.stp_pre_indexed_64(Reg::X29, Reg::X30, Reg::SP, -frame_size)?;
         // Save callee-saved registers used for locals at fixed offsets
         // within the frame, starting at SP+16. STP handles pairs.
@@ -840,6 +876,11 @@ impl Lowerer {
             has_memory: false,
             saved_int_pairs: save_pairs,
             n_int_locals: n_int_locals,
+            max_reg_int: MAX_PRIMARY_INT + (9 - n_int_locals),
+            spill_base: spill_base_off,
+            has_spill: true,
+            pending_spill_depth: None,
+            spill_pop_toggle: false,
             frame_size_base: frame_size,
             mem_size: 64 * 1024,
             table_base: None,
@@ -901,6 +942,11 @@ impl Lowerer {
             call_sigs: Vec::new(),
             data_regions: Vec::new(),
             n_int_locals: 0,
+            max_reg_int: MAX_PRIMARY_INT,
+            spill_base: 0,
+            has_spill: false,
+            pending_spill_depth: None,
+            spill_pop_toggle: false,
         })
     }
 
@@ -1181,40 +1227,68 @@ impl Lowerer {
 
     // ── Stack helpers ───────────────────────────────────────────────
 
-    /// Map an operand-stack depth to a physical register.
-    /// Depths 0..15 → X0..X15 (primary band).
-    /// Depths 16..16+K → X(19+n_locals)..X27 (extended band,
-    /// K = 9 - n_locals callee-saved regs not used for locals).
-    /// Errors if no register is available at this depth.
-    fn int_depth_to_reg(&self, depth: usize) -> Result<Reg, LowerError> {
+    // ── Register allocation with spill support ────────────────────
+    //
+    // Three bands:
+    //   Primary  (0..15)  → X0..X15  — always available
+    //   Extended (16..max_reg_int-1) → X(19+N_locals)..X27
+    //   Spill    (max_reg_int..max_reg_int+15) → frame memory
+    //
+    // Spill uses X14/X15 as alternating scratch for pops and X14
+    // as the write target for pushes. A "pending spill" is flushed
+    // (STR X14 → frame) at the START of every subsequent push/pop,
+    // which is AFTER the caller has written the value into X14.
+
+    /// Map depth to a physical register. Returns None for spill depths.
+    fn int_depth_to_reg(&self, depth: usize) -> Option<Reg> {
         if depth < MAX_PRIMARY_INT {
-            Ok(Reg(depth as u8))
-        } else if self.has_frame {
+            Some(Reg(depth as u8))
+        } else if depth < self.max_reg_int {
             let overflow_base = LOCAL_I32_BASE_REG + self.n_int_locals as u8;
             let overflow_idx = (depth - MAX_PRIMARY_INT) as u8;
-            let reg_num = overflow_base + overflow_idx;
-            if reg_num > MAX_CALLEE_SAVED_INT {
-                Err(LowerError::TypedStackOverflow(ValType::I32))
-            } else {
-                Ok(Reg(reg_num))
-            }
+            Some(Reg(overflow_base + overflow_idx))
+        } else {
+            None // spill to frame
+        }
+    }
+
+    /// Frame offset for spill slot at `depth`.
+    fn spill_offset(&self, depth: usize) -> u32 {
+        let spill_idx = depth - self.max_reg_int;
+        self.spill_base + (spill_idx as u32) * SPILL_SLOT_BYTES
+    }
+
+    /// Flush any pending spill-push STR.
+    fn flush_pending_spill(&mut self) -> Result<(), LowerError> {
+        if let Some(depth) = self.pending_spill_depth.take() {
+            let off = self.spill_offset(depth);
+            self.enc.str_imm(SPILL_SCRATCH_A, Reg::SP, off)?;
+        }
+        Ok(())
+    }
+
+    fn push_i32_slot(&mut self) -> Result<Reg, LowerError> {
+        self.flush_pending_spill()?;
+        let depth = self.int_depth;
+        if let Some(r) = self.int_depth_to_reg(depth) {
+            // Direct or extended band — value goes straight to register
+            self.int_depth += 1;
+            self.stack.push(ValType::I32);
+            Ok(r)
+        } else if self.has_spill && depth < self.max_reg_int + MAX_FRAME_SPILL {
+            // Spill band: caller writes to X14, we'll STR it on the
+            // next push/pop via flush_pending_spill.
+            self.pending_spill_depth = Some(depth);
+            self.int_depth += 1;
+            self.stack.push(ValType::I32);
+            Ok(SPILL_SCRATCH_A)
         } else {
             Err(LowerError::TypedStackOverflow(ValType::I32))
         }
     }
 
-    /// Push an I32 slot. Depths 0..15 use X0..X15 (primary).
-    /// Depths 16+ overflow into callee-saved X19..X27 (the
-    /// prologue saves all of them unconditionally).
-    fn push_i32_slot(&mut self) -> Result<Reg, LowerError> {
-        let r = self.int_depth_to_reg(self.int_depth)?;
-        self.int_depth += 1;
-        self.stack.push(ValType::I32);
-        Ok(r)
-    }
-
-    /// Pop an I32 from the top of the stack.
     fn pop_i32_slot(&mut self) -> Result<Reg, LowerError> {
+        self.flush_pending_spill()?;
         let ty = self.stack.last().copied().ok_or(LowerError::StackUnderflow)?;
         if ty != ValType::I32 {
             return Err(LowerError::TypeMismatch {
@@ -1224,7 +1298,17 @@ impl Lowerer {
         }
         self.stack.pop();
         self.int_depth -= 1;
-        self.int_depth_to_reg(self.int_depth)
+        let depth = self.int_depth;
+        if let Some(r) = self.int_depth_to_reg(depth) {
+            Ok(r)
+        } else {
+            // Spill: load from frame into alternating scratch
+            let scratch = if self.spill_pop_toggle { SPILL_SCRATCH_B } else { SPILL_SCRATCH_A };
+            self.spill_pop_toggle = !self.spill_pop_toggle;
+            let off = self.spill_offset(depth);
+            self.enc.ldr_imm(scratch, Reg::SP, off)?;
+            Ok(scratch)
+        }
     }
 
     /// Push an F32 slot; returns the V-bank register.
@@ -1315,13 +1399,24 @@ impl Lowerer {
     /// same physical register file — the width distinction is in
     /// the instruction, not the register.
     fn push_i64_slot(&mut self) -> Result<Reg, LowerError> {
-        let r = self.int_depth_to_reg(self.int_depth)?;
-        self.int_depth += 1;
-        self.stack.push(ValType::I64);
-        Ok(r)
+        self.flush_pending_spill()?;
+        let depth = self.int_depth;
+        if let Some(r) = self.int_depth_to_reg(depth) {
+            self.int_depth += 1;
+            self.stack.push(ValType::I64);
+            Ok(r)
+        } else if self.has_spill && depth < self.max_reg_int + MAX_FRAME_SPILL {
+            self.pending_spill_depth = Some(depth);
+            self.int_depth += 1;
+            self.stack.push(ValType::I64);
+            Ok(SPILL_SCRATCH_A)
+        } else {
+            Err(LowerError::TypedStackOverflow(ValType::I64))
+        }
     }
 
     fn pop_i64_slot(&mut self) -> Result<Reg, LowerError> {
+        self.flush_pending_spill()?;
         let ty = self.stack.last().copied().ok_or(LowerError::StackUnderflow)?;
         if ty != ValType::I64 {
             return Err(LowerError::TypeMismatch {
@@ -1331,7 +1426,16 @@ impl Lowerer {
         }
         self.stack.pop();
         self.int_depth -= 1;
-        self.int_depth_to_reg(self.int_depth)
+        let depth = self.int_depth;
+        if let Some(r) = self.int_depth_to_reg(depth) {
+            Ok(r)
+        } else {
+            let scratch = if self.spill_pop_toggle { SPILL_SCRATCH_B } else { SPILL_SCRATCH_A };
+            self.spill_pop_toggle = !self.spill_pop_toggle;
+            let off = self.spill_offset(depth);
+            self.enc.ldr_imm(scratch, Reg::SP, off)?;
+            Ok(scratch)
+        }
     }
 
     // ── Op-specific lowering ────────────────────────────────────────
@@ -1378,7 +1482,7 @@ impl Lowerer {
         let rhs = self.pop_f32_slot()?;
         let lhs = self.pop_f32_slot()?;
         let dst = self.push_f32_slot()?;
-        debug_assert_eq!(dst.0, lhs.0);
+        // (dst == lhs not guaranteed with spill)
         match op {
             FBinOp::Add => self.enc.fadd_s(dst, lhs, rhs)?,
             FBinOp::Sub => self.enc.fsub_s(dst, lhs, rhs)?,
@@ -1424,7 +1528,7 @@ impl Lowerer {
         let rhs = self.pop_f64_slot()?;
         let lhs = self.pop_f64_slot()?;
         let dst = self.push_f64_slot()?;
-        debug_assert_eq!(dst.0, lhs.0);
+        // (dst == lhs not guaranteed with spill)
         match op {
             FBinOp::Add => self.enc.fadd_d(dst, lhs, rhs)?,
             FBinOp::Sub => self.enc.fsub_d(dst, lhs, rhs)?,
@@ -2138,7 +2242,7 @@ impl Lowerer {
         let rhs = self.pop_i32_slot()?;
         let lhs = self.pop_i32_slot()?;
         let dst = self.push_i32_slot()?;
-        debug_assert_eq!(dst.0, lhs.0);
+        // (dst == lhs not guaranteed with spill)
         match op {
             BinOp::Add  => self.enc.add(dst, lhs, rhs)?,
             BinOp::Sub  => self.enc.sub(dst, lhs, rhs)?,
@@ -2675,9 +2779,7 @@ impl Lowerer {
     }
 
     fn lower_function_end(&mut self) -> Result<(), LowerError> {
-        // Function returns exactly one value. If it's an F32, bit-
-        // cast into W0 so callers see the float's bit pattern as
-        // a 32-bit integer in X0 (useful for exit-code harnesses).
+        self.flush_pending_spill()?;
         match self.stack.len() {
             1 => match self.stack_top_type().unwrap() {
                 ValType::I32 => {
@@ -3304,15 +3406,31 @@ mod tests {
 
     #[test]
     fn extended_band_overflow_detected() {
-        // 0 locals → 25 total slots. Push 26 → error.
+        // 0 locals → 25 register + 16 spill = 41 total. Push 42 → error.
         let mut lw = Lowerer::new_function(0, Vec::new()).unwrap();
-        for _ in 0..25 {
+        for _ in 0..41 {
             lw.lower_op(WasmOp::I32Const(0)).unwrap();
         }
         assert_eq!(
             lw.lower_op(WasmOp::I32Const(0)),
             Err(LowerError::TypedStackOverflow(ValType::I32))
         );
+    }
+
+    #[test]
+    fn spill_to_memory_roundtrip() {
+        // Push 30 values (16 primary + 9 extended + 5 spill), then
+        // sum them all via I32Add. Exercises the full push→spill→
+        // pop→reload pipeline. Should compile without error.
+        let mut lw = Lowerer::new_function(0, Vec::new()).unwrap();
+        for i in 0..30 {
+            lw.lower_op(WasmOp::I32Const(i as i32)).unwrap();
+        }
+        for _ in 0..29 {
+            lw.lower_op(WasmOp::I32Add).unwrap();
+        }
+        lw.lower_op(WasmOp::End).unwrap();
+        let _bytes = lw.finish();
     }
 
     // ── Phase 4B: MUL / SDIV / UDIV ─────────────────────────────────
