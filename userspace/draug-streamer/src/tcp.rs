@@ -18,12 +18,6 @@ use libfolk::sys::{
     tcp_close_async, tcp_connect_async, tcp_poll_recv, tcp_send_async, yield_cpu, TCP_EAGAIN,
 };
 
-/// Zero-length slice to probe slot state via `tcp_send_async`.
-/// The kernel's `syscall_tcp_send` auto-promotes a `Connecting` slot
-/// to `Connected` once the handshake completes; sending 0 bytes is
-/// a side-effect-free way to drive that promotion.
-const EMPTY: &[u8] = &[];
-
 #[derive(Debug)]
 pub enum TcpError {
     /// `tcp_connect_async` returned `u64::MAX` — kernel out of slots
@@ -51,40 +45,32 @@ const INVALID_SLOT: u64 = 0xFFFF;
 impl TcpSession {
     /// Open a TCP session, **blocking until the handshake completes**.
     ///
-    /// Connection flow:
-    ///   1. `tcp_connect_async(ip, port)` allocates a slot and kicks
-    ///      off the SYN. Returns the slot id (state = Connecting).
-    ///   2. We drive the handshake to completion via
-    ///      `tcp_send_async(slot, &[])`. Empty-slice sends are
-    ///      side-effect-free and return `0` once the kernel has
-    ///      promoted the slot to Connected (or `TCP_EAGAIN` while
-    ///      still handshaking, or `u64::MAX` on failure).
-    ///
-    /// Why not loop on `tcp_connect_async`? The kernel's
-    /// `syscall_tcp_connect` only matches *Connecting* slots in its
-    /// re-poll path — once a slot is promoted to Connected, a
-    /// subsequent call allocates a brand-new slot (and socket) and
-    /// kicks off a second handshake. That means `tcp_poll_recv` on
-    /// the original slot never sees any data because the daemon's
-    /// bytes arrive on the new, unrelated connection. Using
-    /// `tcp_send_async` as the probe sidesteps that quirk.
+    /// The kernel's `tcp_connect_async(ip, port)` is idempotent on
+    /// `(ip, port, owner)`: the first call allocates a slot and
+    /// kicks off the SYN; subsequent calls with the same destination
+    /// return the same slot id (promoting `Connecting → Connected`
+    /// when `may_send()` goes true, or `EAGAIN` while still
+    /// handshaking, or `u64::MAX` on failure). We loop on it until
+    /// the returned value is the real slot id, yielding the CPU on
+    /// each `EAGAIN` so the scheduler stays responsive while the
+    /// handshake completes.
     pub fn connect(ip: [u8; 4], port: u16) -> Result<Self, TcpError> {
-        let slot = tcp_connect_async(ip, port);
-        if slot == u64::MAX {
+        let initial = tcp_connect_async(ip, port);
+        if initial == u64::MAX {
             return Err(TcpError::ConnectFailed);
         }
-        if slot == TCP_EAGAIN || slot == INVALID_SLOT {
+        if initial == TCP_EAGAIN || initial == INVALID_SLOT {
             return Err(TcpError::ConnectFailed);
         }
-        // Drive the handshake to completion. `tcp_send_async` with a
-        // zero-length buffer auto-promotes Connecting → Connected
-        // once `socket.may_send()` is true — the first non-EAGAIN,
-        // non-MAX return value means we're fully connected.
+        // Re-poll until the slot is promoted to Connected. Because
+        // the kernel matches on (ip, port) + owner we'll always get
+        // the same slot id back — no risk of shadow-allocating a
+        // second connection to the same destination.
         loop {
-            match tcp_send_async(slot, EMPTY) {
+            match tcp_connect_async(ip, port) {
                 TCP_EAGAIN => yield_cpu(),
                 v if v == u64::MAX => return Err(TcpError::ConnectFailed),
-                _ => return Ok(TcpSession { slot }),
+                slot => return Ok(TcpSession { slot }),
             }
         }
     }

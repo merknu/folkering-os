@@ -38,19 +38,40 @@ enum SlotState {
 struct AsyncSlot {
     state: SlotState,
     handle: Option<smoltcp::iface::SocketHandle>,
+    /// Task that owns this slot, for cleanup on task exit. `0` means
+    /// "unowned" (slot is Free or was allocated before ownership
+    /// tracking landed — legacy path).
+    owner: u32,
 }
 
 static SLOTS: Mutex<[AsyncSlot; MAX_ASYNC_SLOTS]> = Mutex::new([
-    AsyncSlot { state: SlotState::Free, handle: None },
-    AsyncSlot { state: SlotState::Free, handle: None },
-    AsyncSlot { state: SlotState::Free, handle: None },
-    AsyncSlot { state: SlotState::Free, handle: None },
+    AsyncSlot { state: SlotState::Free, handle: None, owner: 0 },
+    AsyncSlot { state: SlotState::Free, handle: None, owner: 0 },
+    AsyncSlot { state: SlotState::Free, handle: None, owner: 0 },
+    AsyncSlot { state: SlotState::Free, handle: None, owner: 0 },
 ]);
 
-/// Create a non-blocking TCP connection.
+/// Create — or re-poll — a non-blocking TCP connection.
 ///
-/// Returns slot_id (0-3) immediately. Connection completes in background.
-/// Caller should proceed to send — tcp_send will EAGAIN until connected.
+/// **Idempotent on `(ip, port, owner)`:** calling this syscall
+/// repeatedly with the same destination from the same task returns
+/// the same slot id each time. First call allocates, starts the
+/// SYN handshake, returns the slot (state = Connecting). Subsequent
+/// calls:
+///   * while still handshaking → `EAGAIN`
+///   * once `socket.may_send()` → slot promoted to Connected, return
+///     same slot id
+///   * when the socket has failed → slot freed, return `u64::MAX`
+///
+/// Only when no matching slot exists for this caller's (ip, port)
+/// does the syscall allocate a fresh slot. This lets high-level
+/// wrappers (e.g. a synchronous `TcpSession::connect`) poll via
+/// `tcp_connect_async` without risk of silently starting a second
+/// connection to the same destination — the previous version, which
+/// only inspected `SlotState::Connecting` slots, fell through to
+/// the "allocate new" path once a slot had been promoted to
+/// `Connected`, giving the caller a brand-new (unrelated) slot id
+/// and leaving the original connection orphaned.
 pub fn syscall_tcp_connect(ip_packed: u64, port: u64) -> u64 {
     let ip = [
         ((ip_packed >> 24) & 0xFF) as u8,
@@ -58,6 +79,9 @@ pub fn syscall_tcp_connect(ip_packed: u64, port: u64) -> u64 {
         ((ip_packed >> 8) & 0xFF) as u8,
         (ip_packed & 0xFF) as u8,
     ];
+    let target_ip = IpAddress::Ipv4(Ipv4Address::new(ip[0], ip[1], ip[2], ip[3]));
+    let target_port = port as u16;
+    let current_task = crate::task::task::get_current_task();
 
     let mut guard = match NET_STATE.try_lock() {
         Some(g) => g,
@@ -76,36 +100,56 @@ pub fn syscall_tcp_connect(ip_packed: u64, port: u64) -> u64 {
 
     let mut slots = SLOTS.lock();
 
-    // Find a free slot or check existing connecting slot
-    let mut free_slot = None;
-    for (i, slot) in slots.iter_mut().enumerate() {
-        match slot.state {
-            SlotState::Connecting => {
-                // Check if connection completed
-                if let Some(h) = slot.handle {
-                    let socket = state.sockets.get_mut::<tcp::Socket>(h);
-                    if socket.may_send() {
-                        slot.state = SlotState::Connected;
-                        return i as u64;
-                    }
-                    if !socket.is_active() {
-                        // Connection failed
-                        state.sockets.remove(h);
-                        slot.state = SlotState::Free;
-                        slot.handle = None;
-                        return u64::MAX;
-                    }
-                    return EAGAIN; // still connecting
-                }
-            }
-            SlotState::Free if free_slot.is_none() => {
-                free_slot = Some(i);
-            }
-            _ => {}
+    // First pass: look for an existing slot owned by this task that
+    // targets (target_ip, target_port). Matches on the smoltcp
+    // socket's remote endpoint so multiple concurrent connections
+    // to different destinations don't step on each other.
+    for i in 0..MAX_ASYNC_SLOTS {
+        // Filter cheap fields before touching the smoltcp socket.
+        if slots[i].owner != current_task {
+            continue;
         }
+        if matches!(slots[i].state, SlotState::Free) {
+            continue;
+        }
+        let h = match slots[i].handle {
+            Some(h) => h,
+            None => continue,
+        };
+        // Endpoint check — immutable borrow of sockets, released
+        // before we re-borrow as mut below.
+        let matches_remote = {
+            let socket = state.sockets.get::<tcp::Socket>(h);
+            match socket.remote_endpoint() {
+                Some(ep) => ep.addr == target_ip && ep.port == target_port,
+                None => false,
+            }
+        };
+        if !matches_remote {
+            continue;
+        }
+        // Matching slot. Drive its state and return.
+        let socket = state.sockets.get_mut::<tcp::Socket>(h);
+        if socket.may_send() {
+            slots[i].state = SlotState::Connected;
+            return i as u64;
+        }
+        if !socket.is_active() {
+            // Handshake failed (timeout, RST) — clean up and signal
+            // the caller. They can retry by calling us again, which
+            // will allocate a fresh slot since the entry is now Free.
+            state.sockets.remove(h);
+            slots[i].state = SlotState::Free;
+            slots[i].handle = None;
+            return u64::MAX;
+        }
+        return EAGAIN;
     }
 
-    // Allocate new connection
+    // Second pass: no matching slot — allocate a fresh one from the
+    // first Free entry.
+    let free_slot = (0..MAX_ASYNC_SLOTS)
+        .find(|&i| matches!(slots[i].state, SlotState::Free));
     let slot_idx = match free_slot {
         Some(i) => i,
         None => return u64::MAX, // no free slots
@@ -116,22 +160,22 @@ pub fn syscall_tcp_connect(ip_packed: u64, port: u64) -> u64 {
     let tcp_socket = tcp::Socket::new(tcp_rx, tcp_tx);
     let tcp_handle = state.sockets.add(tcp_socket);
 
-    let remote = IpAddress::Ipv4(Ipv4Address::new(ip[0], ip[1], ip[2], ip[3]));
-
     // Enable interrupts for VirtIO-net
     unsafe { core::arch::asm!("sti"); }
 
     let socket = state.sockets.get_mut::<tcp::Socket>(tcp_handle);
-    if socket.connect(state.iface.context(), (remote, port as u16), next_port()).is_err() {
+    if socket.connect(state.iface.context(), (target_ip, target_port), next_port()).is_err() {
         state.sockets.remove(tcp_handle);
         return u64::MAX;
     }
 
     slots[slot_idx].state = SlotState::Connecting;
     slots[slot_idx].handle = Some(tcp_handle);
+    slots[slot_idx].owner = current_task;
 
     // Return slot_id immediately. Connection completes asynchronously.
-    // tcp_send will EAGAIN until the TCP handshake finishes.
+    // Subsequent polls on the same (ip, port) will return this slot
+    // until it's closed (or until a peer-side reset frees it).
     slot_idx as u64
 }
 
@@ -274,7 +318,34 @@ pub fn syscall_tcp_close(slot_id: u64) -> u64 {
         state.sockets.remove(h);
     }
     slot.state = SlotState::Free;
+    slot.owner = 0;
     0
+}
+
+/// Free every async TCP slot owned by `task_id`. Called from
+/// `syscall_exit` so a crashed or dying task doesn't leak slots —
+/// without this, after 4 exits of tasks that opened TCP connections
+/// the pool is exhausted and new `tcp_connect` calls fail.
+pub fn free_task_slots(task_id: u32) {
+    let mut guard = match NET_STATE.try_lock() {
+        Some(g) => g,
+        None => return, // best-effort — if net state is busy, skip
+    };
+    let state = match guard.as_mut() {
+        Some(s) => s,
+        None => return,
+    };
+    let mut slots = SLOTS.lock();
+    for slot in slots.iter_mut() {
+        if slot.owner != task_id { continue; }
+        if let Some(h) = slot.handle.take() {
+            let socket = state.sockets.get_mut::<tcp::Socket>(h);
+            socket.abort();
+            state.sockets.remove(h);
+        }
+        slot.state = SlotState::Free;
+        slot.owner = 0;
+    }
 }
 
 extern crate alloc;
