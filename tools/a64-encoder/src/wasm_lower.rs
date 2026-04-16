@@ -356,6 +356,13 @@ pub enum LowerError {
     /// `call_indirect` signature uses a param or result type the MVP
     /// marshalling doesn't support (today: f32/f64 params and results).
     IndirectTypeUnsupported,
+    /// `call` target has more than 8 integer parameters (beyond the
+    /// AAPCS64 integer arg-register band). Stack-passed args are a
+    /// follow-up.
+    CallArityUnsupported,
+    /// `call` signature uses a param or result type the MVP
+    /// marshalling doesn't support (today: f32/f64 params and results).
+    CallTypeUnsupported,
     /// An op expected a particular stack-top type but saw a different
     /// one — e.g. `i32.add` with an f32 on top, or `f32.add` with
     /// an i32 argument. Catches WASM validation errors the lowerer
@@ -507,6 +514,12 @@ pub struct Lowerer {
     /// Absolute addresses of callable functions, indexed by WASM
     /// function index. Empty when `Call` is not expected.
     call_targets: Vec<u64>,
+    /// Parallel signature list for `call_targets`. `call_sigs[i]` is
+    /// the AAPCS64-relevant signature of `call_targets[i]`. When the
+    /// list is shorter than `call_targets` (or empty), `lower_call`
+    /// treats missing entries as 0-arg / i32-return — preserves the
+    /// Phase 4A contract for existing callers that didn't know sigs.
+    call_sigs: Vec<FnSig>,
     /// True if `new_function` emitted a prologue; controls whether
     /// function-level `End` emits an epilogue (`LDP X29/X30` + RET)
     /// or just RET.
@@ -569,6 +582,7 @@ impl Lowerer {
             has_memory: false,
             table_base: None,
             indirect_sigs: Vec::new(),
+            call_sigs: Vec::new(),
         })
     }
 
@@ -669,6 +683,7 @@ impl Lowerer {
             has_memory: false,
             table_base: None,
             indirect_sigs: Vec::new(),
+            call_sigs: Vec::new(),
         })
     }
 
@@ -718,7 +733,25 @@ impl Lowerer {
             has_memory: true,
             table_base: None,
             indirect_sigs: Vec::new(),
+            call_sigs: Vec::new(),
         })
+    }
+
+    /// Attach AAPCS64 signatures for the direct-call targets. Must be
+    /// called after construction and before any `Call` op is lowered.
+    /// `sigs[i]` is the signature of `call_targets[i]`. Passing a
+    /// shorter list is allowed — entries beyond `sigs.len()` default
+    /// to 0-arg / i32-return for backward compatibility with the
+    /// Phase 4A callers who didn't know their helpers' sigs.
+    pub fn set_call_sigs(&mut self, sigs: Vec<FnSig>) {
+        self.call_sigs = sigs;
+    }
+
+    /// Builder-style variant of [`Self::set_call_sigs`]. Useful for
+    /// chaining off `new_function(...)?`.
+    pub fn with_call_sigs(mut self, sigs: Vec<FnSig>) -> Self {
+        self.call_sigs = sigs;
+        self
     }
 
     /// Build a lowerer for a function that uses `call_indirect`.
@@ -1759,49 +1792,119 @@ impl Lowerer {
         }
     }
 
+    /// Lower a direct `call funcidx`.
+    ///
+    /// AAPCS64 arg-marshalling: the signature (looked up in
+    /// `call_sigs[idx]`, defaulting to 0-arg/i32-return when absent)
+    /// tells us how many operand-stack slots to pop as args and which
+    /// target registers they land in. Staging through X9..X(8+N)
+    /// avoids clobbering AAPCS64 arg regs when the source-register
+    /// band overlaps the target band (which happens whenever the
+    /// stack has anything below the args).
+    ///
+    /// BLR clobbers all caller-saved registers (X0..X18 in the int
+    /// bank, V0..V7/V16..V31 in the FP bank) — any *live* slot below
+    /// the args is therefore logically destroyed by the call. The
+    /// lowerer does not save them; programs must be structured so
+    /// the stack at call time holds only the args. Compiled WASM
+    /// naturally respects this, which is why we don't enforce it.
     fn lower_call(&mut self, idx: u32) -> Result<(), LowerError> {
         let target = *self
             .call_targets
             .get(idx as usize)
             .ok_or(LowerError::CallTargetMissing)?;
+        // Signature lookup — fall back to 0-arg/i32-return for
+        // pre-sigs callers (Phase 4A helpers, the SSH-era tests).
+        let sig = self
+            .call_sigs
+            .get(idx as usize)
+            .cloned()
+            .unwrap_or(FnSig { params: Vec::new(), result: Some(ValType::I32) });
 
-        // Load the 64-bit absolute address into X16 (the AAPCS64
-        // intra-procedure-call scratch register). MOVZ + three
-        // MOVKs covers any 64-bit value; we always emit all four
-        // so the instruction sequence length is fixed — simpler
-        // than variable-length chains when we later add call-site
-        // patching.
+        // Only integer params supported — FP args would require
+        // dual-bank staging through V0..V7 per AAPCS64. Add when a
+        // test case needs it.
+        for p in &sig.params {
+            if !p.is_int() {
+                return Err(LowerError::CallTypeUnsupported);
+            }
+        }
+        let n_args = sig.params.len();
+        if n_args > 8 {
+            return Err(LowerError::CallArityUnsupported);
+        }
+
+        // Step 1: pop args in reverse order (top of stack = rightmost
+        // arg in WASM semantics). Record source register for each.
+        let mut arg_src: Vec<Reg> = Vec::with_capacity(n_args);
+        for p in sig.params.iter().rev() {
+            let src = match p {
+                ValType::I32 => self.pop_i32_slot()?,
+                ValType::I64 => self.pop_i64_slot()?,
+                _ => unreachable!("filtered above"),
+            };
+            arg_src.push(src);
+        }
+        arg_src.reverse();
+
+        // Step 2: synthesize the callee address into X16 (AAPCS64
+        // intra-procedure scratch). Constant MOVZ + up-to-three
+        // MOVKs covers any 64-bit value; emitting only the non-zero
+        // halves keeps the common case (low addresses) compact.
         let x16 = Reg::X16;
         self.enc.movz(x16, (target & 0xFFFF) as u16, MovShift::Lsl0)?;
         let h1 = ((target >> 16) & 0xFFFF) as u16;
-        if h1 != 0 {
-            self.enc.movk(x16, h1, MovShift::Lsl16)?;
-        }
+        if h1 != 0 { self.enc.movk(x16, h1, MovShift::Lsl16)?; }
         let h2 = ((target >> 32) & 0xFFFF) as u16;
-        if h2 != 0 {
-            self.enc.movk(x16, h2, MovShift::Lsl32)?;
-        }
+        if h2 != 0 { self.enc.movk(x16, h2, MovShift::Lsl32)?; }
         let h3 = ((target >> 48) & 0xFFFF) as u16;
-        if h3 != 0 {
-            self.enc.movk(x16, h3, MovShift::Lsl48)?;
+        if h3 != 0 { self.enc.movk(x16, h3, MovShift::Lsl48)?; }
+
+        // Step 3: stage args into X9..X(8+N), then copy to X0..X(N-1).
+        // The two-phase copy avoids clobbers when arg source regs
+        // alias target regs (e.g. arg 0 sits in X3, arg 1 in X4;
+        // naive order `mov X0, X3; mov X1, X4` is fine, but if arg
+        // 0 sat in X1 we'd overwrite it before reading arg 1's source
+        // if we did `mov X0, X1; mov X1, X?`). Using 64-bit MOV via
+        // `add Xd, XZR, Xn` preserves both i32 (upper bits already
+        // zero from our lowerer) and i64 args uniformly.
+        for (i, src) in arg_src.iter().enumerate() {
+            let scratch = Reg((9 + i) as u8);
+            self.enc.add(scratch, Reg::ZR, *src)?;
+        }
+        for i in 0..n_args {
+            let scratch = Reg((9 + i) as u8);
+            let target_reg = Reg(i as u8);
+            self.enc.add(target_reg, Reg::ZR, scratch)?;
         }
 
+        // Step 4: the call itself.
         self.enc.blr(x16)?;
 
-        // Callee's i32 result is in X0. Push a new stack slot that
-        // references it. If our stack bottom is currently X0 (depth
-        // 0), the result is already in place; otherwise we'd need a
-        // copy — but by design our stack allocates X0 first. If we
-        // push a slot at depth > 0, we need to move X0 to the new
-        // slot's register. For Phase 2.3 MVP we require the pre-call
-        // stack to be empty so X0 naturally holds the result.
-        if self.stack.len() != 0 {
-            // Copy X0 to the new slot register.
-            let dst = self.push_i32_slot()?;
-            self.enc.add(dst, Reg::ZR, Reg::X0)?;
-        } else {
-            // Fast path — X0 is already stack[0].
-            let _ = self.push_i32_slot()?;
+        // Step 5: push result slot per signature. Result arrives in
+        // X0 (i32 via W0 zero-extends, i64 via full X0). Moving to
+        // the push slot's register preserves int_depth convention.
+        match sig.result {
+            None => {}
+            Some(ValType::I32) => {
+                let dst = self.push_i32_slot()?;
+                if dst.0 != 0 {
+                    self.enc.and_w(dst, Reg::X0, Reg::X0)?;
+                } else {
+                    // Even when the push slot IS X0, run AND W to zero
+                    // the upper 32 bits — keeps i32-slot semantics
+                    // consistent regardless of what the callee left
+                    // in the high half of X0.
+                    self.enc.and_w(Reg::X0, Reg::X0, Reg::X0)?;
+                }
+            }
+            Some(ValType::I64) => {
+                let dst = self.push_i64_slot()?;
+                if dst.0 != 0 {
+                    self.enc.add(dst, Reg::ZR, Reg::X0)?;
+                }
+            }
+            Some(_) => return Err(LowerError::CallTypeUnsupported),
         }
         Ok(())
     }
@@ -2667,10 +2770,15 @@ mod tests {
         assert_eq!(words[3], 0xF2C24690);
         // Word 4: blr x16
         assert_eq!(words[4], 0xD63F0200);
-        // Word 5: epilogue LDP
-        assert_eq!(words[5], 0xA8C17BFD);
-        // Word 6: ret
-        assert_eq!(words[6], 0xD65F03C0);
+        // Word 5: and w0, w0, w0 — Phase 4A upper-32-bit mask on the
+        // i32 result slot (emitted even when push slot IS X0, to
+        // normalise whatever the callee left in the high half).
+        //   0x0A000000 (Rd=0, Rn=0, Rm=0).
+        assert_eq!(words[5], 0x0A000000);
+        // Word 6: epilogue LDP
+        assert_eq!(words[6], 0xA8C17BFD);
+        // Word 7: ret
+        assert_eq!(words[7], 0xD65F03C0);
     }
 
     #[test]
@@ -2685,12 +2793,11 @@ mod tests {
     #[test]
     fn call_high_addresses_emit_all_movk() {
         // Address with every halfword non-zero — confirms all 4
-        // MOVZ/MOVK slots are emitted (5 instructions total including
-        // BLR + 1 prologue word).
+        // MOVZ/MOVK slots are emitted.
         let addr: u64 = 0xDEAD_BEEF_CAFE_BABE;
         let mut lw = Lowerer::new_function(0, vec![addr]).unwrap();
         lw.lower_op(WasmOp::Call(0)).unwrap();
-        // Prologue (1) + MOVZ+3×MOVK (4) + BLR (1) = 6 words.
-        assert_eq!(lw.as_bytes().len(), 6 * 4);
+        // Prologue (1) + MOVZ+3×MOVK (4) + BLR (1) + AND W0 (1) = 7.
+        assert_eq!(lw.as_bytes().len(), 7 * 4);
     }
 }

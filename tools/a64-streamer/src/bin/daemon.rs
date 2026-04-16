@@ -54,6 +54,22 @@ mod unix {
         x * 2
     }
 
+    /// Two-argument helper — proves AAPCS64 pack into X0 + X1.
+    #[no_mangle]
+    #[inline(never)]
+    pub extern "C" fn helper_add(a: i32, b: i32) -> i32 {
+        a + b
+    }
+
+    /// Three-argument helper — proves pack into X0, X1, X2.
+    /// Computes `a * b + c` so no two output values alias a simple
+    /// re-ordering of inputs (catches mistyped arg indexes).
+    #[no_mangle]
+    #[inline(never)]
+    pub extern "C" fn helper_linear(a: i32, b: i32, c: i32) -> i32 {
+        a * b + c
+    }
+
     // ── Linear-memory buffer ────────────────────────────────────────
     //
     // 64 KiB, aligned to 8 so i64.store offsets are well-formed.
@@ -148,6 +164,14 @@ mod unix {
                 Helper {
                     name: "helper_multiply_two".into(),
                     addr: helper_multiply_two as u64,
+                },
+                Helper {
+                    name: "helper_add".into(),
+                    addr: helper_add as u64,
+                },
+                Helper {
+                    name: "helper_linear".into(),
+                    addr: helper_linear as u64,
                 },
             ],
         };
@@ -285,6 +309,14 @@ mod unix {
         eprintln!(
             "[daemon] helper_multiply_two  = 0x{:016x}",
             helper_multiply_two as u64
+        );
+        eprintln!(
+            "[daemon] helper_add           = 0x{:016x}",
+            helper_add as u64
+        );
+        eprintln!(
+            "[daemon] helper_linear        = 0x{:016x}",
+            helper_linear as u64
         );
 
         for incoming in listener.incoming() {

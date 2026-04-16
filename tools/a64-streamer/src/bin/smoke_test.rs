@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::net::TcpStream;
 
-use a64_encoder::{Lowerer, WasmOp};
+use a64_encoder::{FnSig, Lowerer, ValType, WasmOp};
 use a64_streamer::{
     parse_hello, parse_result, read_frame, serialize_data, write_frame, DEFAULT_PORT, FRAME_BYE,
     FRAME_CODE, FRAME_DATA, FRAME_EXEC, FRAME_HELLO, FRAME_RESULT,
@@ -72,6 +72,28 @@ fn main() {
     let ret_42 = *helpers
         .get("helper_return_42")
         .expect("daemon must expose helper_return_42");
+    let add_five = *helpers
+        .get("helper_add_five")
+        .expect("daemon must expose helper_add_five");
+    let add = *helpers
+        .get("helper_add")
+        .expect("daemon must expose helper_add (2-arg)");
+    let linear = *helpers
+        .get("helper_linear")
+        .expect("daemon must expose helper_linear (3-arg)");
+
+    // Signatures for the helpers we'll be calling. Indexed per
+    // call-target slot in each Lowerer — order matters.
+    let sig_noarg = FnSig { params: vec![], result: Some(ValType::I32) };
+    let sig_1i32 = FnSig { params: vec![ValType::I32], result: Some(ValType::I32) };
+    let sig_2i32 = FnSig {
+        params: vec![ValType::I32, ValType::I32],
+        result: Some(ValType::I32),
+    };
+    let sig_3i32 = FnSig {
+        params: vec![ValType::I32, ValType::I32, ValType::I32],
+        result: Some(ValType::I32),
+    };
 
     let mut passed = 0;
     let mut failed = 0;
@@ -106,7 +128,9 @@ fn main() {
     }
     // Also prove Call(0) to a 0-arg helper works through the link.
     {
-        let mut lw = Lowerer::new_function(0, vec![ret_42]).unwrap();
+        let mut lw = Lowerer::new_function(0, vec![ret_42])
+            .unwrap()
+            .with_call_sigs(vec![sig_noarg.clone()]);
         lw.lower_all(&[WasmOp::Call(0), WasmOp::End]).unwrap();
         let bytes = lw.finish();
         let rv = send_code_and_exec(&mut sock, &bytes);
@@ -114,6 +138,130 @@ fn main() {
             "0-arg helper via BLR through TCP → 42",
             rv,
             42,
+            &mut passed,
+            &mut failed,
+        );
+    }
+
+    // ── Case 3: 1-arg helper — proves X0 packing ──────────────────
+    {
+        let mut lw = Lowerer::new_function(0, vec![add_five])
+            .unwrap()
+            .with_call_sigs(vec![sig_1i32.clone()]);
+        lw.lower_all(&[
+            WasmOp::I32Const(37),
+            WasmOp::Call(0),
+            WasmOp::End,
+        ])
+        .unwrap();
+        let bytes = lw.finish();
+        let rv = send_code_and_exec(&mut sock, &bytes);
+        report(
+            "1-arg helper_add_five(37) → 42",
+            rv,
+            42,
+            &mut passed,
+            &mut failed,
+        );
+    }
+
+    // ── Case 4: 2-arg helper — proves X0 + X1 packing ─────────────
+    {
+        let mut lw = Lowerer::new_function(0, vec![add])
+            .unwrap()
+            .with_call_sigs(vec![sig_2i32.clone()]);
+        lw.lower_all(&[
+            WasmOp::I32Const(17),
+            WasmOp::I32Const(25),
+            WasmOp::Call(0),
+            WasmOp::End,
+        ])
+        .unwrap();
+        let bytes = lw.finish();
+        let rv = send_code_and_exec(&mut sock, &bytes);
+        report(
+            "2-arg helper_add(17, 25) → 42",
+            rv,
+            42,
+            &mut passed,
+            &mut failed,
+        );
+    }
+
+    // ── Case 5: 3-arg helper — proves X0 + X1 + X2 packing ────────
+    //
+    // helper_linear(a, b, c) = a*b + c; choosing args where no two
+    // permutations give the same answer catches mis-indexed regs:
+    //   linear(5, 6, 12) = 42
+    //   linear(6, 5, 12) = 42  ← commutative, still 42 (bad case!)
+    //   linear(12, 5, 6) = 66  ← different → test distinguishes
+    // So also assert that linear(12, 5, 6) gives 66, not 42.
+    {
+        let mut lw = Lowerer::new_function(0, vec![linear])
+            .unwrap()
+            .with_call_sigs(vec![sig_3i32.clone()]);
+        lw.lower_all(&[
+            WasmOp::I32Const(5),
+            WasmOp::I32Const(6),
+            WasmOp::I32Const(12),
+            WasmOp::Call(0),
+            WasmOp::End,
+        ])
+        .unwrap();
+        let bytes = lw.finish();
+        let rv = send_code_and_exec(&mut sock, &bytes);
+        report(
+            "3-arg helper_linear(5, 6, 12) → 42",
+            rv,
+            42,
+            &mut passed,
+            &mut failed,
+        );
+    }
+    // Same helper, reordered args — proves X0/X1/X2 aren't shuffled.
+    {
+        let mut lw = Lowerer::new_function(0, vec![linear])
+            .unwrap()
+            .with_call_sigs(vec![sig_3i32.clone()]);
+        lw.lower_all(&[
+            WasmOp::I32Const(12),
+            WasmOp::I32Const(5),
+            WasmOp::I32Const(6),
+            WasmOp::Call(0),
+            WasmOp::End,
+        ])
+        .unwrap();
+        let bytes = lw.finish();
+        let rv = send_code_and_exec(&mut sock, &bytes);
+        report(
+            "3-arg helper_linear(12, 5, 6) → 66 (order-sensitive)",
+            rv,
+            66,
+            &mut passed,
+            &mut failed,
+        );
+    }
+
+    // ── Case 6: compose — use the result of one call in another ──
+    // add(add_five(10), 7) = add(15, 7) = 22
+    {
+        let mut lw = Lowerer::new_function(0, vec![add_five, add])
+            .unwrap()
+            .with_call_sigs(vec![sig_1i32.clone(), sig_2i32.clone()]);
+        lw.lower_all(&[
+            WasmOp::I32Const(10),
+            WasmOp::Call(0),     // add_five(10) → 15; leaves 15 on stack
+            WasmOp::I32Const(7),
+            WasmOp::Call(1),     // add(15, 7) → 22
+            WasmOp::End,
+        ])
+        .unwrap();
+        let bytes = lw.finish();
+        let rv = send_code_and_exec(&mut sock, &bytes);
+        report(
+            "compose: add(add_five(10), 7) → 22",
+            rv,
+            22,
             &mut passed,
             &mut failed,
         );
