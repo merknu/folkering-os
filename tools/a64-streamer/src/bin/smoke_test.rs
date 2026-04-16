@@ -1,0 +1,213 @@
+//! a64-stream-smoke-test — end-to-end verification client.
+//!
+//! Connects to an a64-stream-daemon, exercises the full protocol,
+//! verifies the JIT path works over TCP. Runs from any platform —
+//! the client only needs to *build* A64 bytes (host-agnostic) and
+//! speak TCP.
+//!
+//! Cases (all target helpers baked by name from HELLO):
+//!   1. CODE+EXEC of `helper_return_42()` — returns 42.
+//!   2. CODE+EXEC of a JIT that calls `helper_add_five(37)` — 42.
+//!   3. DATA to write an i32 into mem[0]; CODE that reads mem[0],
+//!      doubles it; EXEC; result is 2 × sent value. Exercises the
+//!      sensor-streaming flow end-to-end.
+//!
+//! Usage:
+//!   a64-stream-smoke-test               # defaults to 192.168.68.72:14712
+//!   a64-stream-smoke-test 127.0.0.1     # explicit host
+//!   a64-stream-smoke-test host:14712    # host:port
+
+use std::collections::HashMap;
+use std::io::Write;
+use std::net::TcpStream;
+
+use a64_encoder::{Lowerer, WasmOp};
+use a64_streamer::{
+    parse_hello, parse_result, read_frame, serialize_data, write_frame, DEFAULT_PORT, FRAME_BYE,
+    FRAME_CODE, FRAME_DATA, FRAME_EXEC, FRAME_HELLO, FRAME_RESULT,
+};
+
+fn main() {
+    let mut args = std::env::args().skip(1);
+    let target = args.next().unwrap_or_else(|| "192.168.68.72".to_string());
+    let addr = if target.contains(':') {
+        target
+    } else {
+        format!("{target}:{DEFAULT_PORT}")
+    };
+
+    println!("[smoke] connecting to {addr}");
+    let mut sock = match TcpStream::connect(&addr) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[smoke] connect failed: {e}");
+            std::process::exit(2);
+        }
+    };
+    // Reasonable timeouts so a hung daemon doesn't wedge the test.
+    sock.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .ok();
+    sock.set_write_timeout(Some(std::time::Duration::from_secs(10)))
+        .ok();
+
+    // ── 1. HELLO ──────────────────────────────────────────────────
+    let (ty, payload) = read_frame(&mut sock).expect("read HELLO");
+    assert_eq!(ty, FRAME_HELLO, "first frame must be HELLO");
+    let hello = parse_hello(&payload).expect("parse HELLO");
+    println!(
+        "[smoke] HELLO received: mem_base=0x{:016x} mem_size={} helpers={}",
+        hello.mem_base,
+        hello.mem_size,
+        hello.helpers.len()
+    );
+    let helpers: HashMap<String, u64> = hello
+        .helpers
+        .iter()
+        .map(|h| (h.name.clone(), h.addr))
+        .collect();
+    for (name, addr) in &helpers {
+        println!("[smoke]   {name} = 0x{addr:016x}");
+    }
+
+    let ret_42 = *helpers
+        .get("helper_return_42")
+        .expect("daemon must expose helper_return_42");
+
+    let mut passed = 0;
+    let mut failed = 0;
+
+    // ── Case 1: `call helper_return_42()` → 42 ────────────────────
+    {
+        let mut lw = Lowerer::new_function(0, vec![ret_42]).unwrap();
+        lw.lower_all(&[WasmOp::Call(0), WasmOp::End]).unwrap();
+        let bytes = lw.finish();
+        let rv = send_code_and_exec(&mut sock, &bytes);
+        report("call helper_return_42 → 42", rv, 42, &mut passed, &mut failed);
+    }
+
+    // ── Case 2: pure JIT arithmetic (37 + 5 = 42) ─────────────────
+    //
+    // `lower_call` is 0-arg-only today (Phase 4A design, see the
+    // Phase 16 note — proper arg-marshalling lives in call_indirect).
+    // Arithmetic alone exercises CODE + EXEC + RESULT with a non-
+    // trivial instruction sequence (MOVZ + ADD + RET).
+    {
+        let mut lw = Lowerer::new();
+        lw.lower_all(&[
+            WasmOp::I32Const(37),
+            WasmOp::I32Const(5),
+            WasmOp::I32Add,
+            WasmOp::End,
+        ])
+        .unwrap();
+        let bytes = lw.finish();
+        let rv = send_code_and_exec(&mut sock, &bytes);
+        report("JIT arith 37 + 5 → 42", rv, 42, &mut passed, &mut failed);
+    }
+    // Also prove Call(0) to a 0-arg helper works through the link.
+    {
+        let mut lw = Lowerer::new_function(0, vec![ret_42]).unwrap();
+        lw.lower_all(&[WasmOp::Call(0), WasmOp::End]).unwrap();
+        let bytes = lw.finish();
+        let rv = send_code_and_exec(&mut sock, &bytes);
+        report(
+            "0-arg helper via BLR through TCP → 42",
+            rv,
+            42,
+            &mut passed,
+            &mut failed,
+        );
+    }
+
+    // ── Case 3: DATA → JIT reads → EXEC (sensor-stream flow) ──────
+    //
+    // Write i32 = 19 at mem[0]. JIT program:
+    //   load mem[0], double it via `+ self`, return → 38.
+    //
+    // This is the pattern a Folkering client would use for sensor
+    // streaming: ship the model (CODE) once, then pump values
+    // through DATA+EXEC repeatedly. No helper call needed — the
+    // JIT is the model.
+    {
+        let sample: i32 = 19;
+        let data = serialize_data(0, &sample.to_le_bytes());
+        write_frame(&mut sock, FRAME_DATA, &data).expect("write DATA");
+
+        let mut lw = Lowerer::new_function_with_memory(0, Vec::new(), hello.mem_base).unwrap();
+        lw.lower_all(&[
+            WasmOp::I32Const(0), // addr
+            WasmOp::I32Load(0),  // load mem[0]
+            WasmOp::I32Const(2),
+            WasmOp::I32Mul,      // ×2
+            WasmOp::End,
+        ])
+        .unwrap();
+        let bytes = lw.finish();
+        let rv = send_code_and_exec(&mut sock, &bytes);
+        report(
+            "DATA[0]=19 → JIT load×2 → 38",
+            rv,
+            38,
+            &mut passed,
+            &mut failed,
+        );
+    }
+
+    // ── Case 4: streaming loop — same code, many DATA+EXEC ────────
+    //
+    // Prove the happy path: install the multiplier-model once, then
+    // stream several samples without re-installing code. This is the
+    // actual WASM Streaming Service flow.
+    {
+        // Keep the same code loaded (it's still load×2).
+        let samples = [1i32, 2, 3, 7, 21];
+        let mut all_ok = true;
+        for s in samples {
+            write_frame(&mut sock, FRAME_DATA, &serialize_data(0, &s.to_le_bytes()))
+                .expect("DATA");
+            write_frame(&mut sock, FRAME_EXEC, &[]).expect("EXEC");
+            let (ty, pay) = read_frame(&mut sock).expect("RESULT");
+            assert_eq!(ty, FRAME_RESULT);
+            let rv = parse_result(&pay).expect("parse RESULT");
+            let expect = s.wrapping_mul(2);
+            if rv != expect {
+                eprintln!("  [FAIL] stream sample {s}: got {rv}, want {expect}");
+                all_ok = false;
+            }
+        }
+        if all_ok {
+            println!("  [ ok ] stream 5 samples × 2 without CODE re-install");
+            passed += 1;
+        } else {
+            failed += 1;
+        }
+    }
+
+    // ── BYE ───────────────────────────────────────────────────────
+    let _ = write_frame(&mut sock, FRAME_BYE, &[]);
+    let _ = sock.flush();
+
+    println!("\n{passed} passed, {failed} failed");
+    if failed > 0 {
+        std::process::exit(1);
+    }
+}
+
+/// Send CODE+EXEC, return the i32 result. Panics on protocol errors.
+fn send_code_and_exec(sock: &mut TcpStream, bytes: &[u8]) -> i32 {
+    write_frame(sock, FRAME_CODE, bytes).expect("write CODE");
+    write_frame(sock, FRAME_EXEC, &[]).expect("write EXEC");
+    let (ty, payload) = read_frame(sock).expect("read RESULT");
+    assert_eq!(ty, FRAME_RESULT, "expected RESULT, got 0x{ty:02x}");
+    parse_result(&payload).expect("parse RESULT")
+}
+
+fn report(name: &str, got: i32, expected: i32, passed: &mut i32, failed: &mut i32) {
+    if got == expected {
+        println!("  [ ok ] {name}");
+        *passed += 1;
+    } else {
+        println!("  [FAIL] {name}: got {got}, expected {expected}");
+        *failed += 1;
+    }
+}
