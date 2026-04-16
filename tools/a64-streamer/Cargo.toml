@@ -16,6 +16,10 @@ path = "src/bin/daemon.rs"
 name = "a64-stream-smoke-test"
 path = "src/bin/smoke_test.rs"
 
+[[bin]]
+name = "a64-stream-relay"
+path = "src/bin/relay.rs"
+
 [dependencies]
 libc = "0.2"
 a64-encoder = { path = "../a64-encoder" }
