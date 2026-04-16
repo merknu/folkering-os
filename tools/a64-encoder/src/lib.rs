@@ -280,6 +280,57 @@ impl Encoder {
         Ok(())
     }
 
+    /// AND Wd, Wn, Wm — 32-bit bitwise AND.
+    ///
+    /// Encoding (C6.2.13, sf=0): `0 00 01010 00 0 Rm(5) 000000 Rn(5) Rd(5)`.
+    /// Base 0x0A000000.  Matches WASM i32.and semantics exactly (upper
+    /// 32 bits of the hosting X register are written as zero).
+    pub fn and_w(&mut self, rd: Reg, rn: Reg, rm: Reg) -> Result<(), EncodeError> {
+        self.emit(0x0A00_0000u32 | (rm.enc() << 16) | (rn.enc() << 5) | rd.enc());
+        Ok(())
+    }
+
+    /// ORR Wd, Wn, Wm — 32-bit bitwise OR. Encoding C6.2.222, sf=0,
+    /// base 0x2A000000.
+    pub fn orr_w(&mut self, rd: Reg, rn: Reg, rm: Reg) -> Result<(), EncodeError> {
+        self.emit(0x2A00_0000u32 | (rm.enc() << 16) | (rn.enc() << 5) | rd.enc());
+        Ok(())
+    }
+
+    /// EOR Wd, Wn, Wm — 32-bit bitwise XOR. Encoding C6.2.90, sf=0,
+    /// base 0x4A000000.  WASM's `i32.xor`.
+    pub fn eor_w(&mut self, rd: Reg, rn: Reg, rm: Reg) -> Result<(), EncodeError> {
+        self.emit(0x4A00_0000u32 | (rm.enc() << 16) | (rn.enc() << 5) | rd.enc());
+        Ok(())
+    }
+
+    /// LSL Wd, Wn, Wm — 32-bit logical shift left by register.
+    ///
+    /// This is the LSLV form (variable-register shift), not the
+    /// shift-by-immediate form. 32-bit variant uses the low 5 bits
+    /// of Wm as the shift amount, matching WASM `i32.shl`'s
+    /// "shift count mod 32" semantics.
+    ///
+    /// Encoding (C6.2.155, sf=0): base 0x1AC02000.
+    pub fn lsl_w(&mut self, rd: Reg, rn: Reg, rm: Reg) -> Result<(), EncodeError> {
+        self.emit(0x1AC0_2000u32 | (rm.enc() << 16) | (rn.enc() << 5) | rd.enc());
+        Ok(())
+    }
+
+    /// LSR Wd, Wn, Wm — 32-bit logical shift right (zero-fill).
+    /// WASM `i32.shr_u`. Encoding C6.2.161, sf=0, base 0x1AC02400.
+    pub fn lsr_w(&mut self, rd: Reg, rn: Reg, rm: Reg) -> Result<(), EncodeError> {
+        self.emit(0x1AC0_2400u32 | (rm.enc() << 16) | (rn.enc() << 5) | rd.enc());
+        Ok(())
+    }
+
+    /// ASR Wd, Wn, Wm — 32-bit arithmetic shift right (sign-fill).
+    /// WASM `i32.shr_s`. Encoding C6.2.17, sf=0, base 0x1AC02800.
+    pub fn asr_w(&mut self, rd: Reg, rn: Reg, rm: Reg) -> Result<(), EncodeError> {
+        self.emit(0x1AC0_2800u32 | (rm.enc() << 16) | (rn.enc() << 5) | rd.enc());
+        Ok(())
+    }
+
     /// CMP Wn, Wm — 32-bit compare (alias for `SUBS WZR, Wn, Wm`).
     ///
     /// Subtracts Wm from Wn on the low 32 bits and updates the NZCV
@@ -846,6 +897,44 @@ mod tests {
     }
 
     // ── Phase 5 comparisons ─────────────────────────────────────────
+
+    // ── Phase 8 bitops ──────────────────────────────────────────────
+
+    #[test]
+    fn and_w_basic() {
+        // and w0, w0, w1  →  0a010000
+        assert_eq!(one(|e| e.and_w(Reg::X0, Reg::X0, Reg::X1)), 0x0A010000);
+    }
+
+    #[test]
+    fn orr_w_basic() {
+        // orr w0, w0, w1  →  2a010000
+        assert_eq!(one(|e| e.orr_w(Reg::X0, Reg::X0, Reg::X1)), 0x2A010000);
+    }
+
+    #[test]
+    fn eor_w_basic() {
+        // eor w0, w0, w1  →  4a010000
+        assert_eq!(one(|e| e.eor_w(Reg::X0, Reg::X0, Reg::X1)), 0x4A010000);
+    }
+
+    #[test]
+    fn lsl_w_basic() {
+        // lsl w0, w0, w1  →  1ac12000
+        assert_eq!(one(|e| e.lsl_w(Reg::X0, Reg::X0, Reg::X1)), 0x1AC12000);
+    }
+
+    #[test]
+    fn lsr_w_basic() {
+        // lsr w0, w0, w1  →  1ac12400
+        assert_eq!(one(|e| e.lsr_w(Reg::X0, Reg::X0, Reg::X1)), 0x1AC12400);
+    }
+
+    #[test]
+    fn asr_w_basic() {
+        // asr w0, w0, w1  →  1ac12800
+        assert_eq!(one(|e| e.asr_w(Reg::X0, Reg::X0, Reg::X1)), 0x1AC12800);
+    }
 
     #[test]
     fn cmp_w_x0_x1() {

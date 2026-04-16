@@ -161,6 +161,12 @@ pub fn parse_ops(bytes: &[u8], pos: &mut usize) -> Result<Vec<WasmOp>, ParseErro
             0x6C => ops.push(WasmOp::I32Mul),
             0x6D => ops.push(WasmOp::I32DivS),
             0x6E => ops.push(WasmOp::I32DivU),
+            0x71 => ops.push(WasmOp::I32And),
+            0x72 => ops.push(WasmOp::I32Or),
+            0x73 => ops.push(WasmOp::I32Xor),
+            0x74 => ops.push(WasmOp::I32Shl),
+            0x75 => ops.push(WasmOp::I32ShrS),
+            0x76 => ops.push(WasmOp::I32ShrU),
             _ => return Err(ParseError::UnknownOpcode(opcode)),
         }
     }

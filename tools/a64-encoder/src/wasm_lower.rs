@@ -80,6 +80,18 @@ pub enum WasmOp {
     /// Pop one, push 1 if value is zero else 0. Unary version of
     /// `I32Eq` with implicit zero right-hand side.
     I32Eqz,
+    /// Pop two, push bitwise AND.
+    I32And,
+    /// Pop two, push bitwise OR.
+    I32Or,
+    /// Pop two, push bitwise XOR.
+    I32Xor,
+    /// Pop two, push `left << (right mod 32)`.
+    I32Shl,
+    /// Pop two, push `left >> (right mod 32)` — signed (sign-fill).
+    I32ShrS,
+    /// Pop two, push `left >> (right mod 32)` — unsigned (zero-fill).
+    I32ShrU,
     /// Copy local `n` onto the stack.
     LocalGet(u32),
     /// Pop stack top, store into local `n`.
@@ -169,6 +181,7 @@ impl From<EncodeError> for LowerError {
 #[derive(Clone, Copy)]
 enum BinOp {
     Add, Sub, Mul, DivS, DivU,
+    And, Or, Xor, Shl, ShrS, ShrU,
     /// Comparison op — the inner Condition is the "result is true"
     /// predicate (e.g. `Cmp(Eq)` sets result=1 when operands equal).
     Cmp(Condition),
@@ -386,6 +399,12 @@ impl Lowerer {
             WasmOp::I32LeU  => self.lower_binop(BinOp::Cmp(Condition::Ls)),
             WasmOp::I32GeU  => self.lower_binop(BinOp::Cmp(Condition::Hs)),
             WasmOp::I32Eqz  => self.lower_eqz(),
+            WasmOp::I32And  => self.lower_binop(BinOp::And),
+            WasmOp::I32Or   => self.lower_binop(BinOp::Or),
+            WasmOp::I32Xor  => self.lower_binop(BinOp::Xor),
+            WasmOp::I32Shl  => self.lower_binop(BinOp::Shl),
+            WasmOp::I32ShrS => self.lower_binop(BinOp::ShrS),
+            WasmOp::I32ShrU => self.lower_binop(BinOp::ShrU),
             WasmOp::LocalGet(i) => self.lower_local_get(i),
             WasmOp::LocalSet(i) => self.lower_local_set(i),
             WasmOp::Block => self.lower_block(),
@@ -491,6 +510,17 @@ impl Lowerer {
             BinOp::Mul  => self.enc.mul(dst, lhs, rhs)?,
             BinOp::DivS => self.enc.sdiv(dst, lhs, rhs)?,
             BinOp::DivU => self.enc.udiv(dst, lhs, rhs)?,
+            // Bitops use 32-bit W-variants so WASM i32 semantics
+            // hold exactly (shifts mod 32, not mod 64, etc). The
+            // 32-bit form zero-writes the upper 32 of the hosting
+            // X register — consistent with how MOVZ/MOVK fill in
+            // our constant lowering.
+            BinOp::And  => self.enc.and_w(dst, lhs, rhs)?,
+            BinOp::Or   => self.enc.orr_w(dst, lhs, rhs)?,
+            BinOp::Xor  => self.enc.eor_w(dst, lhs, rhs)?,
+            BinOp::Shl  => self.enc.lsl_w(dst, lhs, rhs)?,
+            BinOp::ShrS => self.enc.asr_w(dst, lhs, rhs)?,
+            BinOp::ShrU => self.enc.lsr_w(dst, lhs, rhs)?,
             // 32-bit compare: use CMP W (low 32 bits) so i32-semantic
             // comparisons ignore any upper-bit residue left by prior
             // arithmetic. CSET converts the flag result into 0 or 1.
