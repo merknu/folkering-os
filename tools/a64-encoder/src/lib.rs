@@ -1317,6 +1317,43 @@ impl Encoder {
         Ok(())
     }
 
+    /// CSEL Xd, Xn, Xm, cond — conditional select (64-bit).
+    /// Rd = cond ? Rn : Rm.
+    /// Encoding: `1 0011010100 Rm(5) cond(4) 00 Rn(5) Rd(5)`.
+    pub fn csel(&mut self, rd: Reg, rn: Reg, rm: Reg, cond: Condition) -> Result<(), EncodeError> {
+        let word = 0x9A80_0000u32
+            | (rm.enc() << 16)
+            | ((cond as u32) << 12)
+            | (rn.enc() << 5)
+            | rd.enc();
+        self.emit(word);
+        Ok(())
+    }
+
+    /// FCSEL Sd, Sn, Sm, cond — conditional select (single-precision).
+    /// Encoding: `0 00 11110 00 1 Sm(5) cond(4) 11 Sn(5) Sd(5)`.
+    pub fn fcsel_s(&mut self, sd: Vreg, sn: Vreg, sm: Vreg, cond: Condition) -> Result<(), EncodeError> {
+        let word = 0x1E20_0C00u32
+            | (sm.enc() << 16)
+            | ((cond as u32) << 12)
+            | (sn.enc() << 5)
+            | sd.enc();
+        self.emit(word);
+        Ok(())
+    }
+
+    /// FCSEL Dd, Dn, Dm, cond — conditional select (double-precision).
+    /// Encoding: `0 00 11110 01 1 Dm(5) cond(4) 11 Dn(5) Dd(5)`.
+    pub fn fcsel_d(&mut self, dd: Vreg, dn: Vreg, dm: Vreg, cond: Condition) -> Result<(), EncodeError> {
+        let word = 0x1E60_0C00u32
+            | (dm.enc() << 16)
+            | ((cond as u32) << 12)
+            | (dn.enc() << 5)
+            | dd.enc();
+        self.emit(word);
+        Ok(())
+    }
+
     /// UDIV Xd, Xn, Xm — unsigned 64-bit divide.
     ///
     /// Encoding (C6.2.351): `1 0011010110 Rm(5) 000010 Rn(5) Rd(5)`.

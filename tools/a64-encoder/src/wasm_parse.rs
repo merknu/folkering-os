@@ -126,6 +126,12 @@ pub fn parse_ops(bytes: &[u8], pos: &mut usize) -> Result<Vec<WasmOp>, ParseErro
             0x0F => {
                 ops.push(WasmOp::Return);
             }
+            0x1A => {
+                ops.push(WasmOp::Drop);
+            }
+            0x1B => {
+                ops.push(WasmOp::Select);
+            }
             0x20 => {
                 let idx = read_uleb128(bytes, pos)?;
                 if idx > u32::MAX as u64 { return Err(ParseError::IntegerTooLarge); }
@@ -135,6 +141,11 @@ pub fn parse_ops(bytes: &[u8], pos: &mut usize) -> Result<Vec<WasmOp>, ParseErro
                 let idx = read_uleb128(bytes, pos)?;
                 if idx > u32::MAX as u64 { return Err(ParseError::IntegerTooLarge); }
                 ops.push(WasmOp::LocalSet(idx as u32));
+            }
+            0x22 => {
+                let idx = read_uleb128(bytes, pos)?;
+                if idx > u32::MAX as u64 { return Err(ParseError::IntegerTooLarge); }
+                ops.push(WasmOp::LocalTee(idx as u32));
             }
             0x41 => {
                 let v = read_sleb128(bytes, pos)?;
@@ -694,5 +705,31 @@ mod tests {
                 0xC0, 0x03, 0x5F, 0xD6, // ret
             ]
         );
+    }
+
+    #[test]
+    fn parse_drop_select_local_tee() {
+        // i32.const 10 ; i32.const 20 ; i32.const 1 ; select ; local.tee 0 ; drop ; end
+        // 0x41 0x0A 0x41 0x14 0x41 0x01 0x1B 0x22 0x00 0x1A 0x0B
+        let ops = parse_function_body(&[
+            0x41, 0x0A,  // i32.const 10
+            0x41, 0x14,  // i32.const 20
+            0x41, 0x01,  // i32.const 1
+            0x1B,        // select
+            0x22, 0x00,  // local.tee 0
+            0x1A,        // drop
+            0x41, 0x00,  // i32.const 0 (for End balance)
+            0x0B,        // end
+        ]).unwrap();
+        assert_eq!(ops, vec![
+            WasmOp::I32Const(10),
+            WasmOp::I32Const(20),
+            WasmOp::I32Const(1),
+            WasmOp::Select,
+            WasmOp::LocalTee(0),
+            WasmOp::Drop,
+            WasmOp::I32Const(0),
+            WasmOp::End,
+        ]);
     }
 }

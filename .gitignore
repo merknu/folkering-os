@@ -44,6 +44,7 @@ boot/phase*.txt
 .env
 *.env
 api_keys.txt
+secret.key
 
 # Python
 __pycache__/
