@@ -285,7 +285,10 @@ pub(super) const MAX_FP_SPILL: usize = 8;
 pub(super) const FP_SPILL_SLOT_BYTES: u32 = 16;
 pub(super) const FP_SPILL_AREA_BYTES: u32 = (MAX_FP_SPILL as u32) * FP_SPILL_SLOT_BYTES;
 pub const MAX_I32_LOCALS: usize = 9;
-pub const MAX_F32_LOCALS: usize = 8;
+// F32 locals occupy V16..V(16+MAX-1). V0..V15 are operand-stack
+// slots, V30/V31 are FP_SPILL_SCRATCH_{A,B}, so the largest safe
+// upper bound is V29 ⇒ 14 local slots.
+pub const MAX_F32_LOCALS: usize = 14;
 pub const MAX_LOCALS: usize = MAX_I32_LOCALS;
 pub(super) const LOCAL_I32_BASE_REG: u8 = 19;
 pub(super) const LOCAL_F32_BASE_REG: u8 = 16;
