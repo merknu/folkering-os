@@ -440,24 +440,30 @@ mod unix {
                     }
                 },
                 FRAME_EXEC => match code.as_ref() {
-                    Some(m) => match exec_with_timeout(m.as_fn()) {
-                        Ok(rv) => {
-                            if write_frame(&mut stream, FRAME_RESULT, &serialize_result(rv))
-                                .is_err()
-                            {
-                                return;
+                    Some(m) => {
+                        let t_exec = std::time::Instant::now();
+                        let result = exec_with_timeout(m.as_fn());
+                        let exec_us = t_exec.elapsed().as_micros();
+                        match result {
+                            Ok(rv) => {
+                                eprintln!("[exec] {} us", exec_us);
+                                if write_frame(&mut stream, FRAME_RESULT, &serialize_result(rv))
+                                    .is_err()
+                                {
+                                    return;
+                                }
                             }
-                        }
-                        Err(reason) => {
-                            eprintln!("[daemon] EXEC aborted: {reason}");
-                            let _ = write_frame(
-                                &mut stream,
-                                FRAME_ERROR,
-                                &serialize_error(
-                                    8,
-                                    &format!("EXEC aborted: {reason}"),
-                                ),
-                            );
+                            Err(reason) => {
+                                eprintln!("[daemon] EXEC aborted: {reason}");
+                                let _ = write_frame(
+                                    &mut stream,
+                                    FRAME_ERROR,
+                                    &serialize_error(
+                                        8,
+                                        &format!("EXEC aborted: {reason}"),
+                                    ),
+                                );
+                            }
                         }
                     },
                     None => {
@@ -528,6 +534,14 @@ mod unix {
         for incoming in listener.incoming() {
             match incoming {
                 Ok(stream) => {
+                    // TCP_NODELAY disables Nagle. Without this each
+                    // small frame (EXEC=5 B, RESULT=9 B) waits up to
+                    // ~200 ms in the kernel for batching, which made
+                    // streaming inference look like 10 ops/sec when
+                    // the underlying compute ran in microseconds.
+                    if let Err(e) = stream.set_nodelay(true) {
+                        eprintln!("[daemon] set_nodelay failed: {e}");
+                    }
                     if let Ok(peer) = stream.peer_addr() {
                         eprintln!("[daemon] accepted {peer}");
                     }

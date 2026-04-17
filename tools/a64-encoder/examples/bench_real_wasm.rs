@@ -136,6 +136,7 @@ fn main() {
     let mut sock = TcpStream::connect(&addr).expect("connect");
     sock.set_read_timeout(Some(Duration::from_secs(15))).ok();
     sock.set_write_timeout(Some(Duration::from_secs(15))).ok();
+    sock.set_nodelay(true).ok(); // disable Nagle — small frames otherwise wait ~200 ms
     let (ty, payload) = read_frame(&mut sock).expect("HELLO");
     assert_eq!(ty, FRAME_HELLO);
     let hello = parse_hello(&payload).expect("parse HELLO");
