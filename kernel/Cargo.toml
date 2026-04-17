@@ -73,6 +73,11 @@ default-features = false
 version = "0.5"
 default-features = false
 
+# AArch64 WASM JIT compiler (no_std, zero external deps)
+[dependencies.a64-encoder]
+path = "../tools/a64-encoder"
+default-features = false
+
 [features]
 default = []
 boot-test = []  # Enable to run kernel self-tests at boot and exit QEMU

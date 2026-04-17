@@ -835,6 +835,7 @@ pub mod fs;
 pub mod ipc;
 pub mod memory;
 pub mod net;
+pub mod jit;
 pub mod panic;
 pub mod task;
 pub mod timer;
