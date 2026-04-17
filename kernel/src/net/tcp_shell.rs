@@ -242,7 +242,8 @@ fn cmd_help() -> String {
          \x20 net              network configuration\r\n\
          \x20 df               disk usage\r\n\
          \x20 ping <ip>        send ICMP echo\r\n\
-         \x20 jit <ip>         JIT-compile MLP → AArch64, run on Pi\r\n\
+         \x20 jit <wasm> [<data>] <ip>  JIT a ramdisk WASM → run on Pi\r\n\
+         \x20 jit <ip>         (legacy) run built-in MLP demo\r\n\
          \x20 clear            clear screen\r\n\
          \x20 draug status     AI daemon status + current task\r\n\
          \x20 draug pause      pause the refactor loop\r\n\
@@ -394,64 +395,137 @@ fn cmd_ping(args: &str, state: &mut super::state::NetState) -> String {
     out
 }
 
+/// Push a signed i32 as decimal text into `out`. Reuses the
+/// existing unsigned `push_dec` helper defined later in this file.
+fn push_dec_signed(out: &mut String, val: i32) {
+    if val < 0 {
+        out.push('-');
+        push_dec(out, (val as i64).unsigned_abs() as u32);
+    } else {
+        push_dec(out, val as u32);
+    }
+}
+
+const USAGE_JIT: &str =
+    "usage: jit <wasm-name> [<data-name>] <pi-ip>\r\n  \
+     wasm-name and data-name must be present in the bundled ramdisk.\r\n  \
+     example: jit attention.wasm weights.bin 192.168.68.72\r\n  \
+     legacy:  jit <pi-ip>   (runs the built-in MLP demo)";
+
+/// Look up a file in the FPK ramdisk by name and return its bytes.
+fn ramdisk_read(name: &str) -> Option<&'static [u8]> {
+    let rd = crate::fs::ramdisk()?;
+    let entry = rd.find(name)?;
+    Some(rd.read(entry))
+}
+
 fn cmd_jit(args: &str) -> String {
-    let ip = match parse_ip(args.trim()) {
+    let trimmed = args.trim();
+
+    // Legacy form: just an IP → run hardcoded MLP. Kept so existing
+    // smoke tests keep working without a ramdisk WASM file.
+    if let Some(ip) = parse_ip(trimmed) {
+        return cmd_jit_mlp_legacy(ip);
+    }
+
+    // Generic form: <wasm-name> [<data-name>] <ip>
+    let mut tokens = trimmed.split_ascii_whitespace();
+    let wasm_name = match tokens.next() { Some(t) => t, None => return String::from(USAGE_JIT) };
+    let mid = tokens.next();
+    let last = tokens.next();
+    if tokens.next().is_some() {
+        return String::from(USAGE_JIT);
+    }
+
+    let (data_name, ip_str): (Option<&str>, &str) = match (mid, last) {
+        (Some(ip_str), None) => (None, ip_str),
+        (Some(data), Some(ip_str)) => (Some(data), ip_str),
+        _ => return String::from(USAGE_JIT),
+    };
+
+    let ip = match parse_ip(ip_str) {
         Some(o) => o,
-        None => return String::from("usage: jit <pi-ip>\r\n  example: jit 192.168.68.50"),
+        None => return String::from(USAGE_JIT),
+    };
+
+    let wasm_bytes = match ramdisk_read(wasm_name) {
+        Some(b) => b,
+        None => {
+            let mut e = String::from("error: wasm file not found in ramdisk: ");
+            e.push_str(wasm_name);
+            return e;
+        }
+    };
+
+    let data_bytes = match data_name {
+        Some(name) => match ramdisk_read(name) {
+            Some(b) => Some(b),
+            None => {
+                let mut e = String::from("error: data file not found in ramdisk: ");
+                e.push_str(name);
+                return e;
+            }
+        },
+        None => None,
     };
 
     let mut out = String::with_capacity(256);
-    out.push_str("JIT-compiling MLP (4→4→4→1) to AArch64...\r\n");
+    out.push_str("JIT: ");
+    out.push_str(wasm_name);
+    out.push_str(" (");
+    push_dec(&mut out, wasm_bytes.len() as u32);
+    out.push_str(" B");
+    if let Some(name) = data_name {
+        out.push_str(", data=");
+        out.push_str(name);
+        out.push_str(" (");
+        push_dec(&mut out, data_bytes.unwrap().len() as u32);
+        out.push_str(" B)");
+    }
+    out.push_str(") → ");
+    out.push_str(ip_str);
+    out.push_str("\r\n");
 
-    match crate::jit::run_mlp_on_pi(ip, 7700) {
+    match crate::jit::jit_run_wasm(
+        wasm_bytes,
+        data_bytes,
+        crate::jit::DEFAULT_DATA_BASE,
+        ip,
+        7700,
+    ) {
         Ok(result) => {
-            out.push_str("Pi returned exit code: ");
-            let code = result.exit_code;
-            // Simple decimal formatting
-            if code < 0 {
-                out.push('-');
-            }
-            let abs = if code < 0 { (-code) as u32 } else { code as u32 };
-            let mut buf = [0u8; 10];
-            let mut pos = buf.len();
-            let mut val = abs;
-            if val == 0 {
-                pos -= 1;
-                buf[pos] = b'0';
-            } else {
-                while val > 0 {
-                    pos -= 1;
-                    buf[pos] = b'0' + (val % 10) as u8;
-                    val /= 10;
-                }
-            }
-            if let Ok(s) = core::str::from_utf8(&buf[pos..]) {
-                out.push_str(s);
-            }
-            out.push_str("\r\nNetwork output ≈ ");
-            // Format as X.XX
-            let int_part = abs / 100;
-            let frac_part = abs % 100;
-            let mut tbuf = [0u8; 10];
-            let mut tpos = tbuf.len();
-            let mut tv = int_part;
-            if tv == 0 { tpos -= 1; tbuf[tpos] = b'0'; }
-            else { while tv > 0 { tpos -= 1; tbuf[tpos] = b'0' + (tv % 10) as u8; tv /= 10; } }
-            if let Ok(s) = core::str::from_utf8(&tbuf[tpos..]) { out.push_str(s); }
-            out.push('.');
-            out.push((b'0' + (frac_part / 10) as u8) as char);
-            out.push((b'0' + (frac_part % 10) as u8) as char);
+            out.push_str("Pi result: ");
+            push_dec_signed(&mut out, result.exit_code);
             out.push_str("\r\nCode: ");
-            let mut cbuf = [0u8; 10];
-            let mut cpos = cbuf.len();
-            let mut cv = result.code_bytes as u32;
-            if cv == 0 { cpos -= 1; cbuf[cpos] = b'0'; }
-            else { while cv > 0 { cpos -= 1; cbuf[cpos] = b'0' + (cv % 10) as u8; cv /= 10; } }
-            if let Ok(s) = core::str::from_utf8(&cbuf[cpos..]) { out.push_str(s); }
-            out.push_str(" bytes AArch64");
+            push_dec(&mut out, result.code_bytes as u32);
+            out.push_str(" B AArch64, compile ~");
+            push_dec(&mut out, result.compile_us as u32);
+            out.push_str(" us");
         }
         Err(e) => {
-            out.push_str("Error: ");
+            out.push_str("error: ");
+            out.push_str(e);
+        }
+    }
+    out
+}
+
+/// Backwards-compatible MLP demo: kept callable as `jit <ip>` (no
+/// wasm path). New work should go through the generic `jit_run_wasm`
+/// pathway by packaging its module + data into the ramdisk.
+fn cmd_jit_mlp_legacy(ip: [u8; 4]) -> String {
+    let mut out = String::with_capacity(128);
+    out.push_str("JIT-compiling built-in MLP (4→4→4→1) to AArch64...\r\n");
+    match crate::jit::run_mlp_on_pi(ip, 7700) {
+        Ok(result) => {
+            out.push_str("Pi result: ");
+            push_dec_signed(&mut out, result.exit_code);
+            out.push_str("\r\nCode: ");
+            push_dec(&mut out, result.code_bytes as u32);
+            out.push_str(" B AArch64");
+        }
+        Err(e) => {
+            out.push_str("error: ");
             out.push_str(e);
         }
     }

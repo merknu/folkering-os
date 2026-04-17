@@ -28,11 +28,45 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use a64_encoder::{
-    Lowerer, ValType, WasmOp, FnSig,
-    validate, ValidationError,
+    parse_module, Lowerer, ValType, WasmOp, FnSig,
+    validate,
 };
 
-use crate::net::a64_stream::{A64Session, Hello};
+use crate::net::a64_stream::A64Session;
+
+/// Conventional offset where host writes data via DATA frame.
+/// Matches the BASE constant in our example Rust → WASM crates;
+/// kept ≥ 0x1000 to defeat LLVM's null-page UB folding (which
+/// otherwise turns reads from low addresses into undef → 0.0).
+pub const DEFAULT_DATA_BASE: u32 = 0x1000;
+
+/// Length of the HMAC-SHA256 tag the daemon expects appended to
+/// every CODE frame. Mirrors `a64_streamer::auth::TAG_LEN`.
+pub const HMAC_TAG_LEN: usize = 32;
+
+/// Shared HMAC-SHA256 key — the same 32 random bytes that
+/// `tools/a64-streamer/secret.key` baked into the daemon. The
+/// kernel's build.rs copies it into OUT_DIR; if either side
+/// rotates the key, both must rebuild. Without this signature
+/// the daemon refuses to mmap+execute the CODE.
+const SHARED_HMAC_KEY: &[u8; 32] =
+    include_bytes!(concat!(env!("KERNEL_SECRET_KEY_PATH")));
+
+/// Compute HMAC-SHA256 tag over `data` using the shared key.
+/// The daemon refuses any CODE frame whose payload doesn't end
+/// in this tag.
+fn hmac_sign(data: &[u8]) -> [u8; HMAC_TAG_LEN] {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    type H = Hmac<Sha256>;
+    let mut mac = <H as Mac>::new_from_slice(SHARED_HMAC_KEY)
+        .expect("HMAC takes a 32-byte key");
+    mac.update(data);
+    let out = mac.finalize().into_bytes();
+    let mut tag = [0u8; HMAC_TAG_LEN];
+    tag.copy_from_slice(&out);
+    tag
+}
 
 /// Configuration for a JIT compilation + remote execution.
 pub struct JitRequest {
@@ -41,6 +75,10 @@ pub struct JitRequest {
     pub local_types: Vec<ValType>,
     pub ops: Vec<WasmOp>,
     pub weight_data: Option<Vec<u8>>,
+    /// Offset in the daemon's linear memory where `weight_data` is
+    /// written (when present). Default convention is `DEFAULT_DATA_BASE`.
+    /// Keep ≥ 0x1000 — see the constant's docs.
+    pub data_offset: u32,
     pub call_sigs: Vec<FnSig>,
 }
 
@@ -94,15 +132,23 @@ pub fn jit_exec(req: &JitRequest) -> Result<JitResult, &'static str> {
     crate::drivers::serial::write_dec(compile_us as u32);
     crate::serial_str!(" us\n");
 
-    // Step 4: Send CODE
-    session.send_code(&code)?;
+    // Step 4: Sign + send CODE. Daemon enforces HMAC-SHA256 over
+    // the code bytes before mmaping the page, so we append the
+    // 32-byte tag to the CODE frame payload.
+    let tag = hmac_sign(&code);
+    let mut signed = Vec::with_capacity(code.len() + HMAC_TAG_LEN);
+    signed.extend_from_slice(&code);
+    signed.extend_from_slice(&tag);
+    session.send_code(&signed)?;
 
     // Step 5: Send weight data if present
     if let Some(ref weights) = req.weight_data {
         crate::serial_str!("[JIT] sending ");
         crate::drivers::serial::write_dec(weights.len() as u32);
-        crate::serial_str!(" bytes of weight data\n");
-        session.send_data(0, weights)?;
+        crate::serial_str!(" bytes of data at offset 0x");
+        crate::drivers::serial::write_hex(req.data_offset as u64);
+        crate::serial_str!("\n");
+        session.send_data(req.data_offset, weights)?;
     }
 
     // Step 6: Execute and get result
@@ -121,6 +167,65 @@ pub fn jit_exec(req: &JitRequest) -> Result<JitResult, &'static str> {
         code_bytes: code.len(),
         compile_us,
     })
+}
+
+/// Map a WASM valtype byte to our `ValType` enum.
+/// Returns Err for unsupported types — caller decides how to react.
+fn valtype_from_byte(b: u8) -> Result<ValType, &'static str> {
+    match b {
+        0x7F => Ok(ValType::I32),
+        0x7E => Ok(ValType::I64),
+        0x7D => Ok(ValType::F32),
+        0x7C => Ok(ValType::F64),
+        _ => Err("unsupported WASM valtype"),
+    }
+}
+
+/// Compile and run an arbitrary WASM module on the Pi.
+///
+/// Pipeline: parse_module → take fn[0] → JIT-compile → stream
+/// CODE+DATA+EXEC over TCP → return RESULT exit code.
+///
+/// Multi-function modules use only the first body. The data buffer
+/// is written to the daemon's linear memory at `data_offset` (use
+/// `DEFAULT_DATA_BASE` unless your WASM module uses a different
+/// memory layout).
+pub fn jit_run_wasm(
+    wasm_bytes: &[u8],
+    data_bytes: Option<&[u8]>,
+    data_offset: u32,
+    pi_ip: [u8; 4],
+    pi_port: u16,
+) -> Result<JitResult, &'static str> {
+    crate::serial_str!("[JIT] parsing ");
+    crate::drivers::serial::write_dec(wasm_bytes.len() as u32);
+    crate::serial_str!(" bytes of WASM...\n");
+
+    let bodies = parse_module(wasm_bytes).map_err(|_| "WASM parse failed")?;
+    let body = bodies.into_iter().next().ok_or("no function in module")?;
+
+    crate::serial_str!("[JIT] fn[0]: ");
+    crate::drivers::serial::write_dec(body.ops.len() as u32);
+    crate::serial_str!(" ops, ");
+    crate::drivers::serial::write_dec(body.num_locals);
+    crate::serial_str!(" locals\n");
+
+    let mut local_types = Vec::with_capacity(body.local_types.len());
+    for &b in &body.local_types {
+        local_types.push(valtype_from_byte(b)?);
+    }
+
+    let req = JitRequest {
+        pi_ip,
+        pi_port,
+        local_types,
+        ops: body.ops,
+        weight_data: data_bytes.map(|d| d.to_vec()),
+        data_offset,
+        call_sigs: Vec::new(),
+    };
+
+    jit_exec(&req)
 }
 
 /// Quick helper: compile and run a simple MLP on the Pi.
@@ -166,6 +271,7 @@ pub fn run_mlp_on_pi(pi_ip: [u8; 4], pi_port: u16) -> Result<JitResult, &'static
         local_types: vec![ValType::F32; 8],
         ops,
         weight_data: None,
+        data_offset: DEFAULT_DATA_BASE,
         call_sigs: Vec::new(),
     };
 

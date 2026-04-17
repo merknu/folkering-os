@@ -78,6 +78,16 @@ default-features = false
 path = "../tools/a64-encoder"
 default-features = false
 
+# HMAC-SHA256 for signing CODE frames sent to a64-stream-daemon.
+# Daemon refuses unsigned code, so kernel must sign before send.
+[dependencies.hmac]
+version = "0.12"
+default-features = false
+
+[dependencies.sha2]
+version = "0.10"
+default-features = false
+
 [features]
 default = []
 boot-test = []  # Enable to run kernel self-tests at boot and exit QEMU
