@@ -52,10 +52,12 @@ pub const HMAC_TAG_LEN: usize = 32;
 const SHARED_HMAC_KEY: &[u8; 32] =
     include_bytes!(concat!(env!("KERNEL_SECRET_KEY_PATH")));
 
+pub mod bench;
+
 /// Compute HMAC-SHA256 tag over `data` using the shared key.
 /// The daemon refuses any CODE frame whose payload doesn't end
 /// in this tag.
-fn hmac_sign(data: &[u8]) -> [u8; HMAC_TAG_LEN] {
+pub(super) fn hmac_sign(data: &[u8]) -> [u8; HMAC_TAG_LEN] {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
     type H = Hmac<Sha256>;
@@ -171,7 +173,7 @@ pub fn jit_exec(req: &JitRequest) -> Result<JitResult, &'static str> {
 
 /// Map a WASM valtype byte to our `ValType` enum.
 /// Returns Err for unsupported types — caller decides how to react.
-fn valtype_from_byte(b: u8) -> Result<ValType, &'static str> {
+pub(super) fn valtype_from_byte_pub(b: u8) -> Result<ValType, &'static str> {
     match b {
         0x7F => Ok(ValType::I32),
         0x7E => Ok(ValType::I64),
@@ -179,6 +181,9 @@ fn valtype_from_byte(b: u8) -> Result<ValType, &'static str> {
         0x7C => Ok(ValType::F64),
         _ => Err("unsupported WASM valtype"),
     }
+}
+fn valtype_from_byte(b: u8) -> Result<ValType, &'static str> {
+    valtype_from_byte_pub(b)
 }
 
 /// Compile and run an arbitrary WASM module on the Pi.
