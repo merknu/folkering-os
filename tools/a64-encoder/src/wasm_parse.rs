@@ -325,6 +325,27 @@ pub fn parse_ops(bytes: &[u8], pos: &mut usize) -> Result<Vec<WasmOp>, ParseErro
             0xA1 => ops.push(WasmOp::F64Sub),
             0xA2 => ops.push(WasmOp::F64Mul),
             0xA3 => ops.push(WasmOp::F64Div),
+            0xFC => {
+                // "Misc" prefix — second byte is a ULEB128 sub-opcode.
+                // Currently we only handle the saturating-truncate
+                // variants (0x00..0x07), which Rust emits for `as i32`/
+                // `as i64` casts from f32/f64. AArch64 FCVTZS/U is
+                // already saturating per the ARM ISA, so we lower
+                // these to the same instructions as the legacy
+                // (non-saturating) trunc opcodes.
+                let sub = read_uleb128(bytes, pos)?;
+                match sub {
+                    0x00 => ops.push(WasmOp::I32TruncF32S),
+                    0x01 => ops.push(WasmOp::I32TruncF32U),
+                    0x02 => ops.push(WasmOp::I32TruncF64S),
+                    0x03 => ops.push(WasmOp::I32TruncF64U),
+                    0x04 => ops.push(WasmOp::I64TruncF32S),
+                    0x05 => ops.push(WasmOp::I64TruncF32U),
+                    0x06 => ops.push(WasmOp::I64TruncF64S),
+                    0x07 => ops.push(WasmOp::I64TruncF64U),
+                    _ => return Err(ParseError::UnknownOpcode(sub.min(0xFF) as u8)),
+                }
+            }
             0xFD => {
                 // SIMD prefix — second byte is a ULEB128 sub-opcode.
                 // The current WASM SIMD proposal has ~235 ops; we
