@@ -219,6 +219,7 @@ fn dispatch_command(line: &[u8], state: &mut super::state::NetState) -> String {
         "net" => cmd_net(state),
         "df" => cmd_df(),
         "ping" => cmd_ping(args, state),
+        "jit" => cmd_jit(args),
         "draug" => cmd_draug(args),
         "clear" => String::from("\x1b[2J\x1b[H"),
         "" => String::new(),
@@ -241,6 +242,7 @@ fn cmd_help() -> String {
          \x20 net              network configuration\r\n\
          \x20 df               disk usage\r\n\
          \x20 ping <ip>        send ICMP echo\r\n\
+         \x20 jit <ip>         JIT-compile MLP → AArch64, run on Pi\r\n\
          \x20 clear            clear screen\r\n\
          \x20 draug status     AI daemon status + current task\r\n\
          \x20 draug pause      pause the refactor loop\r\n\
@@ -389,6 +391,70 @@ fn cmd_ping(args: &str, state: &mut super::state::NetState) -> String {
     out.push_str("ping sent to ");
     out.push_str(args);
     out.push_str(" (reply in serial log)");
+    out
+}
+
+fn cmd_jit(args: &str) -> String {
+    let ip = match parse_ip(args.trim()) {
+        Some(o) => o,
+        None => return String::from("usage: jit <pi-ip>\r\n  example: jit 192.168.68.50"),
+    };
+
+    let mut out = String::with_capacity(256);
+    out.push_str("JIT-compiling MLP (4→4→4→1) to AArch64...\r\n");
+
+    match crate::jit::run_mlp_on_pi(ip, 7700) {
+        Ok(result) => {
+            out.push_str("Pi returned exit code: ");
+            let code = result.exit_code;
+            // Simple decimal formatting
+            if code < 0 {
+                out.push('-');
+            }
+            let abs = if code < 0 { (-code) as u32 } else { code as u32 };
+            let mut buf = [0u8; 10];
+            let mut pos = buf.len();
+            let mut val = abs;
+            if val == 0 {
+                pos -= 1;
+                buf[pos] = b'0';
+            } else {
+                while val > 0 {
+                    pos -= 1;
+                    buf[pos] = b'0' + (val % 10) as u8;
+                    val /= 10;
+                }
+            }
+            if let Ok(s) = core::str::from_utf8(&buf[pos..]) {
+                out.push_str(s);
+            }
+            out.push_str("\r\nNetwork output ≈ ");
+            // Format as X.XX
+            let int_part = abs / 100;
+            let frac_part = abs % 100;
+            let mut tbuf = [0u8; 10];
+            let mut tpos = tbuf.len();
+            let mut tv = int_part;
+            if tv == 0 { tpos -= 1; tbuf[tpos] = b'0'; }
+            else { while tv > 0 { tpos -= 1; tbuf[tpos] = b'0' + (tv % 10) as u8; tv /= 10; } }
+            if let Ok(s) = core::str::from_utf8(&tbuf[tpos..]) { out.push_str(s); }
+            out.push('.');
+            out.push((b'0' + (frac_part / 10) as u8) as char);
+            out.push((b'0' + (frac_part % 10) as u8) as char);
+            out.push_str("\r\nCode: ");
+            let mut cbuf = [0u8; 10];
+            let mut cpos = cbuf.len();
+            let mut cv = result.code_bytes as u32;
+            if cv == 0 { cpos -= 1; cbuf[cpos] = b'0'; }
+            else { while cv > 0 { cpos -= 1; cbuf[cpos] = b'0' + (cv % 10) as u8; cv /= 10; } }
+            if let Ok(s) = core::str::from_utf8(&cbuf[cpos..]) { out.push_str(s); }
+            out.push_str(" bytes AArch64");
+        }
+        Err(e) => {
+            out.push_str("Error: ");
+            out.push_str(e);
+        }
+    }
     out
 }
 
