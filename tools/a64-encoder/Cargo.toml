@@ -12,3 +12,9 @@ default = ["std"]
 std = []
 
 [dependencies]
+
+# Used by the memory-based MLP example to stream CODE + DATA frames
+# through the a64-stream-daemon on a Pi. Dev-only — the encoder crate
+# itself stays dependency-free for no_std consumers.
+[dev-dependencies]
+a64-streamer = { path = "../a64-streamer" }

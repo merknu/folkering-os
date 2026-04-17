@@ -16,10 +16,14 @@
 //!   offset 192:  b3              (4 bytes)
 //! Total: 196 bytes of weight data
 
-use std::io::Write;
-use std::process::{Command, Stdio};
+use std::net::TcpStream;
+use std::time::Duration;
 
 use a64_encoder::{Lowerer, ValType, WasmOp};
+use a64_streamer::{
+    auth, parse_hello, parse_result, read_frame, serialize_data, write_frame, DEFAULT_PORT,
+    FRAME_CODE, FRAME_DATA, FRAME_EXEC, FRAME_HELLO, FRAME_RESULT,
+};
 
 const OFF_INPUTS: u32 = 0;
 const OFF_W1: u32 = 16;
@@ -150,54 +154,98 @@ fn emit_relu_store(ops: &mut Vec<WasmOp>, local: u32) {
 }
 
 fn main() {
-    let local_types = vec![ValType::F32; 8];
     let weight_buf = build_weight_buffer();
-    let mem_base: u64 = 0x0040_0000; // placeholder — daemon provides real address
-
-    let mut lw = Lowerer::new_function_with_memory_typed(
-        &local_types, Vec::new(), mem_base,
-    ).expect("constructor");
-    lw.set_mem_size(weight_buf.len() as u32);
-
     let ops = build_memory_mlp_ops();
     println!("[MEM-MLP] {} ops generated", ops.len());
-
-    lw.lower_all(&ops).expect("lower_all");
-    let code = lw.finish();
-    println!("[MEM-MLP] {} bytes AArch64 code", code.len());
     println!("[MEM-MLP] {} bytes weight data", weight_buf.len());
-    println!("[MEM-MLP] Total payload: {} bytes (code + weights)", code.len() + weight_buf.len());
 
     let expected = compute_expected();
     let expected_exit = (expected * 100.0) as i32;
     println!("[MEM-MLP] Host reference: {:.4} (exit code {})", expected, expected_exit);
 
-    // Compare with const-based versions
+    // Resolve daemon address: PI_HOST env may be "host:port", "host", or
+    // "user@host" (legacy). Strip any user@ prefix and append default port.
+    let raw = std::env::var("PI_HOST").unwrap_or_else(|_| "192.168.68.72".to_string());
+    let host_part = raw.split_once('@').map(|(_, h)| h).unwrap_or(&raw);
+    let addr = if host_part.contains(':') {
+        host_part.to_string()
+    } else {
+        format!("{host_part}:{DEFAULT_PORT}")
+    };
+
+    println!("[MEM-MLP] connecting to a64-stream-daemon at {addr}");
+    let mut sock = match TcpStream::connect(&addr) {
+        Ok(s) => s,
+        Err(e) => {
+            println!("[MEM-MLP] connect failed: {e}");
+            println!("[MEM-MLP] Start daemon: a64-stream-daemon 0.0.0.0:7700");
+            std::process::exit(2);
+        }
+    };
+    sock.set_read_timeout(Some(Duration::from_secs(15))).ok();
+    sock.set_write_timeout(Some(Duration::from_secs(15))).ok();
+
+    // ── HELLO: receive the daemon's real mem_base ─────────────────
+    let (ty, payload) = read_frame(&mut sock).expect("read HELLO");
+    assert_eq!(ty, FRAME_HELLO, "first frame must be HELLO");
+    let hello = parse_hello(&payload).expect("parse HELLO");
+    println!(
+        "[MEM-MLP] HELLO: mem_base=0x{:016x} mem_size={}",
+        hello.mem_base, hello.mem_size
+    );
+    assert!(
+        weight_buf.len() as u32 <= hello.mem_size,
+        "weight buffer ({} B) larger than daemon mem_size ({} B)",
+        weight_buf.len(),
+        hello.mem_size
+    );
+
+    // ── Build JIT with the REAL mem_base baked into X28 ───────────
+    let local_types = vec![ValType::F32; 8];
+    let mut lw = Lowerer::new_function_with_memory_typed(
+        &local_types,
+        Vec::new(),
+        hello.mem_base,
+    )
+    .expect("constructor");
+    lw.set_mem_size(hello.mem_size);
+
+    lw.lower_all(&ops).expect("lower_all");
+    let code = lw.finish();
+    println!("[MEM-MLP] {} bytes AArch64 code", code.len());
+    println!(
+        "[MEM-MLP] Total payload: {} bytes (code + weights)",
+        code.len() + weight_buf.len()
+    );
     println!("[MEM-MLP] vs const-scalar: 213 ops / 1548B code");
     println!("[MEM-MLP] vs const-SIMD:   169 ops / 1328B code");
-    println!("[MEM-MLP] This version loads ALL weights from memory at runtime");
 
-    let pi = std::env::var("PI_HOST").unwrap_or_else(|_| "pi5".to_string());
-    let result = Command::new("ssh")
-        .args([&pi, "./run_bytes"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn();
+    // ── DATA frame: populate linear memory at offset 0 ────────────
+    let data_payload = serialize_data(0, &weight_buf);
+    write_frame(&mut sock, FRAME_DATA, &data_payload).expect("write DATA");
+    println!("[MEM-MLP] DATA frame sent ({} bytes at offset 0)", weight_buf.len());
 
-    match result {
-        Ok(mut child) => {
-            child.stdin.take().unwrap().write_all(&code).unwrap();
-            let out = child.wait_with_output().unwrap();
-            let exit = out.status.code().unwrap_or(-1);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            if exit == 255 && !stderr.is_empty() {
-                println!("[MEM-MLP] Pi not reachable — CODE+DATA frames ready for streamer");
-            } else {
-                println!("[MEM-MLP] Pi exit code: {} (expected {})", exit, expected_exit);
-            }
-        }
-        Err(_) => println!("[MEM-MLP] SSH not available — JIT code ready"),
+    // ── CODE frame (HMAC-signed) ──────────────────────────────────
+    let tag = auth::sign(&code);
+    let mut code_payload = Vec::with_capacity(code.len() + auth::TAG_LEN);
+    code_payload.extend_from_slice(&code);
+    code_payload.extend_from_slice(&tag);
+    write_frame(&mut sock, FRAME_CODE, &code_payload).expect("write CODE");
+
+    // ── EXEC + RESULT ─────────────────────────────────────────────
+    write_frame(&mut sock, FRAME_EXEC, &[]).expect("write EXEC");
+    let (ty, payload) = read_frame(&mut sock).expect("read RESULT");
+    assert_eq!(ty, FRAME_RESULT, "expected RESULT, got 0x{:02x}", ty);
+    let exit = parse_result(&payload).expect("parse RESULT");
+
+    println!("[MEM-MLP] Pi exit code: {} (expected {})", exit, expected_exit);
+    if exit == expected_exit {
+        println!("[MEM-MLP] MATCH — JIT inference matches host computation!");
+    } else if (exit - expected_exit).abs() <= 1 {
+        println!("[MEM-MLP] MATCH (within f32 rounding)");
+    } else {
+        println!("[MEM-MLP] MISMATCH");
+        std::process::exit(1);
     }
 }
 
