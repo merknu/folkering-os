@@ -41,6 +41,7 @@ mod convert;
 mod control;
 mod scalar;
 mod call;
+mod globals;
 
 pub use types::{ValType, WasmOp, LowerError, FnSig, MAX_I32_LOCALS, MAX_F32_LOCALS, MAX_LOCALS};
 use types::*;
@@ -142,6 +143,14 @@ pub struct Lowerer {
     /// to eliminate bounds checks when the address is statically known.
     /// Cleared at the start of every `lower_op` except I32Const.
     pub(super) last_i32_const_value: Option<i32>,
+    /// Per-global value types, indexed by WASM global index. Empty
+    /// when the module has no globals. Lowering `global.get/set`
+    /// checks the type here to pick the right LDR/STR width and
+    /// the right operand-stack bank (int vs FP).
+    pub(super) global_types: Vec<ValType>,
+    /// Per-global mutability. `global.set` on a non-mutable global
+    /// returns LowerError::GlobalNotMutable at lower time.
+    pub(super) global_mutable: Vec<bool>,
 }
 
 impl Lowerer {
@@ -193,6 +202,8 @@ impl Lowerer {
             pending_fp_spill_depth: None,
             fp_spill_pop_toggle: false,
             last_i32_const_value: None,
+            global_types: Vec::new(),
+            global_mutable: Vec::new(),
         })
     }
 
@@ -332,6 +343,8 @@ impl Lowerer {
             pending_fp_spill_depth: None,
             fp_spill_pop_toggle: false,
             last_i32_const_value: None,
+            global_types: Vec::new(),
+            global_mutable: Vec::new(),
             frame_size_base: frame_size,
             mem_size: 64 * 1024,
             table_base: None,
@@ -424,6 +437,8 @@ impl Lowerer {
             pending_fp_spill_depth: None,
             fp_spill_pop_toggle: false,
             last_i32_const_value: None,
+            global_types: Vec::new(),
+            global_mutable: Vec::new(),
         })
     }
 
@@ -432,6 +447,35 @@ impl Lowerer {
     /// HELLO frame typically provides the authoritative value.
     pub fn set_mem_size(&mut self, size: u32) {
         self.mem_size = size;
+    }
+
+    /// Declare the module's globals. Types determine which LDR/STR
+    /// width the lowerer emits for `global.get/set`; mutability is
+    /// enforced at lower time. Must be called before any `GlobalGet`
+    /// or `GlobalSet` op is lowered. Globals live in the top
+    /// `GLOBAL_AREA_SIZE` bytes of linear memory.
+    pub fn set_globals(
+        &mut self,
+        types: Vec<ValType>,
+        mutable: Vec<bool>,
+    ) -> Result<(), LowerError> {
+        if types.len() != mutable.len() {
+            return Err(LowerError::GlobalOutOfRange);
+        }
+        if types.len() > MAX_GLOBALS {
+            return Err(LowerError::TooManyGlobals);
+        }
+        self.global_types = types;
+        self.global_mutable = mutable;
+        Ok(())
+    }
+
+    /// Byte offset within linear memory where global `idx`'s 8-byte
+    /// slot starts. Globals are laid out contiguously at the top of
+    /// memory: global[0] at `mem_size - GLOBAL_AREA_SIZE`, global[1]
+    /// at `+ GLOBAL_SLOT_BYTES`, etc.
+    pub(super) fn global_mem_offset(&self, idx: u32) -> u32 {
+        self.mem_size - GLOBAL_AREA_SIZE + idx * GLOBAL_SLOT_BYTES
     }
 
     /// Attach AAPCS64 signatures for the direct-call targets. Must be
@@ -655,6 +699,8 @@ impl Lowerer {
             WasmOp::LocalGet(i) => self.lower_local_get(i),
             WasmOp::LocalSet(i) => self.lower_local_set(i),
             WasmOp::LocalTee(i) => self.lower_local_tee(i),
+            WasmOp::GlobalGet(i) => self.lower_global_get(i),
+            WasmOp::GlobalSet(i) => self.lower_global_set(i),
             WasmOp::Block => self.lower_block(),
             WasmOp::Loop => self.lower_loop(),
             WasmOp::Br(n) => self.lower_br(n),

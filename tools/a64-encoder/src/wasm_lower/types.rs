@@ -163,6 +163,13 @@ pub enum WasmOp {
     LocalSet(u32),
     /// Copy top of stack into local without popping.
     LocalTee(u32),
+    /// `global.get idx` — push the current value of module-global `idx`
+    /// onto the operand stack. Lowered as a load from the globals area
+    /// at the top of linear memory (see `wasm_lower::globals`).
+    GlobalGet(u32),
+    /// `global.set idx` — pop operand stack, store into module-global
+    /// `idx`. The lowerer enforces the global is mutable at parse time.
+    GlobalSet(u32),
     Block,
     Loop,
     Br(u32),
@@ -189,6 +196,14 @@ pub enum LowerError {
     BranchOutOfRange,
     ElseWithoutIf,
     CallTargetMissing,
+    /// `global.get` / `global.set` referenced an index beyond the
+    /// module's declared global count.
+    GlobalOutOfRange,
+    /// `global.set` attempted on a const global.
+    GlobalNotMutable,
+    /// Module declares more globals than the reserved area can hold
+    /// (GLOBAL_AREA_SIZE / 8 slots).
+    TooManyGlobals,
     MemoryNotConfigured,
     TableNotConfigured,
     IndirectTypeMissing,
@@ -284,6 +299,31 @@ pub(super) const FP_SPILL_SCRATCH_B: Vreg = Vreg(31);
 pub(super) const MAX_FP_SPILL: usize = 8;
 pub(super) const FP_SPILL_SLOT_BYTES: u32 = 16;
 pub(super) const FP_SPILL_AREA_BYTES: u32 = (MAX_FP_SPILL as u32) * FP_SPILL_SLOT_BYTES;
+// ── Globals area at top of linear memory ───────────────────────────
+//
+// WASM modules have a Global section containing `i32` / `i64` / `f32`
+// / `f64` slots with optional mutability. Rust-compiled WASM almost
+// always declares at least `__stack_pointer` (mut i32) so it can
+// spill locals beyond the register file.
+//
+// We reserve the last `GLOBAL_AREA_SIZE` bytes of linear memory for
+// globals. Each global occupies an 8-byte slot regardless of its
+// actual width — we accept the waste to get 8-byte alignment for
+// i64/f64 stores without branching on type.
+//
+// For our 64 KiB linear memory this gives us 32 global slots, which
+// is well above what a well-shaped no_std Rust crate ever declares
+// (typically 1-3).
+pub const GLOBAL_AREA_SIZE: u32 = 256;
+pub const GLOBAL_SLOT_BYTES: u32 = 8;
+pub const MAX_GLOBALS: usize = (GLOBAL_AREA_SIZE / GLOBAL_SLOT_BYTES) as usize;
+
+/// Conventional stack-pointer value for `__stack_pointer` if the
+/// module's declared init value is larger than our memory. Grows
+/// downward from this; `GLOBAL_AREA_SIZE` bytes above us are the
+/// globals themselves (not the stack).
+pub const STACK_POINTER_INIT_FALLBACK: u32 = 0xFF00; // for 64 KiB mem
+
 pub const MAX_I32_LOCALS: usize = 9;
 // F32 locals occupy V16..V(16+MAX-1). V0..V15 are operand-stack
 // slots, V30/V31 are FP_SPILL_SCRATCH_{A,B}, so the largest safe

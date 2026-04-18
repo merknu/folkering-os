@@ -42,6 +42,12 @@ pub enum ParseError {
     UnknownOpcode(u8),
     /// i32.const value didn't fit in i32 after sleb128 decode.
     ConstantOutOfRange,
+    /// Module declares imports; Folkering's ABI is deliberately closed
+    /// — all functionality must live in-module or be linked via helper
+    /// symbols the daemon exposes. Import section is rejected.
+    ImportsUnsupported,
+    /// Export name wasn't valid UTF-8.
+    InvalidUtf8,
 }
 
 /// Parse a full function body. Consumes all bytes; the sequence
@@ -146,6 +152,18 @@ pub fn parse_ops(bytes: &[u8], pos: &mut usize) -> Result<Vec<WasmOp>, ParseErro
                 let idx = read_uleb128(bytes, pos)?;
                 if idx > u32::MAX as u64 { return Err(ParseError::IntegerTooLarge); }
                 ops.push(WasmOp::LocalTee(idx as u32));
+            }
+            0x23 => {
+                // global.get idx
+                let idx = read_uleb128(bytes, pos)?;
+                if idx > u32::MAX as u64 { return Err(ParseError::IntegerTooLarge); }
+                ops.push(WasmOp::GlobalGet(idx as u32));
+            }
+            0x24 => {
+                // global.set idx
+                let idx = read_uleb128(bytes, pos)?;
+                if idx > u32::MAX as u64 { return Err(ParseError::IntegerTooLarge); }
+                ops.push(WasmOp::GlobalSet(idx as u32));
             }
             0x41 => {
                 let v = read_sleb128(bytes, pos)?;
