@@ -7,6 +7,15 @@ use super::*;
 
 impl Lowerer {
     pub(super) fn lower_call(&mut self, idx: u32) -> Result<(), LowerError> {
+        // Module-internal path: idx refers to another WASM function
+        // in the same module. Emit a PC-relative BL with offset 0 as
+        // a placeholder; record the site in `pending_relocations`
+        // so compile_module's pass-2 can patch the real delta once
+        // every function's final offset is known.
+        if (idx as usize) < self.module_fn_count {
+            return self.lower_call_internal(idx);
+        }
+
         let target = *self
             .call_targets
             .get(idx as usize)
@@ -59,6 +68,76 @@ impl Lowerer {
 
         self.enc.blr(x16)?;
 
+        match sig.result {
+            None => {}
+            Some(ValType::I32) => {
+                let dst = self.push_i32_slot()?;
+                if dst.0 != 0 {
+                    self.enc.and_w(dst, Reg::X0, Reg::X0)?;
+                } else {
+                    self.enc.and_w(Reg::X0, Reg::X0, Reg::X0)?;
+                }
+            }
+            Some(ValType::I64) => {
+                let dst = self.push_i64_slot()?;
+                if dst.0 != 0 {
+                    self.enc.add(dst, Reg::ZR, Reg::X0)?;
+                }
+            }
+            Some(_) => return Err(LowerError::CallTypeUnsupported),
+        }
+        Ok(())
+    }
+
+    /// Lower a Call to another function in the same module.
+    /// Emits arg-marshalling, a placeholder BL #0, return-value
+    /// rehydration, and records a relocation for the linker.
+    fn lower_call_internal(&mut self, idx: u32) -> Result<(), LowerError> {
+        let sig = self.module_fn_sigs[idx as usize].clone();
+
+        // Same arg/return constraints as the external path for now.
+        for p in &sig.params {
+            if !p.is_int() {
+                return Err(LowerError::CallTypeUnsupported);
+            }
+        }
+        let n_args = sig.params.len();
+        if n_args > 8 {
+            return Err(LowerError::CallArityUnsupported);
+        }
+
+        // Pop args from the operand stack.
+        let mut arg_src: Vec<Reg> = Vec::with_capacity(n_args);
+        for p in sig.params.iter().rev() {
+            let src = match p {
+                ValType::I32 => self.pop_i32_slot()?,
+                ValType::I64 => self.pop_i64_slot()?,
+                _ => unreachable!("filtered above"),
+            };
+            arg_src.push(src);
+        }
+        arg_src.reverse();
+
+        // Marshal args into X0..X(n-1). Use scratch X9..X16 first so
+        // we don't clobber an arg register that's also a source.
+        for (i, src) in arg_src.iter().enumerate() {
+            let scratch = Reg((9 + i) as u8);
+            self.enc.add(scratch, Reg::ZR, *src)?;
+        }
+        for i in 0..n_args {
+            let scratch = Reg((9 + i) as u8);
+            let target_reg = Reg(i as u8);
+            self.enc.add(target_reg, Reg::ZR, scratch)?;
+        }
+
+        // Emit placeholder BL #0. Record the byte offset of the BL
+        // instruction itself for the linker to rewrite.
+        let bl_site = self.enc.pos() as u32;
+        self.enc.bl(0)?;
+        self.pending_relocations.push((bl_site, idx));
+
+        // Rehydrate the return value onto the operand stack. Callee
+        // left it in W0/X0 per AAPCS64.
         match sig.result {
             None => {}
             Some(ValType::I32) => {

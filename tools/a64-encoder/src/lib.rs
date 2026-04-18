@@ -40,7 +40,9 @@ pub mod wasm_lower;
 pub mod wasm_module;
 pub mod wasm_parse;
 pub mod wasm_validate;
-pub use wasm_lower::{FnSig, LowerError, Lowerer, ValType, WasmOp};
+pub use wasm_lower::{
+    compile_module, FnSig, LowerError, Lowerer, ModuleLayout, ValType, WasmOp,
+};
 pub use wasm_module::{
     parse_module, parse_module_full,
     FunctionBody, Module, FuncSig as ModFuncSig, GlobalDef, Export, DataSegment,

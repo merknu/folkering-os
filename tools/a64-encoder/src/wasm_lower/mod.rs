@@ -42,6 +42,9 @@ mod control;
 mod scalar;
 mod call;
 mod globals;
+mod module_lower;
+
+pub use module_lower::{compile_module, ModuleLayout};
 
 pub use types::{ValType, WasmOp, LowerError, FnSig, MAX_I32_LOCALS, MAX_F32_LOCALS, MAX_LOCALS};
 use types::*;
@@ -151,6 +154,20 @@ pub struct Lowerer {
     /// Per-global mutability. `global.set` on a non-mutable global
     /// returns LowerError::GlobalNotMutable at lower time.
     pub(super) global_mutable: Vec<bool>,
+    /// Number of functions in the current module — indices 0..count
+    /// are internal and lowered as PC-relative BL with placeholder
+    /// offsets. Indices ≥ count fall through to the external call_targets
+    /// table (existing helper-call path). Zero = no module context,
+    /// all Call(idx) are external.
+    pub(super) module_fn_count: usize,
+    /// Signatures of in-module functions, indexed by fn_idx. Length
+    /// == `module_fn_count` when module context is active.
+    pub(super) module_fn_sigs: Vec<FnSig>,
+    /// Collected during lowering: (byte_offset_of_BL_in_encoder,
+    /// target_fn_idx). Emitted as placeholder BL #0 at lower time;
+    /// compile_module patches them in pass 2 with the real delta
+    /// once every function's offset in the combined blob is known.
+    pub(super) pending_relocations: Vec<(u32, u32)>,
 }
 
 impl Lowerer {
@@ -204,6 +221,9 @@ impl Lowerer {
             last_i32_const_value: None,
             global_types: Vec::new(),
             global_mutable: Vec::new(),
+            module_fn_count: 0,
+            module_fn_sigs: Vec::new(),
+            pending_relocations: Vec::new(),
         })
     }
 
@@ -345,6 +365,9 @@ impl Lowerer {
             last_i32_const_value: None,
             global_types: Vec::new(),
             global_mutable: Vec::new(),
+            module_fn_count: 0,
+            module_fn_sigs: Vec::new(),
+            pending_relocations: Vec::new(),
             frame_size_base: frame_size,
             mem_size: 64 * 1024,
             table_base: None,
@@ -439,6 +462,9 @@ impl Lowerer {
             last_i32_const_value: None,
             global_types: Vec::new(),
             global_mutable: Vec::new(),
+            module_fn_count: 0,
+            module_fn_sigs: Vec::new(),
+            pending_relocations: Vec::new(),
         })
     }
 
@@ -476,6 +502,75 @@ impl Lowerer {
     /// at `+ GLOBAL_SLOT_BYTES`, etc.
     pub(super) fn global_mem_offset(&self, idx: u32) -> u32 {
         self.mem_size - GLOBAL_AREA_SIZE + idx * GLOBAL_SLOT_BYTES
+    }
+
+    /// Declare module-internal function signatures. After this is
+    /// called, `Call(idx)` with `idx < sigs.len()` emits a PC-relative
+    /// BL with placeholder offset 0, and records a relocation in
+    /// `pending_relocations` so the linker (compile_module) can patch
+    /// it once every function's final blob offset is known. Calls
+    /// with `idx >= sigs.len()` still use the external call_targets
+    /// path (for host helpers).
+    pub fn set_module_fn_sigs(&mut self, sigs: Vec<FnSig>) {
+        self.module_fn_count = sigs.len();
+        self.module_fn_sigs = sigs;
+    }
+
+    /// Extract the relocations recorded during lowering. Each entry
+    /// is `(encoder_byte_offset_of_BL, target_fn_idx)`. The offsets
+    /// are relative to this Lowerer's encoder buffer — `compile_module`
+    /// adjusts them to the combined blob before patching.
+    pub fn take_relocations(&mut self) -> Vec<(u32, u32)> {
+        core::mem::take(&mut self.pending_relocations)
+    }
+
+    /// Emit code that copies the incoming AAPCS64 parameter registers
+    /// (W0-W7 / S0-S7) into the first `n_params` local slots. The
+    /// Lowerer's constructor zero-initialises every local — this
+    /// overrides that for params.
+    ///
+    /// `param_types` gives the ValType of each param in declaration
+    /// order. Counted separately per bank per AAPCS64:
+    ///   int params in X/W 0..,
+    ///   FP  params in V  0..
+    ///
+    /// Supports i32/i64/f32/f64. Errors on > 8 params of either bank
+    /// or on v128.
+    pub fn emit_param_rehydration(
+        &mut self,
+        param_types: &[ValType],
+    ) -> Result<(), LowerError> {
+        if param_types.len() > self.locals.len() {
+            return Err(LowerError::LocalOutOfRange);
+        }
+        let mut int_arg = 0u8;
+        let mut fp_arg = 0u8;
+        for (i, ty) in param_types.iter().enumerate() {
+            match (ty, self.locals[i]) {
+                (ValType::I32, LocalLoc::I32(dst)) => {
+                    if int_arg > 7 { return Err(LowerError::CallArityUnsupported); }
+                    self.enc.and_w(dst, Reg(int_arg), Reg(int_arg))?;
+                    int_arg += 1;
+                }
+                (ValType::I64, LocalLoc::I64(dst)) => {
+                    if int_arg > 7 { return Err(LowerError::CallArityUnsupported); }
+                    self.enc.add(dst, Reg::ZR, Reg(int_arg))?;
+                    int_arg += 1;
+                }
+                (ValType::F32, LocalLoc::F32(dst)) => {
+                    if fp_arg > 7 { return Err(LowerError::CallArityUnsupported); }
+                    self.enc.fmov_s_s(dst, Vreg(fp_arg))?;
+                    fp_arg += 1;
+                }
+                (ValType::F64, LocalLoc::F64(dst)) => {
+                    if fp_arg > 7 { return Err(LowerError::CallArityUnsupported); }
+                    self.enc.fmov_d_d(dst, Vreg(fp_arg))?;
+                    fp_arg += 1;
+                }
+                _ => return Err(LowerError::CallTypeUnsupported),
+            }
+        }
+        Ok(())
     }
 
     /// Attach AAPCS64 signatures for the direct-call targets. Must be
