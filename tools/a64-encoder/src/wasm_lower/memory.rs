@@ -110,6 +110,36 @@ impl Lowerer {
         self.emit_bounds_check(addr_reg, access_size, offset, is_store)
     }
 
+    /// Compute the final byte address `mem_base + addr + offset`
+    /// into X16 and return the effective LDR/STR immediate offset.
+    /// For small offsets (≤ ~16 KiB scaled by access width) the
+    /// offset is left on the LDR/STR instruction. For larger
+    /// offsets we materialise them into X17 and add into X16,
+    /// then return 0 as the effective offset.
+    ///
+    /// Threshold is conservative: 16 380 B is the 12-bit imm12-
+    /// scaled-by-4 max for 32-bit LDR/STR; the 64-bit variants
+    /// can encode up to 32 760 B but using one threshold keeps
+    /// the codepath uniform.
+    pub(super) fn full_addr_in_x16(
+        &mut self,
+        addr_reg: Reg,
+        offset: u32,
+    ) -> Result<u32, LowerError> {
+        self.enc.add_ext_uxtw(Reg::X16, MEM_BASE_REG, addr_reg)?;
+        if offset > 16380 {
+            self.enc.movz(Reg::X17, (offset & 0xFFFF) as u16, MovShift::Lsl0)?;
+            let hi = ((offset >> 16) & 0xFFFF) as u16;
+            if hi != 0 {
+                self.enc.movk(Reg::X17, hi, MovShift::Lsl16)?;
+            }
+            self.enc.add(Reg::X16, Reg::X16, Reg::X17)?;
+            Ok(0)
+        } else {
+            Ok(offset)
+        }
+    }
+
     // ── i32 load/store ──────────────────────────────────────────────
 
     pub(super) fn lower_load(&mut self, offset: u32) -> Result<(), LowerError> {
@@ -119,8 +149,8 @@ impl Lowerer {
         let addr = self.pop_i32_slot()?;
         self.maybe_bounds_check(addr, 4, offset, false)?;
         let dst = self.push_i32_slot()?;
-        self.enc.add_ext_uxtw(dst, MEM_BASE_REG, addr)?;
-        self.enc.ldr_w_imm(dst, dst, offset)?;
+        let eff = self.full_addr_in_x16(addr, offset)?;
+        self.enc.ldr_w_imm(dst, Reg::X16, eff)?;
         Ok(())
     }
 
@@ -131,8 +161,8 @@ impl Lowerer {
         let val = self.pop_i32_slot()?;
         let addr = self.pop_i32_slot()?;
         self.maybe_bounds_check(addr, 4, offset, true)?;
-        self.enc.add_ext_uxtw(addr, MEM_BASE_REG, addr)?;
-        self.enc.str_w_imm(val, addr, offset)?;
+        let eff = self.full_addr_in_x16(addr, offset)?;
+        self.enc.str_w_imm(val, Reg::X16, eff)?;
         Ok(())
     }
 
@@ -145,8 +175,8 @@ impl Lowerer {
         let addr = self.pop_i32_slot()?;
         self.maybe_bounds_check(addr, 4, offset, false)?;
         let dst = self.push_f32_slot()?;
-        self.enc.add_ext_uxtw(Reg::X16, MEM_BASE_REG, addr)?;
-        self.enc.ldr_s_imm(dst, Reg::X16, offset)?;
+        let eff = self.full_addr_in_x16(addr, offset)?;
+        self.enc.ldr_s_imm(dst, Reg::X16, eff)?;
         Ok(())
     }
 
@@ -157,8 +187,8 @@ impl Lowerer {
         let val = self.pop_f32_slot()?;
         let addr = self.pop_i32_slot()?;
         self.maybe_bounds_check(addr, 4, offset, true)?;
-        self.enc.add_ext_uxtw(Reg::X16, MEM_BASE_REG, addr)?;
-        self.enc.str_s_imm(val, Reg::X16, offset)?;
+        let eff = self.full_addr_in_x16(addr, offset)?;
+        self.enc.str_s_imm(val, Reg::X16, eff)?;
         Ok(())
     }
 
@@ -171,8 +201,8 @@ impl Lowerer {
         let addr = self.pop_i32_slot()?;
         self.maybe_bounds_check(addr, 8, offset, false)?;
         let dst = self.push_f64_slot()?;
-        self.enc.add_ext_uxtw(Reg::X16, MEM_BASE_REG, addr)?;
-        self.enc.ldr_d_imm(dst, Reg::X16, offset)?;
+        let eff = self.full_addr_in_x16(addr, offset)?;
+        self.enc.ldr_d_imm(dst, Reg::X16, eff)?;
         Ok(())
     }
 
@@ -183,8 +213,8 @@ impl Lowerer {
         let val = self.pop_f64_slot()?;
         let addr = self.pop_i32_slot()?;
         self.maybe_bounds_check(addr, 8, offset, true)?;
-        self.enc.add_ext_uxtw(Reg::X16, MEM_BASE_REG, addr)?;
-        self.enc.str_d_imm(val, Reg::X16, offset)?;
+        let eff = self.full_addr_in_x16(addr, offset)?;
+        self.enc.str_d_imm(val, Reg::X16, eff)?;
         Ok(())
     }
 
@@ -197,8 +227,8 @@ impl Lowerer {
         let addr = self.pop_i32_slot()?;
         self.maybe_bounds_check(addr, 8, offset, false)?;
         let dst = self.push_i64_slot()?;
-        self.enc.add_ext_uxtw(Reg::X16, MEM_BASE_REG, addr)?;
-        self.enc.ldr_imm(dst, Reg::X16, offset)?;
+        let eff = self.full_addr_in_x16(addr, offset)?;
+        self.enc.ldr_imm(dst, Reg::X16, eff)?;
         Ok(())
     }
 
@@ -209,8 +239,8 @@ impl Lowerer {
         let val = self.pop_i64_slot()?;
         let addr = self.pop_i32_slot()?;
         self.maybe_bounds_check(addr, 8, offset, true)?;
-        self.enc.add_ext_uxtw(Reg::X16, MEM_BASE_REG, addr)?;
-        self.enc.str_imm(val, Reg::X16, offset)?;
+        let eff = self.full_addr_in_x16(addr, offset)?;
+        self.enc.str_imm(val, Reg::X16, eff)?;
         Ok(())
     }
 }

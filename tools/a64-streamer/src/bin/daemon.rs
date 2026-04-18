@@ -86,7 +86,11 @@ mod unix {
     // JIT's i64.store / f64.store encoders require. Safe by
     // construction.
 
-    pub const LINEAR_MEM_SIZE: usize = 64 * 1024;
+    // 4 MiB linear memory — covers our ablation suite all the way
+    // up to the 256→512→256 macro test (~1 MiB of weights) with
+    // headroom for stack frames + globals + intermediate buffers.
+    // Pi 5 has 8 GiB RAM; one extra mmap of 4 MiB is irrelevant.
+    pub const LINEAR_MEM_SIZE: usize = 4 * 1024 * 1024;
 
     use core::sync::atomic::{AtomicUsize, Ordering};
 

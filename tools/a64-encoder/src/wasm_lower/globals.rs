@@ -38,13 +38,17 @@ impl Lowerer {
     /// Materialise `mem_base + global_off` into X16, the per-call
     /// address scratch we use everywhere else for memory ops.
     /// Required because globals live near the top of linear memory
-    /// (offset > 16 KiB), beyond what LDR/STR's immediate-offset
-    /// encoding can reach (max 4095 × scale, so 16 380 B for 32-bit
-    /// access). We always use MOVZ + ADD because every offset in
-    /// our 256 B globals area fits in a single 16-bit immediate.
+    /// (offset typically > 16 KiB), beyond what LDR/STR's immediate-
+    /// offset encoding can reach (max 4095 × scale, so 16 380 B for
+    /// 32-bit access). For our 1 MiB linear memory, the globals
+    /// area sits at 0xFFF00 — needs 32-bit offset materialization
+    /// via MOVZ + MOVK.
     fn materialize_global_addr(&mut self, off: u32) -> Result<(), LowerError> {
-        debug_assert!(off <= 0xFFFF, "global offset must fit MOVZ imm16");
-        self.enc.movz(Reg::X16, off as u16, MovShift::Lsl0)?;
+        self.enc.movz(Reg::X16, (off & 0xFFFF) as u16, MovShift::Lsl0)?;
+        let hi = ((off >> 16) & 0xFFFF) as u16;
+        if hi != 0 {
+            self.enc.movk(Reg::X16, hi, MovShift::Lsl16)?;
+        }
         self.enc.add_ext_uxtw(Reg::X16, MEM_BASE_REG, Reg::X16)?;
         Ok(())
     }
@@ -147,28 +151,27 @@ impl Lowerer {
             match ty {
                 ValType::I32 | ValType::F32 => {
                     let mut val = u32::from_le_bytes([init[0], init[1], init[2], init[3]]);
-                    if matches!(ty, ValType::I32)
-                        && val > self.mem_size.saturating_sub(GLOBAL_AREA_SIZE)
-                    {
+                    let max_safe = self.mem_size.saturating_sub(GLOBAL_AREA_SIZE);
+                    if matches!(ty, ValType::I32) && val > max_safe {
                         // Rust-compiled WASM initialises __stack_pointer
-                        // (and __data_end / __heap_base) to 1 MiB by
-                        // default. Clamp anything that points outside
-                        // our 64 KiB linear memory to a safe top-of-
-                        // stack value so SP-relative spills land in
-                        // [STACK_POINTER_INIT_FALLBACK .. mem_size -
-                        // GLOBAL_AREA_SIZE].
-                        val = STACK_POINTER_INIT_FALLBACK
-                            .min(self.mem_size.saturating_sub(GLOBAL_AREA_SIZE));
+                        // (and __data_end / __heap_base) to a value
+                        // that may exceed our linear-memory window.
+                        // Clamp to the top of the stack area
+                        // (mem_size - GLOBAL_AREA_SIZE). For our 1 MiB
+                        // daemon and Rust's default 0x100000 SP this
+                        // typically means SP starts at 0xFFF00 — fits
+                        // any reasonable Rust frame nesting.
+                        val = max_safe;
                     }
                     self.load_u32_into_reg(Reg::X17, val)?;
-                    self.enc.movz(Reg::X16, off as u16, MovShift::Lsl0)?;
+                    self.load_u32_into_reg(Reg::X16, off)?;
                     self.enc.add_ext_uxtw(Reg::X16, MEM_BASE_REG, Reg::X16)?;
                     self.enc.str_w_imm(Reg::X17, Reg::X16, 0)?;
                 }
                 ValType::I64 | ValType::F64 => {
                     let val = u64::from_le_bytes(*init);
                     self.load_u64_into_reg(Reg::X17, val)?;
-                    self.enc.movz(Reg::X16, off as u16, MovShift::Lsl0)?;
+                    self.load_u32_into_reg(Reg::X16, off)?;
                     self.enc.add_ext_uxtw(Reg::X16, MEM_BASE_REG, Reg::X16)?;
                     self.enc.str_imm(Reg::X17, Reg::X16, 0)?;
                 }
