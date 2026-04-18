@@ -108,6 +108,19 @@ pub fn syscall_shmem_map(shmem_id: u64, virt_addr: u64) -> u64 {
     if virt_addr == 0 {
         return u64::MAX;
     }
+    // Must stay in userspace — mapping into kernel VA would walk the
+    // shared upper-half page tables and corrupt the kernel's own
+    // mappings. `shmem_map` pages are 4 KiB each and the size is
+    // bounded at creation time, but we still reject any vaddr that
+    // could even *start* in the upper half.
+    if virt_addr >= 0x0000_8000_0000_0000 {
+        return u64::MAX;
+    }
+    // Also require page alignment — prevents straddling into kernel
+    // space with an odd offset near the boundary.
+    if virt_addr & 0xFFF != 0 {
+        return u64::MAX;
+    }
 
     match shmem_map(id, virt_addr as usize) {
         Ok(()) => 0,
@@ -192,6 +205,17 @@ pub fn syscall_mmap(hint_addr: u64, size: u64, flags: u64) -> u64 {
 
     let virt_base = if hint_addr != 0 {
         if hint_addr % PAGE_SIZE != 0 || hint_addr < MMAP_BASE {
+            return u64::MAX;
+        }
+        // Must not land in the kernel half. Without this, a user task
+        // could `mmap(hint=0xFFFF_FFFF_8000_0000, ...)` and map pages
+        // into kernel VA — a sandbox escape, since task page tables
+        // share the upper-half lower-level tables with the kernel.
+        let end = match hint_addr.checked_add(num_pages as u64 * PAGE_SIZE) {
+            Some(e) => e,
+            None => return u64::MAX,
+        };
+        if hint_addr >= 0x0000_8000_0000_0000 || end > 0x0000_8000_0000_0000 {
             return u64::MAX;
         }
         hint_addr
@@ -291,9 +315,21 @@ pub fn syscall_mprotect(virt_addr: u64, size: u64, flags: u64) -> u64 {
 
     const PAGE_SIZE: u64 = 4096;
     const MMAP_BASE: u64 = 0x4000_0000;
+    // Canonical user boundary — anything >= this is noncanonical or
+    // kernel space. Rewriting PTEs for kernel VAs would corrupt the
+    // shared upper-half page tables.
+    const USERSPACE_TOP: u64 = 0x0000_8000_0000_0000;
 
     // Validate inputs
     if size == 0 || virt_addr % PAGE_SIZE != 0 || virt_addr < MMAP_BASE {
+        return u64::MAX;
+    }
+    let end = match virt_addr.checked_add(size) {
+        Some(e) => e,
+        None => return u64::MAX, // size overflow
+    };
+    if virt_addr >= USERSPACE_TOP || end > USERSPACE_TOP {
+        crate::serial_strln!("[MPROTECT] REJECTED: vaddr/range crosses into kernel space");
         return u64::MAX;
     }
 
@@ -360,9 +396,16 @@ pub fn syscall_map_physical(phys_addr: u64, virt_addr: u64, size: u64, flags: u6
         return u64::MAX;
     }
 
-    // PCI MMIO BARs are typically above 0xF0000000 (MMIO hole)
-    let is_pci_mmio = phys_addr >= 0xF000_0000 && size <= 1024 * 1024;
-    if !is_pci_mmio && !capability::has_framebuffer_access(task_id, phys_addr, size) {
+    // Cap-gate the mapping. Accept either a Framebuffer cap (the
+    // compositor's primary display buffer, granted from boot_info)
+    // or an MmioRegion cap (one per PCI BAR, granted at compositor
+    // spawn after PCI enumeration). The old `is_pci_mmio` bypass —
+    // "any address above 0xF0000000 is fair game" — let any task
+    // reprogram VirtIO/GPU device registers at will. Per-BAR caps
+    // close that window while preserving legitimate driver use.
+    let has_mmio = capability::has_mmio_access(task_id, phys_addr, size);
+    let has_fb = capability::has_framebuffer_access(task_id, phys_addr, size);
+    if !has_mmio && !has_fb {
         crate::serial_str!("[MAP_PHYSICAL] Error: No capability for task ");
         crate::drivers::serial::write_dec(task_id);
         crate::serial_str!(" phys=");

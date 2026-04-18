@@ -23,7 +23,14 @@ fn transfer_capability(
     let sender_id = sender.lock().id;
     let target_id = target.lock().id;
 
-    capability::transfer(sender_id, target_id, cap_id)
+    // Type-enforced gate: TransferableCap::check rejects hardware-
+    // bound caps (DmaRegion, MmioRegion, IoPort, Framebuffer,
+    // DriverPrivilege, RawBlockIO) at construction time. The
+    // compiler won't let us pass a raw `cap_id` to `transfer()`.
+    let cap = capability::TransferableCap::check(cap_id)
+        .ok_or(Errno::ECAPFAIL)?;
+
+    capability::transfer(sender_id, target_id, cap)
         .map_err(|_| Errno::ECAPFAIL)?;
     Ok(())
 }
@@ -133,6 +140,10 @@ pub fn ipc_send(target: TaskId, msg: &IpcMessage) -> Result<IpcMessage, Errno> {
             let mut current_lock = current.lock();
             sender_priority = current_lock.priority;
             current_lock.state = TaskState::BlockedOnSend(target);
+            // Stamp the target so `syscall_exit` on the receiver can
+            // find us via TASK_TABLE scan and unblock us with an
+            // error instead of letting us hang forever.
+            current_lock.blocked_on = Some(target);
             current_lock.ipc_reply = None;
         }
 

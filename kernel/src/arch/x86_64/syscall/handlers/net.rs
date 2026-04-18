@@ -11,7 +11,7 @@ pub fn syscall_ping(ip_packed: u64) -> u64 {
 }
 
 pub fn syscall_dns_lookup(name_ptr: u64, name_len: u64) -> u64 {
-    if name_ptr < 0x200000 || name_ptr >= 0xFFFF_8000_0000_0000 || name_len == 0 || name_len > 255 {
+    if name_ptr < 0x200000 || name_ptr >= 0x0000_8000_0000_0000 || name_len == 0 || name_len > 255 {
         return 0;
     }
 
@@ -28,9 +28,9 @@ pub fn syscall_dns_lookup(name_ptr: u64, name_len: u64) -> u64 {
 }
 
 pub fn syscall_github_fetch(user_ptr: u64, user_len: u64, repo_ptr: u64, repo_len: u64) -> u64 {
-    if user_ptr < 0x200000 || user_ptr >= 0xFFFF_8000_0000_0000
+    if user_ptr < 0x200000 || user_ptr >= 0x0000_8000_0000_0000
         || user_len == 0 || user_len > 64
-        || repo_ptr < 0x200000 || repo_ptr >= 0xFFFF_8000_0000_0000
+        || repo_ptr < 0x200000 || repo_ptr >= 0x0000_8000_0000_0000
         || repo_len == 0 || repo_len > 64 {
         return u64::MAX;
     }
@@ -60,9 +60,9 @@ pub fn syscall_github_fetch(user_ptr: u64, user_len: u64, repo_ptr: u64, repo_le
 }
 
 pub fn syscall_github_clone(user_ptr: u64, user_len: u64, repo_ptr: u64, repo_len: u64) -> u64 {
-    if user_ptr < 0x200000 || user_ptr >= 0xFFFF_8000_0000_0000
+    if user_ptr < 0x200000 || user_ptr >= 0x0000_8000_0000_0000
         || user_len == 0 || user_len > 64
-        || repo_ptr < 0x200000 || repo_ptr >= 0xFFFF_8000_0000_0000
+        || repo_ptr < 0x200000 || repo_ptr >= 0x0000_8000_0000_0000
         || repo_len == 0 || repo_len > 64 {
         return u64::MAX;
     }
@@ -165,6 +165,17 @@ pub fn syscall_http_fetch(url_ptr: u64, url_len: u64, buf_ptr: u64, buf_len: u64
     if url_len == 0 || url_len > 512 || buf_len == 0 || buf_len > 65536 {
         return u64::MAX;
     }
+    // User-pointer validation — both must point into the lower-half
+    // userspace window. The syscall runs in ring 0 and would happily
+    // read/write kernel memory via a hostile pointer.
+    const USERSPACE_TOP: u64 = 0x0000_8000_0000_0000;
+    if url_ptr < 0x200000 || url_ptr >= USERSPACE_TOP { return u64::MAX; }
+    if buf_ptr < 0x200000 || buf_ptr >= USERSPACE_TOP { return u64::MAX; }
+    let buf_end = match buf_ptr.checked_add(buf_len) {
+        Some(e) => e,
+        None => return u64::MAX,
+    };
+    if buf_end > USERSPACE_TOP { return u64::MAX; }
 
     let url = unsafe {
         let slice = core::slice::from_raw_parts(url_ptr as *const u8, url_len as usize);
@@ -256,6 +267,23 @@ pub fn syscall_http_post(
     }
     if body_len > 4096 {
         return u64::MAX;
+    }
+    // All three pointers must land in userspace.
+    const USERSPACE_TOP: u64 = 0x0000_8000_0000_0000;
+    if url_ptr < 0x200000 || url_ptr >= USERSPACE_TOP { return u64::MAX; }
+    if resp_ptr < 0x200000 || resp_ptr >= USERSPACE_TOP { return u64::MAX; }
+    let resp_end = match resp_ptr.checked_add(resp_max) {
+        Some(e) => e,
+        None => return u64::MAX,
+    };
+    if resp_end > USERSPACE_TOP { return u64::MAX; }
+    if body_len > 0 {
+        if body_ptr < 0x200000 || body_ptr >= USERSPACE_TOP { return u64::MAX; }
+        let body_end = match body_ptr.checked_add(body_len) {
+            Some(e) => e,
+            None => return u64::MAX,
+        };
+        if body_end > USERSPACE_TOP { return u64::MAX; }
     }
 
     let url = unsafe {
@@ -390,8 +418,8 @@ pub fn syscall_fbp_request(
         return u64::MAX;
     }
     // Validate pointers
-    if url_ptr < 0x200000 || url_ptr >= 0xFFFF_8000_0000_0000 { return u64::MAX; }
-    if buf_ptr < 0x200000 || buf_ptr >= 0xFFFF_8000_0000_0000 { return u64::MAX; }
+    if url_ptr < 0x200000 || url_ptr >= 0x0000_8000_0000_0000 { return u64::MAX; }
+    if buf_ptr < 0x200000 || buf_ptr >= 0x0000_8000_0000_0000 { return u64::MAX; }
 
     let url_bytes = unsafe {
         core::slice::from_raw_parts(url_ptr as *const u8, url_len as usize)
@@ -499,6 +527,12 @@ pub fn syscall_fbp_interact(
     if url_len == 0 || url_len > 512 || buf_max == 0 || buf_max > 262144 {
         return u64::MAX;
     }
+    // Pointer sanity — mirror `syscall_fbp_request`: must point into
+    // the userspace range (above 2 MiB) and below the kernel half
+    // (below 0x0000_8000_0000_0000). Blocks null-ptr kernel panics
+    // and accidental writes into the kernel mapping.
+    if url_ptr < 0x200000 || url_ptr >= 0x0000_8000_0000_0000 { return u64::MAX; }
+    if buf_ptr < 0x200000 || buf_ptr >= 0x0000_8000_0000_0000 { return u64::MAX; }
 
     let action = (action_and_node & 0xFF) as u8;
     let node_id = ((action_and_node >> 8) & 0xFFFF_FFFF) as u32;
@@ -651,9 +685,9 @@ pub fn syscall_fbp_patch(
         return u64::MAX;
     }
     // Validate pointers
-    if filename_ptr < 0x200000 || filename_ptr >= 0xFFFF_8000_0000_0000 { return u64::MAX; }
-    if content_ptr < 0x200000 || content_ptr >= 0xFFFF_8000_0000_0000 { return u64::MAX; }
-    if result_ptr < 0x200000 || result_ptr >= 0xFFFF_8000_0000_0000 { return u64::MAX; }
+    if filename_ptr < 0x200000 || filename_ptr >= 0x0000_8000_0000_0000 { return u64::MAX; }
+    if content_ptr < 0x200000 || content_ptr >= 0x0000_8000_0000_0000 { return u64::MAX; }
+    if result_ptr < 0x200000 || result_ptr >= 0x0000_8000_0000_0000 { return u64::MAX; }
 
     let filename_bytes = unsafe {
         core::slice::from_raw_parts(filename_ptr as *const u8, filename_len as usize)
@@ -793,9 +827,9 @@ pub fn syscall_llm_generate(
         return u64::MAX;
     }
     // Validate pointers
-    if model_ptr < 0x200000 || model_ptr >= 0xFFFF_8000_0000_0000 { return u64::MAX; }
-    if prompt_ptr < 0x200000 || prompt_ptr >= 0xFFFF_8000_0000_0000 { return u64::MAX; }
-    if result_ptr < 0x200000 || result_ptr >= 0xFFFF_8000_0000_0000 { return u64::MAX; }
+    if model_ptr < 0x200000 || model_ptr >= 0x0000_8000_0000_0000 { return u64::MAX; }
+    if prompt_ptr < 0x200000 || prompt_ptr >= 0x0000_8000_0000_0000 { return u64::MAX; }
+    if result_ptr < 0x200000 || result_ptr >= 0x0000_8000_0000_0000 { return u64::MAX; }
 
     let model_bytes = unsafe {
         core::slice::from_raw_parts(model_ptr as *const u8, model_len)
@@ -928,6 +962,12 @@ pub fn syscall_wasm_compile(buf_ptr: u64, buf_max: u64) -> u64 {
     if buf_max == 0 || buf_max > 262_144 {
         return u64::MAX;
     }
+    // Pointer sanity — must point into the userspace window. Guards
+    // against a user task handing in 0 or a kernel-half address that
+    // `copy_from_slice` would otherwise write into blindly.
+    if buf_ptr < 0x200000 || buf_ptr >= 0x0000_8000_0000_0000 {
+        return u64::MAX;
+    }
 
     crate::serial_strln!("[WASM_COMPILE] requesting wasm32 build from proxy");
 
@@ -992,6 +1032,13 @@ pub fn syscall_ntp_query(server_ip_packed: u64) -> u64 {
 
 pub fn syscall_udp_send(target_packed: u64, port: u64, data_ptr: u64, data_len: u64) -> u64 {
     if data_len == 0 || data_len > 1472 { return u64::MAX; }
+    const USERSPACE_TOP: u64 = 0x0000_8000_0000_0000;
+    if data_ptr < 0x200000 || data_ptr >= USERSPACE_TOP { return u64::MAX; }
+    let end = match data_ptr.checked_add(data_len) {
+        Some(e) => e,
+        None => return u64::MAX,
+    };
+    if end > USERSPACE_TOP { return u64::MAX; }
     let ip = [
         ((target_packed >> 24) & 0xFF) as u8,
         ((target_packed >> 16) & 0xFF) as u8,
@@ -1014,6 +1061,18 @@ pub fn syscall_udp_send_recv(
     if data_len == 0 || data_len > 1472 || resp_len == 0 || resp_len > 4096 {
         return u64::MAX;
     }
+    const USERSPACE_TOP: u64 = 0x0000_8000_0000_0000;
+    if data_ptr < 0x200000 || data_ptr >= USERSPACE_TOP { return u64::MAX; }
+    if resp_ptr < 0x200000 || resp_ptr >= USERSPACE_TOP { return u64::MAX; }
+    let data_end = match data_ptr.checked_add(data_len) {
+        Some(e) => e,
+        None => return u64::MAX,
+    };
+    let resp_end = match resp_ptr.checked_add(resp_len as u64) {
+        Some(e) => e,
+        None => return u64::MAX,
+    };
+    if data_end > USERSPACE_TOP || resp_end > USERSPACE_TOP { return u64::MAX; }
     let ip = [
         ((target_packed >> 24) & 0xFF) as u8,
         ((target_packed >> 16) & 0xFF) as u8,

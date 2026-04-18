@@ -9,7 +9,22 @@ pub fn syscall_dma_alloc(size: u64, vaddr: u64) -> u64 {
     if num_pages == 0 || num_pages > 256 {
         return u64::MAX;
     }
-    if vaddr < 0x200000 || vaddr >= 0xFFFF_8000_0000_0000 {
+    // Canonical userspace top is 0x0000_8000_0000_0000. Anything at or
+    // above is either noncanonical (would panic VirtAddr::new) or in
+    // kernel VA (would corrupt shared upper-half page tables).
+    if vaddr < 0x200000 || vaddr >= 0x0000_8000_0000_0000 {
+        return u64::MAX;
+    }
+    // Also require page alignment, and check that the whole range
+    // stays in userspace (can't straddle the boundary).
+    if vaddr & 0xFFF != 0 {
+        return u64::MAX;
+    }
+    let end = match vaddr.checked_add(num_pages as u64 * 4096) {
+        Some(e) => e,
+        None => return u64::MAX,
+    };
+    if end > 0x0000_8000_0000_0000 {
         return u64::MAX;
     }
 
@@ -43,6 +58,19 @@ pub fn syscall_dma_alloc(size: u64, vaddr: u64) -> u64 {
     }
 
     let iommu = crate::arch::x86_64::acpi::iommu_available();
+
+    // Stamp the task as the owner of this physical range. Subsequent
+    // `syscall_dma_sync_*` calls check this capability before touching
+    // the page via HHDM — without it any task could sync-write kernel
+    // memory, which was the biggest remaining sandbox-escape vector.
+    //
+    // Grant failure is non-fatal: the mapping already succeeded, so we
+    // can't sensibly roll it back here. Worst case the task owns the
+    // memory but can't sync it — effectively a soft denial.
+    let dma_size_bytes = (num_pages as u64) * 4096;
+    if crate::capability::grant_dma_region(task_id, phys_addr as u64, dma_size_bytes).is_err() {
+        crate::serial_strln!("[DMA] WARN: grant_dma_region failed (cap table full?)");
+    }
 
     crate::serial_str!("[DMA] Allocated ");
     crate::drivers::serial::write_dec(num_pages as u32);
@@ -86,6 +114,16 @@ pub fn syscall_net_submit_rx(vaddr: u64, length: u64) -> u64 {
     if len == 0 || len > 1514 || vaddr < 0x200000 {
         return u64::MAX;
     }
+    // Whole range must stay in userspace. Previously only the lower
+    // bound was checked, so a kernel-VA pointer would pass validation
+    // and the syscall (running ring 0) would read kernel memory into
+    // the network RX ring — a trivial kernel info leak.
+    const USERSPACE_TOP: u64 = 0x0000_8000_0000_0000;
+    let end = match vaddr.checked_add(len as u64) {
+        Some(e) => e,
+        None => return u64::MAX,
+    };
+    if vaddr >= USERSPACE_TOP || end > USERSPACE_TOP { return u64::MAX; }
     let data = unsafe {
         core::slice::from_raw_parts(vaddr as *const u8, len)
     };
@@ -101,6 +139,15 @@ pub fn syscall_net_poll_tx(vaddr: u64, max_len: u64) -> u64 {
     if max == 0 || max > 2048 || vaddr < 0x200000 {
         return u64::MAX;
     }
+    // Same userspace-only guard as `net_submit_rx` — without this a
+    // malicious task could ask us to write up to 2 KiB of TX ring
+    // contents into kernel memory.
+    const USERSPACE_TOP: u64 = 0x0000_8000_0000_0000;
+    let end = match vaddr.checked_add(max as u64) {
+        Some(e) => e,
+        None => return u64::MAX,
+    };
+    if vaddr >= USERSPACE_TOP || end > USERSPACE_TOP { return u64::MAX; }
     let buf = unsafe {
         core::slice::from_raw_parts_mut(vaddr as *mut u8, max)
     };
@@ -122,10 +169,21 @@ pub fn syscall_net_poll_tx(vaddr: u64, max_len: u64) -> u64 {
 pub fn syscall_dma_sync_read(phys_addr: u64, dest_and_len: u64) -> u64 {
     if phys_addr == 0 { return u64::MAX; }
 
+    let len = ((dest_and_len >> 32) & 0xFFFF) as usize;
+
+    // Capability gate: the caller must own a DMA region that covers
+    // [phys_addr, phys_addr + len). Mode 2 (len == 0) reads a single
+    // u64 so we require 8 bytes. Without this a task could sync-read
+    // any physical page via HHDM — kernel code, another task's data,
+    // SQLITE_STATE, etc.
+    let task_id = crate::task::task::get_current_task();
+    let check_size = if len == 0 { 8 } else { len as u64 };
+    if !crate::capability::has_dma_access(task_id, phys_addr, check_size) {
+        return u64::MAX;
+    }
+
     let hhdm = crate::HHDM_OFFSET.load(core::sync::atomic::Ordering::Relaxed);
     let src_virt = hhdm + phys_addr as usize;
-
-    let len = ((dest_and_len >> 32) & 0xFFFF) as usize;
 
     if len == 0 {
         // Mode 2: read u64 directly — flush cache line first to see DMA writes
@@ -139,9 +197,22 @@ pub fn syscall_dma_sync_read(phys_addr: u64, dest_and_len: u64) -> u64 {
 
     // Mode 1: bulk copy
     let dest_vaddr = (dest_and_len & 0xFFFFFFFF) as usize;
-    if len > 4096 || dest_vaddr < 0x200000 {
+    // dest_vaddr is a 32-bit slice from the packed argument, so it's
+    // already bounded to the lower 4 GiB. Still reject below 2 MiB
+    // (user-null guard) and — belt-and-braces — make sure the written
+    // range doesn't straddle into the upper half. On x86-64 the upper
+    // 32 bits are zero here, so the `>= USERSPACE_TOP` check is
+    // effectively a no-op, but it documents intent and prevents
+    // regressions if the ABI ever widens to 64-bit `dest_vaddr`.
+    const USERSPACE_TOP: usize = 0x0000_8000_0000_0000;
+    if len > 4096 || dest_vaddr < 0x200000 || dest_vaddr >= USERSPACE_TOP {
         return u64::MAX;
     }
+    let end = match dest_vaddr.checked_add(len) {
+        Some(e) => e,
+        None => return u64::MAX,
+    };
+    if end > USERSPACE_TOP { return u64::MAX; }
 
     let src = src_virt as *const u8;
     let dst = dest_vaddr as *mut u8;
@@ -224,6 +295,24 @@ pub fn syscall_dma_sync_write(phys_addr: u64, src_and_len: u64) -> u64 {
     if len == 0 || len > 4096 || phys_addr == 0 || src_vaddr < 0x200000 {
         return u64::MAX;
     }
+    // Capability gate: the caller must own a DMA region that covers
+    // [phys_addr, phys_addr + len). Without this a task could overwrite
+    // kernel code pages via HHDM — trivial ring-0 code injection.
+    let task_id = crate::task::task::get_current_task();
+    if !crate::capability::has_dma_access(task_id, phys_addr, len as u64) {
+        return u64::MAX;
+    }
+    // Bound src_vaddr to userspace. The packed 32-bit slice already
+    // keeps us in the lower 4 GiB, but a future ABI bump that widens
+    // `src_vaddr` to 64 bits would let a task point at kernel memory
+    // and the syscall (running ring 0) would happily read it.
+    const USERSPACE_TOP: usize = 0x0000_8000_0000_0000;
+    if src_vaddr >= USERSPACE_TOP { return u64::MAX; }
+    let src_end = match src_vaddr.checked_add(len) {
+        Some(e) => e,
+        None => return u64::MAX,
+    };
+    if src_end > USERSPACE_TOP { return u64::MAX; }
 
     let hhdm = crate::HHDM_OFFSET.load(core::sync::atomic::Ordering::Relaxed);
     let dst_virt = hhdm + phys_addr as usize;

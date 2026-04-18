@@ -36,12 +36,28 @@ pub struct CallerToken(pub u64);
 impl CallerToken {
     /// Create a new CallerToken from sender PID and request ID.
     ///
-    /// Encoding: (sender_pid << 32) | (request_id & 0xFFFFFFFF) ^ OBFUSCATION_KEY
-    /// This is NOT cryptographically secure, but prevents accidental misuse.
+    /// Layout (pre-XOR):
+    ///   bits  0..16  sender_pid (u16 — task IDs are bounded below 65k)
+    ///   bits 16..64  request_id (48 bits, monotonic)
+    ///
+    /// Previously `request_id` occupied only 32 bits. At one-message-
+    /// per-microsecond that wraps in ~72 minutes and two tokens become
+    /// indistinguishable — a spoofed reply could satisfy a legitimate
+    /// waiter. 48 bits pushes wraparound past ~9000 years at 1 M
+    /// msgs/sec, which is comfortably out of reach.
+    ///
+    /// XOR obfuscation is NOT cryptographically secure — it prevents
+    /// accidental misuse, not determined forgery. A future upgrade
+    /// could HMAC with a boot-random kernel secret.
     #[inline]
     pub fn new(sender_pid: TaskId, request_id: u64) -> Self {
         const OBFUSCATION_KEY: u64 = 0xDEAD_BEEF_CAFE_BABE;
-        let raw = ((sender_pid as u64) << 32) | (request_id & 0xFFFF_FFFF);
+        // Clamp sender_pid to 16 bits. task::TaskId is u32 but
+        // MAX_TASKS is vastly smaller; anything that doesn't fit is
+        // a kernel bug, not a legitimate caller.
+        let sender = (sender_pid as u64) & 0xFFFF;
+        let req    = request_id & 0xFFFF_FFFF_FFFF; // 48 bits
+        let raw    = sender | (req << 16);
         Self(raw ^ OBFUSCATION_KEY)
     }
 
@@ -52,8 +68,8 @@ impl CallerToken {
     pub fn decode(self) -> Option<(TaskId, u64)> {
         const OBFUSCATION_KEY: u64 = 0xDEAD_BEEF_CAFE_BABE;
         let raw = self.0 ^ OBFUSCATION_KEY;
-        let sender_pid = (raw >> 32) as TaskId;
-        let request_id = raw & 0xFFFF_FFFF;
+        let sender_pid = (raw & 0xFFFF) as TaskId;
+        let request_id = (raw >> 16) & 0xFFFF_FFFF_FFFF;
 
         // Basic sanity check: sender_pid should be non-zero
         if sender_pid == 0 {

@@ -61,10 +61,17 @@ impl Ramdisk {
             return Err(RamdiskError::EntryTableOverflow);
         }
 
-        // Verify each entry's data region is within bounds
+        // Verify each entry's data region is within bounds. Use
+        // `checked_add` so malicious offset/size values (e.g.
+        // `offset = u64::MAX - 100, size = 200`) can't wrap to a tiny
+        // number that sneaks past the bounds check, leaving `read()`
+        // to read gigabytes of kernel memory via `base.add(offset)`.
         let entries = Self::entries_from_raw(base, header.entry_count as usize);
         for entry in entries {
-            let end = entry.offset as usize + entry.size as usize;
+            let end = match (entry.offset as usize).checked_add(entry.size as usize) {
+                Some(e) => e,
+                None => return Err(RamdiskError::EntryDataOverflow),
+            };
             if end > size {
                 return Err(RamdiskError::EntryDataOverflow);
             }

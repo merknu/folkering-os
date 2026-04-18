@@ -7,6 +7,7 @@
 
 pub mod format;
 pub mod ramdisk;
+pub mod mvfs;
 
 use spin::Once;
 use ramdisk::Ramdisk;

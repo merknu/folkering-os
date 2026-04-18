@@ -180,6 +180,8 @@ pub fn ipc_reply(request: &IpcMessage, reply_payload: [u64; 4]) -> Result<(), Er
         sender_lock.ipc_reply = Some(reply_msg);
         sender_lock.context.rax = reply_payload[0];
         sender_lock.state = TaskState::Runnable;
+        // Clear blocked_on so exit-time sweep doesn't touch us.
+        sender_lock.blocked_on = None;
     }
 
     // Reset priority inheritance (we finished serving the sender's request)
@@ -276,6 +278,8 @@ pub fn ipc_recv_async() -> Result<(CallerToken, IpcMessage), Errno> {
                     let current_id = current.lock().id;
                     if sender_lock.state == TaskState::BlockedOnSend(current_id) {
                         sender_lock.state = TaskState::WaitingForReply(msg.msg_id);
+                        // Keep `blocked_on` stamped — we remain the
+                        // owing party until we reply via token.
                     }
                 }
             }
@@ -331,6 +335,8 @@ pub fn ipc_reply_with_token(token: CallerToken, reply_payload: [u64; 4]) -> Resu
         sender_lock.ipc_reply = Some(reply_msg);
         sender_lock.context.rax = reply_payload[0];
         sender_lock.state = TaskState::Runnable;
+        // Clear blocked_on so exit-time sweep doesn't touch us.
+        sender_lock.blocked_on = None;
     }
 
     // Reset priority inheritance on current task (we just finished
@@ -342,6 +348,61 @@ pub fn ipc_reply_with_token(token: CallerToken, reply_payload: [u64; 4]) -> Resu
 
     crate::task::scheduler::enqueue(sender_pid);
     Ok(())
+}
+
+/// Wake every task blocked on `exiting_task` with an error sentinel.
+///
+/// Called from `syscall_exit`. Without this, if a server task (e.g.
+/// synapse, intent-service) crashes, every client currently sitting
+/// in `BlockedOnSend(server)` or `WaitingForReply(...)` against it
+/// hangs indefinitely — the reply they're waiting for will never
+/// arrive and no other code path unblocks them.
+///
+/// We identify such waiters via the `blocked_on` stamp that
+/// `ipc_send` sets when the sender blocks. On unblock we stash
+/// `u64::MAX` in the waiter's `context.rax` so its syscall returns
+/// the standard error sentinel, and re-enqueue it in the scheduler.
+///
+/// Returns the number of tasks unblocked (for logging).
+pub fn unblock_waiters_for(exiting_task: crate::ipc::message::TaskId) -> u32 {
+    use crate::task::task::{TASK_TABLE, TaskState};
+
+    let mut unblocked = 0u32;
+    // Snapshot task IDs first so we can release TASK_TABLE before
+    // taking per-task locks — avoids holding two locks simultaneously.
+    let candidate_ids: alloc::vec::Vec<crate::ipc::message::TaskId> = {
+        let table = TASK_TABLE.lock();
+        table.iter().map(|(&id, _)| id).collect()
+    };
+
+    for tid in candidate_ids {
+        let task_arc = match crate::task::task::get_task(tid) {
+            Some(t) => t,
+            None => continue,
+        };
+        let mut t = task_arc.lock();
+        if t.blocked_on != Some(exiting_task) {
+            continue;
+        }
+        let should_wake = matches!(
+            t.state,
+            TaskState::BlockedOnSend(x) if x == exiting_task
+        ) || matches!(t.state, TaskState::WaitingForReply(_));
+        if !should_wake {
+            continue;
+        }
+        // Signal failure via syscall return register. The u64::MAX
+        // sentinel is what every affected syscall path already uses
+        // to indicate "kernel-level failure".
+        t.context.rax = u64::MAX;
+        t.state = TaskState::Runnable;
+        t.blocked_on = None;
+        t.ipc_reply = None;
+        unblocked += 1;
+        drop(t);
+        crate::task::scheduler::enqueue(tid);
+    }
+    unblocked
 }
 
 /// Selective receive (future enhancement)

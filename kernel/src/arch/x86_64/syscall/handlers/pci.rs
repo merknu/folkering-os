@@ -30,7 +30,7 @@ pub fn syscall_pci_enumerate(buf_ptr: u64, buf_size: u64) -> u64 {
     let entry_size = core::mem::size_of::<PciDeviceUserInfo>();
     let max_entries = (buf_size as usize) / entry_size;
 
-    if buf_ptr < 0x200000 || buf_ptr >= 0xFFFF_8000_0000_0000 || max_entries == 0 {
+    if buf_ptr < 0x200000 || buf_ptr >= 0x0000_8000_0000_0000 || max_entries == 0 {
         return u64::MAX;
     }
 
@@ -96,9 +96,20 @@ pub fn syscall_pci_enumerate(buf_ptr: u64, buf_size: u64) -> u64 {
 
 // ── Capability-Gated Port I/O ──────────────────────────────────────────
 
-/// Check if a port is within a known PCI device's I/O BAR range.
-/// Returns true if the port is permitted for userspace access.
-fn port_io_allowed(port: u16) -> bool {
+/// Check if the current task may touch `port` (for `width_bytes` bytes).
+///
+/// Two gates stack:
+///   1. Global blocklist for ports the kernel owns exclusively (PIC,
+///      PIT, PS/2, COM, CMOS, PCI config) — no task may touch these
+///      regardless of capabilities.
+///   2. Per-task `IoPort` capability — must cover the requested
+///      `[port, port + width_bytes)` range. Caps are granted at
+///      compositor spawn for each I/O BAR owned by an enumerated PCI
+///      device.
+///
+/// Previous implementation was a global allowlist (any task could
+/// touch any PCI device's I/O BAR); this tightens to per-task tokens.
+fn port_io_allowed(port: u16, width_bytes: u16) -> bool {
     // Blocklist: kernel-critical ports
     match port {
         0x0020..=0x0021 => return false, // PIC1
@@ -113,31 +124,13 @@ fn port_io_allowed(port: u16) -> bool {
         _ => {}
     }
 
-    // Allowlist: check PCI device I/O BARs
-    let list = crate::drivers::pci::PCI_DEVICES.lock();
-    for i in 0..list.count {
-        if let Some(ref dev) = list.devices[i] {
-            for bar_idx in 0..6u8 {
-                let bar_val = dev.bars[bar_idx as usize];
-                if bar_val & 1 != 0 {
-                    let base = (bar_val & 0xFFFC) as u16;
-                    let size = crate::drivers::pci::bar_size(
-                        dev.bus, dev.device, dev.function, bar_idx
-                    ) as u16;
-                    if size > 0 && port >= base && port < base.saturating_add(size) {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-
-    false
+    let task_id = crate::task::task::get_current_task();
+    crate::capability::has_io_port_access(task_id, port, width_bytes)
 }
 
 pub fn syscall_port_inb(port: u64) -> u64 {
     let port = port as u16;
-    if !port_io_allowed(port) {
+    if !port_io_allowed(port, 1) {
         return u64::MAX;
     }
     unsafe {
@@ -148,7 +141,7 @@ pub fn syscall_port_inb(port: u64) -> u64 {
 
 pub fn syscall_port_inw(port: u64) -> u64 {
     let port = port as u16;
-    if !port_io_allowed(port) {
+    if !port_io_allowed(port, 2) {
         return u64::MAX;
     }
     unsafe {
@@ -159,7 +152,7 @@ pub fn syscall_port_inw(port: u64) -> u64 {
 
 pub fn syscall_port_inl(port: u64) -> u64 {
     let port = port as u16;
-    if !port_io_allowed(port) {
+    if !port_io_allowed(port, 4) {
         return u64::MAX;
     }
     unsafe {
@@ -170,7 +163,7 @@ pub fn syscall_port_inl(port: u64) -> u64 {
 
 pub fn syscall_port_outb(port: u64, value: u64) -> u64 {
     let port = port as u16;
-    if !port_io_allowed(port) {
+    if !port_io_allowed(port, 1) {
         return u64::MAX;
     }
     unsafe {
@@ -182,7 +175,7 @@ pub fn syscall_port_outb(port: u64, value: u64) -> u64 {
 
 pub fn syscall_port_outw(port: u64, value: u64) -> u64 {
     let port = port as u16;
-    if !port_io_allowed(port) {
+    if !port_io_allowed(port, 2) {
         return u64::MAX;
     }
     unsafe {
@@ -194,7 +187,7 @@ pub fn syscall_port_outw(port: u64, value: u64) -> u64 {
 
 pub fn syscall_port_outl(port: u64, value: u64) -> u64 {
     let port = port as u16;
-    if !port_io_allowed(port) {
+    if !port_io_allowed(port, 4) {
         return u64::MAX;
     }
     unsafe {
@@ -202,6 +195,114 @@ pub fn syscall_port_outl(port: u64, value: u64) -> u64 {
         p.write(value as u32);
     }
     0
+}
+
+// ── Per-task PCI device acquisition ────────────────────────────────────
+//
+// The compositor gets a blanket grant of every PCI BAR at boot, but
+// other tasks starting later can't. `syscall_pci_acquire` lets a task
+// explicitly request a device by (bus, device, function); the kernel
+// validates that the device was enumerated and grants MmioRegion +
+// IoPort caps for each of its BARs.
+//
+// Typical flow:
+//   1. Task calls `syscall_pci_enumerate()` to discover devices.
+//   2. Task picks the one it wants to drive (matching vendor/device ID).
+//   3. Task calls `syscall_pci_acquire(bus, device, function)`.
+//   4. Kernel checks PCI_DEVICES, grants BAR caps, returns # of BARs.
+//   5. Task calls `syscall_map_physical` / port I/O; caps authorize.
+//
+// Does NOT mutate or remove the device from `PCI_DEVICES` — multiple
+// tasks can theoretically hold caps for the same device. A future
+// refactor could add exclusivity tracking; for now the blanket-grant
+// to compositor plus per-task acquire is additive.
+
+pub fn syscall_pci_acquire(packed: u64) -> u64 {
+    let bus = (packed & 0xFF) as u8;
+    let device = ((packed >> 8) & 0xFF) as u8;
+    let function = ((packed >> 16) & 0xFF) as u8;
+
+    let task_id = crate::task::task::get_current_task();
+
+    // Authorization gate. Without this, any task could call
+    // `pci_acquire` and hand itself MMIO/IoPort caps for an
+    // arbitrary device — a trivial escalation past the "only
+    // compositor touches hardware" invariant established by the
+    // MMIO-capability refactor. `DriverPrivilege` must be granted
+    // explicitly at task spawn time by kernel boot code.
+    if !crate::capability::has_driver_privilege(task_id) {
+        crate::serial_str!("[PCI_ACQUIRE] Task ");
+        crate::drivers::serial::write_dec(task_id);
+        crate::serial_strln!(" lacks DriverPrivilege capability");
+        return u64::MAX;
+    }
+
+    // Find the device in the enumeration snapshot.
+    let list = crate::drivers::pci::PCI_DEVICES.lock();
+    let mut matched = None;
+    for i in 0..list.count {
+        if let Some(ref dev) = list.devices[i] {
+            if dev.bus == bus && dev.device == device && dev.function == function {
+                matched = Some(i);
+                break;
+            }
+        }
+    }
+    let dev_idx = match matched {
+        Some(i) => i,
+        None => {
+            crate::serial_str!("[PCI_ACQUIRE] Device ");
+            crate::drivers::serial::write_dec(bus as u32);
+            crate::serial_str!(":");
+            crate::drivers::serial::write_dec(device as u32);
+            crate::serial_str!(".");
+            crate::drivers::serial::write_dec(function as u32);
+            crate::serial_strln!(" not enumerated");
+            return u64::MAX;
+        }
+    };
+
+    // Grant one cap per non-empty BAR.
+    let dev_ref = list.devices[dev_idx].as_ref().unwrap();
+    let mut grants: u64 = 0;
+    for b in 0..6u8 {
+        let sz = crate::drivers::pci::bar_size(dev_ref.bus, dev_ref.device, dev_ref.function, b) as u64;
+        if sz == 0 { continue; }
+        match crate::drivers::pci::decode_bar(dev_ref, b as usize) {
+            crate::drivers::pci::BarType::Mmio32 { base, .. } => {
+                if crate::capability::grant_mmio_region(task_id, base as u64, sz).is_ok() {
+                    grants += 1;
+                }
+            }
+            crate::drivers::pci::BarType::Mmio64 { base, .. } => {
+                if crate::capability::grant_mmio_region(task_id, base, sz).is_ok() {
+                    grants += 1;
+                }
+            }
+            crate::drivers::pci::BarType::Io { base } => {
+                let port_size = sz.min(0xFFFF) as u16;
+                if crate::capability::grant_io_port(task_id, base, port_size).is_ok() {
+                    grants += 1;
+                }
+            }
+            crate::drivers::pci::BarType::None => {}
+        }
+    }
+    drop(list);
+
+    crate::serial_str!("[PCI_ACQUIRE] Granted ");
+    crate::drivers::serial::write_dec(grants as u32);
+    crate::serial_str!(" BAR caps to task ");
+    crate::drivers::serial::write_dec(task_id);
+    crate::serial_str!(" for device ");
+    crate::drivers::serial::write_dec(bus as u32);
+    crate::serial_str!(":");
+    crate::drivers::serial::write_dec(device as u32);
+    crate::serial_str!(".");
+    crate::drivers::serial::write_dec(function as u32);
+    crate::serial_strln!("");
+
+    grants
 }
 
 // ── IRQ Routing for WASM Drivers ───────────────────────────────────────

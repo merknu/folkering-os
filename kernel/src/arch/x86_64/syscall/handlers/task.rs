@@ -36,10 +36,74 @@ pub fn syscall_exit(exit_code: u64) -> u64 {
         (0, None)
     };
 
+    // Release task-owned IPC resources BEFORE removing the task entry.
+    // Without these, a crashing/exiting task leaks:
+    //   - Async TCP slots (4 total — exhausted after 4 bad exits)
+    //   - Shared-memory regions it created (pages + table entry)
+    //   - Global capability table slots (4096 total — including the
+    //     DmaRegion caps auto-granted by `syscall_dma_alloc`)
+    crate::net::tcp_async::free_task_slots(current_id);
+    crate::ipc::shared_memory::free_task_regions(current_id);
+
+    // Wake every task currently blocked waiting on us. Without this,
+    // a crashing/exiting server (e.g. synapse, intent) leaves every
+    // client sitting in `BlockedOnSend(current_id)` or
+    // `WaitingForReply(...)` against it hung forever — the reply
+    // they're waiting on will never arrive. Waiters are signaled
+    // with u64::MAX in rax so their syscall returns the standard
+    // kernel-failure sentinel.
+    let unblocked = crate::ipc::unblock_waiters_for(current_id);
+    if unblocked > 0 {
+        crate::serial_str!("[EXIT] Unblocked ");
+        crate::drivers::serial::write_dec(unblocked);
+        crate::serial_str!(" waiter(s) on task ");
+        crate::drivers::serial::write_dec(current_id);
+        crate::serial_strln!(" exit");
+    }
+
+    // Drain the task's capability list and revoke each entry so the
+    // global table slot becomes reclaimable. Drain first while the
+    // task is still in TASK_TABLE, then walk the Vec outside the
+    // task lock so `revoke()` (which takes the global cap mutex) can
+    // run without holding a per-task lock.
+    let cap_ids: alloc::vec::Vec<u32> = if let Some(task_arc) = task::get_task(current_id) {
+        let mut t = task_arc.lock();
+        core::mem::take(&mut t.capabilities)
+    } else {
+        alloc::vec::Vec::new()
+    };
+    for cap_id in cap_ids {
+        // `revoke_with_cleanup` frees backing resources (e.g.
+        // `alloc_contiguous` pages held by `DmaRegion` caps) in
+        // addition to marking the cap-table slot reusable.
+        let _ = crate::capability::revoke_with_cleanup(cap_id);
+    }
+
     let _ = task::remove_task(current_id);
 
-    // Free user-space page tables (if task had its own address space)
+    // Free user-space page tables (if task had its own address space).
+    //
+    // CRITICAL: switch CR3 to the kernel PML4 BEFORE calling free
+    // here. `syscall_exit` is still running inside the dying task's
+    // address space, so CR3 currently points at `page_table_phys`.
+    // If we free those pages first, the HLT loop below (and any
+    // interrupt that fires in between) runs with CR3 referencing
+    // PMM-reclaimed frames — the kernel's instruction fetches and
+    // stack accesses go through HHDM which stays valid, but any
+    // code path that walks the current address space (page fault,
+    // nested IRQ, signal delivery) would dereference freed pages.
     if page_table_phys != 0 {
+        let kernel_pml4 = crate::memory::paging::kernel_pml4_phys();
+        if kernel_pml4 != 0 {
+            unsafe {
+                use x86_64::registers::control::{Cr3, Cr3Flags};
+                use x86_64::structures::paging::PhysFrame;
+                let frame = PhysFrame::containing_address(
+                    x86_64::PhysAddr::new(kernel_pml4)
+                );
+                Cr3::write(frame, Cr3Flags::empty());
+            }
+        }
         if let Err(_) = crate::memory::paging::free_task_page_table(page_table_phys) {
             crate::serial_println!("[EXIT] WARN: failed to free page table for task {}", current_id);
         }
@@ -87,6 +151,20 @@ pub fn syscall_task_list_detailed(buf_ptr: u64, buf_size: u64) -> u64 {
         let table = TASK_TABLE.lock();
         return table.len() as u64;
     }
+
+    // Pointer must land entirely in userspace. Without this, a task
+    // could pass `buf_ptr = 0xFFFF_FFFF_8000_0000` and we'd write task
+    // names + state bytes into kernel memory — corruption that
+    // persists for the rest of the boot.
+    const USERSPACE_TOP: u64 = 0x0000_8000_0000_0000;
+    if buf_ptr < 0x200000 || buf_ptr >= USERSPACE_TOP || buf_size > 64 * 1024 {
+        return 0;
+    }
+    let buf_end = match buf_ptr.checked_add(buf_size) {
+        Some(e) => e,
+        None => return 0,
+    };
+    if buf_end > USERSPACE_TOP { return 0; }
 
     let buf = unsafe {
         core::slice::from_raw_parts_mut(buf_ptr as *mut u8, buf_size as usize)

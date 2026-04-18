@@ -37,12 +37,30 @@ unsafe impl FrameAllocator<Size4KiB> for BootFrameAllocator {
 
 /// Initialize paging subsystem
 ///
+/// Physical address of the boot-time kernel PML4.
+///
+/// Stamped once by `init()` from CR3 before any task page tables are
+/// created. `syscall_exit` uses this to switch CR3 off the dying
+/// task's PML4 *before* freeing it — without the switch, the HLT
+/// loop that follows exit would be running with CR3 pointing at
+/// pages the PMM has already reclaimed.
+pub static KERNEL_PML4_PHYS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 /// Sets up recursive page table mapping and creates kernel page table mapper.
 pub fn init(boot_info: &BootInfo) {
     crate::serial_strln!("[PAGING] Initializing page table management...");
 
     // Get active level 4 page table from CR3
     let level_4_table = unsafe { active_level_4_table() };
+
+    // Snapshot the kernel PML4 for later use by task-exit cleanup.
+    use x86_64::registers::control::Cr3;
+    let (kernel_frame, _) = Cr3::read();
+    KERNEL_PML4_PHYS.store(
+        kernel_frame.start_address().as_u64(),
+        core::sync::atomic::Ordering::Release,
+    );
 
     // Create mapper with HHDM offset
     let hhdm = HHDM_OFFSET.load(core::sync::atomic::Ordering::Relaxed);
@@ -51,7 +69,16 @@ pub fn init(boot_info: &BootInfo) {
 
     *MAPPER.lock() = Some(mapper);
 
-    crate::serial_strln!("[PAGING] Page table management initialized");
+    crate::serial_str!("[PAGING] Page table management initialized (kernel PML4 @ ");
+    crate::drivers::serial::write_hex(KERNEL_PML4_PHYS.load(core::sync::atomic::Ordering::Relaxed));
+    crate::serial_strln!(")");
+}
+
+/// Read the stashed kernel PML4 physical address. Returns 0 if
+/// `init()` hasn't run yet (shouldn't happen in practice — every
+/// caller runs after paging is online).
+pub fn kernel_pml4_phys() -> u64 {
+    KERNEL_PML4_PHYS.load(core::sync::atomic::Ordering::Acquire)
 }
 
 /// Get active level 4 page table

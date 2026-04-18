@@ -95,6 +95,23 @@ pub fn spawn(binary: &[u8], _args: &[&str]) -> Result<TaskId, SpawnError> {
             continue;
         }
 
+        // User segments MUST live in the lower half of the address
+        // space. The task's PML4 shares its upper-half (kernel) entries
+        // with the host kernel — mapping into kernel VA would walk the
+        // SHARED lower-level page tables and corrupt the kernel's own
+        // mappings, not just the task's view. Reject before touching
+        // any page tables.
+        const USERSPACE_TOP: u64 = 0x0000_8000_0000_0000;
+        let seg_end = vaddr.saturating_add(memsz as u64);
+        if vaddr >= USERSPACE_TOP || seg_end > USERSPACE_TOP {
+            crate::serial_str!("[SPAWN_ELF] REJECT: segment vaddr/range spans kernel space (vaddr=");
+            crate::drivers::serial::write_hex(vaddr);
+            crate::serial_str!(" end=");
+            crate::drivers::serial::write_hex(seg_end);
+            crate::serial_str!(")\n");
+            return Err(SpawnError::InvalidElf(super::elf::ElfError::KernelVaddr));
+        }
+
         // Calculate number of pages needed
         let start_page = vaddr & !0xFFF; // Page-align start
         let end_addr = vaddr + memsz as u64;
