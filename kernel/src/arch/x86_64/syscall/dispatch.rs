@@ -59,6 +59,16 @@ pub(super) extern "C" fn syscall_handler(
         0x25 => syscall_read_mouse(),
         // Phase 8: Detailed task list via userspace buffer
         0x26 => syscall_task_list_detailed(arg1, arg2),
+        // MVFS v1: mutable, in-memory, tmpfs-style file store.
+        // Distinct namespace from the read-only ramdisk (13/14).
+        0x27 => syscall_mvfs_write(arg1, arg2, arg3, arg4),
+        0x28 => syscall_mvfs_read(arg1, arg2, arg3, arg4),
+        0x29 => syscall_mvfs_delete(arg1, arg2),
+        0x2A => syscall_mvfs_list(arg1, arg2, arg3, arg4),
+        // Per-task PCI device acquisition. `packed` carries
+        // bus(0..8) | device(8..16) | function(16..24). Returns
+        // the number of BAR caps granted.
+        0x2B => syscall_pci_acquire(arg1),
         // Phase 9: Anonymous memory mapping
         0x30 => syscall_mmap(arg1, arg2, arg3),
         0x31 => syscall_munmap(arg1, arg2),
@@ -394,6 +404,29 @@ pub(super) extern "C" fn syscall_handler(
         0x9D => {
             let (pending, total, overflow) = crate::drivers::telemetry::stats();
             (pending as u64) | ((total as u64) << 16) | ((overflow as u64) << 32)
+        },
+
+        // JIT: compile MLP to AArch64 and execute on Pi
+        // arg1 = Pi IP as 4 bytes packed (e.g. 192.168.68.50 → 0xC0A84432)
+        // arg2 = port (default 7700)
+        // Returns: exit code from Pi (low 32 bits), or u64::MAX on error
+        0xE4 => {
+            let ip = [
+                (arg1 & 0xFF) as u8,
+                ((arg1 >> 8) & 0xFF) as u8,
+                ((arg1 >> 16) & 0xFF) as u8,
+                ((arg1 >> 24) & 0xFF) as u8,
+            ];
+            let port = if arg2 == 0 { 7700 } else { arg2 as u16 };
+            match crate::jit::run_mlp_on_pi(ip, port) {
+                Ok(result) => result.exit_code as u64,
+                Err(e) => {
+                    crate::serial_str!("[JIT] error: ");
+                    crate::drivers::serial::write_str(e);
+                    crate::serial_str!("\n");
+                    u64::MAX
+                }
+            }
         },
 
         _ => {

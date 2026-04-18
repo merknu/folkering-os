@@ -29,6 +29,7 @@ pub mod udp;
 pub mod ntp;
 pub mod tcp_shell;
 pub mod tcp_async;
+pub mod a64_stream;
 
 // ── Re-exports for the public API ──────────────────────────────────────
 //

@@ -126,6 +126,12 @@ pub fn parse_ops(bytes: &[u8], pos: &mut usize) -> Result<Vec<WasmOp>, ParseErro
             0x0F => {
                 ops.push(WasmOp::Return);
             }
+            0x1A => {
+                ops.push(WasmOp::Drop);
+            }
+            0x1B => {
+                ops.push(WasmOp::Select);
+            }
             0x20 => {
                 let idx = read_uleb128(bytes, pos)?;
                 if idx > u32::MAX as u64 { return Err(ParseError::IntegerTooLarge); }
@@ -135,6 +141,11 @@ pub fn parse_ops(bytes: &[u8], pos: &mut usize) -> Result<Vec<WasmOp>, ParseErro
                 let idx = read_uleb128(bytes, pos)?;
                 if idx > u32::MAX as u64 { return Err(ParseError::IntegerTooLarge); }
                 ops.push(WasmOp::LocalSet(idx as u32));
+            }
+            0x22 => {
+                let idx = read_uleb128(bytes, pos)?;
+                if idx > u32::MAX as u64 { return Err(ParseError::IntegerTooLarge); }
+                ops.push(WasmOp::LocalTee(idx as u32));
             }
             0x41 => {
                 let v = read_sleb128(bytes, pos)?;
@@ -314,6 +325,27 @@ pub fn parse_ops(bytes: &[u8], pos: &mut usize) -> Result<Vec<WasmOp>, ParseErro
             0xA1 => ops.push(WasmOp::F64Sub),
             0xA2 => ops.push(WasmOp::F64Mul),
             0xA3 => ops.push(WasmOp::F64Div),
+            0xFC => {
+                // "Misc" prefix — second byte is a ULEB128 sub-opcode.
+                // Currently we only handle the saturating-truncate
+                // variants (0x00..0x07), which Rust emits for `as i32`/
+                // `as i64` casts from f32/f64. AArch64 FCVTZS/U is
+                // already saturating per the ARM ISA, so we lower
+                // these to the same instructions as the legacy
+                // (non-saturating) trunc opcodes.
+                let sub = read_uleb128(bytes, pos)?;
+                match sub {
+                    0x00 => ops.push(WasmOp::I32TruncF32S),
+                    0x01 => ops.push(WasmOp::I32TruncF32U),
+                    0x02 => ops.push(WasmOp::I32TruncF64S),
+                    0x03 => ops.push(WasmOp::I32TruncF64U),
+                    0x04 => ops.push(WasmOp::I64TruncF32S),
+                    0x05 => ops.push(WasmOp::I64TruncF32U),
+                    0x06 => ops.push(WasmOp::I64TruncF64S),
+                    0x07 => ops.push(WasmOp::I64TruncF64U),
+                    _ => return Err(ParseError::UnknownOpcode(sub.min(0xFF) as u8)),
+                }
+            }
             0xFD => {
                 // SIMD prefix — second byte is a ULEB128 sub-opcode.
                 // The current WASM SIMD proposal has ~235 ops; we
@@ -344,8 +376,20 @@ pub fn parse_ops(bytes: &[u8], pos: &mut usize) -> Result<Vec<WasmOp>, ParseErro
                         *pos += 16;
                         ops.push(WasmOp::V128Const(u128::from_le_bytes(lit)));
                     }
+                    0x0F => ops.push(WasmOp::I8x16Splat),
+                    0x10 => ops.push(WasmOp::I16x8Splat),
                     0x11 => ops.push(WasmOp::I32x4Splat),
                     0x13 => ops.push(WasmOp::F32x4Splat),
+                    0x15 => {
+                        if *pos >= bytes.len() { return Err(ParseError::UnexpectedEof); }
+                        let lane = bytes[*pos]; *pos += 1;
+                        ops.push(WasmOp::I8x16ExtractLaneU(lane));
+                    }
+                    0x19 => {
+                        if *pos >= bytes.len() { return Err(ParseError::UnexpectedEof); }
+                        let lane = bytes[*pos]; *pos += 1;
+                        ops.push(WasmOp::I16x8ExtractLaneU(lane));
+                    }
                     0x41 => ops.push(WasmOp::F32x4Eq),
                     0x44 => ops.push(WasmOp::F32x4Gt),
                     0x52 => ops.push(WasmOp::V128Bitselect),
@@ -367,6 +411,11 @@ pub fn parse_ops(bytes: &[u8], pos: &mut usize) -> Result<Vec<WasmOp>, ParseErro
                         }
                         ops.push(WasmOp::F32x4ExtractLane(lane));
                     }
+                    0x6E => ops.push(WasmOp::I8x16Add),
+                    0x71 => ops.push(WasmOp::I8x16Sub),
+                    0x8E => ops.push(WasmOp::I16x8Add),
+                    0x91 => ops.push(WasmOp::I16x8Sub),
+                    0x95 => ops.push(WasmOp::I16x8Mul),
                     0xAE => ops.push(WasmOp::I32x4Add),
                     0xB1 => ops.push(WasmOp::I32x4Sub),
                     0xB5 => ops.push(WasmOp::I32x4Mul),
@@ -379,6 +428,22 @@ pub fn parse_ops(bytes: &[u8], pos: &mut usize) -> Result<Vec<WasmOp>, ParseErro
                     0xE7 => ops.push(WasmOp::F32x4Div),
                     0xE8 => ops.push(WasmOp::F32x4Min),
                     0xE9 => ops.push(WasmOp::F32x4Max),
+                    // f64x2 arith
+                    0x12 => ops.push(WasmOp::F64x2Splat),
+                    0x1D => {
+                        // f64x2.extract_lane laneidx (0 or 1)
+                        if *pos >= bytes.len() { return Err(ParseError::UnexpectedEof); }
+                        let lane = bytes[*pos];
+                        *pos += 1;
+                        if lane > 1 { return Err(ParseError::UnknownOpcode(lane)); }
+                        ops.push(WasmOp::F64x2ExtractLane(lane));
+                    }
+                    0xF0 => ops.push(WasmOp::F64x2Add),
+                    0xF1 => ops.push(WasmOp::F64x2Sub),
+                    0xF2 => ops.push(WasmOp::F64x2Mul),
+                    0xF3 => ops.push(WasmOp::F64x2Div),
+                    0xF4 => ops.push(WasmOp::F64x2Min),
+                    0xF5 => ops.push(WasmOp::F64x2Max),
                     _ => {
                         // Encode the unknown SIMD sub-opcode as a
                         // single byte for error reporting (lossy for
@@ -661,5 +726,31 @@ mod tests {
                 0xC0, 0x03, 0x5F, 0xD6, // ret
             ]
         );
+    }
+
+    #[test]
+    fn parse_drop_select_local_tee() {
+        // i32.const 10 ; i32.const 20 ; i32.const 1 ; select ; local.tee 0 ; drop ; end
+        // 0x41 0x0A 0x41 0x14 0x41 0x01 0x1B 0x22 0x00 0x1A 0x0B
+        let ops = parse_function_body(&[
+            0x41, 0x0A,  // i32.const 10
+            0x41, 0x14,  // i32.const 20
+            0x41, 0x01,  // i32.const 1
+            0x1B,        // select
+            0x22, 0x00,  // local.tee 0
+            0x1A,        // drop
+            0x41, 0x00,  // i32.const 0 (for End balance)
+            0x0B,        // end
+        ]).unwrap();
+        assert_eq!(ops, vec![
+            WasmOp::I32Const(10),
+            WasmOp::I32Const(20),
+            WasmOp::I32Const(1),
+            WasmOp::Select,
+            WasmOp::LocalTee(0),
+            WasmOp::Drop,
+            WasmOp::I32Const(0),
+            WasmOp::End,
+        ]);
     }
 }

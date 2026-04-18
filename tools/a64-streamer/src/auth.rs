@@ -40,12 +40,13 @@
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
-/// Shared 32-byte HMAC-SHA256 key. Embedded from
-/// `tools/a64-streamer/secret.key`. The daemon and every client must
-/// read the same file so their computed tags match; rotating the
-/// key means rebuilding all participants.
+/// Shared 32-byte HMAC-SHA256 key resolved by build.rs from:
+///   1. `SECRET_KEY_PATH` env var
+///   2. `tools/a64-streamer/secret.key` (local, gitignored)
+///   3. `~/.folkering/secret.key`
+/// Rotating the key means rebuilding all participants.
 pub const SHARED_KEY: &[u8; 32] =
-    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tools/a64-streamer/secret.key"));
+    include_bytes!(concat!(env!("OUT_DIR"), "/secret.key"));
 
 /// Length of the HMAC-SHA256 tag appended to signed payloads.
 pub const TAG_LEN: usize = 32;

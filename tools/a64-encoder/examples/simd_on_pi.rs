@@ -773,6 +773,104 @@ fn cases() -> Vec<Case> {
             ],
             expected: 1,
         },
+        // ── f64x2 — double-precision SIMD ────────────────────────
+        // Store two f64 values as bit patterns (2 × i64.store).
+        // Then v128.load + f64x2 ops + extract_lane.
+        // [1.5, 2.5] + [10.0, 20.0] = [11.5, 22.5].
+        // Extract lane 0 = 11.5; compare to 11.5 → 1.
+        Case {
+            name: "f64x2.add [1.5,2.5]+[10,20] lane 0 = 11.5",
+            ops: {
+                // Store f64 values as i64 bit patterns
+                let a0 = 1.5_f64.to_bits() as i64;
+                let a1 = 2.5_f64.to_bits() as i64;
+                let b0 = 10.0_f64.to_bits() as i64;
+                let b1 = 20.0_f64.to_bits() as i64;
+                vec![
+                    WasmOp::I32Const(0), WasmOp::I64Const(a0), WasmOp::I64Store(0),
+                    WasmOp::I32Const(8), WasmOp::I64Const(a1), WasmOp::I64Store(0),
+                    WasmOp::I32Const(16), WasmOp::I64Const(b0), WasmOp::I64Store(0),
+                    WasmOp::I32Const(24), WasmOp::I64Const(b1), WasmOp::I64Store(0),
+                    WasmOp::I32Const(0), WasmOp::V128Load(0),
+                    WasmOp::I32Const(16), WasmOp::V128Load(0),
+                    WasmOp::F64x2Add,
+                    WasmOp::F64x2ExtractLane(0),
+                    WasmOp::F64Const(11.5),
+                    WasmOp::F64Eq,
+                    WasmOp::End,
+                ]
+            },
+            expected: 1,
+        },
+        // f64x2.mul lane 1: 2.5 * 20.0 = 50.0
+        Case {
+            name: "f64x2.mul [1.5,2.5]*[10,20] lane 1 = 50.0",
+            ops: {
+                let a0 = 1.5_f64.to_bits() as i64;
+                let a1 = 2.5_f64.to_bits() as i64;
+                let b0 = 10.0_f64.to_bits() as i64;
+                let b1 = 20.0_f64.to_bits() as i64;
+                vec![
+                    WasmOp::I32Const(0), WasmOp::I64Const(a0), WasmOp::I64Store(0),
+                    WasmOp::I32Const(8), WasmOp::I64Const(a1), WasmOp::I64Store(0),
+                    WasmOp::I32Const(16), WasmOp::I64Const(b0), WasmOp::I64Store(0),
+                    WasmOp::I32Const(24), WasmOp::I64Const(b1), WasmOp::I64Store(0),
+                    WasmOp::I32Const(0), WasmOp::V128Load(0),
+                    WasmOp::I32Const(16), WasmOp::V128Load(0),
+                    WasmOp::F64x2Mul,
+                    WasmOp::F64x2ExtractLane(1),
+                    WasmOp::F64Const(50.0),
+                    WasmOp::F64Eq,
+                    WasmOp::End,
+                ]
+            },
+            expected: 1,
+        },
+        // ── i8x16 — packed byte SIMD ──────────────────────────────
+        // splat(10) + splat(32) = 42 per byte. Extract lane 7.
+        Case {
+            name: "i8x16.add splat(10)+splat(32) lane 7 = 42",
+            ops: vec![
+                WasmOp::I32Const(10),
+                WasmOp::I8x16Splat,
+                WasmOp::I32Const(32),
+                WasmOp::I8x16Splat,
+                WasmOp::I8x16Add,
+                WasmOp::I8x16ExtractLaneU(7),
+                WasmOp::End,
+            ],
+            expected: 42,
+        },
+        // ── i16x8 — packed halfword SIMD ──────────────────────────
+        // splat(300) + splat(200) = 500 → low byte = 244 (500 & 0xFF)
+        // But we compare i32 result directly. 500 & 0xFF = 0xF4 = 244.
+        Case {
+            name: "i16x8.add splat(6)*splat(7) lane 3 = 42",
+            ops: vec![
+                WasmOp::I32Const(6),
+                WasmOp::I16x8Splat,
+                WasmOp::I32Const(7),
+                WasmOp::I16x8Splat,
+                WasmOp::I16x8Mul,
+                WasmOp::I16x8ExtractLaneU(3),
+                WasmOp::End,
+            ],
+            expected: 42,
+        },
+        // f64x2.splat + f64x2.sqrt: sqrt([4.0, 4.0]) = [2.0, 2.0]
+        Case {
+            name: "f64x2.splat(4.0) → sqrt → lane 0 = 2.0",
+            ops: vec![
+                WasmOp::F64Const(4.0),
+                WasmOp::F64x2Splat,
+                WasmOp::F64x2Sqrt,
+                WasmOp::F64x2ExtractLane(0),
+                WasmOp::F64Const(2.0),
+                WasmOp::F64Eq,
+                WasmOp::End,
+            ],
+            expected: 1,
+        },
         // ── v128.store round-trip ─────────────────────────────────
         // Load a vector from mem[0], store it to mem[48], then read
         // back mem[48] as v128, extract lane 1, compare to original.

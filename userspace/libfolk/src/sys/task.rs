@@ -346,6 +346,18 @@ pub fn tcp_close_async(slot: u64) {
     unsafe { crate::syscall::syscall1(0xE3, slot); }
 }
 
+/// JIT-compile an MLP to AArch64 and execute on Pi.
+/// ip: packed IPv4 (e.g. [192,168,68,50] → 0x3244A8C0)
+/// port: daemon port (0 = default 7700)
+/// Returns: exit code from Pi, or u64::MAX on error.
+pub fn jit_exec_mlp(ip: [u8; 4], port: u16) -> u64 {
+    let ip_packed = ip[0] as u64
+        | ((ip[1] as u64) << 8)
+        | ((ip[2] as u64) << 16)
+        | ((ip[3] as u64) << 24);
+    unsafe { crate::syscall::syscall2(0xE4, ip_packed, port as u64) }
+}
+
 /// Draug Bridge — push status to kernel tcp_shell atomics.
 /// Returns true if the remote shell has set the pause flag.
 pub fn draug_bridge_update(

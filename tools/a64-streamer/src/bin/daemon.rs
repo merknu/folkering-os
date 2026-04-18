@@ -213,6 +213,202 @@ mod unix {
     /// timeouts within ~1 ms of the deadline.
     const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1);
 
+    // ── Persistent worker process ───────────────────────────────────
+    //
+    // Eliminates the ~1.1 ms per-EXEC fork() cost we measured with
+    // the bench suite. We fork a worker ONCE per CODE install. The
+    // worker inherits the parent's mmap'd CodeMap (MAP_PRIVATE COW
+    // pages, no actual copy), then loops reading 1-byte commands
+    // from a pipe and writing 4-byte results back. The worker
+    // never exits between EXECs.
+    //
+    // Crash isolation is preserved: a JIT segfault kills only the
+    // worker, not the daemon. Parent detects via EOF on the result
+    // pipe and respawns. CODE change → drop old worker (kills it),
+    // spawn new one with the new code function pointer.
+    //
+    // Wire protocol (parent ↔ child, over 2 pipes):
+    //   parent → child:  1 byte command (0x01 = EXEC, 0x02 = QUIT)
+    //   child  → parent: 4 bytes LE i32 result
+    //
+    // No request/response interleaving; worker is single-threaded
+    // and only one EXEC is in flight at a time anyway.
+
+    pub struct Worker {
+        pid: libc::pid_t,
+        cmd_w: libc::c_int,
+        res_r: libc::c_int,
+    }
+
+    const CMD_EXEC: u8 = 0x01;
+    const CMD_QUIT: u8 = 0x02;
+
+    impl Worker {
+        /// Fork a worker bound to the given function pointer. The
+        /// pointer must reference an mmap'd CodeMap that's still
+        /// alive in the parent — the MAP_PRIVATE pages stay pinned
+        /// for the child even if the parent later munmaps them.
+        pub fn spawn(f: extern "C" fn() -> i32) -> std::io::Result<Self> {
+            let mut cmd_pipe = [0 as libc::c_int; 2];
+            let mut res_pipe = [0 as libc::c_int; 2];
+            if unsafe { libc::pipe(cmd_pipe.as_mut_ptr()) } < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if unsafe { libc::pipe(res_pipe.as_mut_ptr()) } < 0 {
+                let e = std::io::Error::last_os_error();
+                unsafe {
+                    libc::close(cmd_pipe[0]);
+                    libc::close(cmd_pipe[1]);
+                }
+                return Err(e);
+            }
+
+            let pid = unsafe { libc::fork() };
+            if pid < 0 {
+                let e = std::io::Error::last_os_error();
+                unsafe {
+                    libc::close(cmd_pipe[0]);
+                    libc::close(cmd_pipe[1]);
+                    libc::close(res_pipe[0]);
+                    libc::close(res_pipe[1]);
+                }
+                return Err(e);
+            }
+
+            if pid == 0 {
+                // Child: close ends we don't use, run loop, _exit.
+                unsafe {
+                    libc::close(cmd_pipe[1]);
+                    libc::close(res_pipe[0]);
+                }
+                child_loop(cmd_pipe[0], res_pipe[1], f);
+                // child_loop never returns
+            }
+
+            // Parent: close ends we don't use.
+            unsafe {
+                libc::close(cmd_pipe[0]);
+                libc::close(res_pipe[1]);
+            }
+            Ok(Worker {
+                pid,
+                cmd_w: cmd_pipe[1],
+                res_r: res_pipe[0],
+            })
+        }
+
+        /// Send EXEC command, await 4-byte result with timeout.
+        /// Returns Err if the worker crashed or timed out — caller
+        /// should spawn a fresh worker before the next exec.
+        pub fn exec(&self, timeout_ms: u64) -> Result<i32, String> {
+            // Send command. write to a pipe of <PIPE_BUF (typically
+            // 4096) bytes is atomic; 1 byte is well under that.
+            let cmd = [CMD_EXEC];
+            let n = unsafe {
+                libc::write(self.cmd_w, cmd.as_ptr() as *const libc::c_void, 1)
+            };
+            if n != 1 {
+                return Err(format!(
+                    "write CMD_EXEC: {}",
+                    std::io::Error::last_os_error(),
+                ));
+            }
+
+            // Read 4-byte result via poll() with deadline.
+            let mut buf = [0u8; 4];
+            let mut got = 0;
+            let start = std::time::Instant::now();
+            while got < 4 {
+                let elapsed_ms = start.elapsed().as_millis() as i32;
+                let remaining = (timeout_ms as i32 - elapsed_ms).max(0);
+                let mut pfd = libc::pollfd {
+                    fd: self.res_r,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let pr = unsafe { libc::poll(&mut pfd, 1, remaining) };
+                if pr < 0 {
+                    return Err(format!(
+                        "poll: {}", std::io::Error::last_os_error()
+                    ));
+                }
+                if pr == 0 {
+                    return Err(format!(
+                        "EXEC timeout ({} ms deadline)", timeout_ms
+                    ));
+                }
+                if (pfd.revents & libc::POLLIN) != 0 {
+                    let n = unsafe {
+                        libc::read(
+                            self.res_r,
+                            buf.as_mut_ptr().add(got) as *mut libc::c_void,
+                            4 - got,
+                        )
+                    };
+                    if n <= 0 {
+                        return Err(format!(
+                            "worker died (read returned {})", n
+                        ));
+                    }
+                    got += n as usize;
+                } else if (pfd.revents & (libc::POLLHUP | libc::POLLERR)) != 0 {
+                    return Err(String::from("worker pipe HUP/ERR"));
+                }
+            }
+            Ok(i32::from_le_bytes(buf))
+        }
+    }
+
+    impl Drop for Worker {
+        fn drop(&mut self) {
+            // Try graceful shutdown: send QUIT, give it 100 ms.
+            let cmd = [CMD_QUIT];
+            unsafe {
+                libc::write(self.cmd_w, cmd.as_ptr() as *const libc::c_void, 1);
+                libc::close(self.cmd_w);
+                libc::close(self.res_r);
+            }
+            // SIGKILL anyway in case worker was wedged in a JIT
+            // infinite loop and never read the QUIT byte.
+            unsafe {
+                libc::kill(self.pid, libc::SIGKILL);
+                let mut status: libc::c_int = 0;
+                libc::waitpid(self.pid, &mut status, 0);
+            }
+        }
+    }
+
+    /// Worker child main loop. Reads 1-byte commands forever,
+    /// dispatches EXEC to the function pointer, writes 4-byte
+    /// result back. Exits on QUIT, EOF, or read error.
+    fn child_loop(
+        cmd_r: libc::c_int,
+        res_w: libc::c_int,
+        f: extern "C" fn() -> i32,
+    ) -> ! {
+        let mut buf = [0u8; 1];
+        loop {
+            let n = unsafe {
+                libc::read(cmd_r, buf.as_mut_ptr() as *mut libc::c_void, 1)
+            };
+            if n != 1 {
+                // EOF or error → parent gone, exit cleanly.
+                unsafe { libc::_exit(0); }
+            }
+            match buf[0] {
+                CMD_EXEC => {
+                    let rv = f();
+                    let bytes = rv.to_le_bytes();
+                    let _ = unsafe {
+                        libc::write(res_w, bytes.as_ptr() as *const libc::c_void, 4)
+                    };
+                }
+                CMD_QUIT => unsafe { libc::_exit(0); }
+                _ => {} // ignore unknown commands
+            }
+        }
+    }
+
     pub fn exec_with_timeout(f: extern "C" fn() -> i32) -> Result<i32, String> {
         use std::time::Instant;
 
@@ -331,6 +527,7 @@ mod unix {
         }
 
         let mut code: Option<CodeMap> = None;
+        let mut worker: Option<Worker> = None;
 
         loop {
             let (ty, payload) = match read_frame(&mut stream) {
@@ -401,7 +598,32 @@ mod unix {
                                 code_bytes.len(),
                                 m.ptr
                             );
+                            // Drop old worker BEFORE old CodeMap so
+                            // its mapping stays alive while the
+                            // worker dies. Drop order: worker first
+                            // (kills child), then old code (munmap).
+                            worker = None;
+                            let f = m.as_fn();
                             code = Some(m);
+                            // Spawn new worker bound to the new
+                            // CODE. Worker inherits parent's mmap.
+                            match Worker::spawn(f) {
+                                Ok(w) => {
+                                    eprintln!("[daemon] worker spawned pid={}", w.pid);
+                                    worker = Some(w);
+                                }
+                                Err(e) => {
+                                    eprintln!("[daemon] worker spawn failed: {e}");
+                                    let _ = write_frame(
+                                        &mut stream,
+                                        FRAME_ERROR,
+                                        &serialize_error(
+                                            6,
+                                            &format!("worker spawn failed: {e}"),
+                                        ),
+                                    );
+                                }
+                            }
                         }
                         Err(e) => {
                             let _ = write_frame(
@@ -439,9 +661,40 @@ mod unix {
                         );
                     }
                 },
-                FRAME_EXEC => match code.as_ref() {
-                    Some(m) => match exec_with_timeout(m.as_fn()) {
+                FRAME_EXEC => {
+                    if code.is_none() {
+                        let _ = write_frame(
+                            &mut stream,
+                            FRAME_ERROR,
+                            &serialize_error(5, "EXEC without CODE"),
+                        );
+                        continue;
+                    }
+                    if worker.is_none() {
+                        // Code is installed but worker died
+                        // last EXEC — respawn now.
+                        let f = code.as_ref().unwrap().as_fn();
+                        match Worker::spawn(f) {
+                            Ok(w) => worker = Some(w),
+                            Err(e) => {
+                                let _ = write_frame(
+                                    &mut stream,
+                                    FRAME_ERROR,
+                                    &serialize_error(
+                                        6,
+                                        &format!("worker respawn failed: {e}"),
+                                    ),
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                    let t_exec = std::time::Instant::now();
+                    let result = worker.as_ref().unwrap().exec(EXEC_TIMEOUT_MS);
+                    let exec_us = t_exec.elapsed().as_micros();
+                    match result {
                         Ok(rv) => {
+                            eprintln!("[exec] {} us (worker)", exec_us);
                             if write_frame(&mut stream, FRAME_RESULT, &serialize_result(rv))
                                 .is_err()
                             {
@@ -450,6 +703,9 @@ mod unix {
                         }
                         Err(reason) => {
                             eprintln!("[daemon] EXEC aborted: {reason}");
+                            // Worker is in unknown state — reap
+                            // and force a respawn next iteration.
+                            worker = None;
                             let _ = write_frame(
                                 &mut stream,
                                 FRAME_ERROR,
@@ -459,13 +715,6 @@ mod unix {
                                 ),
                             );
                         }
-                    },
-                    None => {
-                        let _ = write_frame(
-                            &mut stream,
-                            FRAME_ERROR,
-                            &serialize_error(5, "EXEC without CODE"),
-                        );
                     }
                 },
                 FRAME_BYE => {
@@ -528,6 +777,14 @@ mod unix {
         for incoming in listener.incoming() {
             match incoming {
                 Ok(stream) => {
+                    // TCP_NODELAY disables Nagle. Without this each
+                    // small frame (EXEC=5 B, RESULT=9 B) waits up to
+                    // ~200 ms in the kernel for batching, which made
+                    // streaming inference look like 10 ops/sec when
+                    // the underlying compute ran in microseconds.
+                    if let Err(e) = stream.set_nodelay(true) {
+                        eprintln!("[daemon] set_nodelay failed: {e}");
+                    }
                     if let Ok(peer) = stream.peer_addr() {
                         eprintln!("[daemon] accepted {peer}");
                     }

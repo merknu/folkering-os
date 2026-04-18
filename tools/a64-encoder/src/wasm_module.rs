@@ -41,6 +41,12 @@ pub struct FunctionBody {
     /// already expanded). Does NOT include function parameters —
     /// WASM stores those separately in the type signature.
     pub num_locals: u32,
+    /// Per-local valtype bytes (one entry per slot, expanded from
+    /// the local groups). 0x7F=i32, 0x7E=i64, 0x7D=f32, 0x7C=f64.
+    /// Length matches `num_locals`. Useful when the lowerer needs
+    /// to know whether a local is i32/f32/etc. — the legacy
+    /// `num_locals`-only consumers can ignore this field.
+    pub local_types: Vec<u8>,
     /// Ops in order, terminated by `WasmOp::End`.
     pub ops: Vec<WasmOp>,
 }
@@ -109,16 +115,20 @@ fn parse_code_entry(bytes: &[u8]) -> Result<FunctionBody, ParseError> {
     let mut pos = 0;
     let group_count = read_uleb128(bytes, &mut pos)? as usize;
     let mut total_locals: u32 = 0;
+    let mut local_types: Vec<u8> = Vec::new();
     for _ in 0..group_count {
         let n = read_uleb128(bytes, &mut pos)?;
         if n > u32::MAX as u64 { return Err(ParseError::IntegerTooLarge); }
-        // Skip valtype byte. Real WASM has 0x7F = i32, 0x7E = i64, etc.
         if pos >= bytes.len() { return Err(ParseError::UnexpectedEof); }
+        let valtype = bytes[pos];
         pos += 1;
+        for _ in 0..n {
+            local_types.push(valtype);
+        }
         total_locals = total_locals.saturating_add(n as u32);
     }
     let ops = parse_ops(bytes, &mut pos)?;
-    Ok(FunctionBody { num_locals: total_locals, ops })
+    Ok(FunctionBody { num_locals: total_locals, local_types, ops })
 }
 
 // ── Tests ───────────────────────────────────────────────────────────

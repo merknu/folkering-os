@@ -1,0 +1,44 @@
+name: a64-encoder CI
+
+on:
+  push:
+    paths:
+      - 'tools/a64-encoder/**'
+  pull_request:
+    paths:
+      - 'tools/a64-encoder/**'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Generate test key
+        run: head -c 32 /dev/urandom > tools/a64-streamer/secret.key
+
+      - name: Run tests
+        working-directory: tools/a64-encoder
+        run: cargo test --all-targets
+
+      - name: Clippy
+        working-directory: tools/a64-encoder
+        run: cargo clippy --all-targets -- -D warnings
+
+  streamer-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Generate test key
+        run: head -c 32 /dev/urandom > tools/a64-streamer/secret.key
+
+      - name: Run tests
+        working-directory: tools/a64-streamer
+        run: cargo test --all-targets

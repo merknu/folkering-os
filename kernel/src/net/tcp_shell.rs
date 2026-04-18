@@ -219,6 +219,8 @@ fn dispatch_command(line: &[u8], state: &mut super::state::NetState) -> String {
         "net" => cmd_net(state),
         "df" => cmd_df(),
         "ping" => cmd_ping(args, state),
+        "jit" => cmd_jit(args),
+        "bench" => cmd_bench(args),
         "draug" => cmd_draug(args),
         "clear" => String::from("\x1b[2J\x1b[H"),
         "" => String::new(),
@@ -241,6 +243,9 @@ fn cmd_help() -> String {
          \x20 net              network configuration\r\n\
          \x20 df               disk usage\r\n\
          \x20 ping <ip>        send ICMP echo\r\n\
+         \x20 jit <wasm> [<data>] <ip>  JIT a ramdisk WASM → run on Pi\r\n\
+         \x20 jit <ip>         (legacy) run built-in MLP demo\r\n\
+         \x20 bench <wasm> [<data>] <ip> [N]  benchmark JIT pipeline (default N=100)\r\n\
          \x20 clear            clear screen\r\n\
          \x20 draug status     AI daemon status + current task\r\n\
          \x20 draug pause      pause the refactor loop\r\n\
@@ -389,6 +394,310 @@ fn cmd_ping(args: &str, state: &mut super::state::NetState) -> String {
     out.push_str("ping sent to ");
     out.push_str(args);
     out.push_str(" (reply in serial log)");
+    out
+}
+
+/// Push a signed i32 as decimal text into `out`. Reuses the
+/// existing unsigned `push_dec` helper defined later in this file.
+fn push_dec_signed(out: &mut String, val: i32) {
+    if val < 0 {
+        out.push('-');
+        push_dec(out, (val as i64).unsigned_abs() as u32);
+    } else {
+        push_dec(out, val as u32);
+    }
+}
+
+const USAGE_JIT: &str =
+    "usage: jit <wasm-name> [<data-name>] <pi-ip>\r\n  \
+     wasm-name and data-name must be present in the bundled ramdisk.\r\n  \
+     example: jit attention.wasm weights.bin 192.168.68.72\r\n  \
+     legacy:  jit <pi-ip>   (runs the built-in MLP demo)";
+
+/// Look up a file in the FPK ramdisk by name and return its bytes.
+fn ramdisk_read(name: &str) -> Option<&'static [u8]> {
+    let rd = crate::fs::ramdisk()?;
+    let entry = rd.find(name)?;
+    Some(rd.read(entry))
+}
+
+fn cmd_jit(args: &str) -> String {
+    let trimmed = args.trim();
+
+    // Legacy form: just an IP → run hardcoded MLP. Kept so existing
+    // smoke tests keep working without a ramdisk WASM file.
+    if let Some(ip) = parse_ip(trimmed) {
+        return cmd_jit_mlp_legacy(ip);
+    }
+
+    // Generic form: <wasm-name> [<data-name>] <ip>
+    let mut tokens = trimmed.split_ascii_whitespace();
+    let wasm_name = match tokens.next() { Some(t) => t, None => return String::from(USAGE_JIT) };
+    let mid = tokens.next();
+    let last = tokens.next();
+    if tokens.next().is_some() {
+        return String::from(USAGE_JIT);
+    }
+
+    let (data_name, ip_str): (Option<&str>, &str) = match (mid, last) {
+        (Some(ip_str), None) => (None, ip_str),
+        (Some(data), Some(ip_str)) => (Some(data), ip_str),
+        _ => return String::from(USAGE_JIT),
+    };
+
+    let ip = match parse_ip(ip_str) {
+        Some(o) => o,
+        None => return String::from(USAGE_JIT),
+    };
+
+    let wasm_bytes = match ramdisk_read(wasm_name) {
+        Some(b) => b,
+        None => {
+            let mut e = String::from("error: wasm file not found in ramdisk: ");
+            e.push_str(wasm_name);
+            return e;
+        }
+    };
+
+    let data_bytes = match data_name {
+        Some(name) => match ramdisk_read(name) {
+            Some(b) => Some(b),
+            None => {
+                let mut e = String::from("error: data file not found in ramdisk: ");
+                e.push_str(name);
+                return e;
+            }
+        },
+        None => None,
+    };
+
+    let mut out = String::with_capacity(256);
+    out.push_str("JIT: ");
+    out.push_str(wasm_name);
+    out.push_str(" (");
+    push_dec(&mut out, wasm_bytes.len() as u32);
+    out.push_str(" B");
+    if let Some(name) = data_name {
+        out.push_str(", data=");
+        out.push_str(name);
+        out.push_str(" (");
+        push_dec(&mut out, data_bytes.unwrap().len() as u32);
+        out.push_str(" B)");
+    }
+    out.push_str(") → ");
+    out.push_str(ip_str);
+    out.push_str("\r\n");
+
+    match crate::jit::jit_run_wasm(
+        wasm_bytes,
+        data_bytes,
+        crate::jit::DEFAULT_DATA_BASE,
+        ip,
+        7700,
+    ) {
+        Ok(result) => {
+            out.push_str("Pi result: ");
+            push_dec_signed(&mut out, result.exit_code);
+            out.push_str("\r\nCode: ");
+            push_dec(&mut out, result.code_bytes as u32);
+            out.push_str(" B AArch64, compile ~");
+            push_dec(&mut out, result.compile_us as u32);
+            out.push_str(" us");
+        }
+        Err(e) => {
+            out.push_str("error: ");
+            out.push_str(e);
+        }
+    }
+    out
+}
+
+/// Backwards-compatible MLP demo: kept callable as `jit <ip>` (no
+/// wasm path). New work should go through the generic `jit_run_wasm`
+/// pathway by packaging its module + data into the ramdisk.
+fn cmd_jit_mlp_legacy(ip: [u8; 4]) -> String {
+    let mut out = String::with_capacity(128);
+    out.push_str("JIT-compiling built-in MLP (4→4→4→1) to AArch64...\r\n");
+    match crate::jit::run_mlp_on_pi(ip, 7700) {
+        Ok(result) => {
+            out.push_str("Pi result: ");
+            push_dec_signed(&mut out, result.exit_code);
+            out.push_str("\r\nCode: ");
+            push_dec(&mut out, result.code_bytes as u32);
+            out.push_str(" B AArch64");
+        }
+        Err(e) => {
+            out.push_str("error: ");
+            out.push_str(e);
+        }
+    }
+    out
+}
+
+const USAGE_BENCH: &str =
+    "usage: bench <wasm-name> [<data-name>] <pi-ip> [iterations]\r\n  \
+     iterations defaults to 100 (max 1024).\r\n  \
+     example: bench attention.wasm weights.bin 192.168.68.72 200";
+
+/// Print one line of `Stats { min, mean, p50, p99, max }` in µs.
+fn push_stats_line(out: &mut String, label: &str, s: &crate::jit::bench::Stats) {
+    out.push_str(label);
+    out.push_str("  min=");
+    push_dec(out, s.min as u32);
+    out.push_str("  mean=");
+    push_dec(out, s.mean as u32);
+    out.push_str("  p50=");
+    push_dec(out, s.p50 as u32);
+    out.push_str("  p99=");
+    push_dec(out, s.p99 as u32);
+    out.push_str("  max=");
+    push_dec(out, s.max as u32);
+    out.push_str(" us\r\n");
+}
+
+fn ramdisk_read_bench(name: &str) -> Option<&'static [u8]> {
+    let rd = crate::fs::ramdisk()?;
+    let entry = rd.find(name)?;
+    Some(rd.read(entry))
+}
+
+fn cmd_bench(args: &str) -> String {
+    let trimmed = args.trim();
+    let mut tokens = trimmed.split_ascii_whitespace().peekable();
+
+    let wasm_name = match tokens.next() { Some(t) => t, None => return String::from(USAGE_BENCH) };
+
+    // Parse remaining tokens. Possibilities:
+    //   <wasm> <ip>                       → no data, default 100 iters
+    //   <wasm> <ip> <N>                   → no data, N iters
+    //   <wasm> <data> <ip>                → data, default 100 iters
+    //   <wasm> <data> <ip> <N>            → data, N iters
+    //
+    // We disambiguate by trying parse_ip on each remaining token.
+    let rest: alloc::vec::Vec<&str> = tokens.collect();
+    let (data_name, ip_str, iters): (Option<&str>, &str, u32) = match rest.len() {
+        1 => (None, rest[0], 100),
+        2 => {
+            // Either <data> <ip> or <ip> <N>
+            if parse_ip(rest[0]).is_some() {
+                let n: u32 = rest[1].parse().unwrap_or(100);
+                (None, rest[0], n)
+            } else if parse_ip(rest[1]).is_some() {
+                (Some(rest[0]), rest[1], 100)
+            } else {
+                return String::from(USAGE_BENCH);
+            }
+        }
+        3 => {
+            // Either <data> <ip> <N> or <ip> <N> <something-bad>
+            if parse_ip(rest[1]).is_some() {
+                let n: u32 = rest[2].parse().unwrap_or(100);
+                (Some(rest[0]), rest[1], n)
+            } else {
+                return String::from(USAGE_BENCH);
+            }
+        }
+        _ => return String::from(USAGE_BENCH),
+    };
+
+    let ip = match parse_ip(ip_str) {
+        Some(o) => o,
+        None => return String::from(USAGE_BENCH),
+    };
+
+    let wasm_bytes = match ramdisk_read_bench(wasm_name) {
+        Some(b) => b,
+        None => {
+            let mut e = String::from("error: wasm file not found in ramdisk: ");
+            e.push_str(wasm_name);
+            return e;
+        }
+    };
+
+    let data_bytes = match data_name {
+        Some(name) => match ramdisk_read_bench(name) {
+            Some(b) => Some(b),
+            None => {
+                let mut e = String::from("error: data file not found in ramdisk: ");
+                e.push_str(name);
+                return e;
+            }
+        },
+        None => None,
+    };
+
+    let mut out = String::with_capacity(1024);
+    out.push_str("bench: ");
+    out.push_str(wasm_name);
+    if let Some(d) = data_name { out.push(' '); out.push_str(d); }
+    out.push_str(" → ");
+    out.push_str(ip_str);
+    out.push_str("  iters=");
+    push_dec(&mut out, iters);
+    out.push_str("\r\n");
+
+    match crate::jit::bench::run_bench(
+        wasm_bytes,
+        data_bytes,
+        crate::jit::DEFAULT_DATA_BASE,
+        ip,
+        7700,
+        iters,
+    ) {
+        Ok(r) => {
+            out.push_str("\r\n=== one-time ===\r\n");
+            out.push_str("  parse        ");
+            push_dec(&mut out, r.parse_us as u32);
+            out.push_str(" us  (");
+            push_dec(&mut out, r.wasm_bytes as u32);
+            out.push_str(" B WASM)\r\n");
+
+            out.push_str("  compile      ");
+            push_dec(&mut out, r.compile_us as u32);
+            out.push_str(" us  (");
+            push_dec(&mut out, r.code_bytes as u32);
+            out.push_str(" B AArch64)\r\n");
+
+            out.push_str("  connect+HELLO ");
+            push_dec(&mut out, r.connect_us as u32);
+            out.push_str(" us\r\n");
+
+            out.push_str("  CODE send    ");
+            push_dec(&mut out, r.code_send_us as u32);
+            out.push_str(" us  (HMAC-signed)\r\n");
+
+            out.push_str("\r\n=== warm streaming loop (");
+            push_dec(&mut out, r.iterations);
+            out.push_str(" iterations) ===\r\n");
+
+            if r.data_bytes > 0 {
+                out.push_str("  DATA  (");
+                push_dec(&mut out, r.data_bytes as u32);
+                out.push_str(" B)\r\n");
+                push_stats_line(&mut out, "  DATA  ", &r.data_stats);
+            }
+            push_stats_line(&mut out, "  EXEC  ", &r.exec_stats);
+            push_stats_line(&mut out, "  ITER  ", &r.iter_stats);
+
+            out.push_str("\r\nthroughput: ");
+            push_dec(&mut out, r.throughput_per_sec as u32);
+            out.push_str(" ops/sec\r\n");
+
+            out.push_str("result: ");
+            push_dec_signed(&mut out, r.first_result);
+            if r.all_results_match {
+                out.push_str("  (consistent across all iterations)");
+            } else {
+                out.push_str("  (\x1b[31mWARNING\x1b[0m ");
+                push_dec(&mut out, r.mismatch_count);
+                out.push_str(" mismatches)");
+            }
+        }
+        Err(e) => {
+            out.push_str("error: ");
+            out.push_str(e);
+        }
+    }
     out
 }
 
