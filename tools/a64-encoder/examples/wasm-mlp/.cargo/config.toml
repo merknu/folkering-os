@@ -1,0 +1,7 @@
+# Bake the WASM-build flags. See wasm-attention/.cargo/config.toml
+# for the full rationale.
+[target.wasm32-unknown-unknown]
+rustflags = [
+    "-C", "link-arg=--no-entry",
+    "-C", "link-arg=--export=infer",
+]

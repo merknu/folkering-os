@@ -1,0 +1,12 @@
+# Bake the WASM-build flags so contributors can just run
+#   cargo build --target wasm32-unknown-unknown --release
+# without remembering the RUSTFLAGS env var.
+#
+# `--no-entry` tells wasm-ld there's no `_start`; we're a library.
+# `--export=attention` exposes the `#[no_mangle] pub extern "C" fn`
+# entrypoint by name so the host JIT can find it after parsing.
+[target.wasm32-unknown-unknown]
+rustflags = [
+    "-C", "link-arg=--no-entry",
+    "-C", "link-arg=--export=attention",
+]
