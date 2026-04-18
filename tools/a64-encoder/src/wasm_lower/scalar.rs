@@ -207,6 +207,13 @@ impl Lowerer {
                 let dst = self.push_f64_slot()?;
                 self.enc.fmov_d_d(dst, local)?;
             }
+            LocalLoc::V128(local) => {
+                let dst = self.push_v128_slot()?;
+                // ORR Vd.16B, Vn.16B, Vm.16B with Vn=Vm performs a
+                // 128-bit MOV — same trick we use for v128 stack
+                // moves elsewhere.
+                self.enc.orr_16b_vec(dst, local, local)?;
+            }
         }
         Ok(())
     }
@@ -244,6 +251,14 @@ impl Lowerer {
                 }
                 let src_reg = Vreg((self.fp_depth - 1) as u8);
                 self.enc.fmov_d_d(local, src_reg)?;
+            }
+            LocalLoc::V128(local) => {
+                let top = self.stack.last().copied().ok_or(LowerError::StackUnderflow)?;
+                if top != ValType::V128 {
+                    return Err(LowerError::TypeMismatch { expected: ValType::V128, got: top });
+                }
+                let src_reg = Vreg((self.fp_depth - 1) as u8);
+                self.enc.orr_16b_vec(local, src_reg, src_reg)?;
             }
         }
         Ok(())
@@ -313,6 +328,10 @@ impl Lowerer {
             LocalLoc::F64(local) => {
                 let src = self.pop_f64_slot()?;
                 self.enc.fmov_d_d(local, src)?;
+            }
+            LocalLoc::V128(local) => {
+                let src = self.pop_v128_slot()?;
+                self.enc.orr_16b_vec(local, src, src)?;
             }
         }
         Ok(())

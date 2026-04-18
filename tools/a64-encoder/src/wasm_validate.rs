@@ -402,6 +402,14 @@ pub fn validate_full(
                 stack.push(ValType::V128);
             }
 
+            // SDOT/UDOT — three v128 inputs (acc, a, b) → one v128.
+            WasmOp::I32x4DotI8x16Signed | WasmOp::I32x4DotI8x16Unsigned => {
+                pop_expect(&mut stack, ValType::V128, &err)?;
+                pop_expect(&mut stack, ValType::V128, &err)?;
+                pop_expect(&mut stack, ValType::V128, &err)?;
+                stack.push(ValType::V128);
+            }
+
             // ── SIMD unary v128 → v128 ────────────────────────────
             WasmOp::F32x4Abs | WasmOp::F32x4Neg | WasmOp::F32x4Sqrt
             | WasmOp::F64x2Abs | WasmOp::F64x2Neg | WasmOp::F64x2Sqrt => {

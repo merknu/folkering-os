@@ -283,10 +283,17 @@ impl Lowerer {
                     fp_idx += 1;
                 }
                 ValType::V128 => {
-                    // V128 locals would need a 128-bit zero-init
-                    // (MOVI Vd.2D, #0). Not wired in this sprint —
-                    // v128 values live on the operand stack only.
-                    return Err(LowerError::V128LocalsUnsupported);
+                    if (fp_idx as usize) >= MAX_F32_LOCALS {
+                        return Err(LowerError::TooManyLocals);
+                    }
+                    let v = Vreg(LOCAL_F32_BASE_REG + fp_idx);
+                    // Zero-init: EOR Vd.16B, Vd.16B, Vd.16B clears
+                    // all 128 bits in one instruction. Used by SDOT
+                    // accumulator loops where the user expects
+                    // acc = 0 before the first SDOT.
+                    enc.eor_16b_vec(v, v, v)?;
+                    out.push(LocalLoc::V128(v));
+                    fp_idx += 1;
                 }
             }
         }
@@ -725,6 +732,8 @@ impl Lowerer {
             WasmOp::I32x4Add => self.lower_i32x4_add(),
             WasmOp::I32x4Sub => self.lower_i32x4_sub(),
             WasmOp::I32x4Mul => self.lower_i32x4_mul(),
+            WasmOp::I32x4DotI8x16Signed => self.lower_i32x4_dot_i8x16_signed(),
+            WasmOp::I32x4DotI8x16Unsigned => self.lower_i32x4_dot_i8x16_unsigned(),
             WasmOp::I32x4ExtractLane(lane) => self.lower_i32x4_extract_lane(lane),
             // f64x2
             WasmOp::F64x2Add => self.lower_v128_binop(|e, d, l, r| e.fadd_2d(d, l, r)),

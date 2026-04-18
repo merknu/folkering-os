@@ -140,6 +140,22 @@ pub enum WasmOp {
     F64x2Splat,
     F64x2ExtractLane(u8),
     I8x16Add, I8x16Sub, I8x16Splat, I8x16ExtractLaneU(u8),
+    /// **Folkering-extension**: signed i8 dot product. Maps to
+    /// AArch64 SDOT (ARMv8.4-A FEAT_DotProd).
+    ///
+    /// Pops three v128: an i32x4 accumulator, then two i8x16 source
+    /// vectors. Splits each source into four 4-byte chunks; for each
+    /// of the four output lanes, computes the i8 dot product of the
+    /// matching chunks and adds it to the accumulator lane.
+    /// Pushes the resulting i32x4 v128.
+    ///
+    /// One SDOT = 16 i8 multiplies + 12 i32 adds in a single
+    /// Cortex-A76 cycle. The fastest path to int8 quantised matmul
+    /// on Pi 5.
+    I32x4DotI8x16Signed,
+    /// **Folkering-extension**: unsigned variant — UDOT. Same shape
+    /// as `I32x4DotI8x16Signed` but treats sources as u8.
+    I32x4DotI8x16Unsigned,
     I16x8Add, I16x8Sub, I16x8Mul, I16x8Splat, I16x8ExtractLaneU(u8),
     F32x4Sub,
     F32x4Div,
@@ -258,6 +274,7 @@ pub(crate) enum LocalLoc {
     I64(Reg),
     F32(Vreg),
     F64(Vreg),
+    V128(Vreg),
 }
 
 #[derive(Debug, Clone, Copy)]

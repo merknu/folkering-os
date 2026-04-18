@@ -699,6 +699,69 @@ impl Encoder {
         Ok(())
     }
 
+    /// EOR Vd.16B, Vn.16B, Vm.16B — XOR two 128-bit vectors.
+    /// Setting Vd = Vn = Vm gives a zero-init of Vd in one
+    /// instruction (used by the v128-locals zero-init path).
+    ///
+    /// Encoding (AdvSIMD 3-same, U=1, size=00, opcode=00011):
+    /// `0 Q 1 0 1 1 1 0 0 0 1 Rm 0 0 0 1 1 1 Rn Rd`, base 0x6E20_1C00.
+    pub fn eor_16b_vec(
+        &mut self,
+        vd: Vreg,
+        vn: Vreg,
+        vm: Vreg,
+    ) -> Result<(), EncodeError> {
+        self.emit(0x6E20_1C00u32 | (vm.enc() << 16) | (vn.enc() << 5) | vd.enc());
+        Ok(())
+    }
+
+    /// SDOT Vd.4S, Vn.16B, Vm.16B — signed dot product, ARMv8.4-A.
+    ///
+    /// For each output lane `i ∈ 0..4`:
+    ///     Vd[i] += Σ_{j=0..4} sext_i32(Vn[i*4+j]) * sext_i32(Vm[i*4+j])
+    ///
+    /// I.e. it splits the two 16-byte source vectors into four
+    /// 4-byte chunks, takes the i8 dot product of each chunk pair,
+    /// and accumulates into the corresponding i32 lane of Vd.
+    /// **Vd is read AND written** — this is an accumulating
+    /// instruction. Initialise Vd to zero (or another accumulator
+    /// state) before the first SDOT.
+    ///
+    /// One SDOT executes 16 i8 multiplies + 12 i32 adds in a
+    /// single cycle on Cortex-A76. Per-cycle equivalent of 32
+    /// FLOPs (counting MAC = 2). For 8-bit-quantised matmuls
+    /// this typically beats scalar f32 by 8-10×.
+    ///
+    /// Requires Armv8.4-A (FEAT_DotProd). Pi 5 (Cortex-A76)
+    /// supports it natively.
+    ///
+    /// Encoding (C7.2.282 AdvSIMD vector, U=0):
+    /// `0 Q 0 0 1 1 1 0 1 0 0 Rm 1 0 0 1 0 1 Rn Rd`, Q=1 → base
+    /// 0x4E80_9400.
+    pub fn sdot_4s_16b(
+        &mut self,
+        vd: Vreg,
+        vn: Vreg,
+        vm: Vreg,
+    ) -> Result<(), EncodeError> {
+        self.emit(0x4E80_9400u32 | (vm.enc() << 16) | (vn.enc() << 5) | vd.enc());
+        Ok(())
+    }
+
+    /// UDOT Vd.4S, Vn.16B, Vm.16B — unsigned dot product, ARMv8.4-A.
+    /// Same shape as SDOT but treats the i8 lanes as u8.
+    ///
+    /// Encoding: same as SDOT with U=1, base 0x6E80_9400.
+    pub fn udot_4s_16b(
+        &mut self,
+        vd: Vreg,
+        vn: Vreg,
+        vm: Vreg,
+    ) -> Result<(), EncodeError> {
+        self.emit(0x6E80_9400u32 | (vm.enc() << 16) | (vn.enc() << 5) | vd.enc());
+        Ok(())
+    }
+
     /// MUL Vd.4S, Vn.4S, Vm.4S — lane-wise i32 multiply (low 32 bits
     /// of product). Unlike FMUL this is plain integer mul.
     ///
@@ -2233,6 +2296,37 @@ mod tests {
         // fmul v0.4s, v1.4s, v2.4s
         // base 0x6E20DC00 | (2<<16) | (1<<5) | 0 = 0x6E22DC20
         assert_eq!(one(|e| e.fmul_4s(Vreg::S0, Vreg::S1, Vreg::S2)), 0x6E22DC20);
+    }
+
+    #[test]
+    fn sdot_4s_16b_basic() {
+        // sdot v0.4s, v1.16b, v2.16b
+        // base 0x4E809400 | (2<<16) | (1<<5) | 0 = 0x4E829420
+        assert_eq!(
+            one(|e| e.sdot_4s_16b(Vreg::S0, Vreg::S1, Vreg::S2)),
+            0x4E82_9420,
+        );
+    }
+
+    #[test]
+    fn udot_4s_16b_basic() {
+        // udot v0.4s, v1.16b, v2.16b — same shape as SDOT, U=1
+        // base 0x6E809400 | (2<<16) | (1<<5) | 0 = 0x6E829420
+        assert_eq!(
+            one(|e| e.udot_4s_16b(Vreg::S0, Vreg::S1, Vreg::S2)),
+            0x6E82_9420,
+        );
+    }
+
+    #[test]
+    fn sdot_4s_16b_high_regs() {
+        // sdot v31.4s, v30.16b, v29.16b — verifies field placement
+        // for the upper register range.
+        // 0x4E809400 | (29<<16) | (30<<5) | 31 = 0x4E9D_97DF
+        assert_eq!(
+            one(|e| e.sdot_4s_16b(Vreg::new(31).unwrap(), Vreg::new(30).unwrap(), Vreg::new(29).unwrap())),
+            0x4E9D_97DF,
+        );
     }
 
     #[test]
