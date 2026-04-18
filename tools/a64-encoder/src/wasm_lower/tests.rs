@@ -264,14 +264,14 @@ fn br_if_from_block_patches_cbnz() {
 }
 
 #[test]
-fn unbalanced_end_without_block() {
+fn end_on_empty_stack_is_void_return() {
+    // Phase 3: empty operand stack at function-level End is now
+    // valid — that's a void-return function (e.g. helpers that
+    // mutate linear memory and return nothing). Previously this
+    // errored with StackNotSingleton; now it succeeds and emits
+    // the epilogue + RET.
     let mut lw = Lowerer::new();
-    // function end with empty stack — StackNotSingleton (not UnbalancedEnd,
-    // because no open label exists, we fall through to lower_function_end).
-    assert_eq!(
-        lw.lower_op(WasmOp::End),
-        Err(LowerError::StackNotSingleton)
-    );
+    assert!(lw.lower_op(WasmOp::End).is_ok());
 }
 
 #[test]

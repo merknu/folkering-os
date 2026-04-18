@@ -239,6 +239,12 @@ impl Lowerer {
         self.flush_pending_spill()?;
         self.flush_pending_fp_spill()?;
         match self.stack.len() {
+            // Void function — no return value, stack must be empty.
+            // Helper functions like `fn relu_apply(...)` produce no
+            // result, so their `End` lands here.
+            0 => {}
+            // Standard single-result function — return value goes
+            // into X0/W0 (int) or S0/D0 (FP) per AAPCS64.
             1 => match self.stack_top_type().unwrap() {
                 ValType::I32 => {
                     self.pop_i32_slot()?;
@@ -267,7 +273,13 @@ impl Lowerer {
 
     pub(super) fn lower_explicit_return(&mut self) -> Result<(), LowerError> {
         match self.stack_top_type() {
-            None => return Err(LowerError::StackNotSingleton),
+            // Void function — explicit `return;` from a helper that
+            // doesn't produce a value. Rust emits this for early
+            // returns in fn-pointer-returning-unit. Just RET.
+            None => {
+                self.enc.ret(Reg::X30)?;
+                return Ok(());
+            }
             Some(ValType::I32) | Some(ValType::I64) => {
                 let top = Reg::new((self.int_depth - 1) as u8).unwrap();
                 if top.0 != 0 {
