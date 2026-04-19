@@ -69,11 +69,11 @@ impl Lowerer {
         if !self.has_memory {
             return Err(LowerError::MemoryNotConfigured);
         }
+        // Snapshot the address sym BEFORE the pop, so the elider sees
+        // it (pop_i32_slot drops the symbolic info along with the slot).
+        let addr_sym = self.peek_top_sym();
         let addr = self.pop_i32_slot()?;
-        // Route through maybe_bounds_check so static- and loop-
-        // bounded eliders can skip the runtime check (otherwise
-        // every SDOT-loop iteration paid for a guard).
-        self.maybe_bounds_check(addr, 16, offset, false)?;
+        self.maybe_bounds_check(addr, 16, offset, false, addr_sym)?;
         let dst = self.push_v128_slot()?;
         self.enc.add_ext_uxtw(Reg::X16, MEM_BASE_REG, addr)?;
         self.enc.ldr_q_imm(dst, Reg::X16, offset)?;
@@ -84,9 +84,13 @@ impl Lowerer {
         if !self.has_memory {
             return Err(LowerError::MemoryNotConfigured);
         }
+        // Stack: [..., addr (i32), val (v128)]. val lives on the V
+        // bank; the address is the int-stack top, so peek_top_sym
+        // sees it directly.
+        let addr_sym = self.peek_top_sym();
         let val = self.pop_v128_slot()?;
         let addr = self.pop_i32_slot()?;
-        self.maybe_bounds_check(addr, 16, offset, true)?;
+        self.maybe_bounds_check(addr, 16, offset, true, addr_sym)?;
         self.enc.add_ext_uxtw(Reg::X16, MEM_BASE_REG, addr)?;
         self.enc.str_q_imm(val, Reg::X16, offset)?;
         Ok(())

@@ -56,6 +56,34 @@ impl Lowerer {
         Ok(())
     }
 
+    // ── Symbolic-stack helpers ─────────────────────────────────────
+
+    /// Overwrite the symbolic abstract value at the top of the int
+    /// stack. Lowerings call this after a successful `push_i32_slot`
+    /// (which pushes `None` by default) when they know the value's
+    /// constant or upper bound — the bounds-check elision pass uses
+    /// this to prove memory accesses are safe without a runtime CMP.
+    pub(super) fn set_top_sym(&mut self, sym: Option<SymAddr>) {
+        if let Some(slot) = self.int_sym_stack.last_mut() {
+            *slot = sym;
+        }
+    }
+
+    /// Inspect the symbolic value at the top of the int stack without
+    /// popping. `None` means "no info, treat as unknown".
+    pub(super) fn peek_top_sym(&self) -> Option<SymAddr> {
+        self.int_sym_stack.last().copied().flatten()
+    }
+
+    /// Inspect the symbolic value `n` slots below the int stack top
+    /// (n=0 is the top, n=1 is one below, ...). Used by binary ops
+    /// like `i32.add` to look at both operands before they pop.
+    pub(super) fn peek_sym_at(&self, n: usize) -> Option<SymAddr> {
+        let len = self.int_sym_stack.len();
+        if n >= len { return None; }
+        self.int_sym_stack[len - 1 - n]
+    }
+
     // ── I32 ────────────────────────────────────────────────────────
 
     pub(super) fn push_i32_slot(&mut self) -> Result<Reg, LowerError> {
@@ -64,11 +92,13 @@ impl Lowerer {
         if let Some(r) = self.int_depth_to_reg(depth) {
             self.int_depth += 1;
             self.stack.push(ValType::I32);
+            self.int_sym_stack.push(None);
             Ok(r)
         } else if self.has_spill && depth < self.max_reg_int + MAX_FRAME_SPILL {
             self.pending_spill_depth = Some(depth);
             self.int_depth += 1;
             self.stack.push(ValType::I32);
+            self.int_sym_stack.push(None);
             Ok(SPILL_SCRATCH_A)
         } else {
             Err(LowerError::TypedStackOverflow(ValType::I32))
@@ -82,6 +112,7 @@ impl Lowerer {
             return Err(LowerError::TypeMismatch { expected: ValType::I32, got: ty });
         }
         self.stack.pop();
+        self.int_sym_stack.pop();
         self.int_depth -= 1;
         let depth = self.int_depth;
         if let Some(r) = self.int_depth_to_reg(depth) {
@@ -103,11 +134,13 @@ impl Lowerer {
         if let Some(r) = self.int_depth_to_reg(depth) {
             self.int_depth += 1;
             self.stack.push(ValType::I64);
+            self.int_sym_stack.push(None);
             Ok(r)
         } else if self.has_spill && depth < self.max_reg_int + MAX_FRAME_SPILL {
             self.pending_spill_depth = Some(depth);
             self.int_depth += 1;
             self.stack.push(ValType::I64);
+            self.int_sym_stack.push(None);
             Ok(SPILL_SCRATCH_A)
         } else {
             Err(LowerError::TypedStackOverflow(ValType::I64))
@@ -121,6 +154,7 @@ impl Lowerer {
             return Err(LowerError::TypeMismatch { expected: ValType::I64, got: ty });
         }
         self.stack.pop();
+        self.int_sym_stack.pop();
         self.int_depth -= 1;
         let depth = self.int_depth;
         if let Some(r) = self.int_depth_to_reg(depth) {

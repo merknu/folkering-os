@@ -211,11 +211,20 @@ pub struct Lowerer {
     pub(super) pending_fp_spill_depth: Option<usize>,
     /// Toggle for alternating FP scratch registers on consecutive pops.
     pub(super) fp_spill_pop_toggle: bool,
-    /// Value of the most recent I32Const push, if the const is still
-    /// the stack top (no intervening ops). Used by memory load/store
-    /// to eliminate bounds checks when the address is statically known.
-    /// Cleared at the start of every `lower_op` except I32Const.
-    pub(super) last_i32_const_value: Option<i32>,
+    /// Symbolic abstract value for each live integer stack slot,
+    /// indexed by stack depth (parallel to the I32/I64 entries in
+    /// `stack`). `None` = the slot's value is unknown at lower time;
+    /// `Some(...)` = a constant or upper bound the bounds-check
+    /// elision pass can use to prove a memory access is in range.
+    ///
+    /// Maintained by `push_i32_slot` / `push_i64_slot` (which push
+    /// `None` by default — lowerings overwrite it via `set_top_sym`)
+    /// and `pop_i32_slot` / `pop_i64_slot`. Subsumes the older
+    /// single-element `last_i32_const_value` / `last_pushed_local`
+    /// trackers — being a real per-slot stack lets it survive
+    /// intermediate ops that the single-element trackers had to
+    /// blank out.
+    pub(super) int_sym_stack: Vec<Option<SymAddr>>,
     /// Per-global value types, indexed by WASM global index. Empty
     /// when the module has no globals. Lowering `global.get/set`
     /// checks the type here to pick the right LDR/STR width and
@@ -242,14 +251,16 @@ pub struct Lowerer {
     /// `label_stack`. `Some(LoopBound)` means we recognised the
     /// canonical `local.get N ; i32.const M ; i32.ge_s ; br_if` guard
     /// at the top of this loop. The bounds-check elision pass uses
-    /// this to skip `maybe_bounds_check` when the address is the
-    /// recognised counter local.
+    /// this to skip `maybe_bounds_check` when the address is derived
+    /// from the recognised counter local (directly or via tracked
+    /// arithmetic).
     pub(super) active_loop_bounds: Vec<Option<LoopBound>>,
-    /// Local index of the most recent `LocalGet` push (if it's still
-    /// the operand-stack top). Mirrors `last_i32_const_value`. Memory
-    /// load/store lowerers read this to recognise "address is just a
-    /// bounded loop counter" and skip the runtime check.
-    pub(super) last_pushed_local: Option<u32>,
+    /// Per-loop set of local indices that have been written inside the
+    /// loop body (LocalSet/Tee). Once a counter is tainted we stop
+    /// treating subsequent `local.get N` of it as bounded — the bound
+    /// only holds at the top of the loop where the guard runs.
+    /// One entry per active loop, parallel to `active_loop_bounds`.
+    pub(super) tainted_locals: Vec<BTreeSet<u32>>,
     /// Counter incremented every time the loop-bounded-elision rule
     /// fires (a memory op skipped its bounds check because the
     /// address is a bounded loop counter). Read via
@@ -305,14 +316,14 @@ impl Lowerer {
             fp_spill_base: 0,
             pending_fp_spill_depth: None,
             fp_spill_pop_toggle: false,
-            last_i32_const_value: None,
+            int_sym_stack: Vec::new(),
             global_types: Vec::new(),
             global_mutable: Vec::new(),
             module_fn_count: 0,
             module_fn_sigs: Vec::new(),
             pending_relocations: Vec::new(),
             active_loop_bounds: Vec::new(),
-            last_pushed_local: None,
+            tainted_locals: Vec::new(),
             elision_count: 0,
         })
     }
@@ -459,14 +470,14 @@ impl Lowerer {
             fp_spill_base: fp_spill_base_off,
             pending_fp_spill_depth: None,
             fp_spill_pop_toggle: false,
-            last_i32_const_value: None,
+            int_sym_stack: Vec::new(),
             global_types: Vec::new(),
             global_mutable: Vec::new(),
             module_fn_count: 0,
             module_fn_sigs: Vec::new(),
             pending_relocations: Vec::new(),
             active_loop_bounds: Vec::new(),
-            last_pushed_local: None,
+            tainted_locals: Vec::new(),
             elision_count: 0,
             frame_size_base: frame_size,
             mem_size: 64 * 1024,
@@ -559,14 +570,14 @@ impl Lowerer {
             fp_spill_base: fp_spill_base_off,
             pending_fp_spill_depth: None,
             fp_spill_pop_toggle: false,
-            last_i32_const_value: None,
+            int_sym_stack: Vec::new(),
             global_types: Vec::new(),
             global_mutable: Vec::new(),
             module_fn_count: 0,
             module_fn_sigs: Vec::new(),
             pending_relocations: Vec::new(),
             active_loop_bounds: Vec::new(),
-            last_pushed_local: None,
+            tainted_locals: Vec::new(),
             elision_count: 0,
         })
     }
@@ -728,25 +739,6 @@ impl Lowerer {
 
     /// Lower a single op.
     pub fn lower_op(&mut self, op: WasmOp) -> Result<(), LowerError> {
-        // Memory loads/stores consume the const addr — they read
-        // last_i32_const_value internally, then it's stale after.
-        // All other non-const ops clear it immediately.
-        let is_memory_load = matches!(op,
-            WasmOp::I32Load(_) | WasmOp::I64Load(_) |
-            WasmOp::F32Load(_) | WasmOp::F64Load(_) |
-            WasmOp::V128Load(_)
-        );
-        let is_memory_consumer = is_memory_load;
-        if !matches!(op, WasmOp::I32Const(_)) && !is_memory_consumer {
-            self.last_i32_const_value = None;
-        }
-        // Mirror tracking for `LocalGet` so memory ops can recognise
-        // "address is just a bounded loop counter" and elide the
-        // bounds check. Cleared on every op except LocalGet itself
-        // and the memory consumers that read this state.
-        if !matches!(op, WasmOp::LocalGet(_)) && !is_memory_consumer {
-            self.last_pushed_local = None;
-        }
         let result = match op {
             WasmOp::I32Const(c) => self.lower_const(c),
             WasmOp::I32Add => self.lower_binop(BinOp::Add),
@@ -934,10 +926,6 @@ impl Lowerer {
                 }
             }
         };
-        if is_memory_consumer {
-            self.last_i32_const_value = None;
-            self.last_pushed_local = None;
-        }
         result
     }
 
@@ -959,12 +947,17 @@ impl Lowerer {
 
         for (i, &op) in ops.iter().enumerate() {
             if matches!(op, WasmOp::Loop) {
-                // Push the per-loop bound (or None if no guard).
+                // Push the per-loop bound (or None if no guard) and a
+                // fresh empty taint set so any LocalSet/Tee inside the
+                // body invalidates the matching counter without
+                // bleeding into outer loops.
                 self.active_loop_bounds.push(loop_bounds.get(&i).copied());
+                self.tainted_locals.push(BTreeSet::new());
             }
             self.lower_op(op)?;
             if loop_end_indices.contains(&i) {
                 self.active_loop_bounds.pop();
+                self.tainted_locals.pop();
             }
         }
         Ok(())

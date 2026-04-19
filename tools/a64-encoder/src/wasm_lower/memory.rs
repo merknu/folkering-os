@@ -90,54 +90,41 @@ impl Lowerer {
         self.emit_trap_kind(0)
     }
 
-    /// Check if the address was a compile-time constant and the access
-    /// is statically within bounds. Returns true if the runtime check
-    /// can be skipped entirely.
-    fn static_bounds_ok(&mut self, access_size: u32, offset: u32) -> bool {
-        if let Some(addr_val) = self.last_i32_const_value {
-            let addr = addr_val as u32 as u64;
-            let end = addr + offset as u64 + access_size as u64;
-            return end <= self.mem_size as u64;
-        }
-        false
-    }
-
-    /// Loop-invariant bounds-check elimination: if the address is
-    /// just `local.get N` for a counter that an enclosing Loop has
-    /// pinned to `[0, M)`, and even the worst-case access
-    /// `M + offset + access_size` still fits in linear memory, the
-    /// runtime check is provably redundant and can be skipped.
+    /// Emit bounds check only if the access can't be statically proven
+    /// safe. `addr_sym` is the symbolic abstract value that was on top
+    /// of the stack just before the address was popped — callers must
+    /// snapshot it via [`Self::peek_top_sym`] BEFORE `pop_i32_slot`,
+    /// since the pop discards the slot's symbolic info.
     ///
-    /// This is what turns a 256-iteration SDOT loop into a tight
-    /// MAC pipeline — every per-iteration `bounds_check` is gone.
-    fn loop_bounded_ok(&self, access_size: u32, offset: u32) -> bool {
-        let local_idx = match self.last_pushed_local {
-            Some(l) => l,
-            None => return false,
-        };
-        // Walk innermost-first; an inner loop that re-bounds the
-        // same counter shadows an outer one. (Rare, but correct.)
-        for slot in self.active_loop_bounds.iter().rev() {
-            if let Some(b) = slot {
-                if b.counter_local == local_idx {
-                    let worst = (b.max_value as u64)
-                        .saturating_add(offset as u64)
-                        .saturating_add(access_size as u64);
-                    return worst <= self.mem_size as u64;
-                }
+    /// If `addr_sym` carries a tracked upper bound (constant, bounded
+    /// loop counter, or arithmetic over those) and even the worst-case
+    /// access `addr_sym.max + offset + access_size` still fits in
+    /// linear memory, the runtime check is provably redundant.
+    ///
+    /// Subsumes the old constant-address and loop-counter-only paths:
+    /// a `Const(c)` slot is what a fresh `i32.const c` produces, and
+    /// a `Bounded { max }` slot is what `local.get N` produces when N
+    /// is an active loop counter. Symbolic propagation through
+    /// `i32.add`, `i32.mul`, and `i32.shl` extends the elision to the
+    /// canonical `local.get k ; i32.const 4 ; i32.mul ; <load> off`
+    /// pattern LLVM emits for `arr[k]` — every per-iteration
+    /// CMP + B.cond + trap-block triple is gone.
+    pub(super) fn maybe_bounds_check(
+        &mut self,
+        addr_reg: Reg,
+        access_size: u32,
+        offset: u32,
+        is_store: bool,
+        addr_sym: Option<SymAddr>,
+    ) -> Result<(), LowerError> {
+        if let Some(s) = addr_sym {
+            let worst = s.max()
+                .saturating_add(offset as u64)
+                .saturating_add(access_size as u64);
+            if worst <= self.mem_size as u64 {
+                self.elision_count += 1;
+                return Ok(());
             }
-        }
-        false
-    }
-
-    /// Emit bounds check only if the access can't be statically proven safe.
-    pub(super) fn maybe_bounds_check(&mut self, addr_reg: Reg, access_size: u32, offset: u32, is_store: bool) -> Result<(), LowerError> {
-        if self.static_bounds_ok(access_size, offset) {
-            return Ok(());
-        }
-        if self.loop_bounded_ok(access_size, offset) {
-            self.elision_count += 1;
-            return Ok(());
         }
         self.emit_bounds_check(addr_reg, access_size, offset, is_store)
     }
@@ -178,8 +165,9 @@ impl Lowerer {
         if !self.has_memory {
             return Err(LowerError::MemoryNotConfigured);
         }
+        let addr_sym = self.peek_top_sym();
         let addr = self.pop_i32_slot()?;
-        self.maybe_bounds_check(addr, 4, offset, false)?;
+        self.maybe_bounds_check(addr, 4, offset, false, addr_sym)?;
         let dst = self.push_i32_slot()?;
         let eff = self.full_addr_in_x16(addr, offset)?;
         self.enc.ldr_w_imm(dst, Reg::X16, eff)?;
@@ -190,9 +178,12 @@ impl Lowerer {
         if !self.has_memory {
             return Err(LowerError::MemoryNotConfigured);
         }
+        // Stack layout: [..., addr, val] (val on top). Address sym is
+        // the slot one below the top.
+        let addr_sym = self.peek_sym_at(1);
         let val = self.pop_i32_slot()?;
         let addr = self.pop_i32_slot()?;
-        self.maybe_bounds_check(addr, 4, offset, true)?;
+        self.maybe_bounds_check(addr, 4, offset, true, addr_sym)?;
         let eff = self.full_addr_in_x16(addr, offset)?;
         self.enc.str_w_imm(val, Reg::X16, eff)?;
         Ok(())
@@ -204,8 +195,9 @@ impl Lowerer {
         if !self.has_memory {
             return Err(LowerError::MemoryNotConfigured);
         }
+        let addr_sym = self.peek_top_sym();
         let addr = self.pop_i32_slot()?;
-        self.maybe_bounds_check(addr, 4, offset, false)?;
+        self.maybe_bounds_check(addr, 4, offset, false, addr_sym)?;
         let dst = self.push_f32_slot()?;
         let eff = self.full_addr_in_x16(addr, offset)?;
         self.enc.ldr_s_imm(dst, Reg::X16, eff)?;
@@ -216,9 +208,12 @@ impl Lowerer {
         if !self.has_memory {
             return Err(LowerError::MemoryNotConfigured);
         }
+        // The val on top is f32 (separate sym/V bank); the address i32
+        // is the int-stack top, so peek_top_sym sees it directly.
+        let addr_sym = self.peek_top_sym();
         let val = self.pop_f32_slot()?;
         let addr = self.pop_i32_slot()?;
-        self.maybe_bounds_check(addr, 4, offset, true)?;
+        self.maybe_bounds_check(addr, 4, offset, true, addr_sym)?;
         let eff = self.full_addr_in_x16(addr, offset)?;
         self.enc.str_s_imm(val, Reg::X16, eff)?;
         Ok(())
@@ -230,8 +225,9 @@ impl Lowerer {
         if !self.has_memory {
             return Err(LowerError::MemoryNotConfigured);
         }
+        let addr_sym = self.peek_top_sym();
         let addr = self.pop_i32_slot()?;
-        self.maybe_bounds_check(addr, 8, offset, false)?;
+        self.maybe_bounds_check(addr, 8, offset, false, addr_sym)?;
         let dst = self.push_f64_slot()?;
         let eff = self.full_addr_in_x16(addr, offset)?;
         self.enc.ldr_d_imm(dst, Reg::X16, eff)?;
@@ -242,9 +238,10 @@ impl Lowerer {
         if !self.has_memory {
             return Err(LowerError::MemoryNotConfigured);
         }
+        let addr_sym = self.peek_top_sym();
         let val = self.pop_f64_slot()?;
         let addr = self.pop_i32_slot()?;
-        self.maybe_bounds_check(addr, 8, offset, true)?;
+        self.maybe_bounds_check(addr, 8, offset, true, addr_sym)?;
         let eff = self.full_addr_in_x16(addr, offset)?;
         self.enc.str_d_imm(val, Reg::X16, eff)?;
         Ok(())
@@ -256,8 +253,9 @@ impl Lowerer {
         if !self.has_memory {
             return Err(LowerError::MemoryNotConfigured);
         }
+        let addr_sym = self.peek_top_sym();
         let addr = self.pop_i32_slot()?;
-        self.maybe_bounds_check(addr, 8, offset, false)?;
+        self.maybe_bounds_check(addr, 8, offset, false, addr_sym)?;
         let dst = self.push_i64_slot()?;
         let eff = self.full_addr_in_x16(addr, offset)?;
         self.enc.ldr_imm(dst, Reg::X16, eff)?;
@@ -268,9 +266,12 @@ impl Lowerer {
         if !self.has_memory {
             return Err(LowerError::MemoryNotConfigured);
         }
+        // Stack: [..., addr (i32), val (i64)]. Both on int stack — val
+        // is the top slot, addr is one below.
+        let addr_sym = self.peek_sym_at(1);
         let val = self.pop_i64_slot()?;
         let addr = self.pop_i32_slot()?;
-        self.maybe_bounds_check(addr, 8, offset, true)?;
+        self.maybe_bounds_check(addr, 8, offset, true, addr_sym)?;
         let eff = self.full_addr_in_x16(addr, offset)?;
         self.enc.str_imm(val, Reg::X16, eff)?;
         Ok(())

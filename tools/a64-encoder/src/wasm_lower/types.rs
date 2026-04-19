@@ -277,6 +277,36 @@ pub(crate) enum LocalLoc {
     V128(Vreg),
 }
 
+/// Symbolic abstract value tracked for the i32 stack-top.
+///
+/// The bounds-check elision pass uses this to prove that a memory
+/// access is in range without emitting a runtime CMP/B.cond pair.
+/// Threaded through `i32.const`, `i32.add`, `i32.mul`, `i32.shl`, and
+/// `local.get` of an active loop counter — so the canonical
+/// `local.get k ; i32.const 4 ; i32.mul ; <load> off` pattern that
+/// LLVM emits for `arr[k]` propagates an upper bound all the way to
+/// the load.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SymAddr {
+    /// Stack-top is exactly this constant.
+    Const(u32),
+    /// Stack-top is in `[0, max_inclusive]`. u64 keeps multiplied
+    /// bounds (e.g. `4096 * 4`) representable without overflow even
+    /// when the original value fits in a u32.
+    Bounded { max_inclusive: u64 },
+}
+
+impl SymAddr {
+    /// Maximum u64 value the tracked stack slot can hold. Used by
+    /// memory-access elision to compute the worst-case byte address.
+    pub(crate) fn max(self) -> u64 {
+        match self {
+            SymAddr::Const(c) => c as u64,
+            SymAddr::Bounded { max_inclusive } => max_inclusive,
+        }
+    }
+}
+
 /// Information attached to an active Loop scope so the bounds-check
 /// elision pass knows it can omit the check when the address is a
 /// loop counter that's already constrained by the loop guard.
