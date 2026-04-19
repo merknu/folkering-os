@@ -4,7 +4,7 @@
 //! and the first/last few ops. Helps us see if the parser handles
 //! real Rust-emitted WASM, or if we hit unsupported opcodes.
 
-use a64_encoder::parse_module;
+use a64_encoder::{parse_module, parse_module_full};
 
 fn main() {
     let wasm_path = std::env::args()
@@ -13,6 +13,22 @@ fn main() {
 
     let bytes = std::fs::read(&wasm_path).expect("read wasm");
     println!("[probe] {} bytes loaded from {}", bytes.len(), wasm_path);
+
+    if let Ok(m) = parse_module_full(&bytes) {
+        println!("[probe] module: {} types, {} fns, {} globals, {} exports, {} data segments",
+                 m.types.len(), m.func_types.len(), m.globals.len(), m.exports.len(), m.data.len());
+        for (i, g) in m.globals.iter().enumerate() {
+            let init32 = i32::from_le_bytes(g.init_bytes[..4].try_into().unwrap());
+            println!("  global[{i}]: valtype=0x{:02x} mut={} init_i32={init32} (0x{:x})",
+                     g.valtype, g.mutable, init32 as u32);
+        }
+        for e in &m.exports {
+            println!("  export: {:?} kind={} idx={}", e.name, e.kind, e.index);
+        }
+        for d in &m.data {
+            println!("  data: offset=0x{:x} len={}", d.offset, d.bytes.len());
+        }
+    }
 
     match parse_module(&bytes) {
         Ok(bodies) => {

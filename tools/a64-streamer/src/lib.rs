@@ -45,9 +45,11 @@ pub const FRAME_ERROR: u8 = 0x06;
 pub const FRAME_BYE: u8 = 0x07;
 
 // Hard cap on a single frame payload — above this we reject, since
-// the JIT programs we expect are measured in a few KiB, data frames
-// in at most a page.
-pub const MAX_FRAME_PAYLOAD: usize = 1 << 20; // 1 MiB
+// the JIT programs we expect are measured in tens of KiB and the
+// largest weight buffers we expect are a few MiB. 8 MiB covers our
+// 256→512→256 ablation MLP (~1.05 MiB) with headroom for future
+// transformer weight sets.
+pub const MAX_FRAME_PAYLOAD: usize = 8 * 1024 * 1024;
 
 pub const DEFAULT_PORT: u16 = 14712;
 

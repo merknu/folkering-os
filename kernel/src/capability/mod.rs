@@ -83,11 +83,13 @@ impl CapabilityTable {
         if idx >= MAX_CAPABILITIES {
             return Err(CapError::InvalidId);
         }
-        match self.entries[idx].as_mut() {
-            Some(entry) => {
-                entry.valid = false;
-                Ok(())
-            }
+        // Take the slot so the allocator can reuse it. The earlier
+        // `valid = false` marker left slots occupied forever, and
+        // `allocate` only considers `None` slots reusable — so over
+        // many grant/revoke cycles the cap table would slowly fill
+        // up and start returning `TableFull` to legitimate callers.
+        match self.entries[idx].take() {
+            Some(_) => Ok(()),
             None => Err(CapError::NotFound),
         }
     }
@@ -175,6 +177,42 @@ pub fn revoke(cap_id: CapabilityId) -> Result<(), CapError> {
     CAP_TABLE.lock().revoke(cap_id)
 }
 
+/// Revoke a capability AND free any backing resources it owned.
+///
+/// Currently handles `DmaRegion` variants: their underlying
+/// `alloc_contiguous`-allocated physical pages are returned to the
+/// page allocator. Called from `syscall_exit` so a crashing task
+/// doesn't silently leak its DMA buffers.
+///
+/// CAVEAT — double-free risk if DmaRegion caps are ever transferred:
+/// `transfer()` today creates an independent cap entry pointing at
+/// the same `(phys_base, size)`, not a refcounted alias. If two
+/// tasks hold DmaRegion caps for the same range and both exit, the
+/// second exit will free-pages twice. No code path transfers
+/// DmaRegion today, but if one ever does, refcount the backing
+/// allocation before reusing this helper.
+pub fn revoke_with_cleanup(cap_id: CapabilityId) -> Result<(), CapError> {
+    // Read the cap type out first so we can act on it after revoke.
+    let cap_type = {
+        let table = CAP_TABLE.lock();
+        table.get(cap_id).map(|e| e.cap_type)
+    };
+
+    if let Some(CapabilityType::DmaRegion { phys_base, size }) = cap_type {
+        let num_pages = ((size as usize) + 4095) / 4096;
+        // Compute the order `alloc_contiguous` used: smallest power
+        // of 2 ≥ num_pages. Must match or `free_pages` corrupts the
+        // buddy allocator's internal free lists.
+        let mut order = 0usize;
+        while (1usize << order) < num_pages && order < 10 {
+            order += 1;
+        }
+        crate::memory::physical::free_pages(phys_base as usize, order);
+    }
+
+    revoke(cap_id)
+}
+
 /// Grant framebuffer capability to a task
 pub fn grant_framebuffer(task_id: TaskId, phys_base: u64, size: u64) -> Result<CapabilityId, CapError> {
     grant(task_id, CapabilityType::Framebuffer { phys_base, size })
@@ -188,14 +226,164 @@ pub fn has_framebuffer_access(task_id: TaskId, phys_addr: u64, size: u64) -> boo
     })
 }
 
+/// Grant a DMA region capability to a task.
+///
+/// Called by `syscall_dma_alloc` after it successfully reserves a
+/// contiguous physical range for the task. The capability is the
+/// task's proof-of-ownership — subsequent `syscall_dma_sync_*` calls
+/// check against this range before touching physical memory.
+pub fn grant_dma_region(task_id: TaskId, phys_base: u64, size: u64) -> Result<CapabilityId, CapError> {
+    grant(task_id, CapabilityType::DmaRegion { phys_base, size })
+}
+
+/// Check if a task holds a DMA region capability covering the given
+/// `[phys_addr, phys_addr + size)` range. Returns false if any slice
+/// of the request falls outside every held region.
+pub fn has_dma_access(task_id: TaskId, phys_addr: u64, size: u64) -> bool {
+    has_capability(task_id, CapabilityType::DmaRegion {
+        phys_base: phys_addr,
+        size,
+    })
+}
+
+/// Grant a PCI MMIO region capability to a task. Called from boot
+/// after PCI enumeration, one invocation per non-empty MMIO BAR on
+/// each enumerated device.
+pub fn grant_mmio_region(task_id: TaskId, phys_base: u64, size: u64) -> Result<CapabilityId, CapError> {
+    grant(task_id, CapabilityType::MmioRegion { phys_base, size })
+}
+
+/// Check if a task holds an MMIO region capability covering the
+/// given `[phys_addr, phys_addr + size)` range. Used by
+/// `syscall_map_physical` to gate PCI BAR mapping.
+pub fn has_mmio_access(task_id: TaskId, phys_addr: u64, size: u64) -> bool {
+    has_capability(task_id, CapabilityType::MmioRegion {
+        phys_base: phys_addr,
+        size,
+    })
+}
+
+/// Grant a PCI I/O-port range capability to a task.
+pub fn grant_io_port(task_id: TaskId, base: u16, size: u16) -> Result<CapabilityId, CapError> {
+    grant(task_id, CapabilityType::IoPort { base, size })
+}
+
+/// Check if a task may touch I/O port `[base, base + size)`. Used by
+/// every `syscall_port_{in,out}{b,w,l}` entry point.
+pub fn has_io_port_access(task_id: TaskId, base: u16, size: u16) -> bool {
+    has_capability(task_id, CapabilityType::IoPort { base, size })
+}
+
+/// Grant the "authorized device driver" privilege to a task. Without
+/// this, `syscall_pci_acquire` is a no-op — a task can't escalate its
+/// own hardware access by asking to drive a device.
+pub fn grant_driver_privilege(task_id: TaskId) -> Result<CapabilityId, CapError> {
+    grant(task_id, CapabilityType::DriverPrivilege)
+}
+
+/// Check if a task is allowed to call `syscall_pci_acquire`.
+pub fn has_driver_privilege(task_id: TaskId) -> bool {
+    has_capability(task_id, CapabilityType::DriverPrivilege)
+}
+
+/// Grant raw block-device I/O capability. Only Synapse gets this
+/// today — it's the canonical owner of the SQLite region and the
+/// only task that legitimately needs `syscall_block_read` /
+/// `_write` direct sector access.
+pub fn grant_raw_block_io(task_id: TaskId) -> Result<CapabilityId, CapError> {
+    grant(task_id, CapabilityType::RawBlockIO)
+}
+
+/// Check if a task may perform raw block-device I/O.
+pub fn has_raw_block_io(task_id: TaskId) -> bool {
+    has_capability(task_id, CapabilityType::RawBlockIO)
+}
+
+/// Capability variants that MUST NOT be transferred via IPC.
+///
+/// These caps authorize access to hardware or physical memory that
+/// the kernel has direct authority over. Transferring them would let
+/// a privileged task bootstrap a less-privileged task past the
+/// intended gate. In particular:
+///
+///   - `DmaRegion`: transferring double-frees if both tasks exit
+///     (each `revoke_with_cleanup` frees the same phys range).
+///   - `MmioRegion`/`IoPort`: break "only boot-authorized tasks touch
+///     hardware" — a kernel-granted cap becomes a userspace token.
+///   - `Framebuffer`: same reasoning as MMIO.
+///   - `DriverPrivilege`: the gate on `pci_acquire`. Transferring
+///     defeats the whole point of gating it.
+///   - `RawBlockIO`: Synapse-only disk access.
+///
+/// IPC-style caps (`IpcSend`, `IpcSendAny`, `IpcReceive`) and
+/// general-purpose ones (`Memory`, `TaskControl`, `Scheduler`,
+/// `Hardware(_)`, `Resource(_)`, `All`) remain transferable.
+///
+/// This is a private helper used only by `TransferableCap::check` —
+/// external code can't call it to "verify" a cap before bypassing
+/// `transfer()`. The only path to transfer is through the newtype.
+fn is_non_transferable(cap_type: &CapabilityType) -> bool {
+    matches!(
+        cap_type,
+        CapabilityType::DmaRegion { .. }
+            | CapabilityType::MmioRegion { .. }
+            | CapabilityType::IoPort { .. }
+            | CapabilityType::Framebuffer { .. }
+            | CapabilityType::DriverPrivilege
+            | CapabilityType::RawBlockIO
+    )
+}
+
+/// A `CapabilityId` that has been validated as transferable.
+///
+/// The only way to construct one is via `TransferableCap::check`,
+/// which inspects the cap's type and returns `None` for hardware-
+/// bound variants. This makes the transferability rule **type-
+/// enforced**, not comment-enforced: `transfer()` accepts only
+/// `TransferableCap`, so a future regression that forgets to call
+/// `is_non_transferable` becomes a compile error, not a runtime
+/// escape hatch.
+///
+/// Use pattern:
+/// ```ignore
+/// let tc = TransferableCap::check(cap_id)
+///     .ok_or(CapError::NonTransferable)?;
+/// capability::transfer(from, to, tc)?;
+/// ```
+#[derive(Clone, Copy, Debug)]
+pub struct TransferableCap(CapabilityId);
+
+impl TransferableCap {
+    /// Validate that `cap_id` refers to a transferable cap and return
+    /// the typed wrapper. Returns `None` if the cap is missing or is
+    /// a hardware-bound variant.
+    pub fn check(cap_id: CapabilityId) -> Option<Self> {
+        let table = CAP_TABLE.lock();
+        let entry = table.get(cap_id)?;
+        if is_non_transferable(&entry.cap_type) {
+            return None;
+        }
+        Some(TransferableCap(cap_id))
+    }
+
+    /// Unwrap to the underlying CapabilityId (e.g. for logging).
+    pub fn id(self) -> CapabilityId {
+        self.0
+    }
+}
+
 /// Transfer a capability from one task to another
 ///
-/// Used during IPC to pass capabilities.
+/// Used during IPC to pass capabilities. The `cap` parameter is a
+/// `TransferableCap` — the type system prevents hardware-bound caps
+/// from reaching this function at all.
 pub fn transfer(
     from_task: TaskId,
     to_task: TaskId,
-    cap_id: CapabilityId,
+    cap: TransferableCap,
 ) -> Result<CapabilityId, CapError> {
+    let cap_id = cap.id();
+
     // Verify the source task owns this capability
     let from = crate::task::task::get_task(from_task).ok_or(CapError::NotFound)?;
     let to = crate::task::task::get_task(to_task).ok_or(CapError::NotFound)?;
@@ -207,17 +395,30 @@ pub fn transfer(
         }
     }
 
-    // Get the capability type
+    // Get the capability type. TransferableCap guarantees the
+    // transferability check already passed — but we re-read the
+    // type here because the caller might have held the cap_id
+    // across a revoke + re-grant, and we want the CURRENT type.
     let cap_type = {
         let table = CAP_TABLE.lock();
         table.get(cap_id).ok_or(CapError::NotFound)?.cap_type
     };
 
+    // Belt-and-braces: if the cap has somehow mutated into a
+    // non-transferable variant between TransferableCap::check and
+    // now (shouldn't be possible under current code, but defense in
+    // depth), refuse the transfer. This is the only place where a
+    // runtime fallback makes sense — the type check got us here.
+    if is_non_transferable(&cap_type) {
+        return Err(CapError::NonTransferable);
+    }
+
     // Create a new capability for the destination task
     let new_id = grant(to_task, cap_type)?;
 
-    // Optionally: remove from source task (move semantics) or keep (copy semantics)
-    // For now, we use copy semantics (both tasks have the capability)
+    // Copy semantics: both tasks now hold the capability. Move
+    // semantics would require revoking the source — left as future
+    // work if/when a use case demands it.
 
     crate::drivers::serial::write_str("[CAP] Transferred cap from task ");
     crate::drivers::serial::write_dec(from_task);

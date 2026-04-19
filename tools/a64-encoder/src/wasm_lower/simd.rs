@@ -69,8 +69,11 @@ impl Lowerer {
         if !self.has_memory {
             return Err(LowerError::MemoryNotConfigured);
         }
+        // Snapshot the address sym BEFORE the pop, so the elider sees
+        // it (pop_i32_slot drops the symbolic info along with the slot).
+        let addr_sym = self.peek_top_sym();
         let addr = self.pop_i32_slot()?;
-        self.emit_bounds_check(addr, 16, offset, false)?;
+        self.maybe_bounds_check(addr, 16, offset, false, addr_sym)?;
         let dst = self.push_v128_slot()?;
         self.enc.add_ext_uxtw(Reg::X16, MEM_BASE_REG, addr)?;
         self.enc.ldr_q_imm(dst, Reg::X16, offset)?;
@@ -81,9 +84,13 @@ impl Lowerer {
         if !self.has_memory {
             return Err(LowerError::MemoryNotConfigured);
         }
+        // Stack: [..., addr (i32), val (v128)]. val lives on the V
+        // bank; the address is the int-stack top, so peek_top_sym
+        // sees it directly.
+        let addr_sym = self.peek_top_sym();
         let val = self.pop_v128_slot()?;
         let addr = self.pop_i32_slot()?;
-        self.emit_bounds_check(addr, 16, offset, true)?;
+        self.maybe_bounds_check(addr, 16, offset, true, addr_sym)?;
         self.enc.add_ext_uxtw(Reg::X16, MEM_BASE_REG, addr)?;
         self.enc.str_q_imm(val, Reg::X16, offset)?;
         Ok(())
@@ -169,6 +176,39 @@ impl Lowerer {
         let lhs = self.pop_v128_slot()?;
         let dst = self.push_v128_slot()?;
         self.enc.mul_4s_vector(dst, lhs, rhs)?;
+        Ok(())
+    }
+
+    /// Lower `i32x4.dot_i8x16_signed` — Folkering extension over
+    /// AArch64 SDOT. Stack: [acc i32x4, a i8x16, b i8x16] →
+    /// [acc + dot(a, b) i32x4]. SDOT accumulates into Vd, so we
+    /// move the acc into the destination first, then SDOT against
+    /// the two source vectors.
+    pub(super) fn lower_i32x4_dot_i8x16_signed(&mut self) -> Result<(), LowerError> {
+        let b = self.pop_v128_slot()?;
+        let a = self.pop_v128_slot()?;
+        let acc = self.pop_v128_slot()?;
+        let dst = self.push_v128_slot()?;
+        // Move acc into dst (SDOT reads-modifies-writes Vd).
+        // ORR Vd.16b, Vacc.16b, Vacc.16b is the canonical "MOV V"
+        // — already used by the operand-stack mover. If dst == acc
+        // we skip.
+        if dst != acc {
+            self.enc.orr_16b_vec(dst, acc, acc)?;
+        }
+        self.enc.sdot_4s_16b(dst, a, b)?;
+        Ok(())
+    }
+
+    pub(super) fn lower_i32x4_dot_i8x16_unsigned(&mut self) -> Result<(), LowerError> {
+        let b = self.pop_v128_slot()?;
+        let a = self.pop_v128_slot()?;
+        let acc = self.pop_v128_slot()?;
+        let dst = self.push_v128_slot()?;
+        if dst != acc {
+            self.enc.orr_16b_vec(dst, acc, acc)?;
+        }
+        self.enc.udot_4s_16b(dst, a, b)?;
         Ok(())
     }
 

@@ -8,11 +8,14 @@
 //! microseconds, plus throughput.
 //!
 //! Usage:
-//!   PI_HOST=192.168.68.72:7700 cargo run --release --example bench_real_wasm \
-//!     -- examples/wasm-attention/target/wasm32-unknown-unknown/release/attention_wasm.wasm \
-//!     200
+//!   PI_HOST=192.168.68.72:7700 cargo run --release --example bench_real_wasm
+//!   cargo run --release --example bench_real_wasm -- <wasm> [iters [runs]]
 //!
-//! Or omit args for defaults (attention_wasm.wasm, 100 iters).
+//! Defaults: attention_wasm.wasm, 100 iterations, 1 run.
+//! With runs > 1, reports mean ± stdev across runs (essential for
+//! understanding whether a perf delta between commits is real or
+//! just measurement noise — a single number can swing 2x on a
+//! noisy network).
 
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
@@ -103,65 +106,62 @@ fn fmt_stats(label: &str, s: &Stats) {
     );
 }
 
-fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let wasm_path = args.get(0).cloned().unwrap_or_else(|| DEFAULT_WASM.to_string());
-    let iterations: u32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(100);
+/// One full bench run: open session, install CODE, loop N EXECs,
+/// return per-iteration timing + summary throughput.
+struct RunResult {
+    parse_us: u64,
+    compile_us: u64,
+    connect_us: u64,
+    code_send_us: u64,
+    code_bytes: usize,
+    data_stats: Stats,
+    exec_stats: Stats,
+    iter_stats: Stats,
+    throughput_per_sec: u64,
+    first_result: i32,
+    mismatches: u32,
+}
 
-    println!("[BENCH] WASM:       {wasm_path}");
-    println!("[BENCH] iterations: {iterations}");
-
-    let wasm = std::fs::read(&wasm_path).unwrap_or_else(|e| {
-        eprintln!("Could not read {wasm_path}: {e}");
-        std::process::exit(2);
-    });
-
-    // ── parse ──
-    let t0 = Instant::now();
-    let bodies = parse_module(&wasm).expect("parse_module");
+fn one_run(addr: &str, wasm: &[u8], weights: &[u8], iterations: u32) -> RunResult {
+    // Parse
+    let t = Instant::now();
+    let bodies = parse_module(wasm).expect("parse_module");
     let body = bodies.into_iter().next().expect("at least one fn");
-    let parse_us = t0.elapsed().as_micros() as u64;
+    let parse_us = t.elapsed().as_micros() as u64;
 
     let local_types: Vec<ValType> = body.local_types.iter().map(|&b| vt(b)).collect();
-    let weights = build_attention_data();
 
-    // ── connect + HELLO ──
-    let raw = std::env::var("PI_HOST").unwrap_or_else(|_| "192.168.68.72".to_string());
-    let host_part = raw.split_once('@').map(|(_, h)| h).unwrap_or(&raw);
-    let addr = if host_part.contains(':') { host_part.to_string() }
-               else { format!("{host_part}:{DEFAULT_PORT}") };
-
-    println!("[BENCH] connecting to {addr}");
-    let t0 = Instant::now();
-    let mut sock = TcpStream::connect(&addr).expect("connect");
+    // Connect
+    let t = Instant::now();
+    let mut sock = TcpStream::connect(addr).expect("connect");
     sock.set_read_timeout(Some(Duration::from_secs(15))).ok();
     sock.set_write_timeout(Some(Duration::from_secs(15))).ok();
-    sock.set_nodelay(true).ok(); // disable Nagle — small frames otherwise wait ~200 ms
+    sock.set_nodelay(true).ok();
     let (ty, payload) = read_frame(&mut sock).expect("HELLO");
     assert_eq!(ty, FRAME_HELLO);
     let hello = parse_hello(&payload).expect("parse HELLO");
-    let connect_us = t0.elapsed().as_micros() as u64;
+    let connect_us = t.elapsed().as_micros() as u64;
 
-    // ── compile against real mem_base ──
-    let t0 = Instant::now();
+    // Compile
+    let t = Instant::now();
     let mut lw = Lowerer::new_function_with_memory_typed(
         &local_types, Vec::new(), hello.mem_base,
     ).expect("Lowerer");
     lw.set_mem_size(hello.mem_size);
     lw.lower_all(&body.ops).expect("lower_all");
     let code = lw.finish();
-    let compile_us = t0.elapsed().as_micros() as u64;
+    let compile_us = t.elapsed().as_micros() as u64;
 
-    // ── send signed CODE (one-time) ──
+    // CODE
     let tag = auth::sign(&code);
     let mut signed = Vec::with_capacity(code.len() + auth::TAG_LEN);
     signed.extend_from_slice(&code);
     signed.extend_from_slice(&tag);
-    let t0 = Instant::now();
+    let t = Instant::now();
     write_frame(&mut sock, FRAME_CODE, &signed).expect("CODE");
-    let code_send_us = t0.elapsed().as_micros() as u64;
+    let code_send_us = t.elapsed().as_micros() as u64;
 
-    // ── warm streaming loop ──
+    // Warm loop
     let mut data_samples: Vec<u64> = Vec::with_capacity(iterations as usize);
     let mut exec_samples: Vec<u64> = Vec::with_capacity(iterations as usize);
     let mut iter_samples: Vec<u64> = Vec::with_capacity(iterations as usize);
@@ -173,7 +173,7 @@ fn main() {
         let iter_start = Instant::now();
 
         let t = Instant::now();
-        let data_payload = serialize_data(BASE, &weights);
+        let data_payload = serialize_data(BASE, weights);
         write_frame(&mut sock, FRAME_DATA, &data_payload).expect("DATA");
         let data_us = t.elapsed().as_micros() as u64;
 
@@ -191,39 +191,173 @@ fn main() {
             Some(r) if r != result => mismatches += 1,
             _ => {}
         }
-
         data_samples.push(data_us);
         exec_samples.push(exec_us);
         iter_samples.push(total_us);
     }
     let warm_total_us = warm_start.elapsed().as_micros() as u64;
-
-    let data_stats = Stats::from_unsorted(&mut data_samples);
-    let exec_stats = Stats::from_unsorted(&mut exec_samples);
-    let iter_stats = Stats::from_unsorted(&mut iter_samples);
     let throughput = if warm_total_us > 0 {
         (iterations as u64 * 1_000_000) / warm_total_us
     } else { 0 };
 
-    // ── report ──
-    println!();
-    println!("=== one-time costs ===");
-    println!("  parse        {parse_us:>6} us  ({} B WASM)", wasm.len());
-    println!("  compile      {compile_us:>6} us  ({} B AArch64)", code.len());
-    println!("  connect+HELLO {connect_us:>6} us");
-    println!("  CODE send    {code_send_us:>6} us  (HMAC-signed, {} B)", signed.len());
-    println!();
-    println!("=== warm streaming loop ({iterations} iterations) ===");
-    println!("  DATA payload: {} B at offset 0x{BASE:x}", weights.len());
-    fmt_stats("DATA", &data_stats);
-    fmt_stats("EXEC", &exec_stats);
-    fmt_stats("ITER", &iter_stats);
-    println!();
-    println!("throughput: {throughput} ops/sec  (warm-loop wall time {warm_total_us} us)");
-    println!(
-        "result: {}  ({} mismatches across {} iterations)",
-        first_result.unwrap_or(-1),
+    RunResult {
+        parse_us, compile_us, connect_us, code_send_us,
+        code_bytes: code.len(),
+        data_stats: Stats::from_unsorted(&mut data_samples),
+        exec_stats: Stats::from_unsorted(&mut exec_samples),
+        iter_stats: Stats::from_unsorted(&mut iter_samples),
+        throughput_per_sec: throughput,
+        first_result: first_result.unwrap_or(-1),
         mismatches,
-        iterations,
-    );
+    }
+}
+
+/// Statistics across multiple runs of the same bench. A single
+/// number is meaningless without spread — use this to report
+/// mean ± stdev over K independent runs.
+struct RunsStats {
+    n: usize,
+    mean: f64,
+    stdev: f64,
+    min: u64,
+    max: u64,
+}
+
+fn runs_stats(samples: &[u64]) -> RunsStats {
+    let n = samples.len();
+    if n == 0 {
+        return RunsStats { n: 0, mean: 0.0, stdev: 0.0, min: 0, max: 0 };
+    }
+    let sum: u64 = samples.iter().sum();
+    let mean = sum as f64 / n as f64;
+    let var: f64 = samples.iter()
+        .map(|&v| { let d = v as f64 - mean; d * d })
+        .sum::<f64>() / n as f64;
+    let stdev = var.sqrt();
+    RunsStats {
+        n,
+        mean,
+        stdev,
+        min: *samples.iter().min().unwrap(),
+        max: *samples.iter().max().unwrap(),
+    }
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let wasm_path = args.get(0).cloned().unwrap_or_else(|| DEFAULT_WASM.to_string());
+    let iterations: u32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(100);
+    let runs: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1);
+
+    println!("[BENCH] WASM:       {wasm_path}");
+    println!("[BENCH] iterations: {iterations}  per run");
+    println!("[BENCH] runs:       {runs}");
+    println!();
+
+    let wasm = std::fs::read(&wasm_path).unwrap_or_else(|e| {
+        eprintln!("Could not read {wasm_path}: {e}");
+        std::process::exit(2);
+    });
+    let weights = build_attention_data();
+
+    let raw = std::env::var("PI_HOST").unwrap_or_else(|_| "192.168.68.72".to_string());
+    let host_part = raw.split_once('@').map(|(_, h)| h).unwrap_or(&raw);
+    let addr = if host_part.contains(':') { host_part.to_string() }
+               else { format!("{host_part}:{DEFAULT_PORT}") };
+    println!("[BENCH] target:     {addr}");
+    println!();
+
+    let mut all_throughput: Vec<u64> = Vec::with_capacity(runs);
+    let mut all_exec_mean: Vec<u64> = Vec::with_capacity(runs);
+    let mut all_exec_p50: Vec<u64> = Vec::with_capacity(runs);
+    let mut all_exec_p99: Vec<u64> = Vec::with_capacity(runs);
+    let mut all_compile_us: Vec<u64> = Vec::with_capacity(runs);
+    let mut total_mismatches = 0u32;
+    let mut first_result_overall: Option<i32> = None;
+
+    for run_idx in 1..=runs {
+        if runs > 1 {
+            print!("[run {:>2}/{:>2}] ", run_idx, runs);
+        }
+        let r = one_run(&addr, &wasm, &weights, iterations);
+
+        if runs == 1 {
+            // Single-run mode — print full per-phase report.
+            println!("=== one-time costs ===");
+            println!("  parse        {:>6} us  ({} B WASM)", r.parse_us, wasm.len());
+            println!("  compile      {:>6} us  ({} B AArch64)", r.compile_us, r.code_bytes);
+            println!("  connect+HELLO {:>6} us", r.connect_us);
+            println!("  CODE send    {:>6} us  (HMAC-signed)", r.code_send_us);
+            println!();
+            println!("=== warm streaming loop ({iterations} iterations) ===");
+            println!("  DATA payload: {} B at offset 0x{BASE:x}", weights.len());
+            fmt_stats("DATA", &r.data_stats);
+            fmt_stats("EXEC", &r.exec_stats);
+            fmt_stats("ITER", &r.iter_stats);
+            println!();
+            println!("throughput: {} ops/sec", r.throughput_per_sec);
+            println!(
+                "result: {}  ({} mismatches across {} iterations)",
+                r.first_result, r.mismatches, iterations,
+            );
+        } else {
+            // Multi-run mode — one compact line per run.
+            println!(
+                "throughput={:>5} ops/sec  exec_mean={:>5} us  p50={:>5}  p99={:>5}  result={}",
+                r.throughput_per_sec, r.exec_stats.mean,
+                r.exec_stats.p50, r.exec_stats.p99,
+                r.first_result,
+            );
+        }
+
+        all_throughput.push(r.throughput_per_sec);
+        all_exec_mean.push(r.exec_stats.mean);
+        all_exec_p50.push(r.exec_stats.p50);
+        all_exec_p99.push(r.exec_stats.p99);
+        all_compile_us.push(r.compile_us);
+        total_mismatches += r.mismatches;
+        match first_result_overall {
+            None => first_result_overall = Some(r.first_result),
+            Some(prev) if prev != r.first_result => total_mismatches += 1,
+            _ => {}
+        }
+    }
+
+    // Multi-run summary
+    if runs > 1 {
+        println!();
+        println!("=== summary across {runs} runs ===");
+        let tp = runs_stats(&all_throughput);
+        let em = runs_stats(&all_exec_mean);
+        let ep50 = runs_stats(&all_exec_p50);
+        let ep99 = runs_stats(&all_exec_p99);
+        let cp = runs_stats(&all_compile_us);
+
+        println!(
+            "  throughput   {:>7.1} ± {:>5.1} ops/sec  (min={}, max={})",
+            tp.mean, tp.stdev, tp.min, tp.max,
+        );
+        println!(
+            "  exec_mean    {:>7.1} ± {:>5.1} us       (min={}, max={})",
+            em.mean, em.stdev, em.min, em.max,
+        );
+        println!(
+            "  exec_p50     {:>7.1} ± {:>5.1} us       (min={}, max={})",
+            ep50.mean, ep50.stdev, ep50.min, ep50.max,
+        );
+        println!(
+            "  exec_p99     {:>7.1} ± {:>5.1} us       (min={}, max={})",
+            ep99.mean, ep99.stdev, ep99.min, ep99.max,
+        );
+        println!(
+            "  compile_time {:>7.1} ± {:>5.1} us       (min={}, max={})",
+            cp.mean, cp.stdev, cp.min, cp.max,
+        );
+
+        let cv = if tp.mean > 0.0 { tp.stdev / tp.mean * 100.0 } else { 0.0 };
+        println!(
+            "  throughput coefficient of variation: {:.1}%   ({} mismatches across all runs)",
+            cv, total_mismatches,
+        );
+    }
 }

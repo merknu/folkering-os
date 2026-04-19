@@ -24,8 +24,6 @@
 //! but for now the NOPs don't hurt — they execute in zero cycles
 //! on Cortex-A76's decode stage.
 
-use alloc::vec::Vec;
-
 /// NOP encoding on AArch64.
 const NOP: u32 = 0xD503_201F;
 
@@ -135,6 +133,7 @@ pub fn count_nops(buf: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec::Vec;
 
     fn word_to_bytes(word: u32) -> [u8; 4] {
         word.to_le_bytes()

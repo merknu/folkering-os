@@ -16,7 +16,12 @@ impl Lowerer {
         if hi != 0 {
             self.enc.movk(r, hi, MovShift::Lsl16)?;
         }
-        self.last_i32_const_value = Some(c);
+        // Track only non-negative constants — bounds-check elision
+        // works on byte addresses, and a negative i32 sign-extends to
+        // a huge u64 that we can never prove safe anyway.
+        if c >= 0 {
+            self.set_top_sym(Some(SymAddr::Const(c as u32)));
+        }
         Ok(())
     }
 
@@ -29,6 +34,13 @@ impl Lowerer {
     }
 
     pub(super) fn lower_binop(&mut self, op: BinOp) -> Result<(), LowerError> {
+        // Snapshot symbolic values for both operands before they pop —
+        // rhs is the stack top, lhs is the slot just below. Used by
+        // sym_combine to compute an upper bound on the result so the
+        // canonical `local.get k ; i32.const 4 ; i32.mul ; <load> off`
+        // pattern propagates a bound all the way to the load.
+        let rhs_sym = self.peek_sym_at(0);
+        let lhs_sym = self.peek_sym_at(1);
         let rhs = self.pop_i32_slot()?;
         let lhs = self.pop_i32_slot()?;
         let dst = self.push_i32_slot()?;
@@ -49,6 +61,18 @@ impl Lowerer {
                 self.enc.cset(dst, cond)?;
             }
         }
+        let sym = match op {
+            BinOp::Add  => sym_add(lhs_sym, rhs_sym),
+            BinOp::Mul  => sym_mul(lhs_sym, rhs_sym),
+            BinOp::Shl  => sym_shl(lhs_sym, rhs_sym),
+            BinOp::ShrU => sym_shr_u(lhs_sym, rhs_sym),
+            BinOp::And  => sym_and(lhs_sym, rhs_sym),
+            // Other ops (Sub/Div/Or/Xor/ShrS/Cmp) don't have a clean
+            // monotone upper-bound rule for the address-arithmetic
+            // patterns we care about — leave them untracked.
+            _ => None,
+        };
+        self.set_top_sym(sym);
         Ok(())
     }
 
@@ -190,10 +214,18 @@ impl Lowerer {
     }
 
     pub(super) fn lower_local_get(&mut self, idx: u32) -> Result<(), LowerError> {
+        // If `idx` is the counter of an enclosing loop and that loop's
+        // body hasn't written to it yet, the value is bounded by the
+        // loop guard — propagate that bound to the operand stack so
+        // downstream arithmetic and the eventual load can elide their
+        // bounds checks.
+        let sym = self.local_bound(idx)
+            .map(|m| SymAddr::Bounded { max_inclusive: m });
         match self.local_loc(idx)? {
             LocalLoc::I32(local) => {
                 let dst = self.push_i32_slot()?;
                 self.enc.add(dst, Reg::ZR, local)?;
+                self.set_top_sym(sym);
             }
             LocalLoc::I64(local) => {
                 let dst = self.push_i64_slot()?;
@@ -207,11 +239,22 @@ impl Lowerer {
                 let dst = self.push_f64_slot()?;
                 self.enc.fmov_d_d(dst, local)?;
             }
+            LocalLoc::V128(local) => {
+                let dst = self.push_v128_slot()?;
+                // ORR Vd.16B, Vn.16B, Vm.16B with Vn=Vm performs a
+                // 128-bit MOV — same trick we use for v128 stack
+                // moves elsewhere.
+                self.enc.orr_16b_vec(dst, local, local)?;
+            }
         }
         Ok(())
     }
 
     pub(super) fn lower_local_tee(&mut self, idx: u32) -> Result<(), LowerError> {
+        // Tee writes the local — invalidate any active loop bound that
+        // pinned this counter. (Tee leaves the value on the stack so
+        // its symbolic info there is unaffected.)
+        self.taint_local(idx);
         match self.local_loc(idx)? {
             LocalLoc::I32(local) => {
                 let top = self.stack.last().copied().ok_or(LowerError::StackUnderflow)?;
@@ -245,6 +288,14 @@ impl Lowerer {
                 let src_reg = Vreg((self.fp_depth - 1) as u8);
                 self.enc.fmov_d_d(local, src_reg)?;
             }
+            LocalLoc::V128(local) => {
+                let top = self.stack.last().copied().ok_or(LowerError::StackUnderflow)?;
+                if top != ValType::V128 {
+                    return Err(LowerError::TypeMismatch { expected: ValType::V128, got: top });
+                }
+                let src_reg = Vreg((self.fp_depth - 1) as u8);
+                self.enc.orr_16b_vec(local, src_reg, src_reg)?;
+            }
         }
         Ok(())
     }
@@ -268,16 +319,22 @@ impl Lowerer {
         let top_ty = self.stack.last().copied().ok_or(LowerError::StackUnderflow)?;
         match top_ty {
             ValType::I32 => {
+                let val_false_sym = self.peek_top_sym();
                 let val_false = self.pop_i32_slot()?;
+                let val_true_sym = self.peek_top_sym();
                 let val_true = self.pop_i32_slot()?;
                 let dst = self.push_i32_slot()?;
                 self.enc.csel(dst, val_true, val_false, Condition::Ne)?;
+                self.set_top_sym(sym_select(val_true_sym, val_false_sym));
             }
             ValType::I64 => {
+                let val_false_sym = self.peek_top_sym();
                 let val_false = self.pop_i64_slot()?;
+                let val_true_sym = self.peek_top_sym();
                 let val_true = self.pop_i64_slot()?;
                 let dst = self.push_i64_slot()?;
                 self.enc.csel(dst, val_true, val_false, Condition::Ne)?;
+                self.set_top_sym(sym_select(val_true_sym, val_false_sym));
             }
             ValType::F32 => {
                 let val_false = self.pop_f32_slot()?;
@@ -297,6 +354,10 @@ impl Lowerer {
     }
 
     pub(super) fn lower_local_set(&mut self, idx: u32) -> Result<(), LowerError> {
+        // Set writes the local — invalidate any active loop bound that
+        // pinned this counter so subsequent local.get of it doesn't
+        // get a stale bound.
+        self.taint_local(idx);
         match self.local_loc(idx)? {
             LocalLoc::I32(local) => {
                 let src = self.pop_i32_slot()?;
@@ -314,7 +375,140 @@ impl Lowerer {
                 let src = self.pop_f64_slot()?;
                 self.enc.fmov_d_d(local, src)?;
             }
+            LocalLoc::V128(local) => {
+                let src = self.pop_v128_slot()?;
+                self.enc.orr_16b_vec(local, src, src)?;
+            }
         }
         Ok(())
+    }
+
+    // ── Symbolic-tracking helpers for bounds-check elision ──────────
+
+    /// Maximum value local `idx` can hold inside the current loop
+    /// body, or `None` if unbounded. Walks `active_loop_bounds`
+    /// innermost-first — an inner loop that re-bounds the same
+    /// counter shadows an outer one. A counter is considered bounded
+    /// only if the loop body hasn't yet written to it (LocalSet/Tee
+    /// inside the body invalidates the guard's invariant).
+    pub(super) fn local_bound(&self, idx: u32) -> Option<u64> {
+        let n = self.active_loop_bounds.len();
+        for i in (0..n).rev() {
+            if let Some(b) = self.active_loop_bounds[i] {
+                if b.counter_local == idx {
+                    if let Some(taints) = self.tainted_locals.get(i) {
+                        if taints.contains(&idx) { return None; }
+                    }
+                    return Some(b.max_value as u64);
+                }
+            }
+        }
+        None
+    }
+
+    /// Mark local `idx` as written in every active loop scope. Once
+    /// tainted, [`Self::local_bound`] returns `None` for it within
+    /// that loop — the guard's `counter < M` invariant only holds at
+    /// the top of the iteration, so any subsequent `local.get` of a
+    /// freshly-written counter could see an out-of-bound value.
+    pub(super) fn taint_local(&mut self, idx: u32) {
+        for taints in self.tainted_locals.iter_mut() {
+            taints.insert(idx);
+        }
+    }
+}
+
+// ── Free helpers: combine symbolic operand info under arithmetic ───
+
+/// Result of `i32.add` on two symbolic values. Only fires when both
+/// operands are tracked — partial info collapses to `None` because we
+/// can't bound `unknown + bounded`.
+pub(super) fn sym_add(a: Option<SymAddr>, b: Option<SymAddr>) -> Option<SymAddr> {
+    match (a, b) {
+        (Some(SymAddr::Const(x)), Some(SymAddr::Const(y))) =>
+            Some(SymAddr::Const(x.saturating_add(y))),
+        (Some(x), Some(y)) =>
+            Some(SymAddr::Bounded { max_inclusive: x.max().saturating_add(y.max()) }),
+        _ => None,
+    }
+}
+
+/// Result of `i32.mul` on two symbolic values. The common case is
+/// `Const(scale) * Bounded(counter_max)` for the `arr[k]` pattern
+/// LLVM emits — that becomes `Bounded(scale * counter_max)`.
+pub(super) fn sym_mul(a: Option<SymAddr>, b: Option<SymAddr>) -> Option<SymAddr> {
+    match (a, b) {
+        (Some(SymAddr::Const(x)), Some(SymAddr::Const(y))) =>
+            Some(SymAddr::Const(x.saturating_mul(y))),
+        (Some(x), Some(y)) =>
+            Some(SymAddr::Bounded { max_inclusive: x.max().saturating_mul(y.max()) }),
+        _ => None,
+    }
+}
+
+/// Result of `i32.shl`. Only handled when the shift amount is a
+/// known small constant — a Bounded shift amount could wrap modulo 32
+/// in WASM semantics, so we can't soundly bound the result.
+pub(super) fn sym_shl(a: Option<SymAddr>, b: Option<SymAddr>) -> Option<SymAddr> {
+    let s = match b {
+        Some(SymAddr::Const(s)) if s < 32 => s,
+        _ => return None,
+    };
+    match a {
+        Some(SymAddr::Const(x)) =>
+            Some(SymAddr::Const(x.checked_shl(s).unwrap_or(u32::MAX))),
+        Some(SymAddr::Bounded { max_inclusive }) =>
+            Some(SymAddr::Bounded {
+                max_inclusive: max_inclusive.checked_shl(s).unwrap_or(u64::MAX),
+            }),
+        None => None,
+    }
+}
+
+/// Result of `i32.shr_u`. A right-shift can only lower the upper
+/// bound, so a tracked input still produces a tracked output. As
+/// with `shl`, we only handle constant shift amounts (a variable
+/// shift wraps mod 32 and could leave the value unchanged).
+pub(super) fn sym_shr_u(a: Option<SymAddr>, b: Option<SymAddr>) -> Option<SymAddr> {
+    let s = match b {
+        Some(SymAddr::Const(s)) if s < 32 => s,
+        _ => return None,
+    };
+    match a {
+        Some(SymAddr::Const(x)) => Some(SymAddr::Const(x >> s)),
+        Some(SymAddr::Bounded { max_inclusive }) =>
+            Some(SymAddr::Bounded { max_inclusive: max_inclusive >> s }),
+        None => None,
+    }
+}
+
+/// Result of `i32.and`. The output is bounded by every operand —
+/// `(x & m).max ≤ min(x.max, m.max)` — which makes the common
+/// `idx & (cap - 1)` hash-table mask trivially safe whenever `cap`
+/// is a known constant.
+pub(super) fn sym_and(a: Option<SymAddr>, b: Option<SymAddr>) -> Option<SymAddr> {
+    match (a, b) {
+        (Some(SymAddr::Const(x)), Some(SymAddr::Const(y))) =>
+            Some(SymAddr::Const(x & y)),
+        (Some(x), Some(y)) =>
+            Some(SymAddr::Bounded { max_inclusive: x.max().min(y.max()) }),
+        // One side bounded, other unknown: bound by the known side.
+        // `unknown & 0xFF` is still ≤ 0xFF.
+        (Some(x), None) | (None, Some(x)) =>
+            Some(SymAddr::Bounded { max_inclusive: x.max() }),
+        (None, None) => None,
+    }
+}
+
+/// Result of `select`: the value is one of the two branches, so the
+/// upper bound is the larger of theirs. Both branches must be tracked
+/// — an untracked branch could carry an unbounded value.
+pub(super) fn sym_select(a: Option<SymAddr>, b: Option<SymAddr>) -> Option<SymAddr> {
+    match (a, b) {
+        (Some(SymAddr::Const(x)), Some(SymAddr::Const(y))) if x == y =>
+            Some(SymAddr::Const(x)),
+        (Some(x), Some(y)) =>
+            Some(SymAddr::Bounded { max_inclusive: x.max().max(y.max()) }),
+        _ => None,
     }
 }

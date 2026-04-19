@@ -19,9 +19,6 @@ impl ValType {
     pub(super) fn is_int(self) -> bool {
         matches!(self, ValType::I32 | ValType::I64)
     }
-    pub(super) fn is_fp(self) -> bool {
-        matches!(self, ValType::F32 | ValType::F64 | ValType::V128)
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -140,6 +137,22 @@ pub enum WasmOp {
     F64x2Splat,
     F64x2ExtractLane(u8),
     I8x16Add, I8x16Sub, I8x16Splat, I8x16ExtractLaneU(u8),
+    /// **Folkering-extension**: signed i8 dot product. Maps to
+    /// AArch64 SDOT (ARMv8.4-A FEAT_DotProd).
+    ///
+    /// Pops three v128: an i32x4 accumulator, then two i8x16 source
+    /// vectors. Splits each source into four 4-byte chunks; for each
+    /// of the four output lanes, computes the i8 dot product of the
+    /// matching chunks and adds it to the accumulator lane.
+    /// Pushes the resulting i32x4 v128.
+    ///
+    /// One SDOT = 16 i8 multiplies + 12 i32 adds in a single
+    /// Cortex-A76 cycle. The fastest path to int8 quantised matmul
+    /// on Pi 5.
+    I32x4DotI8x16Signed,
+    /// **Folkering-extension**: unsigned variant — UDOT. Same shape
+    /// as `I32x4DotI8x16Signed` but treats sources as u8.
+    I32x4DotI8x16Unsigned,
     I16x8Add, I16x8Sub, I16x8Mul, I16x8Splat, I16x8ExtractLaneU(u8),
     F32x4Sub,
     F32x4Div,
@@ -163,6 +176,13 @@ pub enum WasmOp {
     LocalSet(u32),
     /// Copy top of stack into local without popping.
     LocalTee(u32),
+    /// `global.get idx` — push the current value of module-global `idx`
+    /// onto the operand stack. Lowered as a load from the globals area
+    /// at the top of linear memory (see `wasm_lower::globals`).
+    GlobalGet(u32),
+    /// `global.set idx` — pop operand stack, store into module-global
+    /// `idx`. The lowerer enforces the global is mutable at parse time.
+    GlobalSet(u32),
     Block,
     Loop,
     Br(u32),
@@ -189,6 +209,14 @@ pub enum LowerError {
     BranchOutOfRange,
     ElseWithoutIf,
     CallTargetMissing,
+    /// `global.get` / `global.set` referenced an index beyond the
+    /// module's declared global count.
+    GlobalOutOfRange,
+    /// `global.set` attempted on a const global.
+    GlobalNotMutable,
+    /// Module declares more globals than the reserved area can hold
+    /// (GLOBAL_AREA_SIZE / 8 slots).
+    TooManyGlobals,
     MemoryNotConfigured,
     TableNotConfigured,
     IndirectTypeMissing,
@@ -243,6 +271,63 @@ pub(crate) enum LocalLoc {
     I64(Reg),
     F32(Vreg),
     F64(Vreg),
+    V128(Vreg),
+}
+
+/// Symbolic abstract value tracked for the i32 stack-top.
+///
+/// The bounds-check elision pass uses this to prove that a memory
+/// access is in range without emitting a runtime CMP/B.cond pair.
+/// Threaded through `i32.const`, `i32.add`, `i32.mul`, `i32.shl`, and
+/// `local.get` of an active loop counter — so the canonical
+/// `local.get k ; i32.const 4 ; i32.mul ; <load> off` pattern that
+/// LLVM emits for `arr[k]` propagates an upper bound all the way to
+/// the load.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SymAddr {
+    /// Stack-top is exactly this constant.
+    Const(u32),
+    /// Stack-top is in `[0, max_inclusive]`. u64 keeps multiplied
+    /// bounds (e.g. `4096 * 4`) representable without overflow even
+    /// when the original value fits in a u32.
+    Bounded { max_inclusive: u64 },
+}
+
+impl SymAddr {
+    /// Maximum u64 value the tracked stack slot can hold. Used by
+    /// memory-access elision to compute the worst-case byte address.
+    pub(crate) fn max(self) -> u64 {
+        match self {
+            SymAddr::Const(c) => c as u64,
+            SymAddr::Bounded { max_inclusive } => max_inclusive,
+        }
+    }
+}
+
+/// Information attached to an active Loop scope so the bounds-check
+/// elision pass knows it can omit the check when the address is a
+/// loop counter that's already constrained by the loop guard.
+///
+/// Set during the [`crate::wasm_lower::Lowerer::lower_all`] pre-scan
+/// for loops whose first 4 body ops match the canonical guard:
+///
+/// ```text
+///   loop
+///     local.get N      ;; counter
+///     i32.const M      ;; bound
+///     i32.ge_s
+///     br_if 1          ;; exit when counter >= bound
+///     ... body that uses local N as an address base ...
+/// ```
+///
+/// Inside such a loop, an access of the form
+/// `local.get N ; <load> offset` is safe iff
+/// `M + offset + access_size <= mem_size` — and the runtime check
+/// can be elided.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LoopBound {
+    pub counter_local: u32,
+    pub max_value: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -271,8 +356,6 @@ pub(crate) struct Label {
 // ── Constants ───────────────────────────────────────────────────────
 
 pub(super) const MAX_PRIMARY_INT: usize = 16;
-pub(super) const MAX_CALLEE_SAVED_INT: u8 = 27;
-pub(super) const MAX_I32_STACK: usize = MAX_PRIMARY_INT;
 pub(super) const SPILL_SCRATCH_A: Reg = Reg(14);
 pub(super) const SPILL_SCRATCH_B: Reg = Reg(15);
 pub(super) const MAX_FRAME_SPILL: usize = 16;
@@ -284,6 +367,25 @@ pub(super) const FP_SPILL_SCRATCH_B: Vreg = Vreg(31);
 pub(super) const MAX_FP_SPILL: usize = 8;
 pub(super) const FP_SPILL_SLOT_BYTES: u32 = 16;
 pub(super) const FP_SPILL_AREA_BYTES: u32 = (MAX_FP_SPILL as u32) * FP_SPILL_SLOT_BYTES;
+// ── Globals area at top of linear memory ───────────────────────────
+//
+// WASM modules have a Global section containing `i32` / `i64` / `f32`
+// / `f64` slots with optional mutability. Rust-compiled WASM almost
+// always declares at least `__stack_pointer` (mut i32) so it can
+// spill locals beyond the register file.
+//
+// We reserve the last `GLOBAL_AREA_SIZE` bytes of linear memory for
+// globals. Each global occupies an 8-byte slot regardless of its
+// actual width — we accept the waste to get 8-byte alignment for
+// i64/f64 stores without branching on type.
+//
+// For our 64 KiB linear memory this gives us 32 global slots, which
+// is well above what a well-shaped no_std Rust crate ever declares
+// (typically 1-3).
+pub const GLOBAL_AREA_SIZE: u32 = 256;
+pub const GLOBAL_SLOT_BYTES: u32 = 8;
+pub const MAX_GLOBALS: usize = (GLOBAL_AREA_SIZE / GLOBAL_SLOT_BYTES) as usize;
+
 pub const MAX_I32_LOCALS: usize = 9;
 // F32 locals occupy V16..V(16+MAX-1). V0..V15 are operand-stack
 // slots, V30/V31 are FP_SPILL_SCRATCH_{A,B}, so the largest safe

@@ -41,11 +41,86 @@ mod convert;
 mod control;
 mod scalar;
 mod call;
+mod globals;
+mod module_lower;
+
+pub use module_lower::{compile_module, ModuleLayout};
 
 pub use types::{ValType, WasmOp, LowerError, FnSig, MAX_I32_LOCALS, MAX_F32_LOCALS, MAX_LOCALS};
 use types::*;
 
 use alloc::{vec, vec::Vec};
+use alloc::collections::{BTreeMap, BTreeSet};
+
+/// Pre-scan helper: find every Loop whose body opens with the
+/// canonical guard
+///
+/// ```text
+///   loop
+///     local.get N
+///     i32.const M
+///     i32.ge_s | i32.gt_s
+///     br_if K
+/// ```
+///
+/// and record (Loop op-index → LoopBound { N, M }). M ≥ 0 since
+/// negative bounds make no sense for an unsigned address calc.
+///
+/// Slack convention: we use `M` as the worst-case value reachable
+/// inside the body regardless of which comparison was used, even
+/// though the strict bounds differ (`ge_s` allows up to `M-1`,
+/// `gt_s` allows up to `M`). The over-approximation costs us
+/// nothing — every elision check still proves
+/// `M + offset + access_size ≤ mem_size`.
+fn scan_loop_bounds(ops: &[WasmOp]) -> BTreeMap<usize, LoopBound> {
+    let mut out = BTreeMap::new();
+    for (i, op) in ops.iter().enumerate() {
+        if !matches!(op, WasmOp::Loop) { continue; }
+        if i + 4 >= ops.len() { continue; }
+        let cmp_ok = matches!(&ops[i + 3], WasmOp::I32GeS | WasmOp::I32GtS);
+        match (&ops[i + 1], &ops[i + 2], &ops[i + 4]) {
+            (
+                WasmOp::LocalGet(local),
+                WasmOp::I32Const(m),
+                WasmOp::BrIf(_),
+            ) if cmp_ok && *m >= 0 => {
+                out.insert(i, LoopBound {
+                    counter_local: *local,
+                    max_value: *m as u32,
+                });
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Pre-scan helper: which `End` ops close a `Loop` (as opposed to a
+/// `Block` or `If`)? We simulate WASM's label-stack discipline on
+/// the op stream so we know which Ends are loop-ends without having
+/// to thread state through every lowering call.
+fn compute_loop_end_indices(ops: &[WasmOp]) -> BTreeSet<usize> {
+    let mut closes_loop_at = BTreeSet::new();
+    let mut stack: Vec<bool> = Vec::new(); // true = is loop
+    for (i, op) in ops.iter().enumerate() {
+        match op {
+            WasmOp::Block | WasmOp::If => stack.push(false),
+            WasmOp::Loop => stack.push(true),
+            WasmOp::Else => {
+                // Else continues an If, no stack change.
+            }
+            WasmOp::End => {
+                if let Some(was_loop) = stack.pop() {
+                    if was_loop {
+                        closes_loop_at.insert(i);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    closes_loop_at
+}
 
 use crate::{
     Condition, Encoder, MovShift, Reg, Vreg,
@@ -137,11 +212,59 @@ pub struct Lowerer {
     pub(super) pending_fp_spill_depth: Option<usize>,
     /// Toggle for alternating FP scratch registers on consecutive pops.
     pub(super) fp_spill_pop_toggle: bool,
-    /// Value of the most recent I32Const push, if the const is still
-    /// the stack top (no intervening ops). Used by memory load/store
-    /// to eliminate bounds checks when the address is statically known.
-    /// Cleared at the start of every `lower_op` except I32Const.
-    pub(super) last_i32_const_value: Option<i32>,
+    /// Symbolic abstract value for each live integer stack slot,
+    /// indexed by stack depth (parallel to the I32/I64 entries in
+    /// `stack`). `None` = the slot's value is unknown at lower time;
+    /// `Some(...)` = a constant or upper bound the bounds-check
+    /// elision pass can use to prove a memory access is in range.
+    ///
+    /// Maintained by `push_i32_slot` / `push_i64_slot` (which push
+    /// `None` by default — lowerings overwrite it via `set_top_sym`)
+    /// and `pop_i32_slot` / `pop_i64_slot`. Per-slot tracking lets
+    /// the bound survive intermediate ops that don't pop the address
+    /// (drops of unrelated values, nested const pushes, etc.).
+    pub(super) int_sym_stack: Vec<Option<SymAddr>>,
+    /// Per-global value types, indexed by WASM global index. Empty
+    /// when the module has no globals. Lowering `global.get/set`
+    /// checks the type here to pick the right LDR/STR width and
+    /// the right operand-stack bank (int vs FP).
+    pub(super) global_types: Vec<ValType>,
+    /// Per-global mutability. `global.set` on a non-mutable global
+    /// returns LowerError::GlobalNotMutable at lower time.
+    pub(super) global_mutable: Vec<bool>,
+    /// Number of functions in the current module — indices 0..count
+    /// are internal and lowered as PC-relative BL with placeholder
+    /// offsets. Indices ≥ count fall through to the external call_targets
+    /// table (existing helper-call path). Zero = no module context,
+    /// all Call(idx) are external.
+    pub(super) module_fn_count: usize,
+    /// Signatures of in-module functions, indexed by fn_idx. Length
+    /// == `module_fn_count` when module context is active.
+    pub(super) module_fn_sigs: Vec<FnSig>,
+    /// Collected during lowering: (byte_offset_of_BL_in_encoder,
+    /// target_fn_idx). Emitted as placeholder BL #0 at lower time;
+    /// compile_module patches them in pass 2 with the real delta
+    /// once every function's offset in the combined blob is known.
+    pub(super) pending_relocations: Vec<(u32, u32)>,
+    /// Stack of active Loop bounds, parallel to the Loop entries in
+    /// `label_stack`. `Some(LoopBound)` means we recognised the
+    /// canonical `local.get N ; i32.const M ; i32.ge_s ; br_if` guard
+    /// at the top of this loop. The bounds-check elision pass uses
+    /// this to skip `maybe_bounds_check` when the address is derived
+    /// from the recognised counter local (directly or via tracked
+    /// arithmetic).
+    pub(super) active_loop_bounds: Vec<Option<LoopBound>>,
+    /// Per-loop set of local indices that have been written inside the
+    /// loop body (LocalSet/Tee). Once a counter is tainted we stop
+    /// treating subsequent `local.get N` of it as bounded — the bound
+    /// only holds at the top of the loop where the guard runs.
+    /// One entry per active loop, parallel to `active_loop_bounds`.
+    pub(super) tainted_locals: Vec<BTreeSet<u32>>,
+    /// Counter incremented every time the loop-bounded-elision rule
+    /// fires (a memory op skipped its bounds check because the
+    /// address is a bounded loop counter). Read via
+    /// `Lowerer::elision_count()` for tooling/benchmarking.
+    pub(super) elision_count: u32,
 }
 
 impl Lowerer {
@@ -192,7 +315,15 @@ impl Lowerer {
             fp_spill_base: 0,
             pending_fp_spill_depth: None,
             fp_spill_pop_toggle: false,
-            last_i32_const_value: None,
+            int_sym_stack: Vec::new(),
+            global_types: Vec::new(),
+            global_mutable: Vec::new(),
+            module_fn_count: 0,
+            module_fn_sigs: Vec::new(),
+            pending_relocations: Vec::new(),
+            active_loop_bounds: Vec::new(),
+            tainted_locals: Vec::new(),
+            elision_count: 0,
         })
     }
 
@@ -252,10 +383,17 @@ impl Lowerer {
                     fp_idx += 1;
                 }
                 ValType::V128 => {
-                    // V128 locals would need a 128-bit zero-init
-                    // (MOVI Vd.2D, #0). Not wired in this sprint —
-                    // v128 values live on the operand stack only.
-                    return Err(LowerError::V128LocalsUnsupported);
+                    if (fp_idx as usize) >= MAX_F32_LOCALS {
+                        return Err(LowerError::TooManyLocals);
+                    }
+                    let v = Vreg(LOCAL_F32_BASE_REG + fp_idx);
+                    // Zero-init: EOR Vd.16B, Vd.16B, Vd.16B clears
+                    // all 128 bits in one instruction. Used by SDOT
+                    // accumulator loops where the user expects
+                    // acc = 0 before the first SDOT.
+                    enc.eor_16b_vec(v, v, v)?;
+                    out.push(LocalLoc::V128(v));
+                    fp_idx += 1;
                 }
             }
         }
@@ -331,7 +469,15 @@ impl Lowerer {
             fp_spill_base: fp_spill_base_off,
             pending_fp_spill_depth: None,
             fp_spill_pop_toggle: false,
-            last_i32_const_value: None,
+            int_sym_stack: Vec::new(),
+            global_types: Vec::new(),
+            global_mutable: Vec::new(),
+            module_fn_count: 0,
+            module_fn_sigs: Vec::new(),
+            pending_relocations: Vec::new(),
+            active_loop_bounds: Vec::new(),
+            tainted_locals: Vec::new(),
+            elision_count: 0,
             frame_size_base: frame_size,
             mem_size: 64 * 1024,
             table_base: None,
@@ -423,7 +569,15 @@ impl Lowerer {
             fp_spill_base: fp_spill_base_off,
             pending_fp_spill_depth: None,
             fp_spill_pop_toggle: false,
-            last_i32_const_value: None,
+            int_sym_stack: Vec::new(),
+            global_types: Vec::new(),
+            global_mutable: Vec::new(),
+            module_fn_count: 0,
+            module_fn_sigs: Vec::new(),
+            pending_relocations: Vec::new(),
+            active_loop_bounds: Vec::new(),
+            tainted_locals: Vec::new(),
+            elision_count: 0,
         })
     }
 
@@ -432,6 +586,111 @@ impl Lowerer {
     /// HELLO frame typically provides the authoritative value.
     pub fn set_mem_size(&mut self, size: u32) {
         self.mem_size = size;
+    }
+
+    /// Declare the module's globals. Types determine which LDR/STR
+    /// width the lowerer emits for `global.get/set`; mutability is
+    /// enforced at lower time. Must be called before any `GlobalGet`
+    /// or `GlobalSet` op is lowered. Globals live in the top
+    /// `GLOBAL_AREA_SIZE` bytes of linear memory.
+    pub fn set_globals(
+        &mut self,
+        types: Vec<ValType>,
+        mutable: Vec<bool>,
+    ) -> Result<(), LowerError> {
+        if types.len() != mutable.len() {
+            return Err(LowerError::GlobalOutOfRange);
+        }
+        if types.len() > MAX_GLOBALS {
+            return Err(LowerError::TooManyGlobals);
+        }
+        self.global_types = types;
+        self.global_mutable = mutable;
+        Ok(())
+    }
+
+    /// Byte offset within linear memory where global `idx`'s 8-byte
+    /// slot starts. Globals are laid out contiguously at the top of
+    /// memory: global[0] at `mem_size - GLOBAL_AREA_SIZE`, global[1]
+    /// at `+ GLOBAL_SLOT_BYTES`, etc.
+    pub(super) fn global_mem_offset(&self, idx: u32) -> u32 {
+        self.mem_size - GLOBAL_AREA_SIZE + idx * GLOBAL_SLOT_BYTES
+    }
+
+    /// Declare module-internal function signatures. After this is
+    /// called, `Call(idx)` with `idx < sigs.len()` emits a PC-relative
+    /// BL with placeholder offset 0, and records a relocation in
+    /// `pending_relocations` so the linker (compile_module) can patch
+    /// it once every function's final blob offset is known. Calls
+    /// with `idx >= sigs.len()` still use the external call_targets
+    /// path (for host helpers).
+    pub fn set_module_fn_sigs(&mut self, sigs: Vec<FnSig>) {
+        self.module_fn_count = sigs.len();
+        self.module_fn_sigs = sigs;
+    }
+
+    /// Extract the relocations recorded during lowering. Each entry
+    /// is `(encoder_byte_offset_of_BL, target_fn_idx)`. The offsets
+    /// are relative to this Lowerer's encoder buffer — `compile_module`
+    /// adjusts them to the combined blob before patching.
+    pub fn take_relocations(&mut self) -> Vec<(u32, u32)> {
+        core::mem::take(&mut self.pending_relocations)
+    }
+
+    /// Number of bounds checks the loop-invariant elision pass
+    /// removed during this Lowerer's run. Useful for benchmarks that
+    /// want to confirm the analysis actually fired.
+    pub fn elision_count(&self) -> u32 {
+        self.elision_count
+    }
+
+    /// Emit code that copies the incoming AAPCS64 parameter registers
+    /// (W0-W7 / S0-S7) into the first `n_params` local slots. The
+    /// Lowerer's constructor zero-initialises every local — this
+    /// overrides that for params.
+    ///
+    /// `param_types` gives the ValType of each param in declaration
+    /// order. Counted separately per bank per AAPCS64:
+    ///   int params in X/W 0..,
+    ///   FP  params in V  0..
+    ///
+    /// Supports i32/i64/f32/f64. Errors on > 8 params of either bank
+    /// or on v128.
+    pub fn emit_param_rehydration(
+        &mut self,
+        param_types: &[ValType],
+    ) -> Result<(), LowerError> {
+        if param_types.len() > self.locals.len() {
+            return Err(LowerError::LocalOutOfRange);
+        }
+        let mut int_arg = 0u8;
+        let mut fp_arg = 0u8;
+        for (i, ty) in param_types.iter().enumerate() {
+            match (ty, self.locals[i]) {
+                (ValType::I32, LocalLoc::I32(dst)) => {
+                    if int_arg > 7 { return Err(LowerError::CallArityUnsupported); }
+                    self.enc.and_w(dst, Reg(int_arg), Reg(int_arg))?;
+                    int_arg += 1;
+                }
+                (ValType::I64, LocalLoc::I64(dst)) => {
+                    if int_arg > 7 { return Err(LowerError::CallArityUnsupported); }
+                    self.enc.add(dst, Reg::ZR, Reg(int_arg))?;
+                    int_arg += 1;
+                }
+                (ValType::F32, LocalLoc::F32(dst)) => {
+                    if fp_arg > 7 { return Err(LowerError::CallArityUnsupported); }
+                    self.enc.fmov_s_s(dst, Vreg(fp_arg))?;
+                    fp_arg += 1;
+                }
+                (ValType::F64, LocalLoc::F64(dst)) => {
+                    if fp_arg > 7 { return Err(LowerError::CallArityUnsupported); }
+                    self.enc.fmov_d_d(dst, Vreg(fp_arg))?;
+                    fp_arg += 1;
+                }
+                _ => return Err(LowerError::CallTypeUnsupported),
+            }
+        }
+        Ok(())
     }
 
     /// Attach AAPCS64 signatures for the direct-call targets. Must be
@@ -479,18 +738,6 @@ impl Lowerer {
 
     /// Lower a single op.
     pub fn lower_op(&mut self, op: WasmOp) -> Result<(), LowerError> {
-        // Memory loads/stores consume the const addr — they read
-        // last_i32_const_value internally, then it's stale after.
-        // All other non-const ops clear it immediately.
-        let is_memory_load = matches!(op,
-            WasmOp::I32Load(_) | WasmOp::I64Load(_) |
-            WasmOp::F32Load(_) | WasmOp::F64Load(_) |
-            WasmOp::V128Load(_)
-        );
-        let is_memory_consumer = is_memory_load;
-        if !matches!(op, WasmOp::I32Const(_)) && !is_memory_consumer {
-            self.last_i32_const_value = None;
-        }
         let result = match op {
             WasmOp::I32Const(c) => self.lower_const(c),
             WasmOp::I32Add => self.lower_binop(BinOp::Add),
@@ -586,6 +833,8 @@ impl Lowerer {
             WasmOp::I32x4Add => self.lower_i32x4_add(),
             WasmOp::I32x4Sub => self.lower_i32x4_sub(),
             WasmOp::I32x4Mul => self.lower_i32x4_mul(),
+            WasmOp::I32x4DotI8x16Signed => self.lower_i32x4_dot_i8x16_signed(),
+            WasmOp::I32x4DotI8x16Unsigned => self.lower_i32x4_dot_i8x16_unsigned(),
             WasmOp::I32x4ExtractLane(lane) => self.lower_i32x4_extract_lane(lane),
             // f64x2
             WasmOp::F64x2Add => self.lower_v128_binop(|e, d, l, r| e.fadd_2d(d, l, r)),
@@ -655,6 +904,8 @@ impl Lowerer {
             WasmOp::LocalGet(i) => self.lower_local_get(i),
             WasmOp::LocalSet(i) => self.lower_local_set(i),
             WasmOp::LocalTee(i) => self.lower_local_tee(i),
+            WasmOp::GlobalGet(i) => self.lower_global_get(i),
+            WasmOp::GlobalSet(i) => self.lower_global_set(i),
             WasmOp::Block => self.lower_block(),
             WasmOp::Loop => self.lower_loop(),
             WasmOp::Br(n) => self.lower_br(n),
@@ -674,16 +925,41 @@ impl Lowerer {
                 }
             }
         };
-        if is_memory_consumer {
-            self.last_i32_const_value = None;
-        }
         result
     }
 
-    /// Lower every op in order.
+    /// Lower every op in order, with a pre-scan pass that recognises
+    /// the canonical `loop { local.get N ; i32.const M ; i32.ge_s ;
+    /// br_if 1 ; ... }` pattern and stores per-loop counter bounds
+    /// so memory ops can elide their bounds checks when the address
+    /// is the bounded counter and `M + offset + access_size <=
+    /// mem_size`.
     pub fn lower_all(&mut self, ops: &[WasmOp]) -> Result<(), LowerError> {
-        for &op in ops {
+        // Pre-scan 1: which Loops have a recognisable counter+bound?
+        // Indexed by op-index of the Loop op.
+        let loop_bounds = scan_loop_bounds(ops);
+        // Pre-scan 2: which End ops close a Loop (vs Block / If)?
+        // We mirror WASM's structured-control-flow stack; on each
+        // closing End the top of the simulation stack tells us what
+        // kind of label is being popped.
+        let loop_end_indices = compute_loop_end_indices(ops);
+
+        for (i, &op) in ops.iter().enumerate() {
+            if matches!(op, WasmOp::Loop) {
+                // Push the per-loop bound (or None if no guard) and a
+                // fresh empty taint set so any LocalSet/Tee inside the
+                // body invalidates the matching counter without
+                // bleeding into outer loops.
+                self.active_loop_bounds.push(loop_bounds.get(&i).copied());
+                self.tainted_locals.push(BTreeSet::new());
+            }
             self.lower_op(op)?;
+            if loop_end_indices.contains(&i) {
+                self.active_loop_bounds.pop();
+                self.tainted_locals.pop();
+            }
+            debug_assert_eq!(self.tainted_locals.len(), self.active_loop_bounds.len(),
+                "tainted_locals/active_loop_bounds diverged at op #{i}");
         }
         Ok(())
     }

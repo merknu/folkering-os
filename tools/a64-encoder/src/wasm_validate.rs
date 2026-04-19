@@ -32,6 +32,20 @@ pub fn validate(
     call_sigs: &[FnSig],
     indirect_sigs: &[FnSig],
 ) -> Result<(), ValidationError> {
+    validate_full(local_types, &[], ops, call_sigs, indirect_sigs)
+}
+
+/// Like [`validate`] but takes per-global types so `GlobalGet`/`GlobalSet`
+/// can be type-checked. New consumers should call this; the legacy
+/// `validate` wrapper passes empty globals (any `Global*` op will be
+/// rejected with "global index out of range").
+pub fn validate_full(
+    local_types: &[ValType],
+    global_types: &[ValType],
+    ops: &[WasmOp],
+    call_sigs: &[FnSig],
+    indirect_sigs: &[FnSig],
+) -> Result<(), ValidationError> {
     const MAX_STACK_DEPTH: usize = 4096;
 
     let mut stack: Vec<ValType> = Vec::new();
@@ -211,6 +225,20 @@ pub fn validate(
                     return Err(err("type mismatch"));
                 }
             }
+            WasmOp::GlobalGet(idx) => {
+                let idx = *idx as usize;
+                if idx >= global_types.len() {
+                    return Err(err("global index out of range"));
+                }
+                stack.push(global_types[idx]);
+            }
+            WasmOp::GlobalSet(idx) => {
+                let idx = *idx as usize;
+                if idx >= global_types.len() {
+                    return Err(err("global index out of range"));
+                }
+                pop_expect(&mut stack, global_types[idx], &err)?;
+            }
             WasmOp::Drop => {
                 if stack.is_empty() {
                     return Err(err("stack underflow"));
@@ -369,6 +397,14 @@ pub fn validate(
             | WasmOp::F64x2Div | WasmOp::F64x2Min | WasmOp::F64x2Max
             | WasmOp::I8x16Add | WasmOp::I8x16Sub
             | WasmOp::I16x8Add | WasmOp::I16x8Sub | WasmOp::I16x8Mul => {
+                pop_expect(&mut stack, ValType::V128, &err)?;
+                pop_expect(&mut stack, ValType::V128, &err)?;
+                stack.push(ValType::V128);
+            }
+
+            // SDOT/UDOT — three v128 inputs (acc, a, b) → one v128.
+            WasmOp::I32x4DotI8x16Signed | WasmOp::I32x4DotI8x16Unsigned => {
+                pop_expect(&mut stack, ValType::V128, &err)?;
                 pop_expect(&mut stack, ValType::V128, &err)?;
                 pop_expect(&mut stack, ValType::V128, &err)?;
                 stack.push(ValType::V128);

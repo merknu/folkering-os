@@ -264,14 +264,14 @@ fn br_if_from_block_patches_cbnz() {
 }
 
 #[test]
-fn unbalanced_end_without_block() {
+fn end_on_empty_stack_is_void_return() {
+    // Phase 3: empty operand stack at function-level End is now
+    // valid — that's a void-return function (e.g. helpers that
+    // mutate linear memory and return nothing). Previously this
+    // errored with StackNotSingleton; now it succeeds and emits
+    // the epilogue + RET.
     let mut lw = Lowerer::new();
-    // function end with empty stack — StackNotSingleton (not UnbalancedEnd,
-    // because no open label exists, we fall through to lower_function_end).
-    assert_eq!(
-        lw.lower_op(WasmOp::End),
-        Err(LowerError::StackNotSingleton)
-    );
+    assert!(lw.lower_op(WasmOp::End).is_ok());
 }
 
 #[test]
@@ -780,4 +780,309 @@ fn call_high_addresses_emit_all_movk() {
     let movk_count = words.iter().filter(|&&w| w & 0xFF80_0000 == 0xF280_0000).count();
     assert!(movz_count >= 1, "need at least 1 MOVZ");
     assert!(movk_count >= 3, "need 3 MOVKs for 4-halfword addr");
+}
+
+// ── Symbolic bounds-check elision ───────────────────────────────────
+
+/// `i32.const C ; i32.load 0` — the address is a known constant, the
+/// access fits, the runtime check is provably redundant.
+#[test]
+fn sym_elides_constant_addr_load() {
+    let mut lw = Lowerer::new_function_with_memory(0, Vec::new(), 0).unwrap();
+    lw.set_mem_size(64 * 1024);
+    lw.lower_all(&[
+        WasmOp::I32Const(100),
+        WasmOp::I32Load(0),
+        WasmOp::End,
+    ]).unwrap();
+    assert_eq!(lw.elision_count(), 1);
+}
+
+/// `local.get k ; i32.load 0` inside `loop { local.get k ; i32.const M ;
+/// i32.ge_s ; br_if 1 ; ... }` — counter is bounded, access fits.
+#[test]
+fn sym_elides_bare_loop_counter_load() {
+    let mut lw = Lowerer::new_function_with_memory(1, Vec::new(), 0).unwrap();
+    lw.set_mem_size(64 * 1024);
+    lw.lower_all(&[
+        WasmOp::Block, WasmOp::Loop,
+            WasmOp::LocalGet(0),
+            WasmOp::I32Const(256),
+            WasmOp::I32GeS,
+            WasmOp::BrIf(1),
+            WasmOp::LocalGet(0),
+            WasmOp::I32Load(0),       // 1 elision
+            WasmOp::Drop,
+            WasmOp::Br(0),
+        WasmOp::End, WasmOp::End,
+        WasmOp::I32Const(0),
+        WasmOp::End,
+    ]).unwrap();
+    assert_eq!(lw.elision_count(), 1);
+}
+
+/// `local.get k ; i32.const 4 ; i32.mul ; f32.load A_OFF` — the new
+/// symbolic path threads the bound through `i32.mul`, which the old
+/// last_pushed_local tracker couldn't (the i32.const blanked it).
+/// This is the f32-bench inner-loop pattern.
+#[test]
+fn sym_elides_counter_times_scale_plus_offset() {
+    let mut lw = Lowerer::new_function_with_memory_typed(
+        &[ValType::I32, ValType::F32],
+        Vec::new(),
+        0,
+    ).unwrap();
+    lw.set_mem_size(4 * 1024 * 1024);
+    lw.lower_all(&[
+        WasmOp::Block, WasmOp::Loop,
+            WasmOp::LocalGet(0),
+            WasmOp::I32Const(4096),
+            WasmOp::I32GeS,
+            WasmOp::BrIf(1),
+
+            // f32.load at A_OFF=0x1000 with addr = k*4
+            WasmOp::LocalGet(0),
+            WasmOp::I32Const(4),
+            WasmOp::I32Mul,
+            WasmOp::F32Load(0x1000),  // 1 elision
+
+            // f32.load at B_OFF=0x1000+N*4 with addr = k*4
+            WasmOp::LocalGet(0),
+            WasmOp::I32Const(4),
+            WasmOp::I32Mul,
+            WasmOp::F32Load(0x1000 + 4096 * 4),  // 1 elision
+
+            WasmOp::F32Mul,
+            WasmOp::Drop,
+            WasmOp::Br(0),
+        WasmOp::End, WasmOp::End,
+        WasmOp::I32Const(0),
+        WasmOp::End,
+    ]).unwrap();
+    assert_eq!(lw.elision_count(), 2);
+}
+
+/// `local.get k ; i32.const 4 ; i32.shl ; f32.load 0` — same idea via
+/// shift instead of multiply. Also tracked.
+#[test]
+fn sym_elides_counter_shl_const() {
+    let mut lw = Lowerer::new_function_with_memory(1, Vec::new(), 0).unwrap();
+    lw.set_mem_size(64 * 1024);
+    lw.lower_all(&[
+        WasmOp::Block, WasmOp::Loop,
+            WasmOp::LocalGet(0),
+            WasmOp::I32Const(1024),
+            WasmOp::I32GeS,
+            WasmOp::BrIf(1),
+            WasmOp::LocalGet(0),
+            WasmOp::I32Const(2),
+            WasmOp::I32Shl,
+            WasmOp::I32Load(0),       // 1 elision
+            WasmOp::Drop,
+            WasmOp::Br(0),
+        WasmOp::End, WasmOp::End,
+        WasmOp::I32Const(0),
+        WasmOp::End,
+    ]).unwrap();
+    assert_eq!(lw.elision_count(), 1);
+}
+
+/// After `local.set k` inside the loop body, the guard's invariant on
+/// `k` is no longer pinned at compile time — subsequent `local.get k`
+/// must NOT be treated as bounded. (Conservative correctness check:
+/// even if the increment-by-1 typically keeps it in range, we don't
+/// model that, so the load gets a real bounds check.)
+#[test]
+fn sym_does_not_elide_after_local_set_taints_counter() {
+    let mut lw = Lowerer::new_function_with_memory(1, Vec::new(), 0).unwrap();
+    lw.set_mem_size(64 * 1024);
+    lw.lower_all(&[
+        WasmOp::Block, WasmOp::Loop,
+            WasmOp::LocalGet(0),
+            WasmOp::I32Const(256),
+            WasmOp::I32GeS,
+            WasmOp::BrIf(1),
+
+            // First load: bound holds, elide.
+            WasmOp::LocalGet(0),
+            WasmOp::I32Load(0),       // 1 elision
+
+            // Mutate the counter — taints the bound.
+            WasmOp::LocalGet(0),
+            WasmOp::I32Const(1),
+            WasmOp::I32Add,
+            WasmOp::LocalSet(0),
+
+            // Second load: bound is tainted, must NOT elide.
+            WasmOp::LocalGet(0),
+            WasmOp::I32Load(0),
+
+            WasmOp::Drop,
+            WasmOp::Drop,
+            WasmOp::Br(0),
+        WasmOp::End, WasmOp::End,
+        WasmOp::I32Const(0),
+        WasmOp::End,
+    ]).unwrap();
+    assert_eq!(lw.elision_count(), 1);
+}
+
+/// Negative i32 constants don't get a tracked sym (they sign-extend
+/// to a huge u64 value we can't prove safe), so they fall through to
+/// the runtime check.
+#[test]
+fn sym_does_not_elide_negative_const_addr() {
+    let mut lw = Lowerer::new_function_with_memory(0, Vec::new(), 0).unwrap();
+    lw.set_mem_size(64 * 1024);
+    lw.lower_all(&[
+        WasmOp::I32Const(-1),
+        WasmOp::I32Load(0),
+        WasmOp::Drop,
+        WasmOp::I32Const(0),
+        WasmOp::End,
+    ]).unwrap();
+    assert_eq!(lw.elision_count(), 0);
+}
+
+/// SDOT inner-loop pattern from `bench_sdot_vs_f32` — bare loop
+/// counter as v128.load address, twice. Regression-guards the
+/// existing 2.81× speedup the original LICM-BCE delivered.
+#[test]
+fn sym_elides_v128_load_with_bare_counter() {
+    let mut lw = Lowerer::new_function_with_memory_typed(
+        &[ValType::I32, ValType::V128],
+        Vec::new(),
+        0,
+    ).unwrap();
+    lw.set_mem_size(4 * 1024 * 1024);
+    lw.lower_all(&[
+        WasmOp::Block, WasmOp::Loop,
+            WasmOp::LocalGet(0),
+            WasmOp::I32Const(4096),
+            WasmOp::I32GeS,
+            WasmOp::BrIf(1),
+
+            WasmOp::LocalGet(1),               // acc
+            WasmOp::LocalGet(0),               // k
+            WasmOp::V128Load(0x1000),          // 1 elision
+            WasmOp::LocalGet(0),               // k
+            WasmOp::V128Load(0x1000 + 4096),   // 1 elision
+            WasmOp::I32x4DotI8x16Signed,
+            WasmOp::Drop,
+            WasmOp::Br(0),
+        WasmOp::End, WasmOp::End,
+        WasmOp::I32Const(0),
+        WasmOp::End,
+    ]).unwrap();
+    assert_eq!(lw.elision_count(), 2);
+}
+
+/// `local.tee` doesn't pop the operand stack (it copies top to the
+/// local but leaves the value on the stack). The sym attached to the
+/// slot must therefore survive the tee — a subsequent `<load>` of
+/// that slot still elides.
+#[test]
+fn sym_survives_local_tee() {
+    let mut lw = Lowerer::new_function_with_memory(1, Vec::new(), 0).unwrap();
+    lw.set_mem_size(64 * 1024);
+    lw.lower_all(&[
+        WasmOp::I32Const(100),
+        WasmOp::LocalTee(0),       // sym top is still Const(100)
+        WasmOp::I32Load(0),        // 1 elision
+        WasmOp::Drop,
+        WasmOp::I32Const(0),
+        WasmOp::End,
+    ]).unwrap();
+    assert_eq!(lw.elision_count(), 1);
+}
+
+/// `i32.gt_s` loop guard recognised the same as `i32.ge_s` (the
+/// scanner accepts both, with conservative slack).
+#[test]
+fn sym_elides_loop_with_gt_s_guard() {
+    let mut lw = Lowerer::new_function_with_memory(1, Vec::new(), 0).unwrap();
+    lw.set_mem_size(64 * 1024);
+    lw.lower_all(&[
+        WasmOp::Block, WasmOp::Loop,
+            WasmOp::LocalGet(0),
+            WasmOp::I32Const(256),
+            WasmOp::I32GtS,            // gt_s, not ge_s
+            WasmOp::BrIf(1),
+            WasmOp::LocalGet(0),
+            WasmOp::I32Load(0),        // 1 elision
+            WasmOp::Drop,
+            WasmOp::Br(0),
+        WasmOp::End, WasmOp::End,
+        WasmOp::I32Const(0),
+        WasmOp::End,
+    ]).unwrap();
+    assert_eq!(lw.elision_count(), 1);
+}
+
+/// `idx & (cap-1)` hash-table mask: the result is bounded by the
+/// mask regardless of the source. A subsequent load through that
+/// index must elide.
+#[test]
+fn sym_elides_const_mask_index() {
+    let mut lw = Lowerer::new_function_with_memory(1, Vec::new(), 0).unwrap();
+    lw.set_mem_size(64 * 1024);
+    lw.lower_all(&[
+        WasmOp::LocalGet(0),           // unknown index (param-like)
+        WasmOp::I32Const(0xFF),        // mask = 255
+        WasmOp::I32And,
+        WasmOp::I32Load(0),            // addr in [0, 255], +4 fits 64KiB
+        WasmOp::End,
+    ]).unwrap();
+    assert_eq!(lw.elision_count(), 1);
+}
+
+/// `select` of two bounded values is bounded by the larger of them.
+#[test]
+fn sym_elides_select_of_bounded_values() {
+    let mut lw = Lowerer::new_function_with_memory(1, Vec::new(), 0).unwrap();
+    lw.set_mem_size(64 * 1024);
+    lw.lower_all(&[
+        WasmOp::I32Const(50),
+        WasmOp::I32Const(100),
+        WasmOp::LocalGet(0),           // cond
+        WasmOp::Select,                // result ≤ 100
+        WasmOp::I32Load(0),            // 100 + 4 < 64 KiB
+        WasmOp::End,
+    ]).unwrap();
+    assert_eq!(lw.elision_count(), 1);
+}
+
+/// `i64.extend_i32_u` preserves the bound across the type widening
+/// (zero-extension is value-preserving). A subsequent `i32.wrap_i64`
+/// brings it back to i32 with bound intact.
+#[test]
+fn sym_survives_extend_then_wrap_roundtrip() {
+    let mut lw = Lowerer::new_function_with_memory(0, Vec::new(), 0).unwrap();
+    lw.set_mem_size(64 * 1024);
+    lw.lower_all(&[
+        WasmOp::I32Const(200),
+        WasmOp::I64ExtendI32U,
+        WasmOp::I32WrapI64,
+        WasmOp::I32Load(0),            // 200 + 4 < 64 KiB
+        WasmOp::End,
+    ]).unwrap();
+    assert_eq!(lw.elision_count(), 1);
+}
+
+/// Sym info survives intermediate stack manipulation that the old
+/// single-element trackers couldn't handle: push a const, push another
+/// value, drop it, then load — the original const should still elide
+/// because per-slot tracking remembers it.
+#[test]
+fn sym_survives_push_pop_intermediate() {
+    let mut lw = Lowerer::new_function_with_memory(0, Vec::new(), 0).unwrap();
+    lw.set_mem_size(64 * 1024);
+    lw.lower_all(&[
+        WasmOp::I32Const(100),
+        WasmOp::I32Const(200),
+        WasmOp::Drop,             // pops 200, leaves 100 on top
+        WasmOp::I32Load(0),       // 1 elision
+        WasmOp::End,
+    ]).unwrap();
+    assert_eq!(lw.elision_count(), 1);
 }

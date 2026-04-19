@@ -111,6 +111,16 @@ pub fn syscall_get_random(buf_ptr: u64, buf_len: u64) -> u64 {
     if buf_ptr == 0 || buf_len == 0 || buf_len > 4096 {
         return u64::MAX;
     }
+    // Userspace-only — otherwise a task could `get_random(kernel_vaddr, 4096)`
+    // and spray 4 KiB of pseudo-random bytes into the kernel image.
+    const USERSPACE_TOP: u64 = 0x0000_8000_0000_0000;
+    let end = match buf_ptr.checked_add(buf_len) {
+        Some(e) => e,
+        None => return u64::MAX,
+    };
+    if buf_ptr < 0x200000 || buf_ptr >= USERSPACE_TOP || end > USERSPACE_TOP {
+        return u64::MAX;
+    }
     let buf = unsafe {
         core::slice::from_raw_parts_mut(buf_ptr as *mut u8, buf_len as usize)
     };

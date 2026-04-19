@@ -1,34 +1,34 @@
-//! Minimal WebAssembly module parser.
+//! WebAssembly module parser.
 //!
 //! Reads the top-level binary format (magic + version + sections)
-//! and extracts enough to feed `wasm_lower::Lowerer` a function
-//! body — specifically, the Code section's function bodies with
-//! their local declarations.
+//! and extracts everything the JIT needs to compile a real module:
 //!
-//! Scope is deliberately aligned with what the JIT can lower:
+//!   * Type section       — function signatures (params + results)
+//!   * Import section     — **fail fast**: we reject modules that
+//!     import anything, because Folkering's ABI is deliberately
+//!     closed. Pure no_std math crates don't import anything.
+//!   * Function section   — maps fn index → type index
+//!   * Memory section     — noted but ignored; we use our own
+//!     fixed 64 KiB linear memory
+//!   * Global section     — variable-valued globals with init
+//!     expressions; the lowerer places these in the top 256 B of
+//!     linear memory (see `wasm_lower::types::GLOBAL_AREA_SIZE`)
+//!   * Export section     — names for the entrypoints we may want
+//!     to call; for now the daemon always runs fn 0
+//!   * Data section       — initial linear-memory contents; the
+//!     host prepends these to any DATA frame it sends
+//!   * Code section       — function bodies
 //!
-//! - Magic `\0asm` + version `01 00 00 00`
-//! - Section walking (we *skip* unknown/unsupported sections rather
-//!   than erroring, so real `.wasm` output from `wat2wasm` or
-//!   `rustc --target wasm32*` works when it only exercises the ops
-//!   the lowerer supports)
-//! - Type and Function sections are inspected just enough to count
-//!   signatures; we don't type-check.
-//! - Code section: parses `vec<CodeEntry>`, where each entry has a
-//!   size-prefixed body containing local-group declarations plus
-//!   the raw op byte stream. The op stream is re-parsed with
-//!   [`crate::wasm_parse::parse_ops`] into a `Vec<WasmOp>`.
-//!
-//! Out of scope for Phase 7:
-//!
-//! - Imports, tables, memory size, globals, exports (we ignore the
-//!   sections but skip past them).
-//! - Data and Element sections.
-//! - Multi-byte SIMD / reference-type opcodes.
+//! Two entry points:
+//!   * `parse_module` — legacy, returns `Vec<FunctionBody>`. Used
+//!     by all existing examples, unchanged.
+//!   * `parse_module_full` — new, returns a richer `Module` struct
+//!     with all of the above. Used by Phase 1+ consumers.
 
-use alloc::{vec, vec::Vec};
+use alloc::vec::Vec;
+use alloc::string::String;
 
-use crate::wasm_parse::{parse_ops, read_uleb128, ParseError};
+use crate::wasm_parse::{parse_ops, read_uleb128, read_sleb128, ParseError};
 use crate::wasm_lower::WasmOp;
 
 /// Parsed body of a single function — all of the information the
@@ -51,21 +51,82 @@ pub struct FunctionBody {
     pub ops: Vec<WasmOp>,
 }
 
-/// Parse a full WebAssembly binary. Returns the bodies from the
-/// Code section in the order they appeared. Other sections are
-/// validated enough to skip past but not otherwise interpreted.
+/// A function signature from the Type section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FuncSig {
+    pub params: Vec<u8>,   // valtype bytes: 0x7F=i32, 0x7E=i64, 0x7D=f32, 0x7C=f64
+    pub results: Vec<u8>,
+}
+
+/// A global variable declared in the module's Global section.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GlobalDef {
+    /// Value type: 0x7F=i32, 0x7E=i64, 0x7D=f32, 0x7C=f64.
+    pub valtype: u8,
+    /// True if the global is mutable (`global.set` allowed).
+    pub mutable: bool,
+    /// Constant-evaluated init value. WASM allows imported-global
+    /// references in init expressions but we fail-fast on imports,
+    /// so every init is a simple const — store it as 8 little-endian
+    /// bytes for i32/i64/f32/f64.
+    pub init_bytes: [u8; 8],
+}
+
+/// A named export. `kind` is 0=func, 1=table, 2=mem, 3=global.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Export {
+    pub name: String,
+    pub kind: u8,
+    pub index: u32,
+}
+
+/// A data segment from the Data section. Written into linear memory
+/// at `offset` before any user code runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataSegment {
+    pub offset: u32,
+    pub bytes: Vec<u8>,
+}
+
+/// Full module — everything the JIT needs to compile a multi-function
+/// WASM binary. See [`parse_module_full`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct Module {
+    pub types: Vec<FuncSig>,
+    /// For each function, the index into `types` of its signature.
+    /// Length = number of functions declared in Function section.
+    /// This matches 1:1 with `bodies` for non-imported functions
+    /// (we reject modules with imports, so it always does).
+    pub func_types: Vec<u32>,
+    pub globals: Vec<GlobalDef>,
+    pub exports: Vec<Export>,
+    pub data: Vec<DataSegment>,
+    pub bodies: Vec<FunctionBody>,
+}
+
+/// Parse a WASM binary and return just the function bodies.
+/// Preserved for backward compatibility with existing examples.
 pub fn parse_module(bytes: &[u8]) -> Result<Vec<FunctionBody>, ParseError> {
+    let m = parse_module_full(bytes)?;
+    Ok(m.bodies)
+}
+
+/// Parse a WASM binary and return the full module structure.
+pub fn parse_module_full(bytes: &[u8]) -> Result<Module, ParseError> {
     // ── Magic + version ──
-    // \0 a s m — four bytes. Anything else is "not a WASM binary".
     if bytes.len() < 8 { return Err(ParseError::UnexpectedEof); }
     if &bytes[0..4] != b"\0asm" { return Err(ParseError::UnknownOpcode(bytes[0])); }
-    // Version must be 1. We treat anything else as unsupported.
     if &bytes[4..8] != [0x01, 0x00, 0x00, 0x00] {
         return Err(ParseError::UnknownOpcode(bytes[4]));
     }
     let mut pos = 8;
 
-    let mut code_bodies: Option<Vec<FunctionBody>> = None;
+    let mut types = Vec::new();
+    let mut func_types = Vec::new();
+    let mut globals = Vec::new();
+    let mut exports = Vec::new();
+    let mut data = Vec::new();
+    let mut bodies = Vec::new();
 
     while pos < bytes.len() {
         let section_id = bytes[pos];
@@ -74,22 +135,146 @@ pub fn parse_module(bytes: &[u8]) -> Result<Vec<FunctionBody>, ParseError> {
         let end = pos.checked_add(size).ok_or(ParseError::UnexpectedEof)?;
         if end > bytes.len() { return Err(ParseError::UnexpectedEof); }
 
-        if section_id == 10 {
-            // Code section.
-            code_bodies = Some(parse_code_section(&bytes[pos..end])?);
+        match section_id {
+            0 => {
+                // Custom section (name, producers, etc.) — skip.
+            }
+            1 => { types = parse_type_section(&bytes[pos..end])?; }
+            2 => {
+                // Import section — fail fast if non-empty.
+                let n = {
+                    let mut p = 0usize;
+                    read_uleb128(&bytes[pos..end], &mut p)? as usize
+                };
+                if n > 0 {
+                    return Err(ParseError::ImportsUnsupported);
+                }
+            }
+            3 => { func_types = parse_function_section(&bytes[pos..end])?; }
+            5 => {
+                // Memory section — we use our own 64 KiB buffer, ignore.
+            }
+            6 => { globals = parse_global_section(&bytes[pos..end])?; }
+            7 => { exports = parse_export_section(&bytes[pos..end])?; }
+            10 => { bodies = parse_code_section(&bytes[pos..end])?; }
+            11 => { data = parse_data_section(&bytes[pos..end])?; }
+            _ => {
+                // Unknown sections: skip. Real .wasm can have section
+                // ids we don't recognise (e.g. "tag" section in
+                // exception-handling proposal); walking past by size
+                // is robust.
+            }
         }
-        // Other sections: skip. A stricter parser would at least
-        // walk the Type + Function sections to cross-reference, but
-        // for our JIT the Code section is the source of truth.
 
         pos = end;
     }
 
-    code_bodies.ok_or(ParseError::UnexpectedEof)
+    if bodies.is_empty() {
+        return Err(ParseError::UnexpectedEof);
+    }
+    Ok(Module { types, func_types, globals, exports, data, bodies })
 }
 
-/// Parse just the Code section's contents (the bytes after the
-/// section id + size prefix).
+// ── Section parsers ────────────────────────────────────────────────
+
+fn parse_type_section(bytes: &[u8]) -> Result<Vec<FuncSig>, ParseError> {
+    let mut pos = 0;
+    let count = read_uleb128(bytes, &mut pos)? as usize;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        if pos >= bytes.len() { return Err(ParseError::UnexpectedEof); }
+        // Every type must be a func type starting with 0x60.
+        if bytes[pos] != 0x60 {
+            return Err(ParseError::UnknownOpcode(bytes[pos]));
+        }
+        pos += 1;
+        let params = read_valtype_vec(bytes, &mut pos)?;
+        let results = read_valtype_vec(bytes, &mut pos)?;
+        out.push(FuncSig { params, results });
+    }
+    Ok(out)
+}
+
+fn parse_function_section(bytes: &[u8]) -> Result<Vec<u32>, ParseError> {
+    let mut pos = 0;
+    let count = read_uleb128(bytes, &mut pos)? as usize;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let ty = read_uleb128(bytes, &mut pos)?;
+        if ty > u32::MAX as u64 { return Err(ParseError::IntegerTooLarge); }
+        out.push(ty as u32);
+    }
+    Ok(out)
+}
+
+fn parse_global_section(bytes: &[u8]) -> Result<Vec<GlobalDef>, ParseError> {
+    let mut pos = 0;
+    let count = read_uleb128(bytes, &mut pos)? as usize;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        // globaltype = valtype + mut byte (0 = const, 1 = mut)
+        if pos + 2 > bytes.len() { return Err(ParseError::UnexpectedEof); }
+        let valtype = bytes[pos];
+        let mut_byte = bytes[pos + 1];
+        pos += 2;
+        let mutable = mut_byte == 0x01;
+        // init expr: a sequence of ops ending in 0x0B (end).
+        // For constant initializers we accept only the matching
+        // const op for the valtype. Imports are rejected earlier so
+        // `global.get $imported` can't appear.
+        let init_bytes = read_const_init_expr(bytes, &mut pos, valtype)?;
+        out.push(GlobalDef { valtype, mutable, init_bytes });
+    }
+    Ok(out)
+}
+
+fn parse_export_section(bytes: &[u8]) -> Result<Vec<Export>, ParseError> {
+    let mut pos = 0;
+    let count = read_uleb128(bytes, &mut pos)? as usize;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let name_len = read_uleb128(bytes, &mut pos)? as usize;
+        if pos + name_len > bytes.len() { return Err(ParseError::UnexpectedEof); }
+        let name = core::str::from_utf8(&bytes[pos..pos + name_len])
+            .map_err(|_| ParseError::InvalidUtf8)?
+            .into();
+        pos += name_len;
+        if pos + 1 > bytes.len() { return Err(ParseError::UnexpectedEof); }
+        let kind = bytes[pos];
+        pos += 1;
+        let index = read_uleb128(bytes, &mut pos)?;
+        if index > u32::MAX as u64 { return Err(ParseError::IntegerTooLarge); }
+        out.push(Export { name, kind, index: index as u32 });
+    }
+    Ok(out)
+}
+
+fn parse_data_section(bytes: &[u8]) -> Result<Vec<DataSegment>, ParseError> {
+    let mut pos = 0;
+    let count = read_uleb128(bytes, &mut pos)? as usize;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        // WASM 1.0 active data-segment layout:
+        //   flags (uleb128) — 0 for "active, memory 0"
+        //   offset (init_expr)
+        //   bytes (vec<u8>)
+        let flags = read_uleb128(bytes, &mut pos)?;
+        if flags != 0 {
+            // We don't handle passive or multi-memory data yet.
+            return Err(ParseError::UnknownOpcode(flags.min(0xFF) as u8));
+        }
+        // Offset is an init expr that evaluates to an i32.
+        let init = read_const_init_expr(bytes, &mut pos, 0x7F)?;
+        let offset = u32::from_le_bytes([init[0], init[1], init[2], init[3]]);
+        let len = read_uleb128(bytes, &mut pos)? as usize;
+        if pos + len > bytes.len() { return Err(ParseError::UnexpectedEof); }
+        let seg_bytes = bytes[pos..pos + len].to_vec();
+        pos += len;
+        out.push(DataSegment { offset, bytes: seg_bytes });
+    }
+    Ok(out)
+}
+
 fn parse_code_section(bytes: &[u8]) -> Result<Vec<FunctionBody>, ParseError> {
     let mut pos = 0;
     let count = read_uleb128(bytes, &mut pos)? as usize;
@@ -106,11 +291,6 @@ fn parse_code_section(bytes: &[u8]) -> Result<Vec<FunctionBody>, ParseError> {
     Ok(out)
 }
 
-/// A single Code entry: `vec<local_group>` + op bytes ending in 0x0B.
-///
-/// Each local group is `(count: uleb128, valtype: u8)`. We count
-/// total locals by summing all `count`s — the valtype byte is
-/// ignored because our lowerer only handles i32 for now.
 fn parse_code_entry(bytes: &[u8]) -> Result<FunctionBody, ParseError> {
     let mut pos = 0;
     let group_count = read_uleb128(bytes, &mut pos)? as usize;
@@ -131,19 +311,77 @@ fn parse_code_entry(bytes: &[u8]) -> Result<FunctionBody, ParseError> {
     Ok(FunctionBody { num_locals: total_locals, local_types, ops })
 }
 
+// ── Helpers ────────────────────────────────────────────────────────
+
+fn read_valtype_vec(bytes: &[u8], pos: &mut usize) -> Result<Vec<u8>, ParseError> {
+    let n = read_uleb128(bytes, pos)? as usize;
+    if *pos + n > bytes.len() { return Err(ParseError::UnexpectedEof); }
+    let out = bytes[*pos..*pos + n].to_vec();
+    *pos += n;
+    Ok(out)
+}
+
+/// Read a constant init expression from `bytes` starting at `pos`.
+/// Accepts only the single matching `<type>.const <val>` op followed
+/// by `end` (0x0B). Returns the value as 8 little-endian bytes
+/// (i32/f32 zero-padded in the upper 4 bytes).
+///
+/// `expected_valtype` — 0x7F i32, 0x7E i64, 0x7D f32, 0x7C f64.
+fn read_const_init_expr(
+    bytes: &[u8],
+    pos: &mut usize,
+    expected_valtype: u8,
+) -> Result<[u8; 8], ParseError> {
+    if *pos >= bytes.len() { return Err(ParseError::UnexpectedEof); }
+    let opcode = bytes[*pos];
+    *pos += 1;
+    let mut out = [0u8; 8];
+    match (opcode, expected_valtype) {
+        (0x41, 0x7F) => {
+            // i32.const
+            let v = read_sleb128(bytes, pos)?;
+            if !(i32::MIN as i64..=i32::MAX as i64).contains(&v) {
+                return Err(ParseError::ConstantOutOfRange);
+            }
+            out[..4].copy_from_slice(&(v as i32).to_le_bytes());
+        }
+        (0x42, 0x7E) => {
+            // i64.const
+            let v = read_sleb128(bytes, pos)?;
+            out.copy_from_slice(&v.to_le_bytes());
+        }
+        (0x43, 0x7D) => {
+            // f32.const — 4 raw bytes LE
+            if *pos + 4 > bytes.len() { return Err(ParseError::UnexpectedEof); }
+            out[..4].copy_from_slice(&bytes[*pos..*pos + 4]);
+            *pos += 4;
+        }
+        (0x44, 0x7C) => {
+            // f64.const — 8 raw bytes LE
+            if *pos + 8 > bytes.len() { return Err(ParseError::UnexpectedEof); }
+            out.copy_from_slice(&bytes[*pos..*pos + 8]);
+            *pos += 8;
+        }
+        _ => return Err(ParseError::UnknownOpcode(opcode)),
+    }
+    // Expect `end` (0x0B) to terminate the init expression.
+    if *pos >= bytes.len() || bytes[*pos] != 0x0B {
+        return Err(ParseError::UnknownOpcode(
+            bytes.get(*pos).copied().unwrap_or(0),
+        ));
+    }
+    *pos += 1;
+    Ok(out)
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     /// Minimal "return 42" WASM module, hand-assembled.
-    ///
-    /// Structure:
-    ///   header: 00 61 73 6D 01 00 00 00
-    ///   type section: id=1 size=5 | 1 type: func () -> i32 (60 00 01 7F)
-    ///   function section: id=3 size=2 | 1 function, type idx 0 (01 00)
-    ///   code section: id=0A size=6 | 1 entry, size=4, 0 local groups, body (00 41 2A 0B)
     const RETURN_42_WASM: &[u8] = &[
         0x00, 0x61, 0x73, 0x6D,
         0x01, 0x00, 0x00, 0x00,
@@ -162,8 +400,21 @@ mod tests {
     }
 
     #[test]
+    fn parse_return_42_full() {
+        let m = parse_module_full(RETURN_42_WASM).expect("parse");
+        assert_eq!(m.bodies.len(), 1);
+        assert_eq!(m.types.len(), 1);
+        assert_eq!(m.types[0].params, vec![]);
+        assert_eq!(m.types[0].results, vec![0x7F]); // i32
+        assert_eq!(m.func_types, vec![0]);
+        assert!(m.globals.is_empty());
+        assert!(m.exports.is_empty());
+        assert!(m.data.is_empty());
+    }
+
+    #[test]
     fn rejects_non_wasm_magic() {
-        let bytes = [0x7F, 0x45, 0x4C, 0x46, 0, 0, 0, 0]; // ELF magic
+        let bytes = [0x7F, 0x45, 0x4C, 0x46, 0, 0, 0, 0];
         assert!(parse_module(&bytes).is_err());
     }
 
@@ -174,22 +425,91 @@ mod tests {
         assert!(parse_module(&bytes).is_err());
     }
 
+    #[test]
+    fn rejects_imports() {
+        // Minimal WASM with a single import: env.foo (func, type 0).
+        //   type section: 1 type (func () -> i32)
+        //   import section: 1 entry: "env" "foo" kind=0 type=0
+        //   code section: dummy (needed so parse doesn't error for other reasons,
+        //                  but actually it'll fail at Import before reaching it).
+        let module: &[u8] = &[
+            0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
+            // type: 1 func () -> i32
+            0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7F,
+            // import: 1 entry: env.foo, kind=func, type=0
+            0x02, 0x0B, 0x01,
+                0x03, b'e', b'n', b'v',
+                0x03, b'f', b'o', b'o',
+                0x00, 0x00,
+        ];
+        let err = parse_module_full(module).unwrap_err();
+        assert!(matches!(err, ParseError::ImportsUnsupported));
+    }
+
+    #[test]
+    fn parses_globals() {
+        // 1 global: mut i32 = 0xFF00
+        //   valtype=0x7F, mut=0x01, init: i32.const 0xFF00 (sleb128: 0x80 0xFE 0x03), end
+        //   sleb128(0xFF00) = 65280 = 0b1111_1111_0000_0000
+        //     7-bit groups: 0000 0000, 1111 111, 1 (with continuation bits)
+        //     = 0x80, 0xFE, 0x03  — let's compute: 0xFF00 = 65280
+        //       first byte: 0x00 | 0x80 (cont) = 0x80
+        //       second:     0xFE | 0x80 = 0xFE — wait, 0xFF00 >> 7 = 0x01FE, low 7 bits = 0x7E, or ...
+        //   Easier: use explicit test-only sleb128 encoder below.
+        let mut init_bytes = alloc::vec![0x41]; // i32.const
+        encode_sleb128(&mut init_bytes, 0xFF00);
+        init_bytes.push(0x0B); // end
+        let global_section_body = alloc::vec![
+            0x01, // 1 global
+            0x7F, 0x01, // mut i32
+        ].iter().copied()
+            .chain(init_bytes.iter().copied())
+            .collect::<Vec<u8>>();
+
+        let mut module = alloc::vec![
+            0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
+            // Minimal function: type section (no types), function section (no fns),
+            // global section, code section (no bodies) — but we need ≥1 body for parse_module_full.
+            // Add a dummy fn.
+            0x01, 0x04, 0x01, 0x60, 0x00, 0x00, // type: () -> ()
+            0x03, 0x02, 0x01, 0x00,              // function: 1 fn of type 0
+            // global section
+            0x06,
+        ];
+        module.push(global_section_body.len() as u8);
+        module.extend_from_slice(&global_section_body);
+        // dummy code: 1 entry size 2: 0 locals, `end`
+        module.extend_from_slice(&[0x0A, 0x04, 0x01, 0x02, 0x00, 0x0B]);
+
+        let m = parse_module_full(&module).expect("parse");
+        assert_eq!(m.globals.len(), 1);
+        assert_eq!(m.globals[0].valtype, 0x7F);
+        assert!(m.globals[0].mutable);
+        let init_val = i32::from_le_bytes(
+            m.globals[0].init_bytes[..4].try_into().unwrap()
+        );
+        assert_eq!(init_val, 0xFF00);
+    }
+
+    /// Test helper — sleb128 encoder. Not used in production.
+    fn encode_sleb128(out: &mut Vec<u8>, mut v: i64) {
+        loop {
+            let byte = (v & 0x7F) as u8;
+            v >>= 7;
+            let sign_bit = byte & 0x40;
+            let done = (v == 0 && sign_bit == 0) || (v == -1 && sign_bit != 0);
+            if done {
+                out.push(byte);
+                return;
+            } else {
+                out.push(byte | 0x80);
+            }
+        }
+    }
+
     /// Module with one local group of 2 i32s, body `local.get 0 ; end`.
-    /// Proves local-group count is aggregated correctly.
     #[test]
     fn parses_locals_declaration() {
-        // Code entry layout:
-        //   size       0x07  (7 bytes below follow)
-        //   groups=1   0x01
-        //   count=2    0x02
-        //   valtype    0x7F  (i32)
-        //   local.get 0: 0x20 0x00
-        //   end        0x0B
-        //
-        // Total body including the leading group-count: 6 bytes, but
-        // the size prefix is the SIZE of the entry, which includes
-        // the group-count byte and everything up to (including) end.
-        // That's "01 02 7F 20 00 0B" = 6 bytes. So entry_size=6.
         let module: &[u8] = &[
             0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
             0x0A, 0x08, 0x01, 0x06, 0x01, 0x02, 0x7F, 0x20, 0x00, 0x0B,
@@ -202,18 +522,9 @@ mod tests {
 
     #[test]
     fn skips_unknown_sections() {
-        // A known WASM with a custom section (id=0) in the middle.
-        // Custom sections carry a name+payload; we just want to
-        // prove the parser walks past by section-size and still
-        // finds the Code section.
-        //   header
-        //   custom id=0 size=4 name_len=2 "xy" pad=0
-        //   code section same as before
         let module: &[u8] = &[
             0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
-            // custom section: id=0, size=4, contents "02 78 79 00" (name_len=2, "xy", one byte)
             0x00, 0x04, 0x02, 0x78, 0x79, 0x00,
-            // code section
             0x0A, 0x06, 0x01, 0x04, 0x00, 0x41, 0x2A, 0x0B,
         ];
         let bodies = parse_module(module).unwrap();

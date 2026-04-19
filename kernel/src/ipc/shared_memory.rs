@@ -81,6 +81,17 @@ pub struct SharedMemory {
     /// Tasks with access to this region
     /// First task in list is the creator/owner
     pub tasks: Vec<TaskId>,
+
+    /// Every live mapping of this region, as `(task_id, virt_base)`.
+    /// Updated on `shmem_map` / `shmem_unmap`. Used by `shmem_destroy`
+    /// to clear each task's PTEs BEFORE the physical pages return to
+    /// the PMM — without this, dangling PTEs in grantee tasks would
+    /// become a use-after-free window the moment the PMM reallocates
+    /// the freed pages to another consumer.
+    ///
+    /// One task mapping the same region at two distinct virtual
+    /// addresses produces two entries, tracked independently.
+    pub mappings: Vec<(TaskId, VirtAddr)>,
 }
 
 /// Global shared memory table
@@ -184,6 +195,7 @@ pub fn shmem_create(size: usize, perms: ShmemPerms) -> Result<ShmemId, ShmemErro
         size: actual_size,
         perms,
         tasks: alloc::vec![current_task_id],
+        mappings: Vec::new(),
     };
 
     // 6. Insert into global table
@@ -269,10 +281,53 @@ pub fn shmem_map(id: ShmemId, virt: VirtAddr) -> Result<(), ShmemError> {
         return Err(ShmemError::MapFailed); // No page table for this task
     }
 
+    // Install PTEs page by page. Track how many succeeded so we can
+    // roll back on partial failure — without this, a failure at the
+    // N-th page leaves pages 0..N mapped to phys pages the caller
+    // thinks it didn't get, and the error return gives them no way
+    // to unmap the leftovers.
+    let mut mapped_pages = 0usize;
     for (i, &phys) in shmem.phys_pages.iter().enumerate() {
         let virt_page = virt + (i * PAGE_SIZE);
-        paging::map_page_in_table(task_pml4, virt_page, phys, pt_flags)
-            .map_err(|_| ShmemError::MapFailed)?;
+        if paging::map_page_in_table(task_pml4, virt_page, phys, pt_flags).is_err() {
+            // Roll back the ones that did land.
+            for j in 0..mapped_pages {
+                let _ = paging::unmap_page_in_table(task_pml4, virt + j * PAGE_SIZE);
+            }
+            return Err(ShmemError::MapFailed);
+        }
+        mapped_pages += 1;
+    }
+
+    // Re-acquire SHMEM_TABLE and verify the region is STILL in the
+    // table. If a concurrent `shmem_destroy` (or `free_task_regions`
+    // via a creator exit) ran between our clone-under-lock above and
+    // this check, the physical pages we just mapped have already
+    // been handed back to the PMM — our task's PTEs point at pages
+    // that the allocator considers free and will reuse. That's a
+    // classic cross-task use-after-free.
+    //
+    // Detect it and unmap our PTEs immediately. The pages may still
+    // be live in their new role, but at least OUR task stops
+    // aliasing them.
+    {
+        let mut table = SHMEM_TABLE.lock();
+        match table.get_mut(&id.get()) {
+            Some(region) => {
+                // Record the mapping so the next `shmem_destroy` /
+                // `free_task_regions` knows to clear our PTEs before
+                // freeing pages.
+                region.mappings.push((current_task_id, virt));
+            }
+            None => {
+                // Region vanished under us. Don't leave dangling PTEs.
+                drop(table);
+                for i in 0..mapped_pages {
+                    let _ = paging::unmap_page_in_table(task_pml4, virt + i * PAGE_SIZE);
+                }
+                return Err(ShmemError::InvalidId);
+            }
+        }
     }
 
     Ok(())
@@ -317,6 +372,15 @@ pub fn shmem_unmap(id: ShmemId, virt: VirtAddr) -> Result<(), ShmemError> {
             .map_err(|_| ShmemError::UnmapFailed)?;
     }
 
+    // De-register the mapping record so a future destroy doesn't
+    // try to unmap pages we just cleared. Match on both fields —
+    // the same task can map the region at multiple virtual
+    // addresses and we must only retire the one actually unmapped.
+    let current_task_id = crate::task::task::current_task().lock().id;
+    if let Some(region) = SHMEM_TABLE.lock().get_mut(&id.get()) {
+        region.mappings.retain(|&(t, v)| !(t == current_task_id && v == virt));
+    }
+
     Ok(())
 }
 
@@ -336,28 +400,75 @@ pub fn shmem_unmap(id: ShmemId, virt: VirtAddr) -> Result<(), ShmemError> {
 /// This frees the physical pages. All tasks must unmap the region
 /// before calling this, otherwise they will get page faults.
 pub fn shmem_destroy(id: ShmemId) -> Result<(), ShmemError> {
-    // Remove from table
+    // 1. Remove from table — subsequent map/unmap calls from any
+    //    task will now fail with InvalidId, preventing new
+    //    mappings from being added while we tear the old ones down.
     let shmem = {
         let mut table = SHMEM_TABLE.lock();
         table.remove(&id.get())
             .ok_or(ShmemError::InvalidId)?
     };
 
-    // Check current task has access (owner or granted)
+    // 2. Permission check (unchanged — put the region back if denied).
     let current_task_id = crate::task::task::current_task().lock().id;
-
     if !shmem.tasks.contains(&current_task_id) {
-        // No access - restore to table
         SHMEM_TABLE.lock().insert(id.get(), shmem);
         return Err(ShmemError::PermissionDenied);
     }
 
-    // Free physical pages (each page is order 0)
+    // 3. Clear every recorded mapping's PTEs BEFORE returning the
+    //    physical pages to the PMM. Without this, each grantee task
+    //    keeps a dangling mapping into whatever the allocator hands
+    //    the page to next — a trivial use-after-free across tasks.
+    //
+    //    Errors here are silent: a task may have already exited
+    //    (its page table freed) or unmapped through some other
+    //    path. The load-bearing guarantee is "no live PTE survives
+    //    past the free_pages call", which unmap_page_in_table
+    //    enforces on the tasks it reaches.
+    clear_mappings(&shmem);
+
+    // 4. Free physical pages.
     for &phys_addr in &shmem.phys_pages {
         free_pages(phys_addr, 0);
     }
 
     Ok(())
+}
+
+/// Walk every `(task, virt_base)` mapping recorded on `shmem` and
+/// clear the PTEs for each page in the region. Shared by
+/// `shmem_destroy` and the creator-arm of `free_task_regions`.
+///
+/// Best-effort: per-task lookup failures are ignored (dead task =
+/// PML4 already freed = PTEs already gone).
+///
+/// ### Why no cross-CPU TLB shootdown?
+///
+/// `unmap_page_in_table` issues `INVLPG` via the x86_64 crate's
+/// `flush.flush()`, which invalidates only the CURRENT CPU's TLB.
+/// On a general SMP OS that'd leave stale entries on the other
+/// CPUs — but Folkering's SMP model restricts APs to a GEMM worker
+/// loop (see `arch/x86_64/smp.rs::ap_worker_loop`). APs never
+/// context-switch into user tasks, never load a task's PML4 into
+/// CR3, and only cache HHDM (kernel-space) mappings — which we
+/// don't mutate here. The BSP is the only CPU that can ever have
+/// a user-space TLB entry for the pages we're clearing, and the
+/// local INVLPG already handles it. If APs ever start running
+/// tasks, this comment is the flag to revisit and add a proper
+/// IPI-driven flush via `arch::x86_64::apic`.
+fn clear_mappings(shmem: &SharedMemory) {
+    let num_pages = shmem.phys_pages.len();
+    for &(task_id, virt_base) in &shmem.mappings {
+        let pml4 = match crate::task::task::get_task(task_id) {
+            Some(t) => t.lock().page_table_phys,
+            None => continue, // task exited — nothing to clear
+        };
+        if pml4 == 0 { continue; }
+        for i in 0..num_pages {
+            let _ = paging::unmap_page_in_table(pml4, virt_base + i * PAGE_SIZE);
+        }
+    }
 }
 
 /// Grant access to shared memory region to another task
@@ -418,6 +529,70 @@ pub fn shmem_revoke(id: ShmemId, task: TaskId) -> Result<(), ShmemError> {
     shmem.tasks.retain(|&t| t == current_task_id || t != task);
 
     Ok(())
+}
+
+/// Free every shared-memory region owned or granted to `task_id`.
+///
+/// Semantics:
+/// - If `task_id` is the *creator* (first entry in the region's
+///   `tasks` list), the region is fully destroyed: physical pages are
+///   returned to the page allocator and the table entry is removed.
+/// - Otherwise the task is just dropped from the grant list — other
+///   tasks that still hold access keep the region.
+///
+/// Called from `syscall_exit`. Without this, any region the task
+/// created (e.g. the 4 KiB IPC shmems libfolk allocates for every
+/// Synapse upsert) would leak forever: its entry sits in
+/// `SHMEM_TABLE`, its pages sit on the physical allocator's books but
+/// nobody can free them because the creator is gone.
+pub fn free_task_regions(task_id: TaskId) {
+    // Phase 1 (under table lock): classify each region, drop any
+    // stale `mappings` entries where the exiting task was the
+    // mapper. If we DIDN'T do this, a later `shmem_destroy` on a
+    // region the exiting task had mapped would call
+    // `unmap_page_in_table` against this task's (about-to-be-freed)
+    // PML4 — a use-after-free on the page table itself.
+    let to_destroy: alloc::vec::Vec<SharedMemory> = {
+        let mut table = SHMEM_TABLE.lock();
+        let mut destroy_ids: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+
+        for (&id, region) in table.iter_mut() {
+            if region.tasks.first() == Some(&task_id) {
+                // Creator — mark for full destroy in phase 2.
+                destroy_ids.push(id);
+            } else {
+                // Grantee — drop from access list and drop any of
+                // this task's live mapping records so the eventual
+                // destroy doesn't touch a freed page table.
+                region.tasks.retain(|&t| t != task_id);
+                region.mappings.retain(|&(t, _)| t != task_id);
+            }
+        }
+
+        // Pull the marked regions OUT of the table so phase 2 can
+        // work without holding the table lock (clear_mappings needs
+        // get_task which takes a task lock — keeping the table lock
+        // while reaching into another subsystem invites deadlock).
+        let mut out = alloc::vec::Vec::with_capacity(destroy_ids.len());
+        for id in destroy_ids {
+            if let Some(region) = table.remove(&id) {
+                out.push(region);
+            }
+        }
+        out
+    };
+
+    // Phase 2 (no locks held): for each region we're destroying,
+    // clear every grantee's PTEs (skipping the exiting task — its
+    // PML4 is about to go away and its entries are the dead ones we
+    // never wanted to touch) BEFORE freeing the physical pages.
+    for mut region in to_destroy {
+        region.mappings.retain(|&(t, _)| t != task_id);
+        clear_mappings(&region);
+        for &phys in &region.phys_pages {
+            free_pages(phys, 0);
+        }
+    }
 }
 
 /// Map a single page into virtual address space

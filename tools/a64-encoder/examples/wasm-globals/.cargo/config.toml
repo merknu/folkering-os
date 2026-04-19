@@ -1,0 +1,5 @@
+[target.wasm32-unknown-unknown]
+rustflags = [
+    "-C", "link-arg=--no-entry",
+    "-C", "link-arg=--export=test_globals",
+]

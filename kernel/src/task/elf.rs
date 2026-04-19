@@ -79,6 +79,8 @@ pub enum ElfError {
     WrongArch,
     /// Invalid program header offset
     InvalidPhoff,
+    /// Segment vaddr/size lands in kernel address space
+    KernelVaddr,
 }
 
 /// Parsed ELF binary

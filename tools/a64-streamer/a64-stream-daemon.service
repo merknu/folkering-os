@@ -15,8 +15,11 @@ User=knut
 Group=knut
 
 # Absolute path so systemd resolves it regardless of the working
-# directory. Update `ExecStart` if the binary moves.
-ExecStart=/home/knut/folkering-jit/tools/a64-streamer/target/release/a64-stream-daemon 0.0.0.0:14712
+# directory. Port 7700 matches the kernel-side JIT pipeline
+# (`kernel::jit::run_mlp_on_pi` and `cmd_jit` shell command both
+# hardcode 7700). Update both sides if you change it here.
+ExecStart=/home/knut/folkering-build/a64-streamer/target/release/a64-stream-daemon 0.0.0.0:7700
+WorkingDirectory=/home/knut/folkering-build/a64-streamer
 
 # Keep the stream flowing if the process panics or is killed. The
 # daemon is stateless across connections (a new client gets a fresh
