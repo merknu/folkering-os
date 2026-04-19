@@ -34,7 +34,7 @@ const REPS: u32 = 200;
 
 const ITERATIONS: u32 = 30;
 
-fn build_f32_dot_loop(mem_base: u64) -> Vec<u8> {
+fn build_f32_dot_loop(mem_base: u64) -> (Vec<u8>, u32) {
     // Outer loop runs the inner dot product REPS times, resetting
     // the accumulator each iteration so the final return value
     // equals one dot product (not REPS × it). Locals:
@@ -107,10 +107,11 @@ fn build_f32_dot_loop(mem_base: u64) -> Vec<u8> {
     ).unwrap();
     lw.set_mem_size(4 * 1024 * 1024);
     lw.lower_all(&ops).unwrap();
-    lw.finish()
+    let elisions = lw.elision_count();
+    (lw.finish(), elisions)
 }
 
-fn build_sdot_loop(mem_base: u64) -> Vec<u8> {
+fn build_sdot_loop(mem_base: u64) -> (Vec<u8>, u32) {
     // Outer loop runs the SDOT inner loop REPS times. Locals:
     //   0: k (i32, inner counter, byte index 0..N stride 16)
     //   1: acc (v128, i32x4 accumulator)
@@ -186,7 +187,8 @@ fn build_sdot_loop(mem_base: u64) -> Vec<u8> {
     ).unwrap();
     lw.set_mem_size(4 * 1024 * 1024);
     lw.lower_all(&ops).unwrap();
-    lw.finish()
+    let elisions = lw.elision_count();
+    (lw.finish(), elisions)
 }
 
 fn run_one(addr: &str, code: &[u8], data: &[u8], iters: u32) -> (i32, Vec<u128>) {
@@ -270,8 +272,9 @@ fn main() {
     let i8_expected = expected;
 
     // ── F32 path ───────────────────────────────────────────────────
-    let f32_code = build_f32_dot_loop(mem_base);
-    println!("[SDOT-BENCH] f32 JIT: {} bytes", f32_code.len());
+    let (f32_code, f32_elisions) = build_f32_dot_loop(mem_base);
+    println!("[SDOT-BENCH] f32 JIT: {} bytes ({} insns), {} bounds-checks elided",
+             f32_code.len(), f32_code.len() / 4, f32_elisions);
     let (got, mut s) = run_one(&addr, &f32_code, &f32_data, ITERATIONS);
     let (f_min, f_mean, f_p50) = stats(&mut s);
     println!(
@@ -279,8 +282,9 @@ fn main() {
     );
 
     // ── SDOT path ──────────────────────────────────────────────────
-    let sdot_code = build_sdot_loop(mem_base);
-    println!("[SDOT-BENCH] SDOT JIT: {} bytes", sdot_code.len());
+    let (sdot_code, sdot_elisions) = build_sdot_loop(mem_base);
+    println!("[SDOT-BENCH] SDOT JIT: {} bytes ({} insns), {} bounds-checks elided",
+             sdot_code.len(), sdot_code.len() / 4, sdot_elisions);
     let (got, mut s) = run_one(&addr, &sdot_code, &i8_data, ITERATIONS);
     let (s_min, s_mean, s_p50) = stats(&mut s);
     println!(

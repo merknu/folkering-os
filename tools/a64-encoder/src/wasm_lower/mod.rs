@@ -50,6 +50,76 @@ pub use types::{ValType, WasmOp, LowerError, FnSig, MAX_I32_LOCALS, MAX_F32_LOCA
 use types::*;
 
 use alloc::{vec, vec::Vec};
+use alloc::collections::{BTreeMap, BTreeSet};
+
+/// Pre-scan helper: find every Loop whose body opens with the
+/// canonical guard
+///
+/// ```text
+///   loop
+///     local.get N
+///     i32.const M
+///     i32.ge_s
+///     br_if K
+/// ```
+///
+/// and record (Loop op-index → LoopBound { N, M }). M ≥ 0 since
+/// negative bounds make no sense for an unsigned address calc.
+/// We also accept `i32.gt_s` as a slightly weaker bound (counter
+/// can hit M).
+fn scan_loop_bounds(ops: &[WasmOp]) -> BTreeMap<usize, LoopBound> {
+    let mut out = BTreeMap::new();
+    for (i, op) in ops.iter().enumerate() {
+        if !matches!(op, WasmOp::Loop) { continue; }
+        if i + 4 >= ops.len() { continue; }
+        match (&ops[i + 1], &ops[i + 2], &ops[i + 3], &ops[i + 4]) {
+            (
+                WasmOp::LocalGet(local),
+                WasmOp::I32Const(m),
+                WasmOp::I32GeS,
+                WasmOp::BrIf(_),
+            ) if *m >= 0 => {
+                // Counter is in [0, M). Worst-case value reachable
+                // inside the body is M - 1 (or M if guard is gt_s,
+                // but we matched ge_s so the strict bound is M-1.
+                // We use M conservatively to leave slack.)
+                out.insert(i, LoopBound {
+                    counter_local: *local,
+                    max_value: *m as u32,
+                });
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Pre-scan helper: which `End` ops close a `Loop` (as opposed to a
+/// `Block` or `If`)? We simulate WASM's label-stack discipline on
+/// the op stream so we know which Ends are loop-ends without having
+/// to thread state through every lowering call.
+fn compute_loop_end_indices(ops: &[WasmOp]) -> BTreeSet<usize> {
+    let mut closes_loop_at = BTreeSet::new();
+    let mut stack: Vec<bool> = Vec::new(); // true = is loop
+    for (i, op) in ops.iter().enumerate() {
+        match op {
+            WasmOp::Block | WasmOp::If => stack.push(false),
+            WasmOp::Loop => stack.push(true),
+            WasmOp::Else => {
+                // Else continues an If, no stack change.
+            }
+            WasmOp::End => {
+                if let Some(was_loop) = stack.pop() {
+                    if was_loop {
+                        closes_loop_at.insert(i);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    closes_loop_at
+}
 
 use crate::{
     Condition, Encoder, MovShift, Reg, Vreg,
@@ -168,6 +238,23 @@ pub struct Lowerer {
     /// compile_module patches them in pass 2 with the real delta
     /// once every function's offset in the combined blob is known.
     pub(super) pending_relocations: Vec<(u32, u32)>,
+    /// Stack of active Loop bounds, parallel to the Loop entries in
+    /// `label_stack`. `Some(LoopBound)` means we recognised the
+    /// canonical `local.get N ; i32.const M ; i32.ge_s ; br_if` guard
+    /// at the top of this loop. The bounds-check elision pass uses
+    /// this to skip `maybe_bounds_check` when the address is the
+    /// recognised counter local.
+    pub(super) active_loop_bounds: Vec<Option<LoopBound>>,
+    /// Local index of the most recent `LocalGet` push (if it's still
+    /// the operand-stack top). Mirrors `last_i32_const_value`. Memory
+    /// load/store lowerers read this to recognise "address is just a
+    /// bounded loop counter" and skip the runtime check.
+    pub(super) last_pushed_local: Option<u32>,
+    /// Counter incremented every time the loop-bounded-elision rule
+    /// fires (a memory op skipped its bounds check because the
+    /// address is a bounded loop counter). Read via
+    /// `Lowerer::elision_count()` for tooling/benchmarking.
+    pub(super) elision_count: u32,
 }
 
 impl Lowerer {
@@ -224,6 +311,9 @@ impl Lowerer {
             module_fn_count: 0,
             module_fn_sigs: Vec::new(),
             pending_relocations: Vec::new(),
+            active_loop_bounds: Vec::new(),
+            last_pushed_local: None,
+            elision_count: 0,
         })
     }
 
@@ -375,6 +465,9 @@ impl Lowerer {
             module_fn_count: 0,
             module_fn_sigs: Vec::new(),
             pending_relocations: Vec::new(),
+            active_loop_bounds: Vec::new(),
+            last_pushed_local: None,
+            elision_count: 0,
             frame_size_base: frame_size,
             mem_size: 64 * 1024,
             table_base: None,
@@ -472,6 +565,9 @@ impl Lowerer {
             module_fn_count: 0,
             module_fn_sigs: Vec::new(),
             pending_relocations: Vec::new(),
+            active_loop_bounds: Vec::new(),
+            last_pushed_local: None,
+            elision_count: 0,
         })
     }
 
@@ -529,6 +625,13 @@ impl Lowerer {
     /// adjusts them to the combined blob before patching.
     pub fn take_relocations(&mut self) -> Vec<(u32, u32)> {
         core::mem::take(&mut self.pending_relocations)
+    }
+
+    /// Number of bounds checks the loop-invariant elision pass
+    /// removed during this Lowerer's run. Useful for benchmarks that
+    /// want to confirm the analysis actually fired.
+    pub fn elision_count(&self) -> u32 {
+        self.elision_count
     }
 
     /// Emit code that copies the incoming AAPCS64 parameter registers
@@ -636,6 +739,13 @@ impl Lowerer {
         let is_memory_consumer = is_memory_load;
         if !matches!(op, WasmOp::I32Const(_)) && !is_memory_consumer {
             self.last_i32_const_value = None;
+        }
+        // Mirror tracking for `LocalGet` so memory ops can recognise
+        // "address is just a bounded loop counter" and elide the
+        // bounds check. Cleared on every op except LocalGet itself
+        // and the memory consumers that read this state.
+        if !matches!(op, WasmOp::LocalGet(_)) && !is_memory_consumer {
+            self.last_pushed_local = None;
         }
         let result = match op {
             WasmOp::I32Const(c) => self.lower_const(c),
@@ -826,14 +936,36 @@ impl Lowerer {
         };
         if is_memory_consumer {
             self.last_i32_const_value = None;
+            self.last_pushed_local = None;
         }
         result
     }
 
-    /// Lower every op in order.
+    /// Lower every op in order, with a pre-scan pass that recognises
+    /// the canonical `loop { local.get N ; i32.const M ; i32.ge_s ;
+    /// br_if 1 ; ... }` pattern and stores per-loop counter bounds
+    /// so memory ops can elide their bounds checks when the address
+    /// is the bounded counter and `M + offset + access_size <=
+    /// mem_size`.
     pub fn lower_all(&mut self, ops: &[WasmOp]) -> Result<(), LowerError> {
-        for &op in ops {
+        // Pre-scan 1: which Loops have a recognisable counter+bound?
+        // Indexed by op-index of the Loop op.
+        let loop_bounds = scan_loop_bounds(ops);
+        // Pre-scan 2: which End ops close a Loop (vs Block / If)?
+        // We mirror WASM's structured-control-flow stack; on each
+        // closing End the top of the simulation stack tells us what
+        // kind of label is being popped.
+        let loop_end_indices = compute_loop_end_indices(ops);
+
+        for (i, &op) in ops.iter().enumerate() {
+            if matches!(op, WasmOp::Loop) {
+                // Push the per-loop bound (or None if no guard).
+                self.active_loop_bounds.push(loop_bounds.get(&i).copied());
+            }
             self.lower_op(op)?;
+            if loop_end_indices.contains(&i) {
+                self.active_loop_bounds.pop();
+            }
         }
         Ok(())
     }

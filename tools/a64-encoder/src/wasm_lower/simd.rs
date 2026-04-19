@@ -70,7 +70,10 @@ impl Lowerer {
             return Err(LowerError::MemoryNotConfigured);
         }
         let addr = self.pop_i32_slot()?;
-        self.emit_bounds_check(addr, 16, offset, false)?;
+        // Route through maybe_bounds_check so static- and loop-
+        // bounded eliders can skip the runtime check (otherwise
+        // every SDOT-loop iteration paid for a guard).
+        self.maybe_bounds_check(addr, 16, offset, false)?;
         let dst = self.push_v128_slot()?;
         self.enc.add_ext_uxtw(Reg::X16, MEM_BASE_REG, addr)?;
         self.enc.ldr_q_imm(dst, Reg::X16, offset)?;
@@ -83,7 +86,7 @@ impl Lowerer {
         }
         let val = self.pop_v128_slot()?;
         let addr = self.pop_i32_slot()?;
-        self.emit_bounds_check(addr, 16, offset, true)?;
+        self.maybe_bounds_check(addr, 16, offset, true)?;
         self.enc.add_ext_uxtw(Reg::X16, MEM_BASE_REG, addr)?;
         self.enc.str_q_imm(val, Reg::X16, offset)?;
         Ok(())

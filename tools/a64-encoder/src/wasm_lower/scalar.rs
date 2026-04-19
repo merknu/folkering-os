@@ -190,6 +190,9 @@ impl Lowerer {
     }
 
     pub(super) fn lower_local_get(&mut self, idx: u32) -> Result<(), LowerError> {
+        // Memory-op lowerers read this to elide bounds checks when
+        // the address turns out to be a bounded loop counter.
+        self.last_pushed_local = Some(idx);
         match self.local_loc(idx)? {
             LocalLoc::I32(local) => {
                 let dst = self.push_i32_slot()?;

@@ -277,6 +277,32 @@ pub(crate) enum LocalLoc {
     V128(Vreg),
 }
 
+/// Information attached to an active Loop scope so the bounds-check
+/// elision pass knows it can omit the check when the address is a
+/// loop counter that's already constrained by the loop guard.
+///
+/// Set during the [`crate::wasm_lower::Lowerer::lower_all`] pre-scan
+/// for loops whose first 4 body ops match the canonical guard:
+///
+/// ```text
+///   loop
+///     local.get N      ;; counter
+///     i32.const M      ;; bound
+///     i32.ge_s
+///     br_if 1          ;; exit when counter >= bound
+///     ... body that uses local N as an address base ...
+/// ```
+///
+/// Inside such a loop, an access of the form
+/// `local.get N ; <load> offset` is safe iff
+/// `M + offset + access_size <= mem_size` — and the runtime check
+/// can be elided.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LoopBound {
+    pub counter_local: u32,
+    pub max_value: u32,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum LabelKind {
     Block,

@@ -102,9 +102,41 @@ impl Lowerer {
         false
     }
 
+    /// Loop-invariant bounds-check elimination: if the address is
+    /// just `local.get N` for a counter that an enclosing Loop has
+    /// pinned to `[0, M)`, and even the worst-case access
+    /// `M + offset + access_size` still fits in linear memory, the
+    /// runtime check is provably redundant and can be skipped.
+    ///
+    /// This is what turns a 256-iteration SDOT loop into a tight
+    /// MAC pipeline — every per-iteration `bounds_check` is gone.
+    fn loop_bounded_ok(&self, access_size: u32, offset: u32) -> bool {
+        let local_idx = match self.last_pushed_local {
+            Some(l) => l,
+            None => return false,
+        };
+        // Walk innermost-first; an inner loop that re-bounds the
+        // same counter shadows an outer one. (Rare, but correct.)
+        for slot in self.active_loop_bounds.iter().rev() {
+            if let Some(b) = slot {
+                if b.counter_local == local_idx {
+                    let worst = (b.max_value as u64)
+                        .saturating_add(offset as u64)
+                        .saturating_add(access_size as u64);
+                    return worst <= self.mem_size as u64;
+                }
+            }
+        }
+        false
+    }
+
     /// Emit bounds check only if the access can't be statically proven safe.
-    fn maybe_bounds_check(&mut self, addr_reg: Reg, access_size: u32, offset: u32, is_store: bool) -> Result<(), LowerError> {
+    pub(super) fn maybe_bounds_check(&mut self, addr_reg: Reg, access_size: u32, offset: u32, is_store: bool) -> Result<(), LowerError> {
         if self.static_bounds_ok(access_size, offset) {
+            return Ok(());
+        }
+        if self.loop_bounded_ok(access_size, offset) {
+            self.elision_count += 1;
             return Ok(());
         }
         self.emit_bounds_check(addr_reg, access_size, offset, is_store)
