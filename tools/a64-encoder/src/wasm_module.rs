@@ -25,7 +25,7 @@
 //!   * `parse_module_full` — new, returns a richer `Module` struct
 //!     with all of the above. Used by Phase 1+ consumers.
 
-use alloc::{vec, vec::Vec};
+use alloc::vec::Vec;
 use alloc::string::String;
 
 use crate::wasm_parse::{parse_ops, read_uleb128, read_sleb128, ParseError};
@@ -379,6 +379,7 @@ fn read_const_init_expr(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     /// Minimal "return 42" WASM module, hand-assembled.
     const RETURN_42_WASM: &[u8] = &[

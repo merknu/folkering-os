@@ -86,10 +86,6 @@ impl Lowerer {
         Ok(())
     }
 
-    pub(super) fn emit_trap(&mut self) -> Result<(), LowerError> {
-        self.emit_trap_kind(0)
-    }
-
     /// Emit bounds check only if the access can't be statically proven
     /// safe. `addr_sym` is the symbolic abstract value that was on top
     /// of the stack just before the address was popped — callers must

@@ -237,9 +237,10 @@ fn main() {
                else { format!("{host_part}:{DEFAULT_PORT}") };
 
     println!("[SDOT-BENCH] N = {N}, REPS = {REPS} per EXEC, iters = {ITERATIONS}");
-    println!("[SDOT-BENCH] MACs per EXEC: {} ({} M)",
-             (N * REPS) as u64,
-             (N * REPS) as u64 / 1_000_000);
+    let macs = (N as u64) * (REPS as u64);
+    println!("[SDOT-BENCH] MACs per EXEC: {} ({:.2} M)",
+             macs,
+             macs as f64 / 1_000_000.0);
 
     // ── Discover mem_base ──────────────────────────────────────────
     let mem_base = {

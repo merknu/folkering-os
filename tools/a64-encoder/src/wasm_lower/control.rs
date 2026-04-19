@@ -188,9 +188,12 @@ impl Lowerer {
             let ty = self.stack.pop().unwrap();
             if ty.is_int() {
                 self.int_depth -= 1;
+                self.int_sym_stack.pop();
             } else {
                 self.fp_depth -= 1;
             }
         }
+        debug_assert_eq!(self.int_sym_stack.len(), self.int_depth,
+            "int_sym_stack and int_depth diverged after truncate_stack_to");
     }
 }

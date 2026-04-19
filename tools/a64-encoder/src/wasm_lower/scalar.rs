@@ -62,12 +62,14 @@ impl Lowerer {
             }
         }
         let sym = match op {
-            BinOp::Add => sym_add(lhs_sym, rhs_sym),
-            BinOp::Mul => sym_mul(lhs_sym, rhs_sym),
-            BinOp::Shl => sym_shl(lhs_sym, rhs_sym),
-            // Other ops can in principle preserve a bound (e.g. `& mask`
-            // bounds the result by the mask), but address arithmetic in
-            // the wild almost never uses them — keep the surface small.
+            BinOp::Add  => sym_add(lhs_sym, rhs_sym),
+            BinOp::Mul  => sym_mul(lhs_sym, rhs_sym),
+            BinOp::Shl  => sym_shl(lhs_sym, rhs_sym),
+            BinOp::ShrU => sym_shr_u(lhs_sym, rhs_sym),
+            BinOp::And  => sym_and(lhs_sym, rhs_sym),
+            // Other ops (Sub/Div/Or/Xor/ShrS/Cmp) don't have a clean
+            // monotone upper-bound rule for the address-arithmetic
+            // patterns we care about — leave them untracked.
             _ => None,
         };
         self.set_top_sym(sym);
@@ -317,16 +319,22 @@ impl Lowerer {
         let top_ty = self.stack.last().copied().ok_or(LowerError::StackUnderflow)?;
         match top_ty {
             ValType::I32 => {
+                let val_false_sym = self.peek_top_sym();
                 let val_false = self.pop_i32_slot()?;
+                let val_true_sym = self.peek_top_sym();
                 let val_true = self.pop_i32_slot()?;
                 let dst = self.push_i32_slot()?;
                 self.enc.csel(dst, val_true, val_false, Condition::Ne)?;
+                self.set_top_sym(sym_select(val_true_sym, val_false_sym));
             }
             ValType::I64 => {
+                let val_false_sym = self.peek_top_sym();
                 let val_false = self.pop_i64_slot()?;
+                let val_true_sym = self.peek_top_sym();
                 let val_true = self.pop_i64_slot()?;
                 let dst = self.push_i64_slot()?;
                 self.enc.csel(dst, val_true, val_false, Condition::Ne)?;
+                self.set_top_sym(sym_select(val_true_sym, val_false_sym));
             }
             ValType::F32 => {
                 let val_false = self.pop_f32_slot()?;
@@ -454,5 +462,53 @@ pub(super) fn sym_shl(a: Option<SymAddr>, b: Option<SymAddr>) -> Option<SymAddr>
                 max_inclusive: max_inclusive.checked_shl(s).unwrap_or(u64::MAX),
             }),
         None => None,
+    }
+}
+
+/// Result of `i32.shr_u`. A right-shift can only lower the upper
+/// bound, so a tracked input still produces a tracked output. As
+/// with `shl`, we only handle constant shift amounts (a variable
+/// shift wraps mod 32 and could leave the value unchanged).
+pub(super) fn sym_shr_u(a: Option<SymAddr>, b: Option<SymAddr>) -> Option<SymAddr> {
+    let s = match b {
+        Some(SymAddr::Const(s)) if s < 32 => s,
+        _ => return None,
+    };
+    match a {
+        Some(SymAddr::Const(x)) => Some(SymAddr::Const(x >> s)),
+        Some(SymAddr::Bounded { max_inclusive }) =>
+            Some(SymAddr::Bounded { max_inclusive: max_inclusive >> s }),
+        None => None,
+    }
+}
+
+/// Result of `i32.and`. The output is bounded by every operand —
+/// `(x & m).max ≤ min(x.max, m.max)` — which makes the common
+/// `idx & (cap - 1)` hash-table mask trivially safe whenever `cap`
+/// is a known constant.
+pub(super) fn sym_and(a: Option<SymAddr>, b: Option<SymAddr>) -> Option<SymAddr> {
+    match (a, b) {
+        (Some(SymAddr::Const(x)), Some(SymAddr::Const(y))) =>
+            Some(SymAddr::Const(x & y)),
+        (Some(x), Some(y)) =>
+            Some(SymAddr::Bounded { max_inclusive: x.max().min(y.max()) }),
+        // One side bounded, other unknown: bound by the known side.
+        // `unknown & 0xFF` is still ≤ 0xFF.
+        (Some(x), None) | (None, Some(x)) =>
+            Some(SymAddr::Bounded { max_inclusive: x.max() }),
+        (None, None) => None,
+    }
+}
+
+/// Result of `select`: the value is one of the two branches, so the
+/// upper bound is the larger of theirs. Both branches must be tracked
+/// — an untracked branch could carry an unbounded value.
+pub(super) fn sym_select(a: Option<SymAddr>, b: Option<SymAddr>) -> Option<SymAddr> {
+    match (a, b) {
+        (Some(SymAddr::Const(x)), Some(SymAddr::Const(y))) if x == y =>
+            Some(SymAddr::Const(x)),
+        (Some(x), Some(y)) =>
+            Some(SymAddr::Bounded { max_inclusive: x.max().max(y.max()) }),
+        _ => None,
     }
 }

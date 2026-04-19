@@ -89,20 +89,23 @@ impl Lowerer {
     pub(super) fn push_i32_slot(&mut self) -> Result<Reg, LowerError> {
         self.flush_pending_spill()?;
         let depth = self.int_depth;
-        if let Some(r) = self.int_depth_to_reg(depth) {
+        let r = if let Some(r) = self.int_depth_to_reg(depth) {
             self.int_depth += 1;
             self.stack.push(ValType::I32);
             self.int_sym_stack.push(None);
-            Ok(r)
+            r
         } else if self.has_spill && depth < self.max_reg_int + MAX_FRAME_SPILL {
             self.pending_spill_depth = Some(depth);
             self.int_depth += 1;
             self.stack.push(ValType::I32);
             self.int_sym_stack.push(None);
-            Ok(SPILL_SCRATCH_A)
+            SPILL_SCRATCH_A
         } else {
-            Err(LowerError::TypedStackOverflow(ValType::I32))
-        }
+            return Err(LowerError::TypedStackOverflow(ValType::I32));
+        };
+        debug_assert_eq!(self.int_sym_stack.len(), self.int_depth,
+            "int_sym_stack and int_depth diverged after push_i32_slot");
+        Ok(r)
     }
 
     pub(super) fn pop_i32_slot(&mut self) -> Result<Reg, LowerError> {
@@ -114,6 +117,8 @@ impl Lowerer {
         self.stack.pop();
         self.int_sym_stack.pop();
         self.int_depth -= 1;
+        debug_assert_eq!(self.int_sym_stack.len(), self.int_depth,
+            "int_sym_stack and int_depth diverged after pop_i32_slot");
         let depth = self.int_depth;
         if let Some(r) = self.int_depth_to_reg(depth) {
             Ok(r)
@@ -131,20 +136,23 @@ impl Lowerer {
     pub(super) fn push_i64_slot(&mut self) -> Result<Reg, LowerError> {
         self.flush_pending_spill()?;
         let depth = self.int_depth;
-        if let Some(r) = self.int_depth_to_reg(depth) {
+        let r = if let Some(r) = self.int_depth_to_reg(depth) {
             self.int_depth += 1;
             self.stack.push(ValType::I64);
             self.int_sym_stack.push(None);
-            Ok(r)
+            r
         } else if self.has_spill && depth < self.max_reg_int + MAX_FRAME_SPILL {
             self.pending_spill_depth = Some(depth);
             self.int_depth += 1;
             self.stack.push(ValType::I64);
             self.int_sym_stack.push(None);
-            Ok(SPILL_SCRATCH_A)
+            SPILL_SCRATCH_A
         } else {
-            Err(LowerError::TypedStackOverflow(ValType::I64))
-        }
+            return Err(LowerError::TypedStackOverflow(ValType::I64));
+        };
+        debug_assert_eq!(self.int_sym_stack.len(), self.int_depth,
+            "int_sym_stack and int_depth diverged after push_i64_slot");
+        Ok(r)
     }
 
     pub(super) fn pop_i64_slot(&mut self) -> Result<Reg, LowerError> {
@@ -156,6 +164,8 @@ impl Lowerer {
         self.stack.pop();
         self.int_sym_stack.pop();
         self.int_depth -= 1;
+        debug_assert_eq!(self.int_sym_stack.len(), self.int_depth,
+            "int_sym_stack and int_depth diverged after pop_i64_slot");
         let depth = self.int_depth;
         if let Some(r) = self.int_depth_to_reg(depth) {
             Ok(r)

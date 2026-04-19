@@ -19,9 +19,6 @@ impl ValType {
     pub(super) fn is_int(self) -> bool {
         matches!(self, ValType::I32 | ValType::I64)
     }
-    pub(super) fn is_fp(self) -> bool {
-        matches!(self, ValType::F32 | ValType::F64 | ValType::V128)
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -359,8 +356,6 @@ pub(crate) struct Label {
 // ── Constants ───────────────────────────────────────────────────────
 
 pub(super) const MAX_PRIMARY_INT: usize = 16;
-pub(super) const MAX_CALLEE_SAVED_INT: u8 = 27;
-pub(super) const MAX_I32_STACK: usize = MAX_PRIMARY_INT;
 pub(super) const SPILL_SCRATCH_A: Reg = Reg(14);
 pub(super) const SPILL_SCRATCH_B: Reg = Reg(15);
 pub(super) const MAX_FRAME_SPILL: usize = 16;
@@ -390,12 +385,6 @@ pub(super) const FP_SPILL_AREA_BYTES: u32 = (MAX_FP_SPILL as u32) * FP_SPILL_SLO
 pub const GLOBAL_AREA_SIZE: u32 = 256;
 pub const GLOBAL_SLOT_BYTES: u32 = 8;
 pub const MAX_GLOBALS: usize = (GLOBAL_AREA_SIZE / GLOBAL_SLOT_BYTES) as usize;
-
-/// Conventional stack-pointer value for `__stack_pointer` if the
-/// module's declared init value is larger than our memory. Grows
-/// downward from this; `GLOBAL_AREA_SIZE` bytes above us are the
-/// globals themselves (not the stack).
-pub const STACK_POINTER_INIT_FALLBACK: u32 = 0xFF00; // for 64 KiB mem
 
 pub const MAX_I32_LOCALS: usize = 9;
 // F32 locals occupy V16..V(16+MAX-1). V0..V15 are operand-stack

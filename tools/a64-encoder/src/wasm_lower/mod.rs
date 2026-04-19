@@ -59,30 +59,31 @@ use alloc::collections::{BTreeMap, BTreeSet};
 ///   loop
 ///     local.get N
 ///     i32.const M
-///     i32.ge_s
+///     i32.ge_s | i32.gt_s
 ///     br_if K
 /// ```
 ///
 /// and record (Loop op-index → LoopBound { N, M }). M ≥ 0 since
 /// negative bounds make no sense for an unsigned address calc.
-/// We also accept `i32.gt_s` as a slightly weaker bound (counter
-/// can hit M).
+///
+/// Slack convention: we use `M` as the worst-case value reachable
+/// inside the body regardless of which comparison was used, even
+/// though the strict bounds differ (`ge_s` allows up to `M-1`,
+/// `gt_s` allows up to `M`). The over-approximation costs us
+/// nothing — every elision check still proves
+/// `M + offset + access_size ≤ mem_size`.
 fn scan_loop_bounds(ops: &[WasmOp]) -> BTreeMap<usize, LoopBound> {
     let mut out = BTreeMap::new();
     for (i, op) in ops.iter().enumerate() {
         if !matches!(op, WasmOp::Loop) { continue; }
         if i + 4 >= ops.len() { continue; }
-        match (&ops[i + 1], &ops[i + 2], &ops[i + 3], &ops[i + 4]) {
+        let cmp_ok = matches!(&ops[i + 3], WasmOp::I32GeS | WasmOp::I32GtS);
+        match (&ops[i + 1], &ops[i + 2], &ops[i + 4]) {
             (
                 WasmOp::LocalGet(local),
                 WasmOp::I32Const(m),
-                WasmOp::I32GeS,
                 WasmOp::BrIf(_),
-            ) if *m >= 0 => {
-                // Counter is in [0, M). Worst-case value reachable
-                // inside the body is M - 1 (or M if guard is gt_s,
-                // but we matched ge_s so the strict bound is M-1.
-                // We use M conservatively to leave slack.)
+            ) if cmp_ok && *m >= 0 => {
                 out.insert(i, LoopBound {
                     counter_local: *local,
                     max_value: *m as u32,
@@ -219,11 +220,9 @@ pub struct Lowerer {
     ///
     /// Maintained by `push_i32_slot` / `push_i64_slot` (which push
     /// `None` by default — lowerings overwrite it via `set_top_sym`)
-    /// and `pop_i32_slot` / `pop_i64_slot`. Subsumes the older
-    /// single-element `last_i32_const_value` / `last_pushed_local`
-    /// trackers — being a real per-slot stack lets it survive
-    /// intermediate ops that the single-element trackers had to
-    /// blank out.
+    /// and `pop_i32_slot` / `pop_i64_slot`. Per-slot tracking lets
+    /// the bound survive intermediate ops that don't pop the address
+    /// (drops of unrelated values, nested const pushes, etc.).
     pub(super) int_sym_stack: Vec<Option<SymAddr>>,
     /// Per-global value types, indexed by WASM global index. Empty
     /// when the module has no globals. Lowering `global.get/set`
@@ -959,6 +958,8 @@ impl Lowerer {
                 self.active_loop_bounds.pop();
                 self.tainted_locals.pop();
             }
+            debug_assert_eq!(self.tainted_locals.len(), self.active_loop_bounds.len(),
+                "tainted_locals/active_loop_bounds diverged at op #{i}");
         }
         Ok(())
     }
