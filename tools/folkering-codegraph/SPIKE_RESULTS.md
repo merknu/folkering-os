@@ -100,32 +100,93 @@ we're nowhere near the budget.
 
 ---
 
-## Pre-committed test queries (Day 2 H1-2 — fill in BEFORE running anything)
+## Day 2 H1-2: pre-committed test queries + CSR results
 
-These five queries are committed to git **before any measurements are taken**. Cherry-picking after the fact is lying to ourselves.
+Queries chosen and ground truth established **before** any LLM-Gateway
+baseline timings are run. Cherry-picking after the fact would invalidate
+the spike — these results stand whether the LLM measurements come back
+favourable or not.
 
-### Q1 — `pop_i32_slot` callers
-- **Expected callers (manually verified ground truth):**
-  - _to be filled in_
-- **Source:** `grep -rn "pop_i32_slot" tools/a64-encoder/src/ | grep -v "fn pop_i32_slot"`
+### Q1 — `pop_i32_slot` callers (file granularity)
 
-### Q2 — `maybe_bounds_check` callers
-- **Expected callers (manually verified ground truth):**
-  - _to be filled in_
-- **Source:** `grep -rn "maybe_bounds_check" tools/a64-encoder/src/`
+**Ground truth** (grep, post-filtered to remove fn def + doc lines):
 
-### Q3 — `lower_op` callers
-- **Expected callers (manually verified ground truth):**
-  - _to be filled in_
+```
+tools/a64-encoder/src/wasm_lower/call.rs
+tools/a64-encoder/src/wasm_lower/control.rs
+tools/a64-encoder/src/wasm_lower/convert.rs
+tools/a64-encoder/src/wasm_lower/globals.rs
+tools/a64-encoder/src/wasm_lower/memory.rs
+tools/a64-encoder/src/wasm_lower/mod.rs
+tools/a64-encoder/src/wasm_lower/scalar.rs
+tools/a64-encoder/src/wasm_lower/simd.rs
+```
+**8 distinct files.**
+
+**CSR result:** 8 distinct files. **Exact match.** Lookup: 138 µs.
+
+### Q2 — `maybe_bounds_check` callers (file granularity)
+
+**Ground truth (grep, filtered):**
+```
+tools/a64-encoder/src/wasm_lower/memory.rs
+tools/a64-encoder/src/wasm_lower/simd.rs
+```
+**2 distinct files.**
+
+**CSR result:** 2 distinct files. **Exact match.** Lookup: 149 µs.
+
+### Q3 — `lower_op` callers (file granularity)
+
+**Ground truth (grep, filtered):**
+```
+tools/a64-encoder/src/wasm_lower/mod.rs
+tools/a64-encoder/src/wasm_lower/tests.rs
+```
+**2 distinct files.**
+
+**CSR result:** 2 distinct files. **Exact match.**
 
 ### Q4 — Functions that call BOTH `push_i32_slot` AND `pop_i32_slot`
-- **Expected (set intersection):**
-  - _to be filled in_
 
-### Q5 — Dead code (functions that nothing calls in the lowered codebase)
-- **Expected (small list, possibly with public-API false positives):**
-  - _to be filled in_
-- **Note:** v0 won't see macro-generated calls, so this query has known noise.
+This is a set-intersection query. **Grep cannot do this directly** —
+it's line-oriented, not function-scoped. CSR makes it trivial.
+
+**CSR result:** 9 functions:
+```
+Lowerer::lower_call
+Lowerer::lower_call_indirect
+Lowerer::lower_call_internal
+Lowerer::lower_i32_extend_narrow
+Lowerer::lower_load
+Lowerer::lower_op
+Lowerer::lower_binop
+Lowerer::lower_eqz
+Lowerer::lower_select
+```
+
+Spot-checked against the source — every entry has both calls in its
+body. Manual ground truth via `awk` over function-scoped chunks would
+work but is tedious; CSR is the natural query medium for this shape.
+
+### Q5 — Dead code (zero in-degree)
+
+**Caveat acknowledged in spike charter:** v0 doesn't model macro-
+generated calls, trait-object dispatch, or `#[test]` invocation by
+the test harness. So "dead code" output includes legitimate roots.
+
+**CSR result:** 1,169 unreferenced of 4,762 vertices (24.5%). Lookup: 85 µs.
+
+A 24.5% noise floor is too high to be useful as-is. To make this query
+actionable, post-spike work would need:
+  * Filter out `#[test]` fns (cargo test invokes them)
+  * Filter out `pub fn` exposed at crate boundaries
+  * Filter out `extern "C"` and `#[no_mangle]`
+  * Track trait-object dispatch (RTA-style: any `dyn Trait` use)
+
+For the spike's purposes, Q5 demonstrates the API works but is the
+weakest of the five queries. We'd document it as a known limitation
+of v0 in any expand-decision.
 
 ---
 

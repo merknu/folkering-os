@@ -27,3 +27,7 @@ path = "src/bin/query_callers.rs"
 [[bin]]
 name = "dump-graph"
 path = "src/bin/dump_graph.rs"
+
+[[bin]]
+name = "dead-code"
+path = "src/bin/dead_code.rs"
