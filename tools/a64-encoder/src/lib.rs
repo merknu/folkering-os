@@ -40,6 +40,8 @@ pub mod wasm_lower;
 pub mod wasm_module;
 pub mod wasm_parse;
 pub mod wasm_validate;
+#[cfg(feature = "jit-cache")]
+pub mod jit_cache;
 pub use wasm_lower::{
     compile_module, FnSig, LowerError, Lowerer, ModuleLayout, ValType, WasmOp,
 };
@@ -49,6 +51,10 @@ pub use wasm_module::{
 };
 pub use wasm_parse::{parse_function_body, ParseError};
 pub use wasm_validate::{validate, validate_full, ValidationError};
+#[cfg(feature = "jit-cache")]
+pub use jit_cache::{
+    cached_compile_module, default_cache_dir, CacheError, CacheOutcome, JIT_VERSION,
+};
 
 /// A64 SIMD/FP register (V-bank, also known as S/D/Q depending on
 /// access width). We use it in the S0..S31 32-bit form for f32

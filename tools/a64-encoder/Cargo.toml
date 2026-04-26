@@ -5,13 +5,22 @@ edition = "2021"
 description = "AArch64 (A64) instruction encoder — emits 32-bit little-endian opcodes for JIT code generation"
 
 [features]
-default = ["std"]
+default = ["std", "jit-cache"]
 # When `std` is off, the crate compiles as `no_std` against `alloc`.
 # Used by Folkering OS userspace / kernel integrations that don't
 # link the Rust standard library.
 std = []
+# Host-side disk cache for JIT'd module blobs. Skips the
+# multi-millisecond `compile_module` cost on repeated invocations
+# of the same WASM module. Pulls in `sha2` + filesystem I/O, so
+# it's gated behind the `std` feature — no_std builds (kernel,
+# WASM apps) don't see it.
+jit-cache = ["std", "dep:sha2"]
 
 [dependencies]
+# Cache-key hashing. Pulled in only when the `jit-cache` feature
+# is enabled, so the no_std footprint is unchanged.
+sha2 = { version = "0.10", optional = true, default-features = false }
 
 # Used by the memory-based MLP example to stream CODE + DATA frames
 # through the a64-stream-daemon on a Pi. Dev-only — the encoder crate
