@@ -128,6 +128,92 @@ pub fn register(linker: &mut Linker<HostState>) {
         },
     );
 
+    // folk_fbp_send(url_ptr, url_len, action, node_id, buf_ptr, max_len) -> i32
+    // Phase 6: FBP proxy interaction. Drives an INTERACTION_EVENT
+    // (click, scroll, type, …) against the host-side chromium
+    // session identified by the NAVIGATE `url`, then writes the
+    // post-interaction DOM snapshot back into the wasm buffer.
+    //
+    // `action` is an ACTION_* constant from fbp_rs.
+    // `node_id` is the 1-based node index inside the most recent
+    // DOM_STATE_UPDATE that the client wants to target.
+    //
+    // Returns bytes written, or -1 on error.
+    let _ = linker.func_wrap("env", "folk_fbp_send",
+        |mut caller: Caller<HostState>,
+         url_ptr: i32, url_len: i32,
+         action: i32, node_id: i32,
+         buf_ptr: i32, max_len: i32| -> i32 {
+            if url_len <= 0 || url_len > 512 || max_len <= 0 || max_len > 262144 {
+                return -1;
+            }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+
+            let mut url_buf = alloc::vec![0u8; url_len as usize];
+            if mem.read(&caller, url_ptr as usize, &mut url_buf).is_err() {
+                return -1;
+            }
+            let url = match alloc::str::from_utf8(&url_buf) {
+                Ok(s) => String::from(s),
+                Err(_) => return -1,
+            };
+
+            let mut resp = alloc::vec![0u8; max_len as usize];
+            let n = libfolk::sys::fbp_interact(
+                &url,
+                (action & 0xFF) as u8,
+                node_id as u32,
+                &mut resp,
+            );
+            if n == 0 { return -1; }
+
+            let copy_len = n.min(max_len as usize);
+            if mem.write(&mut caller, buf_ptr as usize, &resp[..copy_len]).is_ok() {
+                copy_len as i32
+            } else { -1 }
+        },
+    );
+
+    // folk_fbp_recv(url_ptr, url_len, buf_ptr, max_len) -> i32
+    // Phase 5: FBP proxy receive. Talks to the host-side
+    // folkering-proxy at 10.0.2.2:14711, asks for a DOM snapshot,
+    // and writes the raw FBP bytes into the wasm linear memory at
+    // `buf_ptr`. The caller is responsible for ensuring `buf_ptr`
+    // is 8-byte aligned so fbp_rs::parse_state_update can zero-copy
+    // slice-cast the result. Returns bytes written, or -1 on error.
+    let _ = linker.func_wrap("env", "folk_fbp_recv",
+        |mut caller: Caller<HostState>, url_ptr: i32, url_len: i32, buf_ptr: i32, max_len: i32| -> i32 {
+            if url_len <= 0 || url_len > 512 || max_len <= 0 || max_len > 262144 {
+                return -1;
+            }
+            let mem = match caller.get_export("memory") {
+                Some(Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+
+            let mut url_buf = alloc::vec![0u8; url_len as usize];
+            if mem.read(&caller, url_ptr as usize, &mut url_buf).is_err() {
+                return -1;
+            }
+            let url = match alloc::str::from_utf8(&url_buf) {
+                Ok(s) => String::from(s),
+                Err(_) => return -1,
+            };
+
+            let mut resp = alloc::vec![0u8; max_len as usize];
+            let n = libfolk::sys::fbp_request(&url, &mut resp);
+            if n == 0 { return -1; }
+
+            let copy_len = n.min(max_len as usize);
+            if mem.write(&mut caller, buf_ptr as usize, &resp[..copy_len]).is_ok() {
+                copy_len as i32
+            } else { -1 }
+        },
+    );
+
     // Phase 14: WebSocket — Persistent streaming connections
     // folk_ws_connect(url_ptr, url_len) -> i32 (slot_id or -1)
     // URL format: "ws://host:port/path"

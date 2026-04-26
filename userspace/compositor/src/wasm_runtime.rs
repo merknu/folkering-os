@@ -545,7 +545,11 @@ impl PersistentWasmApp {
     /// Write data into WASM linear memory at given offset (for async asset loading).
     pub fn write_memory(&mut self, offset: usize, data: &[u8]) -> bool {
         if let Some(Extern::Memory(mem)) = self.instance.get_export(&self.store, "memory") {
-            if offset + data.len() <= mem.data_size(&self.store) {
+            let end = match offset.checked_add(data.len()) {
+                Some(e) => e,
+                None => return false,
+            };
+            if end <= mem.data_size(&self.store) {
                 return mem.write(&mut self.store, offset, data).is_ok();
             }
         }

@@ -6,8 +6,15 @@ edition = "2021"
 [lib]
 crate-type = ["cdylib"]
 
+[dependencies]
+# Shared FBP protocol parser. Default features keep it strict no_std
+# + parse-only (no alloc, no serializer). This is the same crate the
+# host-side folkering-proxy uses to ENCODE — guaranteed byte-compatible.
+fbp-rs = { path = "../../tools/fbp-rs", default-features = false }
+
 [profile.release]
 opt-level = "z"
 lto = true
 strip = true
 panic = "abort"
+codegen-units = 1

@@ -23,3 +23,9 @@ libaccesskit-folk = { path = "../libaccesskit-folk" }
 # WebAssembly interpreter for JIT tool execution (no_std, fuel metering)
 wasmi = { version = "2.0.0-beta.2", default-features = false }
 
+# FBP protocol parser — zero-copy deserializer for DOM snapshots
+# returned by the host-side folkering-proxy. Used by Draug's
+# Knowledge Hunt cycle to walk the SemanticNode tree and extract
+# text content for MemPalace storage.
+fbp-rs = { path = "../../tools/fbp-rs", default-features = false }
+
