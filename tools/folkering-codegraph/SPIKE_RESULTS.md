@@ -1,9 +1,65 @@
 # Folkering CodeGraph spike — results
 
-**Status:** PRE-MEASUREMENT (Day 1 not yet started)
-**Started:** _to be filled in_
+**Status:** Day 1 H1-4 done; H5-6 (Draug integration) pending.
+**Started:** 2026-04-26
 **Ended:** _to be filled in_
-**Total hours actually spent:** _to be filled in_
+**Total hours actually spent:** ~1 (H1-2: builder + tests + smoke + verify) — well under budget so far.
+
+---
+
+## Day 1 H1-4 findings (preliminary)
+
+### Builder works on full Folkering monorepo
+
+| Metric | Value |
+|---|---:|
+| Vertices (functions discovered) | **4,762** |
+| Edges (over-approximated) | 153,466 |
+| CSR bytes (row_offsets + col_indices) | **618 KB** |
+| Builder wall time (cold, release build) | 3.9 s |
+| Files syn failed to parse | _to be measured_ |
+
+⚠️ **618 KB exceeds the 500 KB threshold from the kill matrix.**
+The edge count is inflated by RTA-style over-approximation: any
+`fn new` call resolves to *every* `fn new` in the codebase.
+Plausible reductions:
+  * Type-aware resolution would cut edges 5–10× (project-wide
+    `new`/`default`/`from` are the worst offenders)
+  * Even crude "prefer same-file simple-name match" heuristic
+    would help
+
+This is the spike's first real finding: **edge count, not vertex
+count, is the memory bottleneck — and it's an over-approximation
+artifact, not a fundamental limit.**
+
+### Q1 sanity check (pop_i32_slot in a64-encoder)
+
+| Source | Distinct callers |
+|---|---|
+| `grep -rln "pop_i32_slot\b"` (excluding fn def line) | 9 files |
+| CSR `query-callers` | 8 files |
+| Hand-verified ground truth | 8 files |
+
+Discrepancy explained: stack.rs grep-hit was a `debug_assert_eq!`
+**string literal** mentioning the name, not a call. CSR correctly
+rejected it. Semantic signal beat textual match.
+
+### Q2 sanity check (maybe_bounds_check)
+
+| Source | Distinct callers |
+|---|---|
+| `grep -n "maybe_bounds_check("` (excluding fn def + doc) | 10 |
+| CSR `query-callers` | 10 |
+
+**Exact match.** mod.rs grep-hit was a doc comment; correctly
+excluded by CSR.
+
+### Lookup latency
+
+`query-callers` end-to-end: ~750 ms — but that includes rebuilding
+the CSR every invocation (cold start). The CSR lookup itself is
+microseconds; the build is the one-time cost. For Draug's use
+case, we'd build once at boot and amortize.
 
 ---
 
