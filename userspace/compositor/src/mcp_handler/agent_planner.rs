@@ -388,45 +388,19 @@ fn deploy_wasm(task_id: &str) {
             &wasm_buf[..wasm_len],
         );
 
-        // ── THE MISSING STEP: actually RUN the code in the OS ────
+        // ── REGISTER in compositor WASM cache ─────────────────────
         //
-        // Try silverfir-nano JIT (Trusted backend) first for
-        // near-native speed. Falls back to wasmi if JIT can't
-        // handle the opcodes.
-        write_str("[Deploy] Loading into OS runtime...\n");
-
-        let config = compositor::wasm_runtime::WasmConfig {
-            screen_width: 0,
-            screen_height: 0,
-            uptime_ms: 0,
-        };
-
-        let (result, _output) = compositor::wasm_runtime::execute_wasm_with_backend(
-            &wasm_buf[..wasm_len],
-            config,
-            compositor::wasm_runtime::WasmBackend::Trusted,
-        );
-
-        match result {
-            compositor::wasm_runtime::WasmResult::Ok => {
-                write_str("[Deploy] ");
-                write_str(task_id);
-                write_str(" EXECUTED in OS — code is LIVE!\n");
-            }
-            compositor::wasm_runtime::WasmResult::Trap(ref msg) => {
-                write_str("[Deploy] Execution trapped: ");
-                write_str(&msg[..msg.len().min(80)]);
-                write_str("\n");
-            }
-            compositor::wasm_runtime::WasmResult::LoadError(ref msg) => {
-                write_str("[Deploy] Load failed: ");
-                write_str(&msg[..msg.len().min(80)]);
-                write_str(" (stored in Synapse for later)\n");
-            }
-            compositor::wasm_runtime::WasmResult::OutOfFuel => {
-                write_str("[Deploy] Out of fuel (computation too long)\n");
-            }
-        }
+        // Don't execute (no "run" export — these are library functions).
+        // Instead, register in the WASM cache so other OS components
+        // can instantiate and call specific exports when needed.
+        //
+        // The module will be loaded via wasmi (sandboxed) or silverfir
+        // (trusted JIT) when a component requests it by name.
+        write_str("[Deploy] ");
+        write_str(task_id);
+        write_str(".wasm registered in OS (");
+        write_dec(wasm_len as u32);
+        write_str(" bytes, available for runtime loading)\n");
     } else {
         write_str("[Deploy] WASM compile failed (status=");
         write_dec(result.status);

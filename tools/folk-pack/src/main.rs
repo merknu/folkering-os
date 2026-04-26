@@ -655,6 +655,86 @@ fn create_sqlite(output_path: String, add_entries: Vec<AddEntry>, generate_embed
         process::exit(1);
     });
 
+    // ────────────────────────────────────────────────────────────────
+    // Phase 9: Bi-Temporal Knowledge Graph schema
+    //
+    // Three tables hold Draug's reasoning spine:
+    //   `entities`       — discrete concepts/modules/users
+    //   `edges`          — bi-temporal SPO relationships (valid_from/valid_to)
+    //   `spatial_nodes`  — Method-of-Loci mapping (wing/hall/room)
+    //
+    // These must be created here at pack time because synapse-service's
+    // custom btree writer can't execute DDL at runtime. Inserts go
+    // through hand-written btree appenders in synapse-service/btree.rs.
+    //
+    // `edges.valid_to` uses a 64-bit INTEGER rather than DATETIME so
+    // that synapse-service can rewrite its 8 bytes in-place via byte
+    // overwrite when a new fact supersedes an old one. Sentinel value
+    // `0` means "still active" (valid_to IS NULL in the spec).
+    conn.execute(
+        "CREATE TABLE entities (
+            entity_id   TEXT PRIMARY KEY,
+            name        TEXT NOT NULL,
+            entity_type TEXT NOT NULL,
+            properties  TEXT,
+            created_at  INTEGER NOT NULL DEFAULT 0
+        )",
+        [],
+    ).unwrap_or_else(|e| {
+        eprintln!("Error creating entities table: {}", e);
+        process::exit(1);
+    });
+
+    conn.execute(
+        "CREATE TABLE edges (
+            edge_id     TEXT PRIMARY KEY,
+            subject_id  TEXT NOT NULL,
+            predicate   TEXT NOT NULL,
+            object_id   TEXT NOT NULL,
+            valid_from  INTEGER NOT NULL,
+            valid_to    INTEGER NOT NULL DEFAULT 0,
+            confidence  REAL NOT NULL DEFAULT 1.0,
+            source_zid  TEXT
+        )",
+        [],
+    ).unwrap_or_else(|e| {
+        eprintln!("Error creating edges table: {}", e);
+        process::exit(1);
+    });
+
+    conn.execute(
+        "CREATE TABLE spatial_nodes (
+            node_id   TEXT PRIMARY KEY,
+            entity_id TEXT NOT NULL,
+            wing      TEXT NOT NULL,
+            hall      TEXT NOT NULL,
+            room      TEXT NOT NULL
+        )",
+        [],
+    ).unwrap_or_else(|e| {
+        eprintln!("Error creating spatial_nodes table: {}", e);
+        process::exit(1);
+    });
+
+    // Optimization indices — match the research report spec.
+    for (name, sql) in [
+        ("idx_edges_subject_object",
+         "CREATE INDEX idx_edges_subject_object ON edges(subject_id, object_id)"),
+        ("idx_edges_temporal",
+         "CREATE INDEX idx_edges_temporal ON edges(valid_from, valid_to)"),
+        ("idx_edges_subject_predicate_active",
+         "CREATE INDEX idx_edges_subject_predicate_active ON edges(subject_id, predicate, valid_to)"),
+        ("idx_spatial_lookup",
+         "CREATE INDEX idx_spatial_lookup ON spatial_nodes(wing, room)"),
+    ] {
+        conn.execute(sql, []).unwrap_or_else(|e| {
+            eprintln!("Error creating {}: {}", name, e);
+            process::exit(1);
+        });
+    }
+
+    println!("folk-pack: Knowledge Graph schema created (entities, edges, spatial_nodes)");
+
     // Create shadow tables for quantized search (if --quantize)
     if generate_quantized {
         // BQ shadow table: 64 vectors × 48 bytes = 3072 bytes per chunk
