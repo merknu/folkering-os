@@ -51,7 +51,15 @@ pub const FRAME_BYE: u8 = 0x07;
 // transformer weight sets.
 pub const MAX_FRAME_PAYLOAD: usize = 8 * 1024 * 1024;
 
-pub const DEFAULT_PORT: u16 = 14712;
+/// Default TCP port for the daemon and matching client tools.
+///
+/// Single source of truth: the Pi's systemd unit, the kernel's JIT
+/// shell command (`cmd_jit` in `kernel/src/net/tcp_shell.rs`), and
+/// the syscall dispatcher's port-arg fallback (`dispatch.rs`) all
+/// expect this value when no port is given. Keep them aligned —
+/// drift here means the new examples connect to a port nothing
+/// listens on.
+pub const DEFAULT_PORT: u16 = 7700;
 
 // ── Frame I/O ───────────────────────────────────────────────────────
 
