@@ -1,0 +1,33 @@
+[package]
+name = "folkering-codegraph"
+version = "0.0.1"
+edition = "2021"
+description = "Spike: CSR-based static call-graph for Rust source. 12-hour time-boxed experiment to test whether structural code queries beat LLM-mediated retrieval for Draug."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+# Used host-side to parse Rust source files. ~600 KB compiled, but
+# we only invoke it during spike-time CSR build, never in the kernel.
+syn = { version = "2", features = ["full", "visit"] }
+# Recursive .rs discovery with skip-rules for target/, .git/.
+walkdir = "2"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "build-graph"
+path = "src/bin/build_graph.rs"
+
+[[bin]]
+name = "query-callers"
+path = "src/bin/query_callers.rs"
+
+[[bin]]
+name = "dump-graph"
+path = "src/bin/dump_graph.rs"
+
+[[bin]]
+name = "dead-code"
+path = "src/bin/dead_code.rs"
