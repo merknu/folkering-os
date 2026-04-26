@@ -116,7 +116,7 @@ pub fn parse_module_full(bytes: &[u8]) -> Result<Module, ParseError> {
     // ── Magic + version ──
     if bytes.len() < 8 { return Err(ParseError::UnexpectedEof); }
     if &bytes[0..4] != b"\0asm" { return Err(ParseError::UnknownOpcode(bytes[0])); }
-    if &bytes[4..8] != [0x01, 0x00, 0x00, 0x00] {
+    if bytes[4..8] != [0x01, 0x00, 0x00, 0x00] {
         return Err(ParseError::UnknownOpcode(bytes[4]));
     }
     let mut pos = 8;

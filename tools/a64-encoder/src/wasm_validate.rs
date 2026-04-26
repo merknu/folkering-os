@@ -61,9 +61,7 @@ pub fn validate_full(
             match op {
                 WasmOp::End => {
                     unreachable = false;
-                    if label_depth > 0 {
-                        label_depth -= 1;
-                    }
+                    label_depth = label_depth.saturating_sub(1);
                     continue;
                 }
                 WasmOp::Else => {
@@ -274,9 +272,7 @@ pub fn validate_full(
                 }
             }
             WasmOp::End => {
-                if label_depth > 0 {
-                    label_depth -= 1;
-                }
+                label_depth = label_depth.saturating_sub(1);
             }
             WasmOp::Return => {
                 if stack.is_empty() {

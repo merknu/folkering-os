@@ -199,6 +199,11 @@ struct LoweredFunction {
     relocations: Vec<(u32, u32)>,
 }
 
+// Private helper threading every per-function context through the
+// pass-1 lowering. Bundling these into a struct would be a real
+// refactor (callers compose them per function), so we accept the
+// 9-arg signature behind an explicit allow rather than hide it.
+#[allow(clippy::too_many_arguments)]
 fn lower_one_function(
     body: &FunctionBody,
     own_sig: &FnSig,

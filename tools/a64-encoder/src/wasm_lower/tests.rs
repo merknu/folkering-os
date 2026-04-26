@@ -324,7 +324,7 @@ fn extended_band_allows_deep_stack() {
     // Function with 0 locals: 16 primary + 9 callee-saved = 25 slots.
     let mut lw = Lowerer::new_function(0, Vec::new()).unwrap();
     for i in 0..20 {
-        lw.lower_op(WasmOp::I32Const(i as i32)).unwrap();
+        lw.lower_op(WasmOp::I32Const(i)).unwrap();
     }
     // 20 pushes: 16 direct (X0..X15) + 4 extended (X19..X22).
     // All in registers, no memory spill.
@@ -342,7 +342,7 @@ fn extended_band_with_locals() {
     // Total: 16 + 7 = 23.
     let mut lw = Lowerer::new_function(2, Vec::new()).unwrap();
     for i in 0..20 {
-        lw.lower_op(WasmOp::I32Const(i as i32)).unwrap();
+        lw.lower_op(WasmOp::I32Const(i)).unwrap();
     }
     for _ in 0..19 {
         lw.lower_op(WasmOp::I32Add).unwrap();
@@ -371,7 +371,7 @@ fn spill_to_memory_roundtrip() {
     // pop→reload pipeline. Should compile without error.
     let mut lw = Lowerer::new_function(0, Vec::new()).unwrap();
     for i in 0..30 {
-        lw.lower_op(WasmOp::I32Const(i as i32)).unwrap();
+        lw.lower_op(WasmOp::I32Const(i)).unwrap();
     }
     for _ in 0..29 {
         lw.lower_op(WasmOp::I32Add).unwrap();
@@ -517,11 +517,11 @@ fn store_then_load_roundtrip() {
         WasmOp::End,
     ])
     .unwrap();
-    let words = bytes_as_u32s(&lw.as_bytes());
+    let words = bytes_as_u32s(lw.as_bytes());
     // Prologue must contain STP (pre-indexed) as first word.
     assert_eq!(words[0] & 0xFFC0_0000, 0xA980_0000, "first word must be STP pre-indexed");
     // Must contain MOVZ X28, #0xBABE somewhere in the prologue.
-    assert!(words.iter().any(|&w| w == 0xD29757DC), "MOVZ X28, #0xBABE not found");
+    assert!(words.contains(&0xD29757DC), "MOVZ X28, #0xBABE not found");
     // Must end with RET.
     assert_eq!(*words.last().unwrap(), 0xD65F03C0, "must end with RET");
 }
@@ -573,7 +573,10 @@ fn memory_typed_with_fp_locals() {
     let types = vec![ValType::F32; 4];
     let mut lw = Lowerer::new_function_with_memory_typed(&types, Vec::new(), 0x2000).unwrap();
     lw.lower_all(&[
-        WasmOp::F32Const(3.14),
+        // Arbitrary non-zero f32 value — the test cares about
+        // F32Const lowering, not the specific bit pattern. We avoid
+        // 3.14 to dodge the approx_constant lint that wants PI.
+        WasmOp::F32Const(2.5),
         WasmOp::LocalSet(0),
         WasmOp::I32Const(0),
         WasmOp::I32Load(0),
@@ -1085,4 +1088,47 @@ fn sym_survives_push_pop_intermediate() {
         WasmOp::End,
     ]).unwrap();
     assert_eq!(lw.elision_count(), 1);
+}
+
+// ── Internal-call placeholder safety (Copilot review #2) ────────────
+
+/// `lower_call_internal` emits BL #4 (= branch to next instruction)
+/// as the placeholder for unresolved internal calls. The linker
+/// pass-2 always patches it, but if a relocation is ever missed
+/// (test bug, partial compile, etc.) BL #4 falls through harmlessly
+/// instead of spinlooping forever like BL #0 would.
+///
+/// This test guards against accidental regression to BL #0.
+#[test]
+fn internal_call_emits_bl_4_placeholder_and_records_relocation() {
+    use alloc::vec::Vec as AllocVec;
+    // Two-fn module: caller (idx 0) returns i32, callee (idx 1) is void.
+    let caller_sig = FnSig { params: AllocVec::new(), result: Some(ValType::I32) };
+    let callee_sig = FnSig { params: AllocVec::new(), result: None };
+
+    let mut lw = Lowerer::new_function(0, AllocVec::new()).unwrap();
+    lw.set_module_fn_sigs(alloc::vec![caller_sig, callee_sig]);
+
+    // Snapshot the encoder position right before the Call so we know
+    // exactly where the BL bytes will land.
+    let bl_site_expected = lw.as_bytes().len() as u32;
+    lw.lower_op(WasmOp::Call(1)).unwrap();
+
+    // The relocation must point at the BL we just emitted, targeting
+    // fn idx 1.
+    let relocs = lw.take_relocations();
+    assert_eq!(relocs.len(), 1, "exactly one internal-call relocation");
+    let (site, target_idx) = relocs[0];
+    assert_eq!(site, bl_site_expected);
+    assert_eq!(target_idx, 1);
+
+    // Decode the placeholder instruction. AArch64 BL is little-endian;
+    // BL #4 → imm26 = 1 → 0x9400_0000 | 0x1 = 0x9400_0001.
+    let bytes = lw.as_bytes();
+    let pos = site as usize;
+    let instr = u32::from_le_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]]);
+    assert_eq!(
+        instr, 0x9400_0001,
+        "placeholder must be BL #4 (= 0x9400_0001), not BL #0 (= 0x9400_0000)",
+    );
 }

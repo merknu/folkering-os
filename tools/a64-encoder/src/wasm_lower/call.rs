@@ -90,8 +90,10 @@ impl Lowerer {
     }
 
     /// Lower a Call to another function in the same module.
-    /// Emits arg-marshalling, a placeholder BL #0, return-value
-    /// rehydration, and records a relocation for the linker.
+    /// Emits arg-marshalling, a placeholder BL #4 (branch to next
+    /// instruction — safe fall-through if relocation is missed,
+    /// see emit site below), return-value rehydration, and records
+    /// a relocation for the linker to patch in pass 2.
     fn lower_call_internal(&mut self, idx: u32) -> Result<(), LowerError> {
         let sig = self.module_fn_sigs[idx as usize].clone();
 

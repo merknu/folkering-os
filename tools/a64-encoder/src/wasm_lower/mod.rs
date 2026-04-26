@@ -460,7 +460,7 @@ impl Lowerer {
             has_frame: true,
             has_memory: false,
             saved_int_pairs: save_pairs,
-            n_int_locals: n_int_locals,
+            n_int_locals,
             max_reg_int: MAX_PRIMARY_INT + (9 - n_int_locals),
             spill_base: spill_base_off,
             has_spill: true,
@@ -738,7 +738,7 @@ impl Lowerer {
 
     /// Lower a single op.
     pub fn lower_op(&mut self, op: WasmOp) -> Result<(), LowerError> {
-        let result = match op {
+        match op {
             WasmOp::I32Const(c) => self.lower_const(c),
             WasmOp::I32Add => self.lower_binop(BinOp::Add),
             WasmOp::I32Sub => self.lower_binop(BinOp::Sub),
@@ -924,8 +924,7 @@ impl Lowerer {
                     self.lower_block_end()
                 }
             }
-        };
-        result
+        }
     }
 
     /// Lower every op in order, with a pre-scan pass that recognises

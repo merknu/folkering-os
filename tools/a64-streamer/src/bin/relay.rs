@@ -24,8 +24,10 @@
 //! Usage:
 //!     a64-stream-relay [LISTEN_ADDR] [TARGET_ADDR]
 //! Defaults:
-//!     LISTEN_ADDR = 0.0.0.0:7700
-//!     TARGET_ADDR = 192.168.68.72:7700
+//!     LISTEN_ADDR = 0.0.0.0:{DEFAULT_PORT}     (currently 7700)
+//!     TARGET_ADDR = 192.168.68.72:{DEFAULT_PORT}
+//! Where DEFAULT_PORT is the single source of truth in
+//! `a64_streamer::DEFAULT_PORT`.
 
 use std::env;
 use std::io::{ErrorKind, Read, Write};
@@ -33,8 +35,12 @@ use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::process;
 use std::thread;
 
-const DEFAULT_LISTEN: &str = "0.0.0.0:7700";
-const DEFAULT_TARGET: &str = "192.168.68.72:7700";
+use a64_streamer::DEFAULT_PORT;
+
+// Defaults are derived from `a64_streamer::DEFAULT_PORT` at startup
+// (see `main`) — single source of truth lives in the lib crate so a
+// future port change there propagates here automatically.
+const DEFAULT_TARGET_HOST: &str = "192.168.68.72";
 
 fn pipe<R: Read, W: Write>(mut src: R, mut dst: W, tag: &'static str) {
     let mut buf = [0u8; 8192];
@@ -128,8 +134,10 @@ fn resolve(addr: &str) -> SocketAddr {
 
 fn main() {
     let mut args = env::args().skip(1);
-    let listen_arg = args.next().unwrap_or_else(|| DEFAULT_LISTEN.into());
-    let target_arg = args.next().unwrap_or_else(|| DEFAULT_TARGET.into());
+    let listen_arg = args.next()
+        .unwrap_or_else(|| format!("0.0.0.0:{DEFAULT_PORT}"));
+    let target_arg = args.next()
+        .unwrap_or_else(|| format!("{DEFAULT_TARGET_HOST}:{DEFAULT_PORT}"));
     let target_addr = resolve(&target_arg);
 
     let listener = match TcpListener::bind(&listen_arg) {
