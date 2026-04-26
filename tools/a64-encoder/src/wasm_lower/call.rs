@@ -130,10 +130,15 @@ impl Lowerer {
             self.enc.add(target_reg, Reg::ZR, scratch)?;
         }
 
-        // Emit placeholder BL #0. Record the byte offset of the BL
-        // instruction itself for the linker to rewrite.
+        // Emit placeholder BL #4 (branch to the very next instruction).
+        // The linker rewrites this with the real PC-relative offset in
+        // pass 2 — but if a relocation is ever missed (test bug,
+        // partial compile, etc.), BL #4 falls through harmlessly
+        // instead of spinlooping forever like BL #0 would. It still
+        // clobbers X30, but the function frame's epilogue restores it
+        // before returning.
         let bl_site = self.enc.pos() as u32;
-        self.enc.bl(0)?;
+        self.enc.bl(4)?;
         self.pending_relocations.push((bl_site, idx));
 
         // Rehydrate the return value onto the operand stack. Callee

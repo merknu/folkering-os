@@ -13,9 +13,9 @@
 //!      sensor-streaming flow end-to-end.
 //!
 //! Usage:
-//!   a64-stream-smoke-test               # defaults to 192.168.68.72:14712
+//!   a64-stream-smoke-test               # defaults to 192.168.68.72:7700
 //!   a64-stream-smoke-test 127.0.0.1     # explicit host
-//!   a64-stream-smoke-test host:14712    # host:port
+//!   a64-stream-smoke-test host:7700     # host:port
 
 use std::collections::HashMap;
 use std::io::Write;

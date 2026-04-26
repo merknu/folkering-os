@@ -24,8 +24,8 @@
 //! Usage:
 //!     a64-stream-relay [LISTEN_ADDR] [TARGET_ADDR]
 //! Defaults:
-//!     LISTEN_ADDR = 0.0.0.0:14712
-//!     TARGET_ADDR = 192.168.68.72:14712
+//!     LISTEN_ADDR = 0.0.0.0:7700
+//!     TARGET_ADDR = 192.168.68.72:7700
 
 use std::env;
 use std::io::{ErrorKind, Read, Write};
@@ -33,8 +33,8 @@ use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::process;
 use std::thread;
 
-const DEFAULT_LISTEN: &str = "0.0.0.0:14712";
-const DEFAULT_TARGET: &str = "192.168.68.72:14712";
+const DEFAULT_LISTEN: &str = "0.0.0.0:7700";
+const DEFAULT_TARGET: &str = "192.168.68.72:7700";
 
 fn pipe<R: Read, W: Write>(mut src: R, mut dst: W, tag: &'static str) {
     let mut buf = [0u8; 8192];
