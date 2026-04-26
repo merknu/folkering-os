@@ -7,12 +7,10 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
-# Used host-side to parse Rust source files. ~600KB compiled, but
+# Used host-side to parse Rust source files. ~600 KB compiled, but
 # we only invoke it during spike-time CSR build, never in the kernel.
 syn = { version = "2", features = ["full", "visit"] }
-
-[dev-dependencies]
-# For the spike's measurement harness only.
+# Recursive .rs discovery with skip-rules for target/, .git/.
 walkdir = "2"
 
 [lib]
