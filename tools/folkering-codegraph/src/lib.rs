@@ -97,7 +97,112 @@ impl CallGraph {
         }
         (0..v as u32).filter(|i| !referenced[*i as usize]).collect()
     }
+
+    // ── Serialization ────────────────────────────────────────────────
+    //
+    // Format `FCG1` (Folkering CodeGraph v1):
+    //
+    //   u32 magic     = 0x31474346  ("FCG1" little-endian ASCII)
+    //   u32 version   = 1
+    //   u32 n_verts
+    //   u32 n_edges
+    //   u32 row_offsets[n_verts + 1]      -- 4 * (V+1) bytes
+    //   u32 col_indices[n_edges]          -- 4 *  E    bytes
+    //   for each name (n_verts total):
+    //     u32 byte_len
+    //     UTF-8 bytes (no padding)
+    //
+    // No checksum, no compression — we want load-time as close to
+    // memcpy as possible so the spike's Day 2 measurements isolate
+    // the lookup cost from any artificial parsing overhead.
+
+    const MAGIC: u32 = 0x3147_4346; // "FCG1"
+    const VERSION: u32 = 1;
+
+    /// Write the graph to a writer in the FCG1 binary format.
+    pub fn write_to<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+        let n_verts = self.names.len() as u32;
+        let n_edges = self.col_indices.len() as u32;
+        debug_assert_eq!(self.row_offsets.len() as u32, n_verts + 1);
+
+        w.write_all(&Self::MAGIC.to_le_bytes())?;
+        w.write_all(&Self::VERSION.to_le_bytes())?;
+        w.write_all(&n_verts.to_le_bytes())?;
+        w.write_all(&n_edges.to_le_bytes())?;
+
+        // Bulk-write the two u32 arrays. on little-endian hosts this
+        // is effectively memcpy; on big-endian we'd need byte-swapping
+        // but Folkering's targets are AArch64-LE and x86_64-LE.
+        for &v in &self.row_offsets { w.write_all(&v.to_le_bytes())?; }
+        for &v in &self.col_indices { w.write_all(&v.to_le_bytes())?; }
+
+        for name in &self.names {
+            let bytes = name.as_bytes();
+            w.write_all(&(bytes.len() as u32).to_le_bytes())?;
+            w.write_all(bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Read an FCG1-formatted blob back into a CallGraph. Validates
+    /// magic + version, returns LoadError on mismatch or short data.
+    pub fn read_from(buf: &[u8]) -> Result<Self, LoadError> {
+        let mut p = 0usize;
+        let magic = read_u32(buf, &mut p)?;
+        if magic != Self::MAGIC { return Err(LoadError::BadMagic); }
+        let version = read_u32(buf, &mut p)?;
+        if version != Self::VERSION { return Err(LoadError::BadVersion(version)); }
+        let n_verts = read_u32(buf, &mut p)? as usize;
+        let n_edges = read_u32(buf, &mut p)? as usize;
+
+        let row_count = n_verts + 1;
+        let mut row_offsets = Vec::with_capacity(row_count);
+        for _ in 0..row_count { row_offsets.push(read_u32(buf, &mut p)?); }
+        let mut col_indices = Vec::with_capacity(n_edges);
+        for _ in 0..n_edges { col_indices.push(read_u32(buf, &mut p)?); }
+
+        let mut names = Vec::with_capacity(n_verts);
+        for _ in 0..n_verts {
+            let len = read_u32(buf, &mut p)? as usize;
+            if p + len > buf.len() { return Err(LoadError::Truncated); }
+            let s = std::str::from_utf8(&buf[p..p + len])
+                .map_err(|_| LoadError::InvalidUtf8)?
+                .to_string();
+            p += len;
+            names.push(s);
+        }
+
+        Ok(CallGraph { names, row_offsets, col_indices })
+    }
 }
+
+fn read_u32(buf: &[u8], p: &mut usize) -> Result<u32, LoadError> {
+    if *p + 4 > buf.len() { return Err(LoadError::Truncated); }
+    let v = u32::from_le_bytes([buf[*p], buf[*p + 1], buf[*p + 2], buf[*p + 3]]);
+    *p += 4;
+    Ok(v)
+}
+
+#[derive(Debug)]
+pub enum LoadError {
+    BadMagic,
+    BadVersion(u32),
+    Truncated,
+    InvalidUtf8,
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LoadError::BadMagic => write!(f, "not an FCG1 file (magic mismatch)"),
+            LoadError::BadVersion(v) => write!(f, "unsupported FCG version: {v}"),
+            LoadError::Truncated => write!(f, "file truncated mid-record"),
+            LoadError::InvalidUtf8 => write!(f, "invalid UTF-8 in name field"),
+        }
+    }
+}
+
+impl std::error::Error for LoadError {}
 
 /// Build a CallGraph from every `.rs` file under `root` recursively.
 /// Skips `target/`, `.git/`, and `node_modules/` build directories.
@@ -377,6 +482,37 @@ mod tests {
         assert!(helper_callers.contains(&lower), "lower calls helper");
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// FCG1 serialization roundtrip — every field must survive
+    /// write_to → read_from intact, including the order of edges
+    /// within each row (which determines lookup correctness).
+    #[test]
+    fn fcg1_roundtrip_preserves_graph() {
+        let g = CallGraph {
+            names: vec![
+                "first".into(),
+                "second".into(),
+                "third_with_unicode_äø".into(),
+                "fourth".into(),
+            ],
+            row_offsets: vec![0, 2, 3, 3, 4],
+            col_indices: vec![1, 2, 2, 1],
+        };
+        let mut buf = Vec::new();
+        g.write_to(&mut buf).unwrap();
+        let g2 = CallGraph::read_from(&buf).expect("read_from");
+        assert_eq!(g.names, g2.names);
+        assert_eq!(g.row_offsets, g2.row_offsets);
+        assert_eq!(g.col_indices, g2.col_indices);
+        assert_eq!(g2.callers_of(2), vec![0, 1]);
+    }
+
+    /// Bad magic must fail loudly rather than producing a phantom graph.
+    #[test]
+    fn fcg1_rejects_bad_magic() {
+        let buf = vec![0xFFu8; 32];
+        assert!(matches!(CallGraph::read_from(&buf), Err(LoadError::BadMagic)));
     }
 
     /// Multiple functions sharing a simple name should each be findable.

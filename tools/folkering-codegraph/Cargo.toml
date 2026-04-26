@@ -23,3 +23,7 @@ path = "src/bin/build_graph.rs"
 [[bin]]
 name = "query-callers"
 path = "src/bin/query_callers.rs"
+
+[[bin]]
+name = "dump-graph"
+path = "src/bin/dump_graph.rs"

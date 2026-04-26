@@ -54,12 +54,31 @@ rejected it. Semantic signal beat textual match.
 **Exact match.** mod.rs grep-hit was a doc comment; correctly
 excluded by CSR.
 
-### Lookup latency
+### Lookup latency (H5-6: serialization landed)
 
-`query-callers` end-to-end: ~750 ms — but that includes rebuilding
-the CSR every invocation (cold start). The CSR lookup itself is
-microseconds; the build is the one-time cost. For Draug's use
-case, we'd build once at boot and amortize.
+Day 1's H5-6 chose path C from the spike-charter follow-up: add
+`dump-graph` and `query-callers --load` so the build cost is paid
+once and per-query latency is measured cleanly. Result:
+
+| Phase | Time |
+|---|---:|
+| Build CSR + serialize to disk (one-time) | 730 ms (warm) |
+| FCG1 blob on disk | 909 KB |
+| Load blob into memory (`--load`) | **1 ms** |
+| Lookup `pop_i32_slot` (29 callers) | **138 µs** |
+| Lookup `maybe_bounds_check` (10 callers) | **149 µs** |
+| End-to-end load + lookup | **~1.15 ms** |
+
+Compared to a *conservative* LLM-Gateway baseline (200–500 ms per
+"find callers of X" query, which is what we'd typically see for
+Draug's source-reading approach), this is **~150–450× faster**.
+Day 2 will measure the actual LLM-Gateway baseline, but the
+preliminary signal is well past the 10× threshold.
+
+The 138 µs lookup is forward CSR scan (`O(V + E)`). A CSC-based
+reverse lookup would drop it to `O(d̄_in)` ≈ low microseconds, but
+the spike scope explicitly skips CSC. Even with the linear scan,
+we're nowhere near the budget.
 
 ---
 
