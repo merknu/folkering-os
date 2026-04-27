@@ -1,0 +1,105 @@
+# Draug refactor-flow evaluation set.
+#
+# These five tasks are pre-committed BEFORE we start measuring whether
+# CodeGraph integration improves Draug's refactor outputs. Adding tasks
+# AFTER measurement begins is cherry-picking — DO NOT.
+#
+# Frozen: 2026-04-27 against main @ 2bce9a0 (post-PR #38 kind-aware edges).
+# CSR: 4826 vertices, 92,717 edges, 392 KB.
+#
+# Each task captures:
+#   - a real fn currently in the tree that's a defensible refactor target
+#   - the expected CodeGraph caller answer at lock-in time
+# The runner verifies the CSR query still matches; if it drifts the user
+# decides whether the fixture is wrong (refresh) or the graph is wrong
+# (regression). Step 3 (refactor flow) will additionally score generated
+# patches against compile + caller-compat tests.
+
+[[task]]
+id = "01_pop_i32_slot"
+description = """
+Refactor `pop_i32_slot` to return `Result<Reg, LowerError>` instead of
+panicking on stack underflow. High-impact change: 29 call sites across
+8 files in the wasm_lower module, all of which need to handle the new
+Result. Tests CodeGraph's blast-radius signal.
+"""
+target_fn = "pop_i32_slot"
+target_file = "tools/a64-encoder/src/wasm_lower/stack.rs"
+expected_caller_count = 29
+expected_caller_files = [
+    "tools/a64-encoder/src/wasm_lower/call.rs",
+    "tools/a64-encoder/src/wasm_lower/control.rs",
+    "tools/a64-encoder/src/wasm_lower/convert.rs",
+    "tools/a64-encoder/src/wasm_lower/globals.rs",
+    "tools/a64-encoder/src/wasm_lower/memory.rs",
+    "tools/a64-encoder/src/wasm_lower/mod.rs",
+    "tools/a64-encoder/src/wasm_lower/scalar.rs",
+    "tools/a64-encoder/src/wasm_lower/simd.rs",
+]
+
+[[task]]
+id = "02_maybe_bounds_check"
+description = """
+`maybe_bounds_check` chooses between elided and emitted bounds checks
+based on symbolic analysis. Refactor: extract the elision-decision
+logic into a separate `BoundsCheckDecision` enum + helper, so the call
+sites can match on intent rather than chase a boolean. 10 call sites
+in 2 files (memory.rs, simd.rs) — moderate blast radius.
+"""
+target_fn = "maybe_bounds_check"
+target_file = "tools/a64-encoder/src/wasm_lower/bounds.rs"
+expected_caller_count = 10
+expected_caller_files = [
+    "tools/a64-encoder/src/wasm_lower/memory.rs",
+    "tools/a64-encoder/src/wasm_lower/simd.rs",
+]
+
+[[task]]
+id = "03_alloc_pages"
+description = """
+Kernel buddy allocator's `alloc_pages` accepts an `order` (log2 page
+count). Add a `Layout`-style API alongside that takes raw byte size
++ alignment and computes order internally. Small blast radius — 4
+call sites all in physical.rs — tests precision (CodeGraph should NOT
+inflate this with cross-file `new` collisions).
+"""
+target_fn = "alloc_pages"
+target_file = "kernel/src/memory/physical.rs"
+expected_caller_count = 4
+expected_caller_files = [
+    "kernel/src/memory/physical.rs",
+]
+
+[[task]]
+id = "04_compile_module"
+description = """
+`compile_module` is the host-side WASM-to-AArch64 entry point. Refactor:
+add explicit `CompileOptions` struct (currently positional args). 5 call
+sites spread across jit_cache + 3 example bins — cross-crate-ish blast
+radius. Examples are intentionally included; refactor must keep them
+working.
+"""
+target_fn = "compile_module"
+target_file = "tools/a64-encoder/src/wasm_lower/mod.rs"
+expected_caller_count = 5
+expected_caller_files = [
+    "tools/a64-encoder/examples/bench_mlp_ablation.rs",
+    "tools/a64-encoder/examples/run_real_wasm_bigmlp.rs",
+    "tools/a64-encoder/examples/run_real_wasm_multifn.rs",
+    "tools/a64-encoder/src/jit_cache.rs",
+]
+
+[[task]]
+id = "05_push_dec"
+description = """
+`push_dec` formats a u32 into a String for the kernel TCP shell. Refactor
+to use the kernel's existing `core::fmt::Write` machinery instead of
+manual digit pushing. 12 call sites all in tcp_shell.rs — tightly
+clustered, single-file refactor, but every cmd_* handler depends on it.
+"""
+target_fn = "push_dec"
+target_file = "kernel/src/net/tcp_shell.rs"
+expected_caller_count = 12
+expected_caller_files = [
+    "kernel/src/net/tcp_shell.rs",
+]

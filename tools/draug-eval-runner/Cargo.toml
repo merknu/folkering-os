@@ -1,0 +1,16 @@
+[package]
+name = "draug-eval-runner"
+version = "0.1.0"
+edition = "2021"
+description = "Pre-committed eval harness for Draug's refactor flow. Loads tasks.toml, queries CodeGraph CSR, and verifies caller counts + file sets match the frozen ground truth."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+folkering-codegraph = { path = "../folkering-codegraph" }
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+
+[[bin]]
+name = "draug-eval"
+path = "src/main.rs"
