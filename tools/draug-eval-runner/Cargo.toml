@@ -10,6 +10,11 @@ publish = false
 folkering-codegraph = { path = "../folkering-codegraph" }
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
+# syn parses target Rust files to validate fn existence + locate the
+# byte range of the fn item before we slice the source for the prompt.
+# Already a transitive dep via folkering-codegraph; declared explicitly
+# here so we don't rely on the transitive guarantee.
+syn = { version = "2", features = ["full", "visit"] }
 
 [[bin]]
 name = "draug-eval"
