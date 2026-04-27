@@ -232,11 +232,24 @@ pub fn build_from_dir(root: &Path) -> Result<CallGraph, BuildError> {
                 continue;
             }
         };
-        b.current_file = path.display().to_string();
+        b.enter_file(path.display().to_string());
         syn::visit::visit_file(&mut b, &file);
     }
 
     Ok(b.finish())
+}
+
+/// How a call site referenced its target. Drives the same-file-first
+/// resolution heuristic in `finish()`: only `Local` calls (bare
+/// `foo()`, `self.bar()`, `Self::baz()`) get the same-file shortcut.
+/// `Qualified` calls (`mod_a::foo()`, `OtherType::new()`) carry an
+/// explicit path that tells us the target lives somewhere specific —
+/// suppressing the global RTA fall-back there would be a soundness
+/// regression (the spike's previous bug, fixed in PR #38 review).
+#[derive(Debug, Clone, Copy)]
+enum CallSiteKind {
+    Local,
+    Qualified,
 }
 
 #[derive(Default)]
@@ -251,21 +264,41 @@ struct Builder {
     fn_stack: Vec<usize>,
     /// All defined functions, in discovery order.
     fns: Vec<FnDef>,
-    /// Raw edges: (caller_vertex_idx, callee_simple_name). Resolved
-    /// to vertex indices in finish() once every fn is known.
-    raw_edges: Vec<(usize, String)>,
+    /// Raw edges: (caller_vertex_idx, callee_simple_name, call_kind).
+    /// Resolved to vertex indices in `finish()` once every fn is
+    /// known. The `kind` decides whether same-file-first is safe.
+    raw_edges: Vec<(usize, String, CallSiteKind)>,
     /// Files that syn failed to parse — typically heavy macro use.
     /// Reported for spike honesty about coverage.
     parse_failures: Vec<(String, String)>,
     /// Path of the file currently being walked. Folded into qualified
     /// names so two private fns in different files don't collide.
     current_file: String,
+    /// Interned table of file paths the builder has seen. Each
+    /// `FnDef` stores a `u32` index into this table instead of
+    /// cloning `current_file` (~hundreds of bytes per fn for deep
+    /// paths). For 4800 fns across ~150 files that's a ~1 MB
+    /// allocation cut.
+    file_table: Vec<String>,
+    /// Reverse index: file path → file_id. Populated lazily as files
+    /// are visited. Cleared by `finish()` since file_table alone
+    /// suffices for resolution.
+    file_id_by_path: HashMap<String, u32>,
+    /// `file_id` for `current_file`. Cached so `push_fn` doesn't
+    /// have to look it up per fn. Set whenever `current_file` changes.
+    current_file_id: u32,
 }
 
 #[derive(Debug)]
 struct FnDef {
     simple: String,
     qualified: String,
+    /// Index into `Builder::file_table`. Used by `finish()` to
+    /// prefer same-file matches for `Local` call sites — slashes the
+    /// over-approximation from `new`/`default`/`from`/etc collisions
+    /// without losing soundness on `mod_a::foo()`-style qualified
+    /// calls (those go straight to global RTA).
+    file_id: u32,
 }
 
 impl Builder {
@@ -278,10 +311,27 @@ impl Builder {
         format!("{prefix}::{simple}")
     }
 
+    /// Set `current_file` and refresh the cached `current_file_id`,
+    /// interning the path if first-seen. Called once per .rs file
+    /// before its `syn::visit::visit_file` traversal.
+    fn enter_file(&mut self, path: String) {
+        let id = match self.file_id_by_path.get(&path) {
+            Some(&id) => id,
+            None => {
+                let id = self.file_table.len() as u32;
+                self.file_table.push(path.clone());
+                self.file_id_by_path.insert(path.clone(), id);
+                id
+            }
+        };
+        self.current_file = path;
+        self.current_file_id = id;
+    }
+
     fn push_fn(&mut self, simple: String) {
         let qualified = self.qualify(&simple);
         let idx = self.fns.len();
-        self.fns.push(FnDef { simple, qualified });
+        self.fns.push(FnDef { simple, qualified, file_id: self.current_file_id });
         self.fn_stack.push(idx);
     }
 
@@ -290,25 +340,55 @@ impl Builder {
     }
 
     fn finish(self) -> CallGraph {
-        let mut name_to_indices: HashMap<&str, Vec<u32>> = HashMap::new();
+        // Two indexes for the resolution pass:
+        //   - `by_name`: simple-name → all matching vertices (global)
+        //   - `by_file_name`: (file_id, simple-name) → matches in file
+        //
+        // Resolution order per call site is kind-aware:
+        //
+        //   * `Local` (bare `foo()` / `self.bar()`): try same-file first,
+        //     fall back to global. Closes the SPIKE_RESULTS.md memory
+        //     caveat — `fn new` no longer multi-edges to every other
+        //     crate's `new`.
+        //
+        //   * `Qualified` (`mod_a::foo()` / `Type::baz()`): skip the
+        //     same-file shortcut entirely. The path tells us the call
+        //     is meant for somewhere else; suppressing global here
+        //     would silently drop real cross-file edges (the bug the
+        //     PR #38 review caught).
+        let mut by_name: HashMap<&str, Vec<u32>> = HashMap::new();
+        let mut by_file_name: HashMap<(u32, &str), Vec<u32>> = HashMap::new();
         for (i, f) in self.fns.iter().enumerate() {
-            name_to_indices.entry(f.simple.as_str()).or_default().push(i as u32);
+            by_name.entry(f.simple.as_str()).or_default().push(i as u32);
+            by_file_name
+                .entry((f.file_id, f.simple.as_str()))
+                .or_default()
+                .push(i as u32);
         }
 
-        // Resolve raw edges. If a simple name matches multiple
-        // definitions (e.g. `fn new` in many impl blocks), emit an
-        // edge to every match — RTA-style over-approximation. Sound
-        // for blast-radius queries; precision improves once we add
-        // type-aware resolution post-spike.
         let mut edges: Vec<(u32, u32)> = Vec::new();
-        for (caller, callee_name) in &self.raw_edges {
-            if let Some(targets) = name_to_indices.get(callee_name.as_str()) {
-                for &t in targets {
-                    edges.push((*caller as u32, t));
+        for (caller, callee_name, kind) in &self.raw_edges {
+            let caller_file_id = self.fns[*caller].file_id;
+            let mut emitted = false;
+            if matches!(kind, CallSiteKind::Local) {
+                if let Some(local) =
+                    by_file_name.get(&(caller_file_id, callee_name.as_str()))
+                {
+                    for &t in local {
+                        edges.push((*caller as u32, t));
+                    }
+                    emitted = true;
                 }
             }
-            // Unresolved callees (std lib, external crates, intrinsics)
-            // are silently dropped — they aren't vertices in our graph.
+            if !emitted {
+                if let Some(targets) = by_name.get(callee_name.as_str()) {
+                    for &t in targets {
+                        edges.push((*caller as u32, t));
+                    }
+                }
+                // Unresolved callees (std lib, external crates, intrinsics)
+                // are silently dropped — they aren't vertices in the graph.
+            }
         }
 
         edges.sort_unstable();
@@ -363,8 +443,8 @@ impl<'ast> Visit<'ast> for Builder {
 
     fn visit_expr_call(&mut self, e: &'ast syn::ExprCall) {
         if let Some(&caller) = self.fn_stack.last() {
-            if let Some(callee) = extract_call_target(&e.func) {
-                self.raw_edges.push((caller, callee));
+            if let Some((callee, kind)) = extract_call_target(&e.func) {
+                self.raw_edges.push((caller, callee, kind));
             }
         }
         syn::visit::visit_expr_call(self, e);
@@ -372,21 +452,58 @@ impl<'ast> Visit<'ast> for Builder {
 
     fn visit_expr_method_call(&mut self, e: &'ast syn::ExprMethodCall) {
         if let Some(&caller) = self.fn_stack.last() {
-            self.raw_edges.push((caller, e.method.to_string()));
+            // `recv.method()` has no path qualifier — semantically it's
+            // a same-file-friendly local-style call. Same-file-first
+            // resolution is safe.
+            self.raw_edges.push((caller, e.method.to_string(), CallSiteKind::Local));
         }
         syn::visit::visit_expr_method_call(self, e);
     }
 }
 
-/// Pull the simple name (last segment) from a callee expression.
-/// `foo()`           → "foo"
-/// `module::foo()`   → "foo"
-/// `Self::foo()`     → "foo"
+/// Pull the simple name (last segment) from a callee expression and
+/// classify the call site:
+/// * `foo()`           → ("foo", Local)        — bare ident, 1 segment
+/// * `Self::foo()`     → ("foo", Local)        — `Self::` is same-impl
+/// * `self::foo()`     → ("foo", Local)        — `self::` is same-mod
+/// * `Type::new()`     → ("new", Local)        — PascalCase prefix
+///                                                (Rust convention: types).
+///                                                Same-file-first wins for
+///                                                the common `A::new()`
+///                                                case, but falls through
+///                                                to global if no match.
+/// * `module::foo()`   → ("foo", Qualified)    — snake_case prefix
+///                                                (modules); resolution
+///                                                must reach across files,
+///                                                so skip same-file shortcut.
+/// * `crate::foo()` / `super::foo()` → ("foo", Qualified) — explicit
+///                                                cross-module reach.
 /// Returns None for non-Path callees (closure invocations, dynamic
 /// fn pointers) — those don't land in the graph in v0.
-fn extract_call_target(func: &syn::Expr) -> Option<String> {
+fn extract_call_target(func: &syn::Expr) -> Option<(String, CallSiteKind)> {
     match func {
-        syn::Expr::Path(p) => p.path.segments.last().map(|s| s.ident.to_string()),
+        syn::Expr::Path(p) => {
+            let last = p.path.segments.last()?.ident.to_string();
+            let kind = if p.path.segments.len() <= 1 {
+                CallSiteKind::Local
+            } else {
+                let first = p.path.segments.first()?.ident.to_string();
+                // `Self::` / `self::` mean "this impl/this module";
+                // PascalCase first segment is a type by Rust convention
+                // — the type's defining file is the most likely target.
+                // Anything else (snake_case modules, `crate`, `super`)
+                // is reaching across files: must go through global RTA
+                // or we'd silently drop the cross-file edge.
+                let local_like = matches!(first.as_str(), "Self" | "self")
+                    || first.chars().next().is_some_and(|c| c.is_uppercase());
+                if local_like {
+                    CallSiteKind::Local
+                } else {
+                    CallSiteKind::Qualified
+                }
+            };
+            Some((last, kind))
+        }
         _ => None,
     }
 }
@@ -550,6 +667,158 @@ mod tests {
             assert!(neighbors.contains(v),
                     "caller should reach both shared() fns; got {:?}", neighbors);
         }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Same-file-first edge resolution: when a simple name like `new`
+    /// or `from` exists in MANY files but a caller has a local match,
+    /// the global RTA fall-back must NOT fire — that's the whole
+    /// point of the heuristic that closes the SPIKE_RESULTS.md
+    /// 618 KB > 500 KB caveat.
+    #[test]
+    fn prefers_same_file_match_over_global() {
+        let tmp = std::env::temp_dir().join(format!(
+            "codegraph-samefile-{}", std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // file_a defines `new` and a caller that uses it.
+        std::fs::write(tmp.join("a.rs"), r#"
+            struct A;
+            impl A {
+                pub fn new() -> A { A }
+            }
+            fn caller_a() -> A { A::new() }
+        "#).unwrap();
+
+        // file_b defines its own `new` (and `caller_b` uses it).
+        // file_c defines a third `new` with no caller — pure noise.
+        std::fs::write(tmp.join("b.rs"), r#"
+            struct B;
+            impl B {
+                pub fn new() -> B { B }
+            }
+            fn caller_b() -> B { B::new() }
+        "#).unwrap();
+        std::fs::write(tmp.join("c.rs"), r#"
+            struct C;
+            impl C { pub fn new() -> C { C } }
+        "#).unwrap();
+
+        let g = build_from_dir(&tmp).expect("build");
+
+        // 5 fns: A::new, caller_a, B::new, caller_b, C::new (no caller).
+        // `impl A { fn new }` produces A::new; the test files are
+        // standalone Rust per-file, so qualified names embed the file
+        // path. We assert by simple-name lookup.
+        let all_new = g.lookup_all("new");
+        assert_eq!(all_new.len(), 3, "expected 3 `new` fns total: {:?}", g.names);
+
+        let caller_a = g.lookup("caller_a").expect("caller_a");
+        let caller_b = g.lookup("caller_b").expect("caller_b");
+
+        // Critical assertion: caller_a's neighbors include EXACTLY
+        // ONE `new` (the same-file one) — NOT all 3. Without same-
+        // file-first this would emit 3 edges per call site.
+        let a_neighbors = g.neighbors(caller_a);
+        let a_new_hits: Vec<u32> = a_neighbors.iter()
+            .copied()
+            .filter(|v| g.names[*v as usize].rsplit("::").next() == Some("new"))
+            .collect();
+        assert_eq!(a_new_hits.len(), 1,
+                   "caller_a should reach exactly one `new` (same-file), got {:?}",
+                   a_new_hits.iter().map(|v| &g.names[*v as usize]).collect::<Vec<_>>());
+
+        let b_neighbors = g.neighbors(caller_b);
+        let b_new_hits: Vec<u32> = b_neighbors.iter()
+            .copied()
+            .filter(|v| g.names[*v as usize].rsplit("::").next() == Some("new"))
+            .collect();
+        assert_eq!(b_new_hits.len(), 1,
+                   "caller_b should reach exactly one `new` (same-file), got {:?}",
+                   b_new_hits.iter().map(|v| &g.names[*v as usize]).collect::<Vec<_>>());
+
+        // The two same-file targets are distinct (a's new ≠ b's new).
+        assert_ne!(a_new_hits[0], b_new_hits[0]);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// PR #38 soundness regression guard: a qualified call like
+    /// `mod_a::shared()` MUST resolve cross-file even when the caller's
+    /// own file defines a same-named local fn. Without the kind-aware
+    /// fix, same-file-first would silently swallow the qualified call
+    /// and edge it to the wrong target — a soundness bug Copilot
+    /// caught in review.
+    #[test]
+    fn qualified_call_resolves_cross_file_even_with_local_shadow() {
+        let tmp = std::env::temp_dir().join(format!(
+            "codegraph-qualified-{}", std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // file_a defines `mod_a::shared` AND a sibling `shared` fn that
+        // could shadow it under naive same-file-first. The caller uses
+        // the *qualified* form `mod_a::shared()` — that path explicitly
+        // names mod_a, so we must NOT collapse it to the same-file
+        // free fn.
+        std::fs::write(tmp.join("a.rs"), r#"
+            mod mod_a {
+                pub fn shared() -> i32 { 1 }
+            }
+            fn shared() -> i32 { 999 }
+            fn caller() -> i32 { mod_a::shared() }
+        "#).unwrap();
+
+        let g = build_from_dir(&tmp).expect("build");
+        let caller = g.lookup("caller").expect("caller");
+        let neighbors = g.neighbors(caller);
+
+        // Both `shared` candidates exist; the qualified call goes to
+        // global RTA which (in v0) emits edges to every name match.
+        // The critical assertion is that we DO reach `mod_a::shared` —
+        // not just the local same-file `shared`.
+        let names: Vec<&str> = neighbors.iter()
+            .map(|v| g.names[*v as usize].as_str())
+            .collect();
+        let has_mod_a_shared = names.iter().any(|n| n.contains("mod_a") && n.ends_with("::shared"));
+        assert!(has_mod_a_shared,
+                "qualified call mod_a::shared() must reach mod_a::shared; got {:?}",
+                names);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Cross-file calls (the case where same-file lookup is empty)
+    /// must still work via the global RTA fall-back.
+    #[test]
+    fn falls_back_to_global_when_no_local_match() {
+        let tmp = std::env::temp_dir().join(format!(
+            "codegraph-fallback-{}", std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // file_a defines `helper`, NO local caller.
+        std::fs::write(tmp.join("a.rs"), r#"
+            pub fn helper() -> i32 { 42 }
+        "#).unwrap();
+
+        // file_b has a caller that calls `helper` — must resolve
+        // cross-file via the global fall-back.
+        std::fs::write(tmp.join("b.rs"), r#"
+            fn caller() -> i32 { helper() }
+        "#).unwrap();
+
+        let g = build_from_dir(&tmp).expect("build");
+        let helper = g.lookup("helper").expect("helper");
+        let caller = g.lookup("caller").expect("caller");
+        assert!(g.neighbors(caller).contains(&helper),
+                "caller should reach helper via cross-file fall-back; got {:?}",
+                g.neighbors(caller));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
