@@ -46,13 +46,35 @@ The prompt folds together three things:
   3. The refactor goal + a small constraint set (preserve signature
      unless authorized, output a single fenced block, no diff format).
 
-## Phase 2B: applying + scoring (next PR)
+## Phase 2B: applying + scoring (live now)
 
-Each task's refactor patch will be applied to a sandbox copy of the
-monorepo, `cargo check` will run on the target + every caller file,
-and the score will be reported. **Compile + caller-compat is the
-headline metric** — that's what CodeGraph integration is supposed to
-enable.
+The `score` and `eval` subcommands close the loop: apply the LLM
+refactor to a sandbox, run `cargo check`, write a JSON verdict.
+
+**The sandbox** is a persistent git worktree at `sandbox/`. First
+run creates it from HEAD; subsequent runs reset uncommitted changes
+between tasks. Worktree means it shares `.git` with the main repo
+(no source duplication) but has its own `target/` for cargo's
+incremental cache. Cold first-build of the kernel workspace is ~45 s;
+warm reruns are ~2 s.
+
+**Patch application** picks one of two strategies based on the LLM's
+output:
+  - **Replace** — patch contains `fn <target_fn>` → splice into the
+    original fn's byte range, preserving indent + surrounding code.
+  - **Append** — patch defines other names (e.g. `alloc_pages_with_layout`
+    alongside the original) → insert into the same impl block when
+    the original lives in one, otherwise at end of file.
+
+**Cargo args per workspace** — kernel + userspace are `#![no_std]`
+so `--all-targets` would fail with E0463 "can't find crate for test".
+Tool crates (a64-encoder etc) keep `--all-targets` to also catch
+caller-breakage in `examples/`.
+
+**Verdict** is `PASS` only when `cargo check` exits 0. The full
+diagnostic set (errors + warnings + a stderr excerpt focused on the
+diagnostic blocks themselves, not cargo's progress noise) lands in
+`output/<id>/score.json` for downstream aggregation.
 
 ## Running
 
@@ -65,6 +87,15 @@ cargo run -p draug-eval-runner --release -- prompt 03_alloc_pages
 
 # Full refactor against the proxy (proxy must be running):
 cargo run -p draug-eval-runner --release -- refactor 03_alloc_pages
+
+# Score the existing refactor.md against cargo check (sandbox):
+cargo run -p draug-eval-runner --release -- score 03_alloc_pages
+
+# Refactor + score in one go:
+cargo run -p draug-eval-runner --release -- eval 03_alloc_pages
+
+# Run the full suite:
+cargo run -p draug-eval-runner --release -- eval --all
 
 # Use a different model:
 cargo run -p draug-eval-runner --release -- \
