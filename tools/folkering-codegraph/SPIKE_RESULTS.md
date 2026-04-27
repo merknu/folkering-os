@@ -11,26 +11,33 @@
 
 ### Builder works on full Folkering monorepo
 
-| Metric | Value |
-|---|---:|
-| Vertices (functions discovered) | **4,762** |
-| Edges (over-approximated) | 153,466 |
-| CSR bytes (row_offsets + col_indices) | **618 KB** |
-| Builder wall time (cold, release build) | 3.9 s |
-| Files syn failed to parse | _to be measured_ |
+| Metric | Spike (RTA-only) | Post-fix (same-file-first) |
+|---|---:|---:|
+| Vertices (functions discovered) | 4,762 | 4,826 |
+| Edges | 153,466 | **92,717** (-39 %) |
+| CSR bytes (row_offsets + col_indices) | 618 KB | **381 KB** ✅ |
+| FCG1 on disk | 909 KB | **675 KB** |
+| Builder wall time (cold) | 3.9 s | 1.5 s |
 
-⚠️ **618 KB exceeds the 500 KB threshold from the kill matrix.**
-The edge count is inflated by RTA-style over-approximation: any
-`fn new` call resolves to *every* `fn new` in the codebase.
-Plausible reductions:
-  * Type-aware resolution would cut edges 5–10× (project-wide
-    `new`/`default`/`from` are the worst offenders)
-  * Even crude "prefer same-file simple-name match" heuristic
-    would help
+✅ **The 500 KB caveat is closed.** Same-file-first edge resolution
+landed (folkering-codegraph commit, April 2026): when a callee's
+simple name has a match in the caller's own file, that match is
+preferred and the global RTA fall-back is skipped. `fn new` no
+longer multi-edges from every caller to every other crate's `new`.
 
-This is the spike's first real finding: **edge count, not vertex
-count, is the memory bottleneck — and it's an over-approximation
-artifact, not a fundamental limit.**
+The fall-back to global resolution still fires for genuine cross-
+file calls (verified by the `falls_back_to_global_when_no_local_match`
+test). Q1 + Q2 sanity-check counts unchanged (8 / 2 distinct files,
+29 / 10 callers respectively) — the dropped edges were the
+mechanically-redundant ones.
+
+For historical context, the original spike framing:
+> ⚠️ 618 KB exceeds the 500 KB threshold from the kill matrix.
+> The edge count is inflated by RTA-style over-approximation.
+> Plausible reductions: type-aware resolution; or "prefer same-file
+> simple-name match" heuristic.
+
+The latter is what landed.
 
 ### Q1 sanity check (pop_i32_slot in a64-encoder)
 
