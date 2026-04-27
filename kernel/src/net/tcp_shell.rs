@@ -222,6 +222,7 @@ fn dispatch_command(line: &[u8], state: &mut super::state::NetState) -> String {
         "jit" => cmd_jit(args),
         "bench" => cmd_bench(args),
         "draug" => cmd_draug(args),
+        "graph-callers" | "graph_callers" => cmd_graph_callers(args),
         "clear" => String::from("\x1b[2J\x1b[H"),
         "" => String::new(),
         _ => {
@@ -249,8 +250,94 @@ fn cmd_help() -> String {
          \x20 clear            clear screen\r\n\
          \x20 draug status     AI daemon status + current task\r\n\
          \x20 draug pause      pause the refactor loop\r\n\
-         \x20 draug resume     resume the refactor loop"
+         \x20 draug resume     resume the refactor loop\r\n\
+         \x20 graph-callers <fn>  query proxy CSR for callers of <fn>"
     )
+}
+
+/// `graph-callers <fn-name>` — query the host-side proxy's CSR
+/// call-graph and print the caller list. Exercises the full chain:
+///   tcp_shell → syscall_graph_callers → TCP to 10.0.2.2:14711 →
+///   proxy GRAPH_CALLERS handler → FCG1 lookup → reply → format.
+///
+/// Same shape as the userspace `graph-callers` shell command but
+/// callable over the remote TCP shell so the OS doesn't need a
+/// keyboard for verification.
+fn cmd_graph_callers(args: &str) -> String {
+    let name = args.trim();
+    if name.is_empty() {
+        return String::from(
+            "usage: graph-callers <function-name>\r\n\
+             example: graph-callers pop_i32_slot"
+        );
+    }
+    if name.len() > 256 {
+        return String::from("error: name too long (max 256 chars)");
+    }
+
+    // Use the kernel-internal helper directly — `syscall_graph_callers`
+    // would reject our kernel-space buffer pointer in its userspace-
+    // range validation. The proxy round-trip + wire format is identical.
+    const RESULT_MAX: usize = 4096;
+    let mut buf = alloc::vec![0u8; RESULT_MAX];
+
+    let (status, output_len) = match
+        crate::arch::x86_64::syscall::graph_callers_inner(name, &mut buf)
+    {
+        Some(r) => r,
+        None => return String::from(
+            "error: TCP failed / proxy unreachable\r\n\
+             confirm folkering-proxy on 10.0.2.2:14711 with --codegraph"
+        ),
+    };
+
+    match status {
+        0 => {
+            let body = match core::str::from_utf8(&buf[..output_len]) {
+                Ok(s) => s,
+                Err(_) => return String::from("error: proxy returned non-UTF-8"),
+            };
+            let mut out = String::with_capacity(body.len() + 80);
+            let mut count: u32 = 0;
+            for line in body.split('\n') {
+                if !line.trim().is_empty() { count += 1; }
+            }
+            if count == 0 {
+                out.push_str("'");
+                out.push_str(name);
+                out.push_str("' exists but has no callers\r\n");
+                return out;
+            }
+            push_dec(&mut out, count);
+            out.push_str(" caller(s) of '");
+            out.push_str(name);
+            out.push_str("':\r\n");
+            for line in body.split('\n') {
+                let line = line.trim();
+                if !line.is_empty() {
+                    out.push_str("  - ");
+                    out.push_str(line);
+                    out.push_str("\r\n");
+                }
+            }
+            out
+        }
+        1 => {
+            let mut out = String::from("'");
+            out.push_str(name);
+            out.push_str("' not found in graph\r\n(case sensitive — try qualified path)");
+            out
+        }
+        2 => String::from(
+            "proxy started without --codegraph\r\n\
+             restart with: folkering-proxy --codegraph <fcg1>"
+        ),
+        n => {
+            let mut out = String::from("unknown proxy status: ");
+            push_dec(&mut out, n);
+            out
+        }
+    }
 }
 
 fn cmd_ps() -> String {
