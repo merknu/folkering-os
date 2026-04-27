@@ -11,13 +11,13 @@
 
 ### Builder works on full Folkering monorepo
 
-| Metric | Spike (RTA-only) | Post-fix (same-file-first) |
-|---|---:|---:|
-| Vertices (functions discovered) | 4,762 | 4,826 |
-| Edges | 153,466 | **92,717** (-39 %) |
-| CSR bytes (row_offsets + col_indices) | 618 KB | **381 KB** ✅ |
-| FCG1 on disk | 909 KB | **675 KB** |
-| Builder wall time (cold) | 3.9 s | 1.5 s |
+| Metric | Spike (RTA-only) | Same-file-first | + PR #38 review fix |
+|---|---:|---:|---:|
+| Vertices (functions discovered) | 4,762 | 4,826 | 4,828 |
+| Edges | 153,466 | 92,717 (-39 %) | **95,662** (-37.7 %) |
+| CSR bytes (row_offsets + col_indices) | 618 KB | 381 KB | **392 KB** ✅ |
+| FCG1 on disk | 909 KB | 675 KB | **686 KB** |
+| Builder wall time (cold) | 3.9 s | 1.5 s | 0.76 s |
 
 ✅ **The 500 KB caveat is closed.** Same-file-first edge resolution
 landed (folkering-codegraph commit, April 2026): when a callee's
@@ -25,9 +25,30 @@ simple name has a match in the caller's own file, that match is
 preferred and the global RTA fall-back is skipped. `fn new` no
 longer multi-edges from every caller to every other crate's `new`.
 
+The PR #38 review (Copilot) caught a soundness regression: the
+initial fix applied same-file-first to *every* call site, including
+qualified calls like `mod_a::shared()` where the path explicitly
+names a different module. That under-approximated cross-file edges.
+The follow-up fix introduces a `CallSiteKind { Local, Qualified }`
+classification driven by path shape:
+
+* `foo()` / `Self::foo()` / `self::foo()` / `Type::method()` (PascalCase prefix) → **Local** → same-file-first applies
+* `module::foo()` / `crate::foo()` / `super::foo()` (snake_case / keyword prefix) → **Qualified** → goes straight to global RTA
+
+The +3K edges between 92,717 and 95,662 are the previously-dropped
+cross-file qualified calls now correctly resolved. CSR bytes still
+sit comfortably below the 500 KB threshold.
+
+Memory allocations during build also dropped: `FnDef::file: String`
+became `FnDef::file_id: u32` interned against a per-builder
+`Vec<String>` file table. For ~4,800 fns across ~150 files that's
+roughly a 1 MB cut in transient build allocations, with no impact
+on the serialized FCG1 format.
+
 The fall-back to global resolution still fires for genuine cross-
-file calls (verified by the `falls_back_to_global_when_no_local_match`
-test). Q1 + Q2 sanity-check counts unchanged (8 / 2 distinct files,
+file calls (verified by `falls_back_to_global_when_no_local_match`
+and `qualified_call_resolves_cross_file_even_with_local_shadow`).
+Q1 + Q2 sanity-check counts unchanged (8 / 2 distinct files,
 29 / 10 callers respectively) — the dropped edges were the
 mechanically-redundant ones.
 
