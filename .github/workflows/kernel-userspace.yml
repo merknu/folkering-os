@@ -1,0 +1,142 @@
+name: kernel + userspace CI
+
+# Triggers on changes to anything that affects the kernel or userspace
+# build graph. The a64-encoder workflow handles tools/a64-encoder/**;
+# this one covers the rest of the OS.
+#
+# Why two workflows: keeping a64-encoder fast and tightly scoped means
+# a JIT-only PR doesn't pay for a full kernel build. Conversely a
+# kernel-only PR doesn't have to wait for a64-encoder tests it can't
+# affect.
+on:
+  push:
+    paths:
+      - 'kernel/**'
+      - 'userspace/**'
+      - 'apps/**'
+      - 'drivers/**'
+      - 'tools/folk-pack/**'
+      - 'tools/folkering-codegraph/**'
+      - 'tools/fbp-rs/**'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/kernel-userspace.yml'
+  pull_request:
+    paths:
+      - 'kernel/**'
+      - 'userspace/**'
+      - 'apps/**'
+      - 'drivers/**'
+      - 'tools/folk-pack/**'
+      - 'tools/folkering-codegraph/**'
+      - 'tools/fbp-rs/**'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/kernel-userspace.yml'
+
+jobs:
+  # The kernel is the heaviest single build but also the one with the
+  # most blast-radius — a syscall ABI change here breaks every userspace
+  # crate. Run release because that's what we ship.
+  kernel-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins nightly-2026-01-20 with rust-src,
+      # llvm-tools-preview, clippy, and the targets the kernel needs.
+      # The dtolnay action reads that file when channel = "stable" so
+      # we just point at our pinned channel directly.
+      - name: Install Rust (pinned nightly + components)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-01-20
+          components: rust-src, llvm-tools-preview, clippy
+          targets: x86_64-unknown-none, wasm32-unknown-unknown
+
+      - name: Cache cargo registry + kernel target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            kernel/target
+          key: ${{ runner.os }}-kernel-${{ hashFiles('kernel/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-kernel-
+
+      - name: Build kernel
+        working-directory: kernel
+        run: cargo build --release
+
+      - name: Clippy (lib only — kernel binary is the lib build)
+        working-directory: kernel
+        # Examples and tests can be lint-noisy and don't ship; lib
+        # check is what governs production correctness.
+        run: cargo clippy --lib -- -D warnings
+
+  # Userspace covers compositor, shell, libfolk, synapse-service, the
+  # mcp_handler agent_planner / draug_async / knowledge_hunt, and every
+  # ramdisk binary. `cargo check` is enough to catch the syscall-rename
+  # / ABI-mismatch class of bugs that motivated this CI in the first
+  # place — full builds are deferred to `folkering_rebuild_run` locally.
+  userspace-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (pinned nightly + components)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-01-20
+          components: rust-src, llvm-tools-preview, clippy
+          targets: x86_64-unknown-none, wasm32-unknown-unknown
+
+      - name: Cache cargo registry + userspace target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            userspace/target
+          key: ${{ runner.os }}-userspace-${{ hashFiles('userspace/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-userspace-
+
+      # draug-streamer's #[path]-include of a64-streamer/auth.rs needs
+      # OUT_DIR/secret.key — same dance as the a64-encoder workflow.
+      - name: Generate auth key
+        run: head -c 32 /dev/urandom > tools/a64-streamer/secret.key
+
+      - name: Cargo check (whole userspace workspace)
+        working-directory: userspace
+        run: cargo check --release
+
+  # Standalone host-side crates that aren't in either of the above
+  # workspaces but still affect the OS image (folk-pack repacks the
+  # initrd; folkering-codegraph builds the FCG1 blob the proxy serves).
+  host-tools:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (pinned nightly + components)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-01-20
+          components: rust-src, llvm-tools-preview, clippy
+          targets: x86_64-unknown-none, wasm32-unknown-unknown
+
+      - name: Build folk-pack
+        working-directory: tools/folk-pack
+        run: cargo build --release
+
+      - name: Build + test folkering-codegraph
+        working-directory: tools/folkering-codegraph
+        run: |
+          cargo test --lib
+          cargo build --release --bins
+
+      - name: Build + test fbp-rs
+        working-directory: tools/fbp-rs
+        run: |
+          cargo test --lib
+          cargo test --tests
