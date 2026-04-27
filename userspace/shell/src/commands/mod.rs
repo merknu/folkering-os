@@ -7,3 +7,4 @@ pub mod network;
 pub mod search;
 pub mod system;
 pub mod ai;
+pub mod graph;

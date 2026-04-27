@@ -243,19 +243,17 @@ pub fn execute_next_step(plan: &mut TaskPlan) -> bool {
     prompt.push_str("Must compile in a fresh no_std-compatible Rust crate. ");
     prompt.push_str("No explanation.");
 
-    // CodeGraph context enrichment: if the task_id matches a known
-    // function name in the static call-graph (host-side proxy answers
-    // GRAPH_CALLERS in ~150 µs), append the caller list. The LLM gets
-    // a much better picture of what the function should be shaped like
-    // when it can see who depends on it. Failure / NOT_FOUND / empty
-    // result is silent — we just don't add the extra context.
-    if let Some(callers) = fetch_callers_summary(&plan.task_id) {
-        write_str("[Executor] enriching prompt with ");
-        write_dec(callers.matches('-').count() as u32);
-        write_str(" caller(s) from CodeGraph\n");
-        prompt.push_str("\n\n");
-        prompt.push_str(&callers);
-    }
+    // NOTE on CodeGraph: `fetch_callers_summary` exists in this module
+    // and the kernel + libfolk + proxy wires are live, but the
+    // executor flow (Phase 15) WRITES new functions from scratch —
+    // the task_ids ("ringbuffer", "bump_alloc", …) are conceptual
+    // descriptions, not Rust function names that exist in the source
+    // tree. Calling graph_callers here would always return NOT_FOUND
+    // and add no value. The right consumer is a *refactor of an
+    // existing folkering-os core fn* flow — currently exposed only
+    // via the `graph_callers` shell command for manual use. When
+    // such an autonomous flow is added, route it through
+    // `fetch_callers_summary` from this module.
 
     // Retry loop with error feedback
     // Pre-allocate error buffer to avoid fragmentation from variable Strings
