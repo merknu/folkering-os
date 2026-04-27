@@ -70,6 +70,15 @@ const SUMMARY_CHAR_CAP: usize = 64 * 1024;
 /// (successfully or with a terminal error — either way Draug marks
 /// the session flag so we don't retry this boot).
 pub(super) fn run(draug: &mut DraugDaemon) -> bool {
+    // ── 0. Phase 9 self-test — ALWAYS runs ─────────────────────────
+    //
+    // The bi-temporal graph supersession test is fully self-contained
+    // (uses hardcoded entity ids + edges, touches only Synapse) so we
+    // run it first, before the proxy fetch. That way a missing proxy
+    // doesn't hide a genuine KG regression. The test is idempotent —
+    // repeated boots just re-supersede the same edge.
+    run_graph_supersession_test();
+
     write_str("[KHunt] waking up — fetching ");
     // Truncate the URL in the log to keep output clean.
     let url_show = &KNOWLEDGE_HUNT_URL[..KNOWLEDGE_HUNT_URL.len().min(72)];
@@ -196,17 +205,7 @@ pub(super) fn run(draug: &mut DraugDaemon) -> bool {
     write_str(KNOWLEDGE_HUNT_ROOM);
     write_str("\n");
 
-    // ── 6. Phase 9 — Bi-Temporal Graph supersession self-test ──
-    //
-    // After storing the Wikipedia payload, we exercise the new
-    // Knowledge Graph path end-to-end:
-    //   1. upsert 3 entities (folk_browser, wasmi, Silverfir)
-    //   2. upsert edge folk_browser-[uses]->wasmi
-    //   3. upsert edge folk_browser-[uses]->Silverfir
-    //      (should trigger temporal supersession of the wasmi edge)
-    //   4. graph_walk from folk_browser and assert only Silverfir
-    //      shows up, wasmi does not.
-    run_graph_supersession_test();
+    // (Phase 9 KG self-test already ran at step 0 above.)
 
     // ── 7. Phase 11 — Draug auto-refactor pipeline test ─────────
     //
@@ -696,7 +695,6 @@ fn build_retry_prompt(
 /// Phase 12 — LLM-driven auto-refactor (Phase 13 wraps this into a
 /// loop via `run_refactor_step`).
 fn run_auto_refactor_test() {
-    use libfolk::sys::synapse::{upsert_edge, upsert_entity};
     use libfolk::sys::{fbp_patch, llm_generate};
 
     write_str("[AutoRefactor] asking Gemma4 to write Rust...\n");
@@ -960,6 +958,60 @@ fn run_graph_supersession_test() {
         write_str("[KGraph] FAIL: wasmi is still reachable — temporal supersession did NOT fire\n");
     } else {
         write_str("[KGraph] FAIL: Silverfir not reached — graph_walk didn't find the new active edge\n");
+    }
+
+    // ── MVFS smoke test ───────────────────────────────────────────
+    //
+    // Phase 1 check: basic write/read/delete round-trip within a
+    // single boot session.
+    //
+    // Phase 2 check: "boot_counter" survives across reboots. First
+    // boot on a fresh disk writes 1; every subsequent boot reads the
+    // prior value and increments. This proves the load-from-disk +
+    // flush-on-write path works end-to-end.
+    {
+        use libfolk::sys::fs::{mvfs_write, mvfs_read, mvfs_delete};
+
+        // ── Round-trip test (Phase 1 — still green).
+        let name = "mvfs_smoke";
+        let payload: &[u8] = b"round-trip";
+        if !mvfs_write(name, payload) {
+            write_str("[MVFS] FAIL: write rejected\n");
+        } else {
+            let mut buf = [0u8; 32];
+            match mvfs_read(name, &mut buf) {
+                Some(n) if &buf[..n] == payload => {
+                    write_str("[MVFS] PASS: write/read round-trip matches\n");
+                }
+                Some(n) => {
+                    write_str("[MVFS] FAIL: read returned ");
+                    write_dec(n as u32);
+                    write_str(" bytes, content mismatch\n");
+                }
+                None => write_str("[MVFS] FAIL: read returned None on just-written entry\n"),
+            }
+            if !mvfs_delete(name) {
+                write_str("[MVFS] FAIL: delete reported not-found on known entry\n");
+            }
+            if mvfs_read(name, &mut buf).is_some() {
+                write_str("[MVFS] FAIL: entry survived delete\n");
+            }
+        }
+
+        // ── Persistence test (Phase 2).
+        let mut buf = [0u8; 8];
+        let prev = match mvfs_read("boot_counter", &mut buf) {
+            Some(n) if n >= 1 => buf[0],
+            _ => 0,
+        };
+        let next = prev.saturating_add(1);
+        if mvfs_write("boot_counter", &[next]) {
+            write_str("[MVFS] boot_counter = ");
+            write_dec(next as u32);
+            write_str("\n");
+        } else {
+            write_str("[MVFS] FAIL: boot_counter write rejected\n");
+        }
     }
 }
 

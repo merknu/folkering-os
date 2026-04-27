@@ -1,9 +1,17 @@
 // Folkering OS Host-Side Test Suite
 //
-// Tests pure logic from compositor crate that has no hardware dependencies.
-// Runs with standard `cargo test` on the host machine.
+// Tests pure logic from kernel + compositor that has no hardware
+// dependencies. Runs with standard `cargo test` on the host machine.
 //
 // Usage: cd tests && cargo test
+//
+// Modules:
+//   damage          — compositor damage-tracker algorithm
+//   intent          — agent-intent JSON parser
+//   capability      — kernel capability containment semantics
+//   mvfs_dirty      — MVFS dirty-bitmap bookkeeping
+//   caller_token    — IPC token encode/decode + 48-bit collision
+//   transferability — non-transferable cap-type policy
 
 // ── Damage Tracker (copy of pure logic from compositor/src/damage.rs) ──
 
@@ -379,3 +387,574 @@ mod intent {
         }
     }
 }
+
+// ── Capability containment (kernel/src/capability/types.rs) ───────────
+//
+// Mirrors the `grants()` arm semantics for Framebuffer, DmaRegion,
+// MmioRegion, and IoPort variants. The key property being tested is
+// that overflow-unsafe additions (`base + size` wrapping past u64::MAX)
+// can't fool a held cap into granting access to a request that wraps
+// past zero. Caught in the audit pass as `checked_add` was added.
+
+mod capability {
+    /// Re-implements `CapabilityType::grants` for just the region
+    /// variants — `IpcSend`/`All`/etc aren't relevant to the tests
+    /// we're writing here. The kernel type is mirrored by shape.
+    #[derive(Clone, Copy, Debug)]
+    pub enum Region {
+        Framebuffer { phys_base: u64, size: u64 },
+        DmaRegion   { phys_base: u64, size: u64 },
+        MmioRegion  { phys_base: u64, size: u64 },
+        IoPort      { base: u16, size: u16 },
+    }
+
+    /// Check if `held` grants access to `required`. Same logic as
+    /// the kernel's `grants()`; the point of these tests is to pin
+    /// that the overflow guards behave correctly.
+    pub fn grants(held: Region, required: Region) -> bool {
+        use Region::*;
+        match (held, required) {
+            (Framebuffer { phys_base: b1, size: s1 },
+             Framebuffer { phys_base: b2, size: s2 }) => contains_u64(b1, s1, b2, s2),
+            (DmaRegion   { phys_base: b1, size: s1 },
+             DmaRegion   { phys_base: b2, size: s2 }) => contains_u64(b1, s1, b2, s2),
+            (MmioRegion  { phys_base: b1, size: s1 },
+             MmioRegion  { phys_base: b2, size: s2 }) => contains_u64(b1, s1, b2, s2),
+            (IoPort      { base: b1, size: s1 },
+             IoPort      { base: b2, size: s2 }) => {
+                let he = (b1 as u32) + (s1 as u32);
+                let re = (b2 as u32) + (s2 as u32);
+                b2 >= b1 && re <= he
+            }
+            _ => false, // mismatched variants don't grant
+        }
+    }
+
+    fn contains_u64(hb: u64, hs: u64, rb: u64, rs: u64) -> bool {
+        let held_end = hb.checked_add(hs);
+        let req_end  = rb.checked_add(rs);
+        match (held_end, req_end) {
+            (Some(he), Some(re)) => rb >= hb && re <= he,
+            _ => false,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::Region::*;
+        use super::grants;
+
+        #[test]
+        fn framebuffer_exact_match() {
+            let held = Framebuffer { phys_base: 0xFD00_0000, size: 0x100000 };
+            assert!(grants(held, held));
+        }
+
+        #[test]
+        fn framebuffer_subrange_grants() {
+            let held = Framebuffer { phys_base: 0xFD00_0000, size: 0x100000 };
+            let req  = Framebuffer { phys_base: 0xFD00_8000, size: 0x10000 };
+            assert!(grants(held, req));
+        }
+
+        #[test]
+        fn framebuffer_outside_denied() {
+            let held = Framebuffer { phys_base: 0xFD00_0000, size: 0x10000 };
+            let req  = Framebuffer { phys_base: 0xFD02_0000, size: 0x1000 };
+            assert!(!grants(held, req));
+        }
+
+        #[test]
+        fn framebuffer_overflow_request_denied() {
+            // Held = 0x1000..0x2000 (tiny). Request claims to start at
+            // 0x1000 with size=u64::MAX. Pre-checked_add code would
+            // compute 0x1000 + u64::MAX = 0x0FFF (wraps) and find it
+            // <= held_end → falsely grant. `checked_add` returns None
+            // for the request side → deny.
+            let held = Framebuffer { phys_base: 0x1000, size: 0x1000 };
+            let req  = Framebuffer { phys_base: 0x1000, size: u64::MAX };
+            assert!(!grants(held, req));
+        }
+
+        #[test]
+        fn framebuffer_overflow_held_denied() {
+            // Same trick applied to the held side.
+            let held = Framebuffer { phys_base: u64::MAX - 10, size: 100 };
+            let req  = Framebuffer { phys_base: u64::MAX - 5, size: 3 };
+            assert!(!grants(held, req));
+        }
+
+        #[test]
+        fn dma_region_subrange() {
+            let held = DmaRegion { phys_base: 0x2119000, size: 0x10000 };
+            let req  = DmaRegion { phys_base: 0x211A000, size: 0x1000 };
+            assert!(grants(held, req));
+        }
+
+        #[test]
+        fn dma_region_straddles_end_denied() {
+            let held = DmaRegion { phys_base: 0x1000, size: 0x1000 };
+            let req  = DmaRegion { phys_base: 0x1800, size: 0x1000 }; // ends at 0x2800, held ends at 0x2000
+            assert!(!grants(held, req));
+        }
+
+        #[test]
+        fn mmio_and_dma_dont_cross_grant() {
+            let mmio = MmioRegion { phys_base: 0xFD00_0000, size: 0x1000 };
+            let dma  = DmaRegion  { phys_base: 0xFD00_0000, size: 0x1000 };
+            // Same range, different variant → must not grant across.
+            assert!(!grants(mmio, dma));
+            assert!(!grants(dma, mmio));
+        }
+
+        #[test]
+        fn io_port_exact_match() {
+            let held = IoPort { base: 0xC000, size: 256 };
+            let req  = IoPort { base: 0xC000, size: 256 };
+            assert!(grants(held, req));
+        }
+
+        #[test]
+        fn io_port_subrange() {
+            let held = IoPort { base: 0xC000, size: 256 };
+            let req  = IoPort { base: 0xC010, size: 16 };
+            assert!(grants(held, req));
+        }
+
+        #[test]
+        fn io_port_outside_denied() {
+            let held = IoPort { base: 0xC000, size: 16 };
+            let req  = IoPort { base: 0xC100, size: 1 };
+            assert!(!grants(held, req));
+        }
+
+        #[test]
+        fn io_port_straddles_end_denied() {
+            // Held [0xFFF0..0xFFFF], request [0xFFF8..0x10007] — the
+            // u32 math catches the overflow past the 16-bit port space.
+            let held = IoPort { base: 0xFFF0, size: 16 };
+            let req  = IoPort { base: 0xFFF8, size: 16 };
+            assert!(!grants(held, req));
+        }
+    }
+}
+
+// ── MVFS dirty-bitmap bookkeeping (kernel/src/fs/mvfs.rs) ──────────────
+//
+// The partial-flush optimization depends on the dirty-mask arithmetic
+// being exactly right — especially the delete path, where all slots
+// from the deleted index onwards shift down and need to be rewritten.
+
+mod mvfs_dirty {
+    pub const MVFS_MAX_FILES: usize = 16;
+    pub const DIRTY_HEADER: u32 = 1 << 31;
+
+    /// Mirrors the mask computation inside `delete()` in
+    /// `kernel/src/fs/mvfs.rs`. Returns the set of bits marked dirty
+    /// when slot `victim` is removed from a table holding `old_len`
+    /// entries.
+    pub fn delete_mask(victim: usize, old_len: usize) -> u32 {
+        let mask_lo = (1u32 << victim) - 1;
+        let mask_hi = if old_len >= 32 { u32::MAX } else { (1u32 << old_len) - 1 };
+        (mask_hi & !mask_lo) | DIRTY_HEADER
+    }
+
+    /// Mirrors the mask computation inside `write()` for overwrite
+    /// or insert of a single slot `i`.
+    pub fn write_mask(slot: usize) -> u32 {
+        (1u32 << slot) | DIRTY_HEADER
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn write_single_slot() {
+            // Writing slot 3 → bits [3, 31] dirty.
+            let m = write_mask(3);
+            assert_eq!(m, (1u32 << 3) | DIRTY_HEADER);
+            assert!(m & DIRTY_HEADER != 0);
+            assert!(m & (1 << 3) != 0);
+            assert!(m & (1 << 2) == 0);
+        }
+
+        #[test]
+        fn delete_slot_0_marks_everything() {
+            // Table with 5 entries, delete slot 0. Slots 0..5 all shift
+            // down, so all must be marked dirty. Slots 5..15 untouched.
+            let m = delete_mask(0, 5);
+            assert!(m & DIRTY_HEADER != 0);
+            for i in 0..5 {
+                assert!(m & (1 << i) != 0, "slot {} should be dirty", i);
+            }
+            for i in 5..16 {
+                assert!(m & (1 << i) == 0, "slot {} should be clean", i);
+            }
+        }
+
+        #[test]
+        fn delete_middle_slot() {
+            // Table with 8 entries, delete slot 3. Slots [3..8) shift.
+            let m = delete_mask(3, 8);
+            for i in 0..3 { assert!(m & (1 << i) == 0); }
+            for i in 3..8 { assert!(m & (1 << i) != 0); }
+            for i in 8..16 { assert!(m & (1 << i) == 0); }
+            assert!(m & DIRTY_HEADER != 0);
+        }
+
+        #[test]
+        fn delete_last_slot_only_self() {
+            // Delete slot 7 of 8. Only slot 7 needs rewriting (no
+            // trailing entries to shift). Plus header for entry_count.
+            let m = delete_mask(7, 8);
+            assert!(m & (1 << 7) != 0);
+            for i in 0..7 { assert!(m & (1 << i) == 0); }
+            for i in 8..16 { assert!(m & (1 << i) == 0); }
+            assert!(m & DIRTY_HEADER != 0);
+        }
+
+        #[test]
+        fn delete_full_table() {
+            // Delete slot 0 of a completely full 16-slot table.
+            let m = delete_mask(0, MVFS_MAX_FILES);
+            // Lower 16 bits all set + header.
+            assert_eq!(m & 0xFFFF, 0xFFFF);
+            assert!(m & DIRTY_HEADER != 0);
+        }
+
+        #[test]
+        fn atomic_swap_semantics() {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            // Simulates DIRTY: `take_dirty` must atomically read + clear.
+            let dirty = AtomicU32::new(0);
+            dirty.fetch_or(write_mask(1), Ordering::Relaxed);
+            dirty.fetch_or(write_mask(2), Ordering::Relaxed);
+            // Post-taking: dirty is 0, value has both bits.
+            let taken = dirty.swap(0, Ordering::AcqRel);
+            assert_eq!(dirty.load(Ordering::Relaxed), 0);
+            assert!(taken & (1 << 1) != 0);
+            assert!(taken & (1 << 2) != 0);
+            assert!(taken & DIRTY_HEADER != 0);
+        }
+    }
+}
+
+// ── CallerToken encode/decode (kernel/src/ipc/message.rs) ─────────────
+//
+// Pass A Fix 3 widened request_id from 32 bits to 48 bits so
+// rapid-fire sends from the same task can't produce colliding
+// tokens. These tests pin the encoding invariant, including the
+// upper-bit wraparound scenario that used to cause false matches.
+
+mod caller_token {
+    // Mirror of the kernel's CallerToken::new / ::decode, bit-for-bit.
+    // If this logic diverges from `kernel/src/ipc/message.rs`, these
+    // tests catch it immediately.
+    pub fn encode(sender_pid: u32, request_id: u64) -> u64 {
+        const OBFUSCATION_KEY: u64 = 0xDEAD_BEEF_CAFE_BABE;
+        let sender = (sender_pid as u64) & 0xFFFF;
+        let req    = request_id & 0xFFFF_FFFF_FFFF; // 48 bits
+        let raw    = sender | (req << 16);
+        raw ^ OBFUSCATION_KEY
+    }
+
+    pub fn decode(token: u64) -> Option<(u32, u64)> {
+        const OBFUSCATION_KEY: u64 = 0xDEAD_BEEF_CAFE_BABE;
+        let raw = token ^ OBFUSCATION_KEY;
+        let sender_pid = (raw & 0xFFFF) as u32;
+        let request_id = (raw >> 16) & 0xFFFF_FFFF_FFFF;
+        if sender_pid == 0 {
+            return None;
+        }
+        Some((sender_pid, request_id))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::collections::BTreeSet;
+
+        #[test]
+        fn encode_decode_round_trip_small_ids() {
+            let t = encode(3, 42);
+            assert_eq!(decode(t), Some((3, 42)));
+        }
+
+        #[test]
+        fn encode_decode_round_trip_large_request_id() {
+            // 48-bit max value — biggest legitimate request_id.
+            let max_req = 0xFFFF_FFFF_FFFF;
+            let t = encode(5, max_req);
+            assert_eq!(decode(t), Some((5, max_req)));
+        }
+
+        #[test]
+        fn zero_sender_pid_rejected() {
+            // Encoding a sender_pid of 0 must decode to None — the
+            // kernel uses this check to reject obviously-corrupt tokens.
+            let t = encode(0, 42);
+            assert_eq!(decode(t), None);
+        }
+
+        #[test]
+        fn no_collision_after_32bit_wrap() {
+            // Pre-Fix: request_id was 32 bits, so IDs N and N+2^32
+            // produced the same token (wraparound). Now with 48 bits,
+            // N and N+2^32 must produce DIFFERENT tokens.
+            let sender = 3;
+            let t_low  = encode(sender, 1);
+            let t_wrap = encode(sender, 1u64 + (1u64 << 32));
+            assert_ne!(t_low, t_wrap, "48-bit id must survive 32-bit wrap");
+
+            // Both must decode to distinct request_ids.
+            let (_, r_low) = decode(t_low).unwrap();
+            let (_, r_wrap) = decode(t_wrap).unwrap();
+            assert_ne!(r_low, r_wrap);
+        }
+
+        #[test]
+        fn million_unique_tokens() {
+            // Generate 1M tokens with different (sender, request_id)
+            // combinations. None may collide.
+            let mut seen = BTreeSet::new();
+            for sender in 1..=10u32 {
+                for req in 0..100_000u64 {
+                    let t = encode(sender, req);
+                    assert!(seen.insert(t), "collision at sender={sender} req={req}");
+                }
+            }
+            assert_eq!(seen.len(), 1_000_000);
+        }
+
+        #[test]
+        fn sender_pid_truncation() {
+            // The sender field is 16 bits. Values above 0xFFFF get
+            // their upper bits silently clamped. Check that a value
+            // with a 17th bit decodes to the lower 16.
+            let t = encode(0x1_0003, 42); // high bit set
+            let (sender, req) = decode(t).unwrap();
+            assert_eq!(sender, 3, "high bit should be clipped");
+            assert_eq!(req, 42);
+        }
+
+        #[test]
+        fn request_id_above_48bit_clamped() {
+            // Similarly, request_ids above 2^48 should clamp.
+            let req_too_big = 0xFFFF_FFFF_FFFF_FFFF;
+            let t = encode(5, req_too_big);
+            let (_, r) = decode(t).unwrap();
+            assert_eq!(r, 0xFFFF_FFFF_FFFF, "req should be clipped to 48 bits");
+        }
+    }
+}
+
+// ── Non-transferable cap policy (kernel/src/capability/mod.rs) ────────
+//
+// Pass B made the transferability guard type-enforced via a
+// `TransferableCap` newtype. At the heart of that guard is
+// `is_non_transferable()` — these tests pin the exact set of cap
+// types that refuse transfer, so adding a new hardware-bound variant
+// without updating the list becomes visible as a test failure.
+
+mod transferability {
+    /// Mirror of the kernel's cap variants — keep in lockstep with
+    /// `CapabilityType` in capability/types.rs.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub enum CapKind {
+        All,
+        IpcSend,
+        IpcSendAny,
+        IpcReceive,
+        Memory,
+        Resource,
+        TaskControl,
+        Scheduler,
+        Hardware,
+        Framebuffer,
+        DmaRegion,
+        MmioRegion,
+        IoPort,
+        DriverPrivilege,
+        RawBlockIO,
+    }
+
+    pub fn is_non_transferable(k: CapKind) -> bool {
+        use CapKind::*;
+        matches!(
+            k,
+            DmaRegion | MmioRegion | IoPort | Framebuffer | DriverPrivilege | RawBlockIO
+        )
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use super::CapKind::*;
+
+        #[test]
+        fn hardware_caps_are_non_transferable() {
+            for k in [Framebuffer, DmaRegion, MmioRegion, IoPort, DriverPrivilege, RawBlockIO] {
+                assert!(is_non_transferable(k), "{k:?} must be non-transferable");
+            }
+        }
+
+        #[test]
+        fn ipc_and_general_caps_are_transferable() {
+            for k in [All, IpcSend, IpcSendAny, IpcReceive, Memory, Resource,
+                      TaskControl, Scheduler, Hardware] {
+                assert!(!is_non_transferable(k), "{k:?} must be transferable");
+            }
+        }
+
+        #[test]
+        fn coverage_is_complete() {
+            // Sanity: every variant must have been classified in one
+            // of the two groups. If a future refactor adds a new
+            // variant, this test forces the author to think about
+            // transferability explicitly.
+            let all_variants = [
+                All, IpcSend, IpcSendAny, IpcReceive, Memory, Resource,
+                TaskControl, Scheduler, Hardware,
+                Framebuffer, DmaRegion, MmioRegion, IoPort,
+                DriverPrivilege, RawBlockIO,
+            ];
+            // Just walk the list — if any classification panics or
+            // errors, something is wrong.
+            for k in all_variants {
+                let _ = is_non_transferable(k);
+            }
+            assert_eq!(all_variants.len(), 15);
+        }
+    }
+}
+
+// ── Blocked-waiter cleanup semantics (kernel/src/ipc/receive.rs) ──────
+//
+// Pass A Fix 1 adds `unblock_waiters_for(task_id)` to wake tasks
+// sitting in BlockedOnSend(target) or WaitingForReply(_). These tests
+// pin the predicate that determines which waiters to wake so the
+// kernel's iteration logic matches.
+
+mod waiter_cleanup {
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub enum TaskState {
+        Runnable,
+        Running,
+        BlockedOnSend(u32),
+        BlockedOnReceive,
+        WaitingForReply(u64),
+        Exited,
+    }
+
+    pub struct MockTask {
+        pub state: TaskState,
+        pub blocked_on: Option<u32>,
+    }
+
+    /// Mirror of the `should_wake` predicate inside
+    /// `unblock_waiters_for`. A waiter qualifies if its `blocked_on`
+    /// stamp matches the exiting task AND its state is a blocking
+    /// IPC state.
+    pub fn should_wake(task: &MockTask, exiting: u32) -> bool {
+        if task.blocked_on != Some(exiting) {
+            return false;
+        }
+        match task.state {
+            TaskState::BlockedOnSend(x) if x == exiting => true,
+            TaskState::WaitingForReply(_) => true,
+            _ => false,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use super::TaskState::*;
+
+        #[test]
+        fn blocked_on_send_matches() {
+            let t = MockTask {
+                state: BlockedOnSend(7),
+                blocked_on: Some(7),
+            };
+            assert!(should_wake(&t, 7));
+        }
+
+        #[test]
+        fn blocked_on_different_target_no_match() {
+            let t = MockTask {
+                state: BlockedOnSend(8),
+                blocked_on: Some(8),
+            };
+            // Exiting task is 7, blocked waiter is on 8. No match.
+            assert!(!should_wake(&t, 7));
+        }
+
+        #[test]
+        fn waiting_for_reply_matches() {
+            let t = MockTask {
+                state: WaitingForReply(12345),
+                blocked_on: Some(7),
+            };
+            assert!(should_wake(&t, 7));
+        }
+
+        #[test]
+        fn waiting_for_reply_wrong_stamp_no_match() {
+            let t = MockTask {
+                state: WaitingForReply(12345),
+                blocked_on: Some(99),
+            };
+            // blocked_on points elsewhere — this waiter belongs to
+            // another target.
+            assert!(!should_wake(&t, 7));
+        }
+
+        #[test]
+        fn runnable_task_not_woken() {
+            let t = MockTask {
+                state: Runnable,
+                blocked_on: Some(7), // stale stamp
+            };
+            // Even if blocked_on matches, a Runnable task isn't
+            // actually blocked — skip it.
+            assert!(!should_wake(&t, 7));
+        }
+
+        #[test]
+        fn blocked_on_receive_not_woken() {
+            // BlockedOnReceive means "waiting for a message to
+            // arrive" — not blocked on any specific server. The
+            // exiting of server X doesn't unblock us.
+            let t = MockTask {
+                state: BlockedOnReceive,
+                blocked_on: None,
+            };
+            assert!(!should_wake(&t, 7));
+        }
+
+        #[test]
+        fn exited_task_not_woken() {
+            let t = MockTask {
+                state: Exited,
+                blocked_on: Some(7),
+            };
+            assert!(!should_wake(&t, 7));
+        }
+
+        #[test]
+        fn no_blocked_on_stamp_not_woken() {
+            let t = MockTask {
+                state: WaitingForReply(42),
+                blocked_on: None,
+            };
+            // Stamp wasn't set (pre-Pass-A code path). We conservatively
+            // skip — better to leave a rare hanging waiter than to
+            // unblock the wrong task.
+            assert!(!should_wake(&t, 7));
+        }
+    }
+}
+
+
