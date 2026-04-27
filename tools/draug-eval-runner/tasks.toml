@@ -47,7 +47,7 @@ sites can match on intent rather than chase a boolean. 10 call sites
 in 2 files (memory.rs, simd.rs) — moderate blast radius.
 """
 target_fn = "maybe_bounds_check"
-target_file = "tools/a64-encoder/src/wasm_lower/bounds.rs"
+target_file = "tools/a64-encoder/src/wasm_lower/memory.rs"
 expected_caller_count = 10
 expected_caller_files = [
     "tools/a64-encoder/src/wasm_lower/memory.rs",
@@ -80,7 +80,7 @@ radius. Examples are intentionally included; refactor must keep them
 working.
 """
 target_fn = "compile_module"
-target_file = "tools/a64-encoder/src/wasm_lower/mod.rs"
+target_file = "tools/a64-encoder/src/wasm_lower/module_lower.rs"
 expected_caller_count = 5
 expected_caller_files = [
     "tools/a64-encoder/examples/bench_mlp_ablation.rs",

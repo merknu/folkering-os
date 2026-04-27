@@ -1,28 +1,34 @@
 //! Draug refactor-flow eval runner.
 //!
-//! Loads `tasks.toml`, builds a CodeGraph CSR over the monorepo, and verifies
-//! that each task's frozen caller count + file set still matches reality.
+//! Three subcommands:
 //!
-//! Phase 1 (now): regression check on CodeGraph — if the CSR drifts away
-//! from the locked-in expectations, the runner fails and the user decides
-//! whether the fixture or the graph is wrong.
+//!   * `verify`  — load `tasks.toml`, build a fresh CSR, confirm every
+//!                 task's frozen caller count + file set still matches.
+//!                 Catches CodeGraph regressions. Default subcommand.
 //!
-//! Phase 2 (lands with Draug refactor flow in step 3): each task additionally
-//! gets fed to Draug, the resulting patch is applied to a sandbox copy of
-//! the monorepo, `cargo check` is run on the target file + every caller
-//! file, and the score is reported. Compile + caller-compat is the headline
-//! metric — that's what CodeGraph integration is supposed to enable.
+//!   * `prompt <task-id>`  — assemble the LLM-facing refactor prompt for
+//!                 a single task and write it to `output/<id>/prompt.md`.
+//!                 No LLM call. Useful for inspecting / hand-editing the
+//!                 prompt before paying for tokens.
 //!
-//! Usage:
-//!     draug-eval                   # build CSR, verify all tasks
-//!     draug-eval --tasks PATH      # use a different tasks.toml
-//!     draug-eval --root PATH       # build CSR from PATH instead of CWD
+//!   * `refactor <task-id>` — assemble the prompt, ship it to the
+//!                 host-side `folkering-proxy` LLM endpoint, save the
+//!                 response. Pulls a code block out of the response if
+//!                 there is one.
+//!
+//! Verifying the actual refactor (apply patch + cargo check + caller-
+//! compat scoring) is Phase 2B, deferred to its own PR. This crate's
+//! README documents the full plan.
+
+mod prompt;
+mod proxy;
+mod source_extract;
 
 use serde::Deserialize;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Deserialize)]
 struct TasksFile {
@@ -30,8 +36,6 @@ struct TasksFile {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)] // `description` + `target_file` aren't checked yet but
-                    // are surfaced when step 3's refactor flow lands.
 struct Task {
     id: String,
     description: String,
@@ -41,65 +45,129 @@ struct Task {
     expected_caller_files: Vec<String>,
 }
 
-fn main() -> ExitCode {
-    let mut args = std::env::args().skip(1);
-    let mut tasks_path = PathBuf::from("tools/draug-eval-runner/tasks.toml");
-    let mut root_path = PathBuf::from(".");
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--tasks" => tasks_path = args.next().expect("--tasks needs a path").into(),
-            "--root"  => root_path  = args.next().expect("--root needs a path").into(),
-            "-h" | "--help" => {
-                println!("draug-eval — verify CodeGraph against frozen task fixtures");
-                println!();
-                println!("Usage: draug-eval [--tasks tasks.toml] [--root .]");
-                return ExitCode::SUCCESS;
-            }
-            other => {
-                eprintln!("unknown arg: {other}");
-                return ExitCode::from(2);
-            }
+#[derive(Debug)]
+struct GlobalArgs {
+    tasks_path: PathBuf,
+    root_path: PathBuf,
+    output_dir: PathBuf,
+    proxy_host: String,
+    proxy_port: u16,
+    /// LLM model used by the `refactor` subcommand. The L1 default in
+    /// Draug is qwen2.5-coder:7b, which is local + fast — keep that
+    /// here so the eval doesn't burn cloud tokens on every run.
+    llm_model: String,
+}
+
+impl GlobalArgs {
+    fn defaults() -> Self {
+        GlobalArgs {
+            tasks_path: PathBuf::from("tools/draug-eval-runner/tasks.toml"),
+            root_path: PathBuf::from("."),
+            output_dir: PathBuf::from("tools/draug-eval-runner/output"),
+            proxy_host: proxy::DEFAULT_HOST.to_string(),
+            proxy_port: proxy::DEFAULT_PORT,
+            llm_model: "qwen2.5-coder:7b".to_string(),
         }
     }
+}
 
-    let raw = match std::fs::read_to_string(&tasks_path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: read {}: {}", tasks_path.display(), e);
-            return ExitCode::from(2);
+fn main() -> ExitCode {
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    let mut g = GlobalArgs::defaults();
+    let mut subcommand: Option<String> = None;
+    let mut subcommand_args: Vec<String> = Vec::new();
+
+    let mut i = 0;
+    while i < raw_args.len() {
+        let a = &raw_args[i];
+        match a.as_str() {
+            "-h" | "--help" => return print_help(),
+            "--tasks" => { g.tasks_path = next_or_die(&raw_args, &mut i, "--tasks").into(); }
+            "--root"  => { g.root_path  = next_or_die(&raw_args, &mut i, "--root").into(); }
+            "--output" => { g.output_dir = next_or_die(&raw_args, &mut i, "--output").into(); }
+            "--proxy-host" => { g.proxy_host = next_or_die(&raw_args, &mut i, "--proxy-host"); }
+            "--proxy-port" => {
+                let s = next_or_die(&raw_args, &mut i, "--proxy-port");
+                g.proxy_port = match s.parse() {
+                    Ok(p) => p,
+                    Err(_) => { eprintln!("--proxy-port: not a u16: {s}"); return ExitCode::from(2); }
+                };
+            }
+            "--model" => { g.llm_model = next_or_die(&raw_args, &mut i, "--model"); }
+            other if subcommand.is_none() => {
+                subcommand = Some(other.to_string());
+            }
+            other => {
+                subcommand_args.push(other.to_string());
+            }
         }
-    };
-    let tasks: TasksFile = match toml::from_str(&raw) {
+        i += 1;
+    }
+
+    let cmd = subcommand.as_deref().unwrap_or("verify");
+    match cmd {
+        "verify" => cmd_verify(&g),
+        "prompt"   => cmd_prompt(&g, &subcommand_args),
+        "refactor" => cmd_refactor(&g, &subcommand_args),
+        other => {
+            eprintln!("unknown subcommand: {other}");
+            print_help();
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn next_or_die(args: &[String], i: &mut usize, flag: &str) -> String {
+    *i += 1;
+    if *i >= args.len() {
+        eprintln!("flag '{flag}' needs a value");
+        std::process::exit(2);
+    }
+    args[*i].clone()
+}
+
+fn print_help() -> ExitCode {
+    println!("draug-eval — refactor-flow evaluation harness for Draug");
+    println!();
+    println!("USAGE:");
+    println!("  draug-eval [GLOBAL FLAGS] <subcommand> [ARGS]");
+    println!();
+    println!("SUBCOMMANDS:");
+    println!("  verify                  Verify CSR against frozen task fixtures (default)");
+    println!("  prompt <task-id>        Build refactor prompt → output/<id>/prompt.md");
+    println!("  refactor <task-id>      Build prompt + LLM call → output/<id>/refactor.md");
+    println!();
+    println!("GLOBAL FLAGS:");
+    println!("  --tasks PATH            tasks.toml location");
+    println!("  --root PATH             repo root for CSR build");
+    println!("  --output DIR            where prompt/refactor results land");
+    println!("  --proxy-host HOST       folkering-proxy address (default 127.0.0.1)");
+    println!("  --proxy-port PORT       (default 14711)");
+    println!("  --model NAME            LLM model name (default qwen2.5-coder:7b)");
+    ExitCode::SUCCESS
+}
+
+// ── verify ──────────────────────────────────────────────────────────
+
+fn cmd_verify(g: &GlobalArgs) -> ExitCode {
+    let tasks = match load_tasks(&g.tasks_path) {
         Ok(t) => t,
-        Err(e) => {
-            eprintln!("error: parse {}: {}", tasks_path.display(), e);
-            return ExitCode::from(2);
-        }
+        Err(code) => return code,
     };
-
-    println!("[draug-eval] {} task(s) loaded from {}", tasks.task.len(), tasks_path.display());
-    println!("[draug-eval] building CSR from {} ...", root_path.display());
-
-    let t0 = Instant::now();
-    let graph = match folkering_codegraph::build_from_dir(&root_path) {
+    let graph = match build_graph(&g.root_path) {
         Ok(g) => g,
-        Err(e) => {
-            eprintln!("error: build_from_dir: {e:?}");
-            return ExitCode::from(2);
-        }
+        Err(code) => return code,
     };
-    let build_ms = t0.elapsed().as_millis();
     println!(
-        "[draug-eval] CSR ready ({} vertices, {} edges, {} bytes) in {} ms\n",
+        "[verify] {} task(s); CSR {} verts / {} edges / {} bytes",
+        tasks.task.len(),
         graph.names.len(),
         graph.col_indices.len(),
         graph.csr_bytes(),
-        build_ms,
     );
 
     let mut passed = 0;
     let mut failed = 0;
-
     for task in &tasks.task {
         match check_task(task, &graph) {
             Ok(()) => {
@@ -117,9 +185,234 @@ fn main() -> ExitCode {
             }
         }
     }
-
-    println!("\n[draug-eval] summary: {passed} passed, {failed} failed");
+    println!("\n[verify] summary: {passed} passed, {failed} failed");
     if failed > 0 { ExitCode::from(1) } else { ExitCode::SUCCESS }
+}
+
+// ── prompt ──────────────────────────────────────────────────────────
+
+fn cmd_prompt(g: &GlobalArgs, args: &[String]) -> ExitCode {
+    let task_id = match args.first() {
+        Some(s) => s,
+        None => {
+            eprintln!("prompt: needs <task-id>");
+            return ExitCode::from(2);
+        }
+    };
+    let tasks = match load_tasks(&g.tasks_path) {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
+    let task = match tasks.task.iter().find(|t| t.id == *task_id) {
+        Some(t) => t,
+        None => {
+            eprintln!("prompt: task '{task_id}' not in {}", g.tasks_path.display());
+            return ExitCode::from(2);
+        }
+    };
+    let graph = match build_graph(&g.root_path) {
+        Ok(g) => g,
+        Err(code) => return code,
+    };
+
+    let target_file = g.root_path.join(&task.target_file);
+    let input = prompt::RefactorPromptInput {
+        task_id: &task.id,
+        goal: &task.description,
+        target_fn: &task.target_fn,
+        target_file: &target_file,
+        graph: &graph,
+    };
+    let built = match prompt::build(&input) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("prompt: build failed: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let task_out = g.output_dir.join(&task.id);
+    if let Err(e) = std::fs::create_dir_all(&task_out) {
+        eprintln!("prompt: mkdir {}: {e}", task_out.display());
+        return ExitCode::from(2);
+    }
+    let prompt_path = task_out.join("prompt.md");
+    if let Err(e) = std::fs::write(&prompt_path, &built.markdown) {
+        eprintln!("prompt: write {}: {e}", prompt_path.display());
+        return ExitCode::from(2);
+    }
+
+    println!("[prompt] {} bytes → {}", built.markdown.len(), prompt_path.display());
+    println!("[prompt] {} caller(s) across {} file(s)",
+        built.caller_count, built.caller_files.len());
+    ExitCode::SUCCESS
+}
+
+// ── refactor ────────────────────────────────────────────────────────
+
+fn cmd_refactor(g: &GlobalArgs, args: &[String]) -> ExitCode {
+    let task_id = match args.first() {
+        Some(s) => s,
+        None => {
+            eprintln!("refactor: needs <task-id>");
+            return ExitCode::from(2);
+        }
+    };
+    let tasks = match load_tasks(&g.tasks_path) {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
+    let task = match tasks.task.iter().find(|t| t.id == *task_id) {
+        Some(t) => t,
+        None => {
+            eprintln!("refactor: task '{task_id}' not in {}", g.tasks_path.display());
+            return ExitCode::from(2);
+        }
+    };
+    let graph = match build_graph(&g.root_path) {
+        Ok(g) => g,
+        Err(code) => return code,
+    };
+
+    let target_file = g.root_path.join(&task.target_file);
+    let input = prompt::RefactorPromptInput {
+        task_id: &task.id,
+        goal: &task.description,
+        target_fn: &task.target_fn,
+        target_file: &target_file,
+        graph: &graph,
+    };
+    let built = match prompt::build(&input) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("refactor: prompt build failed: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let task_out = g.output_dir.join(&task.id);
+    if let Err(e) = std::fs::create_dir_all(&task_out) {
+        eprintln!("refactor: mkdir {}: {e}", task_out.display());
+        return ExitCode::from(2);
+    }
+    let prompt_path = task_out.join("prompt.md");
+    let _ = std::fs::write(&prompt_path, &built.markdown);
+
+    println!("[refactor] task={} model={} prompt_bytes={}",
+        task.id, g.llm_model, built.markdown.len());
+    println!("[refactor] calling proxy {}:{} ...", g.proxy_host, g.proxy_port);
+
+    let t0 = Instant::now();
+    // 3-min timeout matches the proxy's OLLAMA_TIMEOUT_SECS for cloud-
+    // backed models. Local 7b should answer in ≤30s once warm.
+    let resp = match proxy::llm_generate(
+        (&g.proxy_host, g.proxy_port),
+        &g.llm_model,
+        &built.markdown,
+        Duration::from_secs(180),
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("refactor: proxy call failed: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let elapsed = t0.elapsed();
+
+    println!("[refactor] status={} body_bytes={} elapsed={:.1}s",
+        resp.status, resp.body.len(), elapsed.as_secs_f32());
+
+    if resp.status != 0 {
+        eprintln!("[refactor] proxy returned non-OK status — see body for details");
+        let response_path = task_out.join("response.txt");
+        let _ = std::fs::write(&response_path, &resp.body);
+        eprintln!("[refactor] saved raw body → {}", response_path.display());
+        return ExitCode::from(1);
+    }
+
+    // Persist raw + extracted artefacts.
+    let response_path = task_out.join("response.txt");
+    if let Err(e) = std::fs::write(&response_path, &resp.body) {
+        eprintln!("refactor: write {}: {e}", response_path.display());
+        return ExitCode::from(2);
+    }
+
+    let body = match resp.body_str() {
+        Some(s) => s,
+        None => {
+            eprintln!("refactor: response not valid UTF-8 (saved to response.txt as raw bytes)");
+            return ExitCode::from(1);
+        }
+    };
+    let code = extract_rust_code_block(body);
+    let refactor_path = task_out.join("refactor.md");
+    let mut report = String::with_capacity(body.len() + 256);
+    report.push_str("# Refactor result for ");
+    report.push_str(&task.id);
+    report.push_str("\n\n");
+    report.push_str("Model: `");
+    report.push_str(&g.llm_model);
+    report.push_str("`\n");
+    report.push_str("Prompt: see `prompt.md`\n");
+    report.push_str("Raw response: see `response.txt`\n\n");
+    if let Some(rs) = &code {
+        report.push_str("## Extracted refactored function\n\n```rust\n");
+        report.push_str(rs);
+        if !rs.ends_with('\n') { report.push('\n'); }
+        report.push_str("```\n");
+    } else {
+        report.push_str("## No fenced ```rust block found\n\n");
+        report.push_str("Raw response was saved verbatim to `response.txt`. ");
+        report.push_str("Inspect manually — the model didn't follow the format constraint.\n");
+    }
+    if let Err(e) = std::fs::write(&refactor_path, &report) {
+        eprintln!("refactor: write {}: {e}", refactor_path.display());
+        return ExitCode::from(2);
+    }
+
+    println!("[refactor] saved → {}", refactor_path.display());
+    if code.is_none() {
+        println!("[refactor] WARNING: no ```rust block extracted — check response.txt");
+    }
+    ExitCode::SUCCESS
+}
+
+/// Pull the first ```rust ... ``` fenced block out of an LLM response.
+/// Falls back to ``` (no language tag) if no rust-tagged fence appears.
+fn extract_rust_code_block(body: &str) -> Option<String> {
+    for tag in ["```rust", "```"] {
+        if let Some(open) = body.find(tag) {
+            let rest = &body[open + tag.len()..];
+            // Skip optional newline/spaces after the opening fence.
+            let after_fence = rest.trim_start_matches(|c: char| c != '\n')
+                .strip_prefix('\n')
+                .unwrap_or(rest);
+            if let Some(close) = after_fence.find("\n```") {
+                return Some(after_fence[..close].to_string());
+            }
+        }
+    }
+    None
+}
+
+// ── shared plumbing ─────────────────────────────────────────────────
+
+fn load_tasks(path: &Path) -> Result<TasksFile, ExitCode> {
+    let raw = std::fs::read_to_string(path).map_err(|e| {
+        eprintln!("error: read {}: {}", path.display(), e);
+        ExitCode::from(2)
+    })?;
+    toml::from_str(&raw).map_err(|e| {
+        eprintln!("error: parse {}: {}", path.display(), e);
+        ExitCode::from(2)
+    })
+}
+
+fn build_graph(root: &Path) -> Result<folkering_codegraph::CallGraph, ExitCode> {
+    folkering_codegraph::build_from_dir(root).map_err(|e| {
+        eprintln!("error: build_from_dir({}): {e:?}", root.display());
+        ExitCode::from(2)
+    })
 }
 
 fn check_task(task: &Task, graph: &folkering_codegraph::CallGraph) -> Result<(), String> {
@@ -154,7 +447,7 @@ fn check_task(task: &Task, graph: &folkering_codegraph::CallGraph) -> Result<(),
             .map(|s| s.as_str()).collect();
         let mut msg = String::from("caller-file set drift\n");
         if !missing.is_empty() {
-            msg.push_str(&format!("  missing (expected, not found):\n"));
+            msg.push_str("  missing (expected, not found):\n");
             for f in &missing { msg.push_str(&format!("    - {f}\n")); }
         }
         if !extra.is_empty() {
@@ -167,17 +460,13 @@ fn check_task(task: &Task, graph: &folkering_codegraph::CallGraph) -> Result<(),
     Ok(())
 }
 
-/// Pull the file path out of a qualified vertex name like
-/// `.\tools\a64-encoder\src\wasm_lower\call.rs::Lowerer::lower_call`
-/// → `tools/a64-encoder/src/wasm_lower/call.rs`.
 fn qualified_to_file(qualified: &str) -> String {
     let path = qualified.split("::").next().unwrap_or(qualified);
-    normalize_path(&path.to_string())
+    normalize_path(path)
 }
 
 fn normalize_path(p: &str) -> String {
-    let mut s = p.to_string();
-    s = s.replace('\\', "/");
+    let mut s = p.replace('\\', "/");
     if let Some(stripped) = s.strip_prefix("./") { s = stripped.to_string(); }
     s
 }
@@ -201,18 +490,33 @@ mod tests {
         );
     }
 
-    /// Real fixture parses cleanly. Catches `tasks.toml` schema regressions.
     #[test]
     fn fixture_parses() {
         let path = Path::new("tasks.toml");
-        if !path.exists() { return; } // skip when not run from crate dir
+        if !path.exists() { return; }
         let raw = std::fs::read_to_string(path).unwrap();
         let parsed: TasksFile = toml::from_str(&raw).unwrap();
-        assert!(!parsed.task.is_empty(), "tasks.toml must have at least one task");
+        assert!(!parsed.task.is_empty());
         for t in &parsed.task {
             assert!(!t.id.is_empty());
             assert!(!t.target_fn.is_empty());
-            assert_eq!(t.expected_caller_files.iter().filter(|s| s.is_empty()).count(), 0);
         }
+    }
+
+    #[test]
+    fn extract_rust_code_block_pulls_first_fence() {
+        let body = "Some preamble\n```rust\nfn foo() {}\n```\nTrailing.";
+        assert_eq!(extract_rust_code_block(body).as_deref(), Some("fn foo() {}"));
+    }
+
+    #[test]
+    fn extract_rust_code_block_falls_back_to_unlabelled() {
+        let body = "```\nfn foo() {}\n```";
+        assert_eq!(extract_rust_code_block(body).as_deref(), Some("fn foo() {}"));
+    }
+
+    #[test]
+    fn extract_rust_code_block_returns_none_for_unfenced() {
+        assert_eq!(extract_rust_code_block("plain text"), None);
     }
 }

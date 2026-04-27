@@ -26,38 +26,66 @@ and you decide:
 This is also a regression test for `folkering-codegraph` itself: the same
 five functions yield the same caller answer commit after commit.
 
-## What it will do tomorrow (Phase 2, lands with step 3)
+## Phase 2A: refactor flow infrastructure (live now)
 
-Each task additionally gets fed to Draug. The resulting patch is applied
-to a sandbox copy of the monorepo, `cargo check` runs on the target file
-+ every caller file, and the score is reported. **Compile + caller-compat
-is the headline metric** — that's what CodeGraph integration is supposed
-to enable, so that's what gets measured.
+Two new subcommands let you actually drive a refactor end-to-end:
+
+* `prompt <task-id>` — assemble the LLM-facing refactor prompt and
+  write it to `output/<id>/prompt.md`. No LLM call. Useful for
+  inspecting the prompt before paying for tokens.
+
+* `refactor <task-id>` — assemble the prompt, ship it to the host-side
+  `folkering-proxy` LLM endpoint (default `127.0.0.1:14711`,
+  `qwen2.5-coder:7b`), save the response, and pull the first `​```rust​`
+  fenced block out as a `refactor.md`.
+
+The prompt folds together three things:
+  1. The original source extracted verbatim from the tree (layout
+     preserved, comments included).
+  2. The caller list from CodeGraph — Draug's blast radius.
+  3. The refactor goal + a small constraint set (preserve signature
+     unless authorized, output a single fenced block, no diff format).
+
+## Phase 2B: applying + scoring (next PR)
+
+Each task's refactor patch will be applied to a sandbox copy of the
+monorepo, `cargo check` will run on the target + every caller file,
+and the score will be reported. **Compile + caller-compat is the
+headline metric** — that's what CodeGraph integration is supposed to
+enable.
 
 ## Running
 
 ```sh
+# Verify CSR matches frozen task fixtures (default, no LLM):
 cargo run -p draug-eval-runner --release
-# or
-tools/draug-eval-runner/target/release/draug-eval
+
+# Build a prompt only:
+cargo run -p draug-eval-runner --release -- prompt 03_alloc_pages
+
+# Full refactor against the proxy (proxy must be running):
+cargo run -p draug-eval-runner --release -- refactor 03_alloc_pages
+
+# Use a different model:
+cargo run -p draug-eval-runner --release -- \
+    --model gemma4:31b-cloud refactor 01_pop_i32_slot
 ```
 
-```
-[draug-eval] 5 task(s) loaded from tools/draug-eval-runner/tasks.toml
-[draug-eval] building CSR from . ...
-[draug-eval] CSR ready (4835 vertices, 95902 edges, 402952 bytes) in 762 ms
+`verify` output:
 
+```
+[verify] 5 task(s); CSR 4887 verts / 97566 edges / 409816 bytes
 [PASS] 01_pop_i32_slot (29 callers across 8 files)
 [PASS] 02_maybe_bounds_check (10 callers across 2 files)
 [PASS] 03_alloc_pages (4 callers across 1 files)
 [PASS] 04_compile_module (5 callers across 4 files)
 [PASS] 05_push_dec (12 callers across 1 files)
 
-[draug-eval] summary: 5 passed, 0 failed
+[verify] summary: 5 passed, 0 failed
 ```
 
 Exit code: `0` on full pass, `1` on any task fail, `2` on infrastructure
-error (bad fixture, can't build CSR, etc).
+error (bad fixture, can't build CSR, can't reach proxy).
 
 ## The five tasks
 
