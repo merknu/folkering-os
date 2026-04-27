@@ -40,6 +40,10 @@ boot/*-test.txt
 boot/working-*.txt
 boot/phase*.txt
 
+# Driver wasms — regenerated from drivers/*.rs by compositor's build.rs
+# (see drivers/README.md and tools/build-drivers.sh).
+drivers/*.wasm
+
 # Secrets — NEVER commit API keys
 .env
 *.env
