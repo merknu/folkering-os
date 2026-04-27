@@ -284,6 +284,49 @@ pub fn llm_generate(
     Some(PatchStatus { status, output_len })
 }
 
+/// Folkering CodeGraph — query callers of a function via the proxy.
+///
+/// Sends `GRAPH_CALLERS <name>\n` over the kernel's syscall 0x65 to
+/// the host-side proxy. The proxy reads from a pre-loaded FCG1 blob
+/// (see `tools/folkering-codegraph/dump-graph`) and answers in
+/// microseconds — far faster than asking the LLM the same question.
+///
+/// Reuses [`PatchStatus`] as the generic (status, output_len) carrier:
+///   status 0 = OK         — `result_buf[..output_len]` is callers,
+///                           one qualified name per line, terminated
+///                           with `\n`. Empty output means the fn
+///                           exists but has no callers.
+///   status 1 = NOT_FOUND  — the name isn't in the call-graph
+///   status 2 = NOT_LOADED — the proxy started without --codegraph
+///
+/// Returns `None` on TCP/syscall failure (see kernel serial log for
+/// reason). Caller is responsible for parsing the line-separated body.
+pub fn graph_callers(
+    fn_name: &str,
+    result_buf: &mut [u8],
+) -> Option<PatchStatus> {
+    let name_len = fn_name.len() as u64;
+    let result_max = result_buf.len() as u64;
+    let mask = 0x1F_FFFFu64; // 21 bits each — matches the kernel unpacker
+    let packed = (name_len & mask) | ((result_max & mask) << 21);
+
+    let ret = unsafe {
+        syscall4(
+            0x65, // SYS_GRAPH_CALLERS
+            fn_name.as_ptr() as u64,
+            result_buf.as_mut_ptr() as u64,
+            0, // unused, kept 0 for ABI symmetry with llm_generate
+            packed,
+        )
+    };
+    if ret == u64::MAX {
+        return None;
+    }
+    let status = ((ret >> 32) & 0xFFFF_FFFF) as u32;
+    let output_len = (ret & 0xFFFF_FFFF) as usize;
+    Some(PatchStatus { status, output_len })
+}
+
 pub fn fbp_patch(
     filename: &str,
     content: &[u8],
