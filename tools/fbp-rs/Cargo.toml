@@ -1,0 +1,28 @@
+[package]
+name = "fbp-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Folkering Binary Protocol — zero-copy Rust deserializer (host-side tests + future OS-side use)"
+license = "MIT OR Apache-2.0"
+
+# This is a standalone crate. It has NO workspace parent so it can be
+# tested on the host without pulling in the entire folkering-os kernel
+# build graph.
+
+[lib]
+name = "fbp_rs"
+path = "src/lib.rs"
+
+[features]
+# Default: pure no_std parser-only build. Used by folk_browser WASM.
+default = []
+# Host-side builds (folkering-proxy) can opt into alloc + serializer.
+alloc = []
+
+[dependencies]
+
+[dev-dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true

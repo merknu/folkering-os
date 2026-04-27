@@ -296,3 +296,23 @@ pub fn check_irq(irq_line: u8) -> Result<bool, ()> {
         _ => Err(()),
     }
 }
+
+/// Acquire a PCI device by (bus, device, function).
+///
+/// Asks the kernel to grant this task `MmioRegion` + `IoPort`
+/// capabilities for each BAR of the named device. Must be called
+/// BEFORE the task attempts `map_physical` or port-I/O on that
+/// device's ranges.
+///
+/// Returns the number of BARs successfully granted (≥ 1 = success),
+/// or `None` if the device wasn't in the PCI enumeration.
+///
+/// The compositor doesn't need this — it gets a blanket grant at
+/// boot. Other tasks that want direct hardware access call this
+/// first to authorize themselves.
+pub fn pci_acquire(bus: u8, device: u8, function: u8) -> Option<u32> {
+    const SYS_PCI_ACQUIRE: u64 = 0x2B;
+    let packed = (bus as u64) | ((device as u64) << 8) | ((function as u64) << 16);
+    let ret = unsafe { syscall1(SYS_PCI_ACQUIRE, packed) };
+    if ret == u64::MAX { None } else { Some(ret as u32) }
+}

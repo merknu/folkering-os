@@ -26,6 +26,12 @@ pub mod vaddr {
     pub const INTENT_SHMEM: usize = 0x14000000;
     /// QUERY_INTENT input string
     pub const QUERY_INTENT: usize = 0x15000000;
+    /// Phase 9: UPSERT_ENTITY request
+    pub const ENTITY_SHMEM: usize = 0x16000000;
+    /// Phase 9: UPSERT_EDGE request
+    pub const EDGE_SHMEM: usize = 0x17000000;
+    /// Phase 9: GRAPH_WALK request + response
+    pub const GRAPH_WALK: usize = 0x18000000;
 }
 
 /// RAII handle to a mapped shared memory region.

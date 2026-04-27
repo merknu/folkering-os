@@ -142,6 +142,7 @@ pub fn process_mouse(
             });
             // Send click event on button press edge
             if new_click {
+                write_str("[CLICK->WASM]\n");
                 app.push_event(compositor::wasm_runtime::FolkEvent {
                     event_type: 2, x: cursor.x, y: cursor.y, data: 1,
                 });

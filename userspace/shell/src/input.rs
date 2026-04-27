@@ -95,6 +95,7 @@ pub fn execute_command() {
         "clone" => commands::network::cmd_clone(parts),
         "save" => commands::vfs::cmd_save(parts),
         "load" => commands::vfs::cmd_load(),
+        "mvfs" => commands::mvfs::cmd_mvfs(parts),
         "ask" | "infer" => commands::ai::cmd_ask(cmd),
         "ai-status" => commands::ai::cmd_ai_status(),
         _ => {
