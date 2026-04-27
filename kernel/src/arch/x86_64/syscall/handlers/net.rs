@@ -924,6 +924,109 @@ pub fn syscall_llm_generate(
     ((status as u64) << 32) | (copy_len as u64)
 }
 
+/// Folkering CodeGraph — query callers of a fn name via the proxy's
+/// `GRAPH_CALLERS <name>\n` command.
+///
+/// Returns `(status << 32) | output_bytes_written`, or `u64::MAX`
+/// on TCP failure / bad input. Status codes match the proxy:
+///   0 = OK         — output is one qualified caller per line
+///   1 = NOT_FOUND  — function not in the graph
+///   2 = NOT_LOADED — proxy started without --codegraph
+///
+/// Same packed-lengths ABI as `syscall_llm_generate`:
+///   arg1 = name_ptr
+///   arg2 = result_ptr
+///   arg3 = (unused, kept 0 for layout symmetry)
+///   arg4 = (name_len & 0x1F_FFFF) | ((result_max & 0x1F_FFFF) << 21)
+pub fn syscall_graph_callers(
+    name_ptr: u64,
+    result_ptr: u64,
+    _arg3: u64,
+    packed_lens: u64,
+) -> u64 {
+    const PROXY_IP: [u8; 4] = [10, 0, 2, 2];
+    const PROXY_PORT: u16 = 14711;
+
+    let name_len = (packed_lens & 0x1F_FFFF) as usize;
+    let result_max = ((packed_lens >> 21) & 0x1F_FFFF) as usize;
+
+    if name_len == 0 || name_len > 256
+        || result_max == 0 || result_max > 65_536
+    {
+        crate::serial_str!("[GRAPH] bad lens: n=");
+        crate::drivers::serial::write_dec(name_len as u32);
+        crate::serial_str!(" r=");
+        crate::drivers::serial::write_dec(result_max as u32);
+        crate::serial_strln!("");
+        return u64::MAX;
+    }
+    if name_ptr < 0x200000 || name_ptr >= 0x0000_8000_0000_0000 { return u64::MAX; }
+    if result_ptr < 0x200000 || result_ptr >= 0x0000_8000_0000_0000 { return u64::MAX; }
+
+    let name_bytes = unsafe {
+        core::slice::from_raw_parts(name_ptr as *const u8, name_len)
+    };
+    let name = match core::str::from_utf8(name_bytes) {
+        Ok(s) => s,
+        Err(_) => return u64::MAX,
+    };
+
+    crate::serial_str!("[GRAPH] callers of ");
+    crate::serial_strln!(name);
+
+    // Wire frame: GRAPH_CALLERS <name>\n
+    let mut req: alloc::vec::Vec<u8> =
+        alloc::vec::Vec::with_capacity(name_len + 16);
+    req.extend_from_slice(b"GRAPH_CALLERS ");
+    req.extend_from_slice(name.as_bytes());
+    req.push(b'\n');
+
+    let max_total = (result_max.saturating_add(8)).min(65_544);
+
+    // 5s timeout — graph lookup is microseconds; anything longer
+    // means TCP/proxy trouble, not a slow query.
+    let response = match crate::net::tcp_plain::tcp_request_with_timeout(
+        PROXY_IP,
+        PROXY_PORT,
+        &req,
+        max_total,
+        15_000, // ~5s wall
+    ) {
+        Ok(data) => data,
+        Err(e) => {
+            crate::serial_str!("[GRAPH] TCP failed: ");
+            crate::serial_strln!(e);
+            return u64::MAX;
+        }
+    };
+
+    if response.len() < 8 {
+        crate::serial_strln!("[GRAPH] short reply header");
+        return u64::MAX;
+    }
+    let status = u32::from_le_bytes([
+        response[0], response[1], response[2], response[3],
+    ]);
+    let output_len = u32::from_le_bytes([
+        response[4], response[5], response[6], response[7],
+    ]) as usize;
+
+    let available = response.len() - 8;
+    let copy_len = output_len.min(available).min(result_max);
+    unsafe {
+        let dst = core::slice::from_raw_parts_mut(result_ptr as *mut u8, copy_len);
+        dst.copy_from_slice(&response[8..8 + copy_len]);
+    }
+
+    crate::serial_str!("[GRAPH] status=");
+    crate::drivers::serial::write_dec(status);
+    crate::serial_str!(" output=");
+    crate::drivers::serial::write_dec(copy_len as u32);
+    crate::serial_strln!(" bytes");
+
+    ((status as u64) << 32) | (copy_len as u64)
+}
+
 /// Stability Fix 7 — Proxy health check.
 ///
 /// Sends `PING\n` to the proxy with a 5_000 tsc_ms timeout (~2s).
