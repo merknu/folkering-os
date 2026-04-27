@@ -118,6 +118,10 @@ pub(super) extern "C" fn syscall_handler(
         0x63 => syscall_wasm_compile(arg1, arg2),
         // Proxy health check (Stability Fix 7)
         0x64 => syscall_proxy_ping(),
+        // Folkering CodeGraph: query callers of a fn name via the
+        // proxy's GRAPH_CALLERS command. Same packed-lengths shape
+        // as fbp_patch / llm_generate.
+        0x65 => syscall_graph_callers(arg1, arg2, arg3, arg4),
         // Draug bridge: push status to tcp_shell atomics, return pause flag
         // Draug bridge: producer writes status for TCP shell consumer.
         // Release ordering ensures all stores are visible before the

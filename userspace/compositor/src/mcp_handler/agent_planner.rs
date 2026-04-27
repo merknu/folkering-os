@@ -30,10 +30,46 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use libfolk::sys::io::write_str;
 // Graph writes removed — see eviction policy note in plan_task()
-use libfolk::sys::{fbp_patch, llm_generate};
+use libfolk::sys::{fbp_patch, llm_generate, graph_callers};
 
 use compositor::draug::{TaskPlan, PlanStep};
 use super::knowledge_hunt::{extract_rust_code_block, write_dec};
+
+/// Query the host-side proxy's CSR call-graph for callers of `fn_name`.
+/// Returns `Some(formatted_block)` on a successful non-empty result —
+/// caller can paste it into an LLM prompt as additional context. None
+/// when the function isn't in the graph, has no callers, the graph
+/// isn't loaded, or the proxy is unreachable.
+///
+/// Format:
+/// ```text
+/// Callers of `fn_name` (per the static call-graph):
+///   - mod_a::caller_one
+///   - mod_b::caller_two
+/// ```
+///
+/// Cost is ~150 µs lookup (cache hit) + RTT — orders of magnitude
+/// cheaper than asking the LLM the same question.
+pub fn fetch_callers_summary(fn_name: &str) -> Option<String> {
+    let mut buf = [0u8; 4096];
+    let res = graph_callers(fn_name, &mut buf)?;
+    if res.status != 0 || res.output_len == 0 {
+        return None;
+    }
+    let body = core::str::from_utf8(&buf[..res.output_len]).ok()?;
+    let mut out = String::with_capacity(body.len() + 80);
+    out.push_str("Callers of `");
+    out.push_str(fn_name);
+    out.push_str("` (per the static call-graph):\n");
+    for line in body.split('\n') {
+        let line = line.trim();
+        if line.is_empty() { continue; }
+        out.push_str("  - ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    Some(out)
+}
 
 /// Complex tasks that require multi-step planning.
 /// Each entry is (task_id, task_description).
@@ -206,6 +242,20 @@ pub fn execute_next_step(plan: &mut TaskPlan) -> bool {
     prompt.push_str("Respond with ONLY code in a ```rust fenced block. ");
     prompt.push_str("Must compile in a fresh no_std-compatible Rust crate. ");
     prompt.push_str("No explanation.");
+
+    // CodeGraph context enrichment: if the task_id matches a known
+    // function name in the static call-graph (host-side proxy answers
+    // GRAPH_CALLERS in ~150 µs), append the caller list. The LLM gets
+    // a much better picture of what the function should be shaped like
+    // when it can see who depends on it. Failure / NOT_FOUND / empty
+    // result is silent — we just don't add the extra context.
+    if let Some(callers) = fetch_callers_summary(&plan.task_id) {
+        write_str("[Executor] enriching prompt with ");
+        write_dec(callers.matches('-').count() as u32);
+        write_str(" caller(s) from CodeGraph\n");
+        prompt.push_str("\n\n");
+        prompt.push_str(&callers);
+    }
 
     // Retry loop with error feedback
     // Pre-allocate error buffer to avoid fragmentation from variable Strings
