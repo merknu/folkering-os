@@ -23,6 +23,13 @@ mod handlers;
 pub use init::init;
 pub use entry::int_syscall_entry;
 pub use state::{set_current_context_ptr, get_syscall_count};
+
+// Re-export specific handlers that kernel-side code needs to invoke
+// directly (e.g. tcp_shell's `graph-callers` command goes through
+// the same proxy-call path as the userspace syscall, not via int 0x80).
+// `graph_callers_inner` is the kernel-only path that skips the
+// userspace pointer-range validation.
+pub use handlers::net::{syscall_graph_callers, graph_callers_inner};
 pub use debug::{
     DEBUG_MARKER, DEBUG_CONTEXT_R14, DEBUG_CONTEXT_RSP,
     DEBUG_NEXT_CTX_PTR, DEBUG_NEXT_CTX_CS, DEBUG_NEXT_CTX_RIP,

@@ -98,6 +98,7 @@ pub fn execute_command() {
         "mvfs" => commands::mvfs::cmd_mvfs(parts),
         "ask" | "infer" => commands::ai::cmd_ask(cmd),
         "ai-status" => commands::ai::cmd_ai_status(),
+        "graph-callers" | "graph_callers" => commands::graph::cmd_graph_callers(parts),
         _ => {
             println!("Unknown command: {}", command);
             println!("Type 'help' for available commands.");

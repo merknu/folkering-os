@@ -10,7 +10,7 @@ mod memory;
 mod task;
 mod io;
 mod fs;
-mod net;
+pub(super) mod net;
 mod audio;
 mod compute;
 mod gpu;
