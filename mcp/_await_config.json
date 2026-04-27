@@ -1,1 +1,1 @@
-{"pattern": "Model loaded successfully|PANIC|DOUBLE FAULT", "log_path": "C:\\Users\\merkn\\folkering-mcp\\serial.log", "timeout": 300, "context_lines": 30, "from_start": false}
+{"pattern": "\\[DRAUG-STREAMER\\]|PANIC|DOUBLE FAULT", "log_path": "C:\\Users\\merkn\\folkering-mcp\\serial.log", "timeout": 90, "context_lines": 20, "from_start": false}

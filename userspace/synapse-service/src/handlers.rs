@@ -1060,7 +1060,11 @@ fn handle_upsert_entity<T: TokenSource>(
     match sqlite_insert_entity(sqlite, eid, name, etype, ts) {
         Some(rowid) => {
             flush_sqlite_to_disk(sqlite);
-            let _ = reply(src, rowid as u64, 0);
+            // Shift rowid into bits 16..48 so a value of exactly
+            // 0xFFFF (= `SYN_STATUS_ERROR`) can't be mistaken for a
+            // failure reply. The libfolk wrapper unpacks via
+            // `(ret >> 16) & 0xFFFFFFFF`.
+            let _ = reply(src, (rowid as u64) << 16, 0);
         }
         None => { let _ = reply(src, SYN_STATUS_ERROR, 0); }
     }
@@ -1134,7 +1138,9 @@ fn handle_upsert_edge<T: TokenSource>(
     match sqlite_insert_edge(sqlite, eid, subj, pred, obj, ts, 0, 1.0) {
         Some(rowid) => {
             flush_sqlite_to_disk(sqlite);
-            let _ = reply(src, rowid as u64, 0);
+            // Same shift pattern as `handle_upsert_entity` — keeps
+            // rowid out of the low-16-bit status-code window.
+            let _ = reply(src, (rowid as u64) << 16, 0);
         }
         None => { let _ = reply(src, SYN_STATUS_ERROR, 0); }
     }

@@ -27,6 +27,7 @@ pub fn cmd_help() {
     println!("  clone <user> <repo> - Download repo to VFS (SQLite)");
     println!("  save <file> <text> - Save text file to VFS (SQLite)");
     println!("  load              - Load text from persistent storage");
+    println!("  mvfs <subcmd>     - Mutable tmpfs (ls/cat/write/rm, disk-persistent)");
     println!("  ask <question>    - Ask AI a question (RAG-enhanced)");
     println!("  infer <prompt>    - Generate text from prompt");
     println!("  ai-status         - Check AI inference server status");
