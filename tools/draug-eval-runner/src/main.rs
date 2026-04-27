@@ -20,8 +20,11 @@
 //! compat scoring) is Phase 2B, deferred to its own PR. This crate's
 //! README documents the full plan.
 
+mod apply;
+mod cargo_check;
 mod prompt;
 mod proxy;
+mod sandbox;
 mod source_extract;
 
 use serde::Deserialize;
@@ -106,9 +109,11 @@ fn main() -> ExitCode {
 
     let cmd = subcommand.as_deref().unwrap_or("verify");
     match cmd {
-        "verify" => cmd_verify(&g),
+        "verify"   => cmd_verify(&g),
         "prompt"   => cmd_prompt(&g, &subcommand_args),
         "refactor" => cmd_refactor(&g, &subcommand_args),
+        "score"    => cmd_score(&g, &subcommand_args),
+        "eval"     => cmd_eval(&g, &subcommand_args),
         other => {
             eprintln!("unknown subcommand: {other}");
             print_help();
@@ -136,6 +141,8 @@ fn print_help() -> ExitCode {
     println!("  verify                  Verify CSR against frozen task fixtures (default)");
     println!("  prompt <task-id>        Build refactor prompt → output/<id>/prompt.md");
     println!("  refactor <task-id>      Build prompt + LLM call → output/<id>/refactor.md");
+    println!("  score <task-id>         Apply existing refactor.md to sandbox + cargo check");
+    println!("  eval [task-id|--all]    Refactor + score in one go; --all runs every task");
     println!();
     println!("GLOBAL FLAGS:");
     println!("  --tasks PATH            tasks.toml location");
@@ -375,6 +382,197 @@ fn cmd_refactor(g: &GlobalArgs, args: &[String]) -> ExitCode {
         println!("[refactor] WARNING: no ```rust block extracted — check response.txt");
     }
     ExitCode::SUCCESS
+}
+
+// ── score ───────────────────────────────────────────────────────────
+
+fn cmd_score(g: &GlobalArgs, args: &[String]) -> ExitCode {
+    let task_id = match args.first() {
+        Some(s) => s.clone(),
+        None => {
+            eprintln!("score: needs <task-id>");
+            return ExitCode::from(2);
+        }
+    };
+    let tasks = match load_tasks(&g.tasks_path) { Ok(t) => t, Err(c) => return c };
+    let task = match tasks.task.iter().find(|t| t.id == task_id) {
+        Some(t) => t,
+        None => {
+            eprintln!("score: task '{task_id}' not in {}", g.tasks_path.display());
+            return ExitCode::from(2);
+        }
+    };
+
+    // Pull the previously-saved refactor.md and re-extract its rust block.
+    let task_out = g.output_dir.join(&task.id);
+    let refactor_path = task_out.join("refactor.md");
+    let refactor_md = match std::fs::read_to_string(&refactor_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("score: read {}: {e}\n  did you run `draug-eval refactor {task_id}` first?",
+                refactor_path.display());
+            return ExitCode::from(2);
+        }
+    };
+    let patch_code = match extract_rust_code_block(&refactor_md) {
+        Some(s) => s,
+        None => {
+            eprintln!("score: no ```rust block in {} — refactor produced no usable patch",
+                refactor_path.display());
+            return ExitCode::from(1);
+        }
+    };
+
+    score_one(g, task, &patch_code)
+}
+
+fn score_one(g: &GlobalArgs, task: &Task, patch_code: &str) -> ExitCode {
+    let task_out = g.output_dir.join(&task.id);
+    let _ = std::fs::create_dir_all(&task_out);
+
+    println!("[score] task={} patch_bytes={}", task.id, patch_code.len());
+
+    // (1) Spin up / reset the sandbox worktree.
+    println!("[score] preparing sandbox ...");
+    let sandbox = match sandbox::Sandbox::prepare(
+        &g.root_path,
+        Path::new("tools/draug-eval-runner/sandbox"),
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("score: sandbox prepare failed: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    // (2) Apply the patch in the sandbox.
+    let target_rel = Path::new(&task.target_file);
+    let target_abs = sandbox.inside(target_rel);
+    let applied = match apply::apply(&target_abs, &task.target_fn, patch_code) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("score: apply failed: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Err(e) = std::fs::write(&target_abs, &applied.patched) {
+        eprintln!("score: write {}: {e}", target_abs.display());
+        return ExitCode::from(2);
+    }
+    println!("[score] applied: {:?} (lines {}–{})",
+        applied.strategy, applied.start_line, applied.end_line);
+
+    // (3) Run cargo check in the workspace that owns this file.
+    let outcome = match cargo_check::check(&sandbox.path, target_rel) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("score: cargo check failed to launch: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    println!(
+        "[score] cargo check: workspace={} exit={} errors={} warnings={} elapsed={:.1}s",
+        outcome.workspace, outcome.exit_code, outcome.error_count,
+        outcome.warning_count, outcome.elapsed.as_secs_f32(),
+    );
+
+    // (4) Restore the file so the sandbox is clean for the next task.
+    let _ = sandbox.restore(target_rel);
+
+    // (5) Write a JSON report so future tooling can aggregate.
+    let report = TaskReport {
+        task_id: task.id.clone(),
+        target_fn: task.target_fn.clone(),
+        target_file: task.target_file.clone(),
+        patch_strategy: format!("{:?}", applied.strategy).to_lowercase(),
+        patch_chars: patch_code.len(),
+        cargo_check: CargoReport {
+            workspace: outcome.workspace.clone(),
+            exit_code: outcome.exit_code,
+            error_count: outcome.error_count,
+            warning_count: outcome.warning_count,
+            elapsed_secs: outcome.elapsed.as_secs_f32(),
+            stderr_excerpt: outcome.stderr_excerpt.clone(),
+        },
+        verdict: if outcome.passed() { "PASS".into() } else { "FAIL".into() },
+    };
+    let json = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into());
+    let json_path = task_out.join("score.json");
+    if let Err(e) = std::fs::write(&json_path, &json) {
+        eprintln!("score: write {}: {e}", json_path.display());
+    } else {
+        println!("[score] report → {}", json_path.display());
+    }
+
+    println!("[score] verdict: {}", report.verdict);
+    if outcome.passed() { ExitCode::SUCCESS } else { ExitCode::from(1) }
+}
+
+// ── eval ────────────────────────────────────────────────────────────
+
+fn cmd_eval(g: &GlobalArgs, args: &[String]) -> ExitCode {
+    let tasks = match load_tasks(&g.tasks_path) { Ok(t) => t, Err(c) => return c };
+    let want_all = args.iter().any(|a| a == "--all");
+    let single_id = args.iter().find(|a| !a.starts_with("--")).cloned();
+
+    let chosen: Vec<&Task> = if want_all {
+        tasks.task.iter().collect()
+    } else if let Some(id) = single_id {
+        match tasks.task.iter().find(|t| t.id == id) {
+            Some(t) => vec![t],
+            None => {
+                eprintln!("eval: task '{id}' not in {}", g.tasks_path.display());
+                return ExitCode::from(2);
+            }
+        }
+    } else {
+        eprintln!("eval: needs <task-id> or --all");
+        return ExitCode::from(2);
+    };
+
+    let mut passed = 0;
+    let mut failed = 0;
+    let mut skipped = 0;
+    for task in &chosen {
+        println!("\n=== eval: {} ===", task.id);
+        // Re-run refactor to get fresh LLM output.
+        let rc = cmd_refactor(g, &[task.id.clone()]);
+        if rc != ExitCode::SUCCESS {
+            eprintln!("[eval] {} refactor step failed — skipping score", task.id);
+            skipped += 1;
+            continue;
+        }
+        let rc = cmd_score(g, &[task.id.clone()]);
+        if rc == ExitCode::SUCCESS { passed += 1; }
+        else if rc == ExitCode::from(1) { failed += 1; }
+        else { skipped += 1; }
+    }
+
+    println!("\n[eval] summary: {passed} pass, {failed} fail, {skipped} skipped");
+    if failed > 0 || skipped > 0 { ExitCode::from(1) } else { ExitCode::SUCCESS }
+}
+
+// ── JSON report shapes ──────────────────────────────────────────────
+
+#[derive(serde::Serialize)]
+struct TaskReport {
+    task_id: String,
+    target_fn: String,
+    target_file: String,
+    patch_strategy: String,
+    patch_chars: usize,
+    cargo_check: CargoReport,
+    verdict: String,
+}
+
+#[derive(serde::Serialize)]
+struct CargoReport {
+    workspace: String,
+    exit_code: i32,
+    error_count: u32,
+    warning_count: u32,
+    elapsed_secs: f32,
+    stderr_excerpt: String,
 }
 
 /// Pull the first ```rust ... ``` fenced block out of an LLM response.
