@@ -63,6 +63,10 @@ struct GlobalArgs {
     /// Used by ablation runs to measure whether feeding the call-graph
     /// to the LLM actually improves refactor quality.
     no_codegraph: bool,
+    /// When true, place the caller list AFTER the original source
+    /// instead of before. Tests the "goal-dilution" hypothesis from
+    /// the cross-model trial.
+    callers_at_end: bool,
 }
 
 impl GlobalArgs {
@@ -75,6 +79,7 @@ impl GlobalArgs {
             proxy_port: proxy::DEFAULT_PORT,
             llm_model: "qwen2.5-coder:7b".to_string(),
             no_codegraph: false,
+            callers_at_end: false,
         }
     }
 }
@@ -103,6 +108,7 @@ fn main() -> ExitCode {
             }
             "--model" => { g.llm_model = next_or_die(&raw_args, &mut i, "--model"); }
             "--no-codegraph" => { g.no_codegraph = true; }
+            "--callers-at-end" => { g.callers_at_end = true; }
             other if subcommand.is_none() => {
                 subcommand = Some(other.to_string());
             }
@@ -158,6 +164,7 @@ fn print_help() -> ExitCode {
     println!("  --proxy-port PORT       (default 14711)");
     println!("  --model NAME            LLM model name (default qwen2.5-coder:7b)");
     println!("  --no-codegraph          Redact caller list from the LLM prompt (ablation)");
+    println!("  --callers-at-end        Place caller list AFTER source instead of before");
     ExitCode::SUCCESS
 }
 
@@ -237,6 +244,11 @@ fn cmd_prompt(g: &GlobalArgs, args: &[String]) -> ExitCode {
         target_file: &target_file,
         graph: &graph,
         include_callers: !g.no_codegraph,
+        callers_position: if g.callers_at_end {
+            prompt::CallersPosition::Bottom
+        } else {
+            prompt::CallersPosition::Top
+        },
     };
     let built = match prompt::build(&input) {
         Ok(b) => b,
@@ -297,6 +309,11 @@ fn cmd_refactor(g: &GlobalArgs, args: &[String]) -> ExitCode {
         target_file: &target_file,
         graph: &graph,
         include_callers: !g.no_codegraph,
+        callers_position: if g.callers_at_end {
+            prompt::CallersPosition::Bottom
+        } else {
+            prompt::CallersPosition::Top
+        },
     };
     let built = match prompt::build(&input) {
         Ok(b) => b,
@@ -497,6 +514,7 @@ fn score_one(g: &GlobalArgs, task: &Task, patch_code: &str) -> ExitCode {
         patch_chars: patch_code.len(),
         codegraph_in_prompt: !g.no_codegraph,
         model: g.llm_model.clone(),
+        callers_position: if g.callers_at_end { "bottom".into() } else { "top".into() },
         cargo_check: CargoReport {
             workspace: outcome.workspace.clone(),
             exit_code: outcome.exit_code,
@@ -582,6 +600,10 @@ struct TaskReport {
     /// the aggregator can compare across models without inferring
     /// from output dir names.
     model: String,
+    /// "top" or "bottom" — where the blast-radius caller list lived
+    /// in the prompt for this run. "top" matches the historic shape;
+    /// "bottom" is the goal-dilution-hypothesis variant.
+    callers_position: String,
     cargo_check: CargoReport,
     verdict: String,
 }
