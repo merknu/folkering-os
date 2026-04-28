@@ -329,8 +329,78 @@ fn tick_processing(draug: &mut DraugDaemon, now_ms: u64) -> bool {
         AsyncOp::FbpPatch => process_patch_result(draug, &response, now_ms),
         AsyncOp::PlannerLlm => process_planner_response(draug, &response),
         AsyncOp::ExecutorLlm => process_executor_llm(draug, &response, now_ms),
+        // Phase 17 — autonomous refactor loop. Both arms are
+        // explicitly handled (rather than falling into the `_ =>`
+        // catch-all) so the next session can wire tick_idle into
+        // them without revisiting the dispatch shape.
+        AsyncOp::RefactorLlm => process_refactor_llm(draug, &response, now_ms),
+        AsyncOp::CargoCheck => process_cargo_check_result(draug, &response, now_ms),
         _ => { draug.async_phase = AsyncPhase::Idle; true }
     }
+}
+
+/// Phase 17 — handle the LLM's response to a refactor prompt.
+/// Extracts the rust code block from the response and is the natural
+/// place to fire the follow-up CARGO_CHECK request. Compile-only
+/// today: tick_idle does not yet drive the loop into this state.
+fn process_refactor_llm(draug: &mut DraugDaemon, response: &[u8], _now_ms: u64) -> bool {
+    let code = match parse_llm_response(response) {
+        Some(c) => c,
+        None => {
+            write_str("[Draug-async] Refactor LLM: parse failed\n");
+            draug.async_phase = AsyncPhase::Idle;
+            draug.async_operation = AsyncOp::None;
+            draug.record_skip();
+            return true;
+        }
+    };
+
+    write_str("[Draug-async] Refactor LLM OK → ");
+    write_dec(code.len() as u32);
+    write_str("B (CARGO_CHECK wiring lands with tick_idle integration)\n");
+
+    // Next session: thread `current_refactor_target` through DraugDaemon,
+    // call `super::refactor_loop::build_cargo_check_request(target, &code)`,
+    // stash into `draug.async_request`, set `async_operation = AsyncOp::CargoCheck`,
+    // and re-fire `tcp_connect_async` exactly like start_patch_request does.
+    draug.async_phase = AsyncPhase::Idle;
+    draug.async_operation = AsyncOp::None;
+    draug.record_skip();
+    true
+}
+
+/// Phase 17 — handle the proxy's CARGO_CHECK reply for a refactor
+/// task. The 8-byte header gives `[u32 status LE][u32 output_len LE]`;
+/// the status maps to `AttemptVerdict` via
+/// `refactor_loop::verdict_from_cargo_check_status`. Compile-only:
+/// the persistence step (`task_store::save`) lands when tick_idle
+/// drives this state.
+fn process_cargo_check_result(
+    draug: &mut DraugDaemon,
+    response: &[u8],
+    _now_ms: u64,
+) -> bool {
+    let header = super::refactor_loop::parse_cargo_check_header(response);
+    match header {
+        Some((status, output_len)) => {
+            write_str("[Draug-async] CARGO_CHECK status=");
+            write_dec(status);
+            write_str(" output=");
+            write_dec(output_len);
+            write_str("B (verdict→record_attempt wiring lands next)\n");
+            // Next session: pull current task index, call
+            // `refactor_loop::record_attempt(&mut tasks[idx], verdict)`,
+            // then `task_store::save(&tasks)`. Verdict comes from
+            // `refactor_loop::verdict_from_cargo_check_status(status)`.
+        }
+        None => {
+            write_str("[Draug-async] CARGO_CHECK: short/empty response\n");
+            draug.record_skip();
+        }
+    }
+    draug.async_phase = AsyncPhase::Idle;
+    draug.async_operation = AsyncOp::None;
+    true
 }
 
 /// Skill tree: LLM returned code → extract → start PATCH.

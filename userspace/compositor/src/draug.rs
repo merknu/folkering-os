@@ -96,6 +96,33 @@ pub enum AsyncOp {
     PlannerLlm,
     /// Phase 15: LLM call for step execution
     ExecutorLlm,
+    /// Phase 17 (autonomous refactor loop): LLM call to refactor an
+    /// existing function. Body of the request includes the source +
+    /// goal + (optionally, gated by `--cg-policy by-model`) the
+    /// caller list from CodeGraph.
+    RefactorLlm,
+    /// Phase 17: ship Draug's refactored source to the proxy's
+    /// CARGO_CHECK endpoint, get back a verdict on whether the
+    /// patch compiles + keeps callers compiling.
+    CargoCheck,
+}
+
+/// Which kind of work Draug is doing right now. Lets `tick_idle`
+/// dispatch to one of three coexisting flows (Skill Tree / Phase 15
+/// / Phase 17 refactor) instead of cramming all three into a single
+/// linear path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskKind {
+    /// Skill Tree L1-L3: write fresh code from a static task list.
+    SkillTree,
+    /// Phase 15 Plan-and-Solve: planner + executor loop on
+    /// `agent_planner::COMPLEX_TASKS`.
+    PlanAndSolve,
+    /// Phase 17 autonomous refactor: read an existing fn from the
+    /// tree, ship to LLM with CodeGraph caller context (per the
+    /// by-model policy), CARGO_CHECK the result. Picks the next
+    /// `Pending` entry from `task_store::load()`.
+    Refactor,
 }
 
 // ── Knowledge Hunt (Phase 7) ────────────────────────────────────────

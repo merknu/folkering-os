@@ -327,6 +327,114 @@ pub fn graph_callers(
     Some(PatchStatus { status, output_len })
 }
 
+/// Phase 17 — autonomous-refactor cargo check.
+///
+/// Ship a candidate refactor (`content`) for the file at
+/// `target_file` (repo-relative, e.g. `kernel/src/memory/physical.rs`)
+/// to the host-side proxy's `CARGO_CHECK` command. The proxy
+/// overwrites the file in the live tree, runs `cargo check` in the
+/// owning workspace, restores the original, and returns:
+///
+///   `PatchStatus { status, output_len }`
+///
+/// where `status` is one of `CC_STATUS_*` from the proxy's
+/// `cargo_check.rs` (mirrored here as constants). `result_buf` is
+/// filled with up to `output_len` bytes of stderr excerpt.
+///
+/// Sister of `fbp_patch` — same packed-lengths ABI — but operates
+/// on real OS source paths instead of the draug-sandbox crate, so
+/// Draug can verify a refactor against actual callers.
+///
+/// Returns `None` on TCP/syscall failure.
+pub fn cargo_check(
+    target_file: &str,
+    content: &[u8],
+    result_buf: &mut [u8],
+) -> Option<PatchStatus> {
+    let target_len = target_file.len() as u64;
+    let content_len = content.len() as u64;
+    let result_max = result_buf.len() as u64;
+    let mask = 0x1F_FFFFu64; // 21 bits — matches kernel unpacker
+    let packed = (target_len & mask)
+        | ((content_len & mask) << 21)
+        | ((result_max & mask) << 42);
+
+    let ret = unsafe {
+        syscall4(
+            0x66, // SYS_CARGO_CHECK
+            target_file.as_ptr() as u64,
+            content.as_ptr() as u64,
+            result_buf.as_mut_ptr() as u64,
+            packed,
+        )
+    };
+    if ret == u64::MAX {
+        return None;
+    }
+    let status = ((ret >> 32) & 0xFFFF_FFFF) as u32;
+    let output_len = (ret & 0xFFFF_FFFF) as usize;
+    Some(PatchStatus { status, output_len })
+}
+
+/// CARGO_CHECK status codes (mirror `CC_STATUS_*` in
+/// `folkering-proxy/src/cargo_check.rs`). 0 = OK, 1 = BUILD_FAILED,
+/// 2 = BAD_PATH, 3 = IO_ERROR, 4 = CHECK_TIMEOUT, 5 = TOO_LARGE,
+/// 6 = NOT_CONFIGURED.
+pub const CC_STATUS_OK: u32             = 0;
+pub const CC_STATUS_BUILD_FAILED: u32   = 1;
+pub const CC_STATUS_BAD_PATH: u32       = 2;
+pub const CC_STATUS_IO_ERROR: u32       = 3;
+pub const CC_STATUS_CHECK_TIMEOUT: u32  = 4;
+pub const CC_STATUS_TOO_LARGE: u32      = 5;
+pub const CC_STATUS_NOT_CONFIGURED: u32 = 6;
+
+/// Phase 17 — fetch the original source of a real OS file.
+///
+/// Companion to `cargo_check`: Draug needs to read the current text
+/// of a target file before she can build a refactor prompt, but the
+/// bare-metal OS has no host filesystem. This wrapper ships a
+/// `FETCH_SOURCE <path>` request to the proxy and reads back the
+/// raw bytes into `result_buf`.
+///
+/// Returns `Some(PatchStatus { status, output_len })` on success,
+/// where `status` is one of `FS_STATUS_*` (0 = OK, 1 = BAD_PATH,
+/// 2 = NOT_FOUND, 3 = IO_ERROR, 4 = TOO_LARGE, 5 = NOT_CONFIGURED).
+/// Returns `None` on TCP/syscall failure.
+pub fn fetch_source(
+    target_file: &str,
+    result_buf: &mut [u8],
+) -> Option<PatchStatus> {
+    let target_len = target_file.len() as u64;
+    let result_max = result_buf.len() as u64;
+    let mask = 0x1F_FFFFu64;
+    let packed = (target_len & mask) | ((result_max & mask) << 21);
+
+    let ret = unsafe {
+        syscall4(
+            0x67, // SYS_FETCH_SOURCE
+            target_file.as_ptr() as u64,
+            result_buf.as_mut_ptr() as u64,
+            0, // unused, kept 0 for ABI symmetry
+            packed,
+        )
+    };
+    if ret == u64::MAX {
+        return None;
+    }
+    let status = ((ret >> 32) & 0xFFFF_FFFF) as u32;
+    let output_len = (ret & 0xFFFF_FFFF) as usize;
+    Some(PatchStatus { status, output_len })
+}
+
+/// FETCH_SOURCE status codes (mirror `FS_STATUS_*` in
+/// `folkering-proxy/src/fetch_source.rs`).
+pub const FS_STATUS_OK: u32             = 0;
+pub const FS_STATUS_BAD_PATH: u32       = 1;
+pub const FS_STATUS_NOT_FOUND: u32      = 2;
+pub const FS_STATUS_IO_ERROR: u32       = 3;
+pub const FS_STATUS_TOO_LARGE: u32      = 4;
+pub const FS_STATUS_NOT_CONFIGURED: u32 = 5;
+
 pub fn fbp_patch(
     filename: &str,
     content: &[u8],
