@@ -29,6 +29,8 @@ pub(crate) mod agent_planner;
 mod autodream;
 pub(crate) mod draug_async;
 pub(crate) mod knowledge_hunt;
+pub(crate) mod refactor_loop;
+pub(crate) mod task_store;
 mod token_stream;
 
 // ── Constants (shared between submodules) ─────────────────────────────
