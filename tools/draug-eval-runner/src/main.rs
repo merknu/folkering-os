@@ -60,13 +60,81 @@ struct GlobalArgs {
     /// here so the eval doesn't burn cloud tokens on every run.
     llm_model: String,
     /// When true, suppress the CodeGraph caller list from the prompt.
-    /// Used by ablation runs to measure whether feeding the call-graph
-    /// to the LLM actually improves refactor quality.
+    /// Equivalent to `--cg-policy never`; kept as a shortcut for
+    /// backwards compat with the original ablation runs.
     no_codegraph: bool,
+    /// Policy for whether to include the CodeGraph caller list:
+    ///   always  — include unconditionally (current default; what
+    ///             every prior trial measured)
+    ///   never   — never include; same as --no-codegraph
+    ///   by-model — small models get the list, large ones don't.
+    ///             Based on the evidence so far: 7b PASS rate lifts
+    ///             +20 pp with CG (replicated). Larger models show
+    ///             unclear/possibly-negative effect (single-batch
+    ///             cloud variance > effect size at N=3).
+    cg_policy: CgPolicy,
     /// When true, place the caller list AFTER the original source
     /// instead of before. Tests the "goal-dilution" hypothesis from
     /// the cross-model trial.
     callers_at_end: bool,
+}
+
+/// CodeGraph caller-list inclusion policy. See `cg_policy` on
+/// `GlobalArgs` for the rationale behind each variant.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum CgPolicy {
+    Always,
+    Never,
+    ByModel,
+}
+
+impl CgPolicy {
+    fn as_str(self) -> &'static str {
+        match self {
+            CgPolicy::Always   => "always",
+            CgPolicy::Never    => "never",
+            CgPolicy::ByModel  => "by-model",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "always"               => Some(CgPolicy::Always),
+            "never"                => Some(CgPolicy::Never),
+            "by-model" | "bymodel" => Some(CgPolicy::ByModel),
+            _ => None,
+        }
+    }
+
+    /// Resolve the policy to a concrete include/exclude decision for
+    /// a given model name. The "by-model" branch uses simple substring
+    /// heuristics on the model name. When the model is ambiguous (no
+    /// recognised size token), we default to including — that matches
+    /// the existing-behaviour-was-safe-for-7b stance, and we'd rather
+    /// over-include than silently strip.
+    fn includes_callers(self, model: &str) -> bool {
+        match self {
+            CgPolicy::Always => true,
+            CgPolicy::Never => false,
+            CgPolicy::ByModel => {
+                let m = model.to_ascii_lowercase();
+                // Known-large signatures from the trial set + common
+                // industry sizes. Add as we grow the matrix.
+                let large_markers = [
+                    ":13b", ":14b", ":17b", ":20b", ":30b", ":31b",
+                    ":32b", ":33b", ":34b", ":35b", ":40b", ":65b",
+                    ":70b", ":72b", ":80b", ":120b", ":135b", ":175b",
+                    ":405b",
+                    "cloud",
+                ];
+                if large_markers.iter().any(|tag| m.contains(tag)) {
+                    return false;
+                }
+                // Default for small / unknown models: include.
+                true
+            }
+        }
+    }
 }
 
 impl GlobalArgs {
@@ -79,8 +147,30 @@ impl GlobalArgs {
             proxy_port: proxy::DEFAULT_PORT,
             llm_model: "qwen2.5-coder:7b".to_string(),
             no_codegraph: false,
+            // Default: by-model. Small models (≤8b, default-treated)
+            // get the caller list (replicated +20 pp for 7b); known-
+            // large models (≥13b, "cloud" tag) skip it. Override
+            // explicitly with --cg-policy always to reproduce the
+            // historic prompt shape; --no-codegraph still works as
+            // shortcut for never.
+            cg_policy: CgPolicy::ByModel,
             callers_at_end: false,
         }
+    }
+
+    /// Resolve `no_codegraph` + `cg_policy` to a single boolean for
+    /// the prompt builder. `--no-codegraph` always wins (same as
+    /// `--cg-policy never`).
+    fn includes_callers(&self) -> bool {
+        if self.no_codegraph { return false; }
+        self.cg_policy.includes_callers(&self.llm_model)
+    }
+
+    /// Effective policy after `--no-codegraph` short-circuit. Carried
+    /// into score.json so post-hoc analysis can see what was actually
+    /// asked for vs. inferred.
+    fn effective_policy(&self) -> CgPolicy {
+        if self.no_codegraph { CgPolicy::Never } else { self.cg_policy }
     }
 }
 
@@ -108,6 +198,16 @@ fn main() -> ExitCode {
             }
             "--model" => { g.llm_model = next_or_die(&raw_args, &mut i, "--model"); }
             "--no-codegraph" => { g.no_codegraph = true; }
+            "--cg-policy" => {
+                let s = next_or_die(&raw_args, &mut i, "--cg-policy");
+                g.cg_policy = match CgPolicy::parse(&s) {
+                    Some(p) => p,
+                    None => {
+                        eprintln!("--cg-policy: unknown value '{s}', expected always|never|by-model");
+                        return ExitCode::from(2);
+                    }
+                };
+            }
             "--callers-at-end" => { g.callers_at_end = true; }
             other if subcommand.is_none() => {
                 subcommand = Some(other.to_string());
@@ -163,7 +263,10 @@ fn print_help() -> ExitCode {
     println!("  --proxy-host HOST       folkering-proxy address (default 127.0.0.1)");
     println!("  --proxy-port PORT       (default 14711)");
     println!("  --model NAME            LLM model name (default qwen2.5-coder:7b)");
-    println!("  --no-codegraph          Redact caller list from the LLM prompt (ablation)");
+    println!("  --no-codegraph          Shortcut for --cg-policy never");
+    println!("  --cg-policy POLICY      Caller-list policy: always | never | by-model (default)");
+    println!("                          by-model: include for small models, skip for known-large");
+    println!("                          (>=13b parameters or 'cloud' tag)");
     println!("  --callers-at-end        Place caller list AFTER source instead of before");
     ExitCode::SUCCESS
 }
@@ -243,7 +346,7 @@ fn cmd_prompt(g: &GlobalArgs, args: &[String]) -> ExitCode {
         target_fn: &task.target_fn,
         target_file: &target_file,
         graph: &graph,
-        include_callers: !g.no_codegraph,
+        include_callers: g.includes_callers(),
         callers_position: if g.callers_at_end {
             prompt::CallersPosition::Bottom
         } else {
@@ -308,7 +411,7 @@ fn cmd_refactor(g: &GlobalArgs, args: &[String]) -> ExitCode {
         target_fn: &task.target_fn,
         target_file: &target_file,
         graph: &graph,
-        include_callers: !g.no_codegraph,
+        include_callers: g.includes_callers(),
         callers_position: if g.callers_at_end {
             prompt::CallersPosition::Bottom
         } else {
@@ -512,7 +615,8 @@ fn score_one(g: &GlobalArgs, task: &Task, patch_code: &str) -> ExitCode {
         target_file: task.target_file.clone(),
         patch_strategy: format!("{:?}", applied.strategy).to_lowercase(),
         patch_chars: patch_code.len(),
-        codegraph_in_prompt: !g.no_codegraph,
+        codegraph_in_prompt: g.includes_callers(),
+        cg_policy: g.effective_policy().as_str().to_string(),
         model: g.llm_model.clone(),
         callers_position: if g.callers_at_end { "bottom".into() } else { "top".into() },
         cargo_check: CargoReport {
@@ -591,10 +695,16 @@ struct TaskReport {
     patch_strategy: String,
     patch_chars: usize,
     /// Whether the caller list from CodeGraph was included in the
-    /// LLM prompt for the run that produced this score. False ↔
-    /// `--no-codegraph` was set. Carried so post-hoc analysis can
-    /// segment results by experimental condition.
+    /// LLM prompt for the run that produced this score. Decided by
+    /// (--no-codegraph || --cg-policy never) || (--cg-policy by-model
+    /// + model is large) being false. Carried so post-hoc analysis
+    /// can segment results by experimental condition.
     codegraph_in_prompt: bool,
+    /// Caller-list policy that produced this run. One of
+    /// "always" | "never" | "by-model". Distinct from
+    /// `codegraph_in_prompt`: `cg_policy="by-model"` can resolve to
+    /// either include or exclude depending on the model name.
+    cg_policy: String,
     /// Model name passed on the wire to the proxy LLM endpoint
     /// (e.g. "qwen2.5-coder:7b", "gemma4:31b-cloud"). Carried so
     /// the aggregator can compare across models without inferring
@@ -759,5 +869,66 @@ mod tests {
     #[test]
     fn extract_rust_code_block_returns_none_for_unfenced() {
         assert_eq!(extract_rust_code_block("plain text"), None);
+    }
+
+    #[test]
+    fn cg_policy_always_includes_for_every_model() {
+        assert!(CgPolicy::Always.includes_callers("qwen2.5-coder:7b"));
+        assert!(CgPolicy::Always.includes_callers("gemma4:31b-cloud"));
+        assert!(CgPolicy::Always.includes_callers("anything"));
+    }
+
+    #[test]
+    fn cg_policy_never_excludes_for_every_model() {
+        assert!(!CgPolicy::Never.includes_callers("qwen2.5-coder:7b"));
+        assert!(!CgPolicy::Never.includes_callers("gemma4:31b-cloud"));
+    }
+
+    #[test]
+    fn cg_policy_by_model_includes_small_excludes_large() {
+        // Small / unknown — include.
+        assert!(CgPolicy::ByModel.includes_callers("qwen2.5-coder:7b"));
+        assert!(CgPolicy::ByModel.includes_callers("deepseek-r1:8b"));
+        assert!(CgPolicy::ByModel.includes_callers("gemma3:1b"));
+        assert!(CgPolicy::ByModel.includes_callers("llama3:latest"));
+        // Large parameter tags — exclude.
+        assert!(!CgPolicy::ByModel.includes_callers("gemma4:31b-cloud"));
+        assert!(!CgPolicy::ByModel.includes_callers("qwen-coder:32b"));
+        assert!(!CgPolicy::ByModel.includes_callers("llama:70b"));
+        // The "cloud" tag alone is enough to exclude.
+        assert!(!CgPolicy::ByModel.includes_callers("some-model:cloud"));
+    }
+
+    #[test]
+    fn cg_policy_parse_round_trip() {
+        for (s, p) in [("always", CgPolicy::Always),
+                       ("never", CgPolicy::Never),
+                       ("by-model", CgPolicy::ByModel),
+                       ("bymodel", CgPolicy::ByModel)] {
+            assert_eq!(CgPolicy::parse(s), Some(p), "parse({s})");
+        }
+        assert_eq!(CgPolicy::parse("nope"), None);
+    }
+
+    #[test]
+    fn no_codegraph_short_circuits_policy() {
+        let mut g = GlobalArgs::defaults();
+        g.cg_policy = CgPolicy::Always;
+        g.no_codegraph = true;
+        assert!(!g.includes_callers());
+        assert_eq!(g.effective_policy(), CgPolicy::Never);
+    }
+
+    #[test]
+    fn by_model_resolves_per_model() {
+        let mut g = GlobalArgs::defaults();
+        g.cg_policy = CgPolicy::ByModel;
+        g.llm_model = "qwen2.5-coder:7b".to_string();
+        assert!(g.includes_callers());
+        g.llm_model = "gemma4:31b-cloud".to_string();
+        assert!(!g.includes_callers());
+        // effective_policy should reflect the requested policy, not
+        // the resolved boolean.
+        assert_eq!(g.effective_policy(), CgPolicy::ByModel);
     }
 }

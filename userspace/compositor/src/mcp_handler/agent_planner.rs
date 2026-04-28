@@ -35,11 +35,55 @@ use libfolk::sys::{fbp_patch, llm_generate, graph_callers};
 use compositor::draug::{TaskPlan, PlanStep};
 use super::knowledge_hunt::{extract_rust_code_block, write_dec};
 
-/// Query the host-side proxy's CSR call-graph for callers of `fn_name`.
+/// Mirror of `tools/draug-eval-runner/src/main.rs::CgPolicy::ByModel`.
+///
+/// Returns true when the named model is small enough that injecting
+/// the CodeGraph caller list into the prompt demonstrably helps —
+/// based on the eval data:
+///
+/// - qwen2.5-coder:7b, replicated 4×: with-CG +20 pp vs no-CG
+/// - gemma4:31b-cloud, N=3: effect size below cloud variance noise
+///   floor at this N (see folkering-os/tools/draug-eval-runner/
+///   position-experiment-001.md for the 17 pp same-prompt swing
+///   that made the cross-model claim unreliable)
+///
+/// Conservative default for unknown model names: include. Adding
+/// noise to a prompt is cheaper than missing context that helps.
+///
+/// Update the `LARGE_MARKERS` table when we add new model classes
+/// to the eval matrix. Same heuristic shape as the eval runner so
+/// they don't drift.
+pub fn codegraph_for_model(model: &str) -> bool {
+    // Known-large parameter tags + cloud routing. Substring match
+    // on the lowercased model string. ASCII-only for no_std.
+    const LARGE_MARKERS: &[&str] = &[
+        ":13b", ":14b", ":17b", ":20b", ":30b", ":31b", ":32b",
+        ":33b", ":34b", ":35b", ":40b", ":65b", ":70b", ":72b",
+        ":80b", ":120b", ":135b", ":175b", ":405b",
+        "cloud",
+    ];
+    let m = ascii_lower(model);
+    !LARGE_MARKERS.iter().any(|tag| m.contains(tag))
+}
+
+fn ascii_lower(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        out.push(c.to_ascii_lowercase());
+    }
+    out
+}
+
+/// Query the host-side proxy's CSR call-graph for callers of `fn_name`,
+/// gated by the `--cg-policy by-model` decision for the given LLM.
+///
 /// Returns `Some(formatted_block)` on a successful non-empty result —
 /// caller can paste it into an LLM prompt as additional context. None
-/// when the function isn't in the graph, has no callers, the graph
-/// isn't loaded, or the proxy is unreachable.
+/// when:
+///   - the policy says skip the caller list for this model
+///   - the function isn't in the graph
+///   - the graph isn't loaded / proxy unreachable
+///   - the function has no callers
 ///
 /// Format:
 /// ```text
@@ -50,7 +94,10 @@ use super::knowledge_hunt::{extract_rust_code_block, write_dec};
 ///
 /// Cost is ~150 µs lookup (cache hit) + RTT — orders of magnitude
 /// cheaper than asking the LLM the same question.
-pub fn fetch_callers_summary(fn_name: &str) -> Option<String> {
+pub fn fetch_callers_summary(fn_name: &str, model: &str) -> Option<String> {
+    if !codegraph_for_model(model) {
+        return None;
+    }
     let mut buf = [0u8; 4096];
     let res = graph_callers(fn_name, &mut buf)?;
     if res.status != 0 || res.output_len == 0 {
@@ -69,6 +116,35 @@ pub fn fetch_callers_summary(fn_name: &str) -> Option<String> {
         out.push('\n');
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod codegraph_policy_tests {
+    use super::*;
+
+    #[test]
+    fn small_models_include_callers() {
+        assert!(codegraph_for_model("qwen2.5-coder:7b"));
+        assert!(codegraph_for_model("deepseek-r1:8b"));
+        assert!(codegraph_for_model("gemma3:1b"));
+        // Unknown model: include (conservative default).
+        assert!(codegraph_for_model("some-future-model:latest"));
+    }
+
+    #[test]
+    fn large_models_exclude_callers() {
+        assert!(!codegraph_for_model("gemma4:31b-cloud"));
+        assert!(!codegraph_for_model("qwen-coder:32b"));
+        assert!(!codegraph_for_model("llama:70b"));
+        // The "cloud" tag alone is enough to exclude.
+        assert!(!codegraph_for_model("anything:cloud"));
+    }
+
+    #[test]
+    fn case_insensitive() {
+        assert!(!codegraph_for_model("Gemma4:31B-CLOUD"));
+        assert!(!codegraph_for_model("QWEN-CODER:32B"));
+    }
 }
 
 /// Complex tasks that require multi-step planning.
