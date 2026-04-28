@@ -25,6 +25,7 @@ set -uo pipefail
 N="${1:-3}"
 MODEL="${2:-qwen2.5-coder:7b}"
 LABEL="${3:-}"
+POSITION="${4:-top}"   # "top" (default) or "bottom" — adds --callers-at-end
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BIN="$ROOT/tools/draug-eval-runner/target/release/draug-eval.exe"
 
@@ -75,14 +76,19 @@ run_trial() {
         return 0
     fi
 
+    local pos_flag=()
+    if [[ "$POSITION" == "bottom" ]]; then
+        pos_flag=(--callers-at-end)
+    fi
+
     if [[ -n "$extra_flag" ]]; then
-        "$BIN" "$extra_flag" --model "$MODEL" --output "$out" eval --all
+        "$BIN" "$extra_flag" "${pos_flag[@]}" --model "$MODEL" --output "$out" eval --all
     else
-        "$BIN" --model "$MODEL" --output "$out" eval --all
+        "$BIN" "${pos_flag[@]}" --model "$MODEL" --output "$out" eval --all
     fi
 }
 
-echo "[run-trials] N=$N MODEL=$MODEL LABEL=${LABEL:-<none>}"
+echo "[run-trials] N=$N MODEL=$MODEL LABEL=${LABEL:-<none>} POSITION=$POSITION"
 
 for i in $(seq 1 "$N"); do
     run_trial "cg"   ""               "$i"
