@@ -38,6 +38,64 @@ use alloc::string::{String, ToString};
 use super::agent_planner::{codegraph_for_model, fetch_callers_summary};
 use super::task_store::{RefactorTask, TaskStatus};
 
+/// Default fixture seed for [`task_store::seed_or_merge`]. Mirrors
+/// `tools/draug-eval-runner/tasks.toml` — five real refactor targets
+/// the eval harness has scored multiple times. When the autonomous
+/// loop boots into a clean Synapse VFS (no `draug/refactor_tasks.txt`)
+/// it seeds the queue from this list so Draug always has work
+/// available, without re-implementing the toml parser inside the
+/// no_std compositor.
+///
+/// Tuple shape: `(id, target_file, target_fn, goal)`.
+///
+/// Add new entries by mirroring the eval-runner fixture; the runner
+/// remains the source of truth, this is the in-OS shadow.
+pub const REFACTOR_FIXTURES: &[(&str, &str, &str, &str)] = &[
+    (
+        "01_pop_i32_slot",
+        "tools/a64-encoder/src/wasm_lower/stack.rs",
+        "pop_i32_slot",
+        "Refactor `pop_i32_slot` to return `Result<Reg, LowerError>` instead \
+         of panicking on stack underflow. 29 call sites across 8 files in \
+         the wasm_lower module — all callers need to handle the new Result.",
+    ),
+    (
+        "02_maybe_bounds_check",
+        "tools/a64-encoder/src/wasm_lower/memory.rs",
+        "maybe_bounds_check",
+        "Extract the elision-decision logic in `maybe_bounds_check` into a \
+         separate `BoundsCheckDecision` enum + helper, so call sites can \
+         match on intent rather than chase a boolean. 10 call sites across \
+         memory.rs + simd.rs.",
+    ),
+    (
+        "03_alloc_pages",
+        "kernel/src/memory/physical.rs",
+        "alloc_pages",
+        "The kernel buddy allocator's `alloc_pages` accepts an `order` \
+         (log2 page count). Add a `Layout`-style API alongside that takes \
+         raw byte size + alignment and computes order internally. 4 call \
+         sites all in physical.rs.",
+    ),
+    (
+        "04_compile_module",
+        "tools/a64-encoder/src/wasm_lower/module_lower.rs",
+        "compile_module",
+        "`compile_module` is the host-side WASM-to-AArch64 entry point. \
+         Add an explicit `CompileOptions` struct (currently positional \
+         args). 5 call sites across jit_cache + 3 example bins — examples \
+         must keep working.",
+    ),
+    (
+        "05_push_dec",
+        "kernel/src/net/tcp_shell.rs",
+        "push_dec",
+        "`push_dec` formats a u32 into a String for the kernel TCP shell. \
+         Refactor to use the kernel's existing `core::fmt::Write` machinery \
+         instead of manual digit pushing. 12 call sites all in tcp_shell.rs.",
+    ),
+];
+
 /// Find the next refactor task that's eligible for an attempt.
 /// Scans in declared order and returns the first `Pending` entry
 /// (or any failed entry whose attempt count is below the retry cap).
@@ -161,6 +219,53 @@ pub enum AttemptVerdict {
     Skip,
 }
 
+/// Build the `CARGO_CHECK <target>\n<len>\n<source>` request frame
+/// the proxy expects on the wire. Same shape as `start_patch_request`
+/// in `draug_async.rs` — pulled out here so the formatting is unit-
+/// testable without booting the OS.
+///
+/// `target_file` is the repo-relative path (e.g.
+/// `kernel/src/memory/physical.rs`). `source` is the candidate Rust
+/// text the proxy will overwrite the file with before running
+/// `cargo check`.
+pub fn build_cargo_check_request(target_file: &str, source: &str) -> alloc::vec::Vec<u8> {
+    let mut req = alloc::vec::Vec::with_capacity(target_file.len() + source.len() + 32);
+    req.extend_from_slice(b"CARGO_CHECK ");
+    req.extend_from_slice(target_file.as_bytes());
+    req.push(b'\n');
+    push_decimal(&mut req, source.len());
+    req.push(b'\n');
+    req.extend_from_slice(source.as_bytes());
+    req
+}
+
+fn push_decimal(out: &mut alloc::vec::Vec<u8>, mut v: usize) {
+    if v == 0 { out.push(b'0'); return; }
+    let mut buf = [0u8; 20];
+    let mut i = 0;
+    while v > 0 {
+        buf[i] = (v % 10) as u8 + b'0';
+        v /= 10;
+        i += 1;
+    }
+    while i > 0 {
+        i -= 1;
+        out.push(buf[i]);
+    }
+}
+
+/// Parse the 8-byte `[u32 status LE][u32 output_len LE]` reply header
+/// the proxy emits at the front of a CARGO_CHECK response. Returns
+/// `None` when the buffer is too short. `output_len` is what the
+/// proxy claims the body length is — the caller is responsible for
+/// reconciling that with the actual bytes it has buffered.
+pub fn parse_cargo_check_header(reply: &[u8]) -> Option<(u32, u32)> {
+    if reply.len() < 8 { return None; }
+    let status = u32::from_le_bytes([reply[0], reply[1], reply[2], reply[3]]);
+    let len    = u32::from_le_bytes([reply[4], reply[5], reply[6], reply[7]]);
+    Some((status, len))
+}
+
 /// Map a proxy CARGO_CHECK status code to an [`AttemptVerdict`].
 /// Mirrors `folkering-proxy/src/cargo_check.rs` constants:
 ///
@@ -259,6 +364,57 @@ mod tests {
         assert!(prompt.contains("## Target"));
         assert!(prompt.contains("## Constraints"));
         assert!(prompt.contains("fn f() {}"));
+    }
+
+    #[test]
+    fn fixtures_have_unique_ids() {
+        let mut ids: Vec<&str> = REFACTOR_FIXTURES.iter().map(|(id, _, _, _)| *id).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), REFACTOR_FIXTURES.len(),
+            "REFACTOR_FIXTURES has duplicate ids — task_store::seed_or_merge \
+             would silently keep only the first instance");
+    }
+
+    #[test]
+    fn fixtures_target_files_are_repo_relative() {
+        for (id, target_file, _, _) in REFACTOR_FIXTURES {
+            assert!(!target_file.starts_with('/'),
+                "fixture `{id}`: target_file `{target_file}` is absolute");
+            assert!(!target_file.contains(".."),
+                "fixture `{id}`: target_file `{target_file}` has parent traversal");
+            assert!(target_file.ends_with(".rs"),
+                "fixture `{id}`: target_file `{target_file}` is not a .rs file");
+        }
+    }
+
+    #[test]
+    fn cargo_check_request_frame_matches_proxy_wire_format() {
+        let req = build_cargo_check_request("kernel/src/foo.rs", "fn x() {}");
+        // Wire layout: `CARGO_CHECK <target>\n<len>\n<source>`
+        let s = core::str::from_utf8(&req).unwrap();
+        assert!(s.starts_with("CARGO_CHECK kernel/src/foo.rs\n"));
+        assert!(s.contains("\n9\n")); // 9 = len("fn x() {}")
+        assert!(s.ends_with("fn x() {}"));
+    }
+
+    #[test]
+    fn cargo_check_header_parses_status_and_len() {
+        // status=1 (BUILD_FAILED), output_len=42, both little-endian
+        let reply = [
+            0x01, 0x00, 0x00, 0x00,
+            0x2A, 0x00, 0x00, 0x00,
+            b'p', b'a', b'd',
+        ];
+        let (status, len) = parse_cargo_check_header(&reply).unwrap();
+        assert_eq!(status, 1);
+        assert_eq!(len, 42);
+    }
+
+    #[test]
+    fn cargo_check_header_rejects_short_buffer() {
+        let short = [0u8; 4];
+        assert!(parse_cargo_check_header(&short).is_none());
     }
 
     /// Large-model path: `codegraph_for_model` returns false, so the
