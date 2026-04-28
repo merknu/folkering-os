@@ -147,7 +147,13 @@ impl GlobalArgs {
             proxy_port: proxy::DEFAULT_PORT,
             llm_model: "qwen2.5-coder:7b".to_string(),
             no_codegraph: false,
-            cg_policy: CgPolicy::Always,
+            // Default: by-model. Small models (≤8b, default-treated)
+            // get the caller list (replicated +20 pp for 7b); known-
+            // large models (≥13b, "cloud" tag) skip it. Override
+            // explicitly with --cg-policy always to reproduce the
+            // historic prompt shape; --no-codegraph still works as
+            // shortcut for never.
+            cg_policy: CgPolicy::ByModel,
             callers_at_end: false,
         }
     }
@@ -258,7 +264,7 @@ fn print_help() -> ExitCode {
     println!("  --proxy-port PORT       (default 14711)");
     println!("  --model NAME            LLM model name (default qwen2.5-coder:7b)");
     println!("  --no-codegraph          Shortcut for --cg-policy never");
-    println!("  --cg-policy POLICY      Caller-list policy: always (default) | never | by-model");
+    println!("  --cg-policy POLICY      Caller-list policy: always | never | by-model (default)");
     println!("                          by-model: include for small models, skip for known-large");
     println!("                          (>=13b parameters or 'cloud' tag)");
     println!("  --callers-at-end        Place caller list AFTER source instead of before");
