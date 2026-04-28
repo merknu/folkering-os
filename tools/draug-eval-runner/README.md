@@ -97,9 +97,20 @@ cargo run -p draug-eval-runner --release -- eval 03_alloc_pages
 # Run the full suite:
 cargo run -p draug-eval-runner --release -- eval --all
 
+# Ablation — same suite without the CodeGraph caller list in the prompt:
+cargo run -p draug-eval-runner --release -- \
+    --no-codegraph --output output-no-cg eval --all
+
 # Use a different model:
 cargo run -p draug-eval-runner --release -- \
     --model gemma4:31b-cloud refactor 01_pop_i32_slot
+
+# N=3 trial: 3 runs per condition + aggregator (writes Markdown + CSV):
+tools/draug-eval-runner/run-trials.sh 3
+python tools/draug-eval-runner/aggregate.py \
+    tools/draug-eval-runner/output-cg-r* \
+    tools/draug-eval-runner/output-nocg-r* \
+    --csv tools/draug-eval-runner/n3-trial.csv
 ```
 
 `verify` output:
