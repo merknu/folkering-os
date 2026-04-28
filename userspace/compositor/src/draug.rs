@@ -201,6 +201,11 @@ pub fn model_for_level(level: u8) -> &'static str {
 pub const PLANNER_MODEL: &str = "gemma4:31b-cloud";
 /// Model for Phase 15 Executor persona (complex multi-step).
 pub const EXECUTOR_MODEL: &str = "gemma4:31b-cloud";
+/// Model for Phase 17 autonomous refactor LLM calls. Uses the small
+/// model to keep cloud costs bounded — the eval-runner trial 002
+/// showed gemma4:31b doesn't measurably outperform 7b on the fixture
+/// task set, while costing ~10× per call.
+pub const REFACTOR_MODEL: &str = "qwen2.5-coder:7b";
 pub const ACTIVE_SKILL_LEVELS: u8 = 3;
 pub const MAX_SKILL_LEVELS: u8 = 5;
 /// Number of tasks in REFACTOR_TASKS.
@@ -496,12 +501,39 @@ pub struct DraugDaemon {
     /// Uptime (ms) when current async phase started — for timeout.
     /// If now - async_phase_started_ms > ASYNC_TIMEOUT_MS, force abort.
     pub async_phase_started_ms: u64,
+
+    // ── Phase 17 — autonomous refactor loop ─────────────────────────
+    /// Persisted refactor task queue. Loaded from Synapse VFS at
+    /// startup (or seeded from `mcp_handler::refactor_loop::REFACTOR_FIXTURES`
+    /// on cold-boot). `None` until the loader runs at boot —
+    /// `tick_idle` treats `None` as "Phase 17 unavailable".
+    pub refactor_tasks: Option<alloc::vec::Vec<crate::refactor_types::RefactorTask>>,
+    /// Index into `refactor_tasks` for the iteration currently in
+    /// flight. `usize::MAX` = nothing in flight. Outlives the
+    /// LlmGenerate→CargoCheck transition so process_cargo_check_result
+    /// can find the task it should record_attempt against.
+    pub current_refactor_idx: usize,
+    /// Repo-relative path of the file the in-flight refactor is
+    /// targeting. Cached so `process_refactor_llm` can pass it to
+    /// `build_cargo_check_request` without re-reading the task.
+    pub current_refactor_target: alloc::string::String,
+    /// Cap on how many refactor iterations we run per boot — keeps
+    /// cloud costs bounded and means Draug eventually idles instead
+    /// of looping forever.
+    pub refactor_iterations_done: u32,
 }
 
 /// Timeout for any single async TCP phase (connect/send/read).
 /// 90 seconds wall clock — enough for cold Ollama + cargo test,
 /// but prevents permanent hang if proxy stops responding.
 pub const ASYNC_TIMEOUT_MS: u64 = 90_000;
+
+/// Cap on autonomous refactor iterations per boot. cargo check on
+/// real OS code is expensive (cold workspace ≈ 45 s) and each
+/// iteration also burns a cloud-routed LLM call. 16 iterations is
+/// enough to cycle every fixture task at the 3-attempt cap a few
+/// times before idling — see `mcp_handler::refactor_loop::pick_next_refactor_task`.
+pub const MAX_REFACTOR_ITERATIONS_PER_BOOT: u32 = 16;
 
 // ── Phase 15 types (must live in lib crate so draug.rs can own them) ──
 
@@ -588,6 +620,10 @@ impl DraugDaemon {
             async_level: 0,
             async_attempt: 0,
             async_phase_started_ms: 0,
+            refactor_tasks: None,
+            current_refactor_idx: usize::MAX,
+            current_refactor_target: alloc::string::String::new(),
+            refactor_iterations_done: 0,
         }
     }
 
@@ -685,6 +721,48 @@ impl DraugDaemon {
             }
         }
         None
+    }
+
+    /// Phase 17 — find the next refactor task eligible for an
+    /// attempt. Mirrors the eval-runner's pick logic: first
+    /// `Pending`, then any failed entry under the per-task retry
+    /// cap (3). Returns `None` when every task has settled — caller
+    /// should fall through to `start_phase15` then.
+    pub fn pick_next_refactor(&self) -> Option<usize> {
+        const MAX_ATTEMPTS_PER_TASK: u32 = 3;
+        let tasks = self.refactor_tasks.as_ref()?;
+        for (idx, t) in tasks.iter().enumerate() {
+            use crate::refactor_types::TaskStatus;
+            match t.last_status {
+                TaskStatus::Pending => return Some(idx),
+                TaskStatus::Pass | TaskStatus::Skip => continue,
+                TaskStatus::FailCompile | TaskStatus::FailCallerCompat => {
+                    if t.attempts < MAX_ATTEMPTS_PER_TASK {
+                        return Some(idx);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Phase 17 — caller-side guard for the per-boot iteration cap.
+    /// `tick_idle` calls this before picking a refactor task to
+    /// short-circuit when we've already done MAX_REFACTOR_ITERATIONS_PER_BOOT.
+    pub fn refactor_budget_remaining(&self) -> bool {
+        self.refactor_iterations_done < MAX_REFACTOR_ITERATIONS_PER_BOOT
+    }
+
+    /// Phase 17 — install the refactor task queue. Caller is the
+    /// boot path in `main.rs`, which loads from Synapse VFS via
+    /// `task_store::load()` (and seeds from REFACTOR_FIXTURES on
+    /// cold boot). Stored as `Some(_)` so `tick_idle` can tell
+    /// "queue available" from "queue not yet loaded".
+    pub fn install_refactor_tasks(
+        &mut self,
+        tasks: alloc::vec::Vec<crate::refactor_types::RefactorTask>,
+    ) {
+        self.refactor_tasks = Some(tasks);
     }
 
     /// Record that task `idx` passed its current level.

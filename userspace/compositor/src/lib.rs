@@ -68,6 +68,7 @@ pub mod slm_runtime;
 pub mod window_manager;
 pub mod agent;
 pub mod draug;
+pub mod refactor_types;
 
 extern crate alloc;
 
