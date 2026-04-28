@@ -32,6 +32,11 @@ pub struct RefactorPromptInput<'a> {
     /// instead of trusting whatever's in tasks.toml — that way the
     /// prompt always reflects current reality, not stale fixture data.
     pub graph: &'a CallGraph,
+    /// When true, suppress the "Blast radius — callers from the static
+    /// call-graph" section. Used by the `--no-codegraph` ablation to
+    /// measure whether feeding the caller list to the LLM actually
+    /// improves refactor quality, or whether the model ignores it.
+    pub include_callers: bool,
 }
 
 #[derive(Debug)]
@@ -115,17 +120,27 @@ pub fn build(input: &RefactorPromptInput<'_>) -> Result<BuiltPrompt, PromptError
     md.push_str(&extracted.end_line.to_string());
     md.push_str(")\n\n");
 
-    md.push_str("## Blast radius — callers from the static call-graph\n\n");
-    md.push_str(&caller_count.to_string());
-    md.push_str(" caller(s) across ");
-    md.push_str(&caller_files.len().to_string());
-    md.push_str(" file(s):\n\n");
-    for c in &caller_lines {
-        md.push_str("- `");
-        md.push_str(c);
-        md.push_str("`\n");
+    if input.include_callers {
+        md.push_str("## Blast radius — callers from the static call-graph\n\n");
+        md.push_str(&caller_count.to_string());
+        md.push_str(" caller(s) across ");
+        md.push_str(&caller_files.len().to_string());
+        md.push_str(" file(s):\n\n");
+        for c in &caller_lines {
+            md.push_str("- `");
+            md.push_str(c);
+            md.push_str("`\n");
+        }
+        md.push('\n');
+    } else {
+        // Ablation mode: no blast-radius section. We still know the
+        // count (from CSR) and surface it as a single number so the
+        // post-hoc analysis can see whether the model used the absence
+        // as a signal to take more risks. Caller-files are still
+        // returned in BuiltPrompt for downstream tooling.
+        md.push_str("## Blast radius\n\n");
+        md.push_str("(call-graph context redacted for this ablation run)\n\n");
     }
-    md.push('\n');
 
     md.push_str("## Constraints\n\n");
     md.push_str(
@@ -179,15 +194,43 @@ mod tests {
             target_fn: "alloc_pages",
             target_file: &target_file,
             graph: &graph,
+            include_callers: true,
         };
         let built = build(&input).expect("build");
         assert!(built.markdown.contains("# Refactor task: smoke"));
         assert!(built.markdown.contains("## Goal"));
-        assert!(built.markdown.contains("## Blast radius"));
+        assert!(built.markdown.contains("## Blast radius — callers from the static call-graph"));
         assert!(built.markdown.contains("## Original source"));
         assert!(built.markdown.contains("fn alloc_pages"),
             "prompt must include the original fn body");
         assert!(built.caller_count >= 1, "expected ≥1 caller from real graph");
+        assert!(!built.caller_files.is_empty());
+    }
+
+    /// Ablation mode: no caller list, but the rest of the prompt
+    /// stays intact and `caller_files`/`caller_count` still surface.
+    #[test]
+    fn ablation_suppresses_caller_list() {
+        let root = folkering_root();
+        let graph = folkering_codegraph::build_from_dir(&root).expect("graph");
+        let target_file = root.join("kernel/src/memory/physical.rs");
+        let input = RefactorPromptInput {
+            task_id: "smoke-ablation",
+            goal: "Add a Layout-style API alongside `alloc_pages`.",
+            target_fn: "alloc_pages",
+            target_file: &target_file,
+            graph: &graph,
+            include_callers: false,
+        };
+        let built = build(&input).expect("build");
+        assert!(built.markdown.contains("call-graph context redacted"),
+            "ablation mode should advertise itself");
+        assert!(!built.markdown.contains("## Blast radius — callers from the"),
+            "caller-list section must NOT appear");
+        // But the metadata is still available to the runner — the
+        // ablation only redacts the LLM-facing prompt, not what we
+        // know internally about callers.
+        assert!(built.caller_count >= 1);
         assert!(!built.caller_files.is_empty());
     }
 }

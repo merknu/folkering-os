@@ -59,6 +59,10 @@ struct GlobalArgs {
     /// Draug is qwen2.5-coder:7b, which is local + fast — keep that
     /// here so the eval doesn't burn cloud tokens on every run.
     llm_model: String,
+    /// When true, suppress the CodeGraph caller list from the prompt.
+    /// Used by ablation runs to measure whether feeding the call-graph
+    /// to the LLM actually improves refactor quality.
+    no_codegraph: bool,
 }
 
 impl GlobalArgs {
@@ -70,6 +74,7 @@ impl GlobalArgs {
             proxy_host: proxy::DEFAULT_HOST.to_string(),
             proxy_port: proxy::DEFAULT_PORT,
             llm_model: "qwen2.5-coder:7b".to_string(),
+            no_codegraph: false,
         }
     }
 }
@@ -97,6 +102,7 @@ fn main() -> ExitCode {
                 };
             }
             "--model" => { g.llm_model = next_or_die(&raw_args, &mut i, "--model"); }
+            "--no-codegraph" => { g.no_codegraph = true; }
             other if subcommand.is_none() => {
                 subcommand = Some(other.to_string());
             }
@@ -151,6 +157,7 @@ fn print_help() -> ExitCode {
     println!("  --proxy-host HOST       folkering-proxy address (default 127.0.0.1)");
     println!("  --proxy-port PORT       (default 14711)");
     println!("  --model NAME            LLM model name (default qwen2.5-coder:7b)");
+    println!("  --no-codegraph          Redact caller list from the LLM prompt (ablation)");
     ExitCode::SUCCESS
 }
 
@@ -229,6 +236,7 @@ fn cmd_prompt(g: &GlobalArgs, args: &[String]) -> ExitCode {
         target_fn: &task.target_fn,
         target_file: &target_file,
         graph: &graph,
+        include_callers: !g.no_codegraph,
     };
     let built = match prompt::build(&input) {
         Ok(b) => b,
@@ -288,6 +296,7 @@ fn cmd_refactor(g: &GlobalArgs, args: &[String]) -> ExitCode {
         target_fn: &task.target_fn,
         target_file: &target_file,
         graph: &graph,
+        include_callers: !g.no_codegraph,
     };
     let built = match prompt::build(&input) {
         Ok(b) => b,
@@ -486,6 +495,7 @@ fn score_one(g: &GlobalArgs, task: &Task, patch_code: &str) -> ExitCode {
         target_file: task.target_file.clone(),
         patch_strategy: format!("{:?}", applied.strategy).to_lowercase(),
         patch_chars: patch_code.len(),
+        codegraph_in_prompt: !g.no_codegraph,
         cargo_check: CargoReport {
             workspace: outcome.workspace.clone(),
             exit_code: outcome.exit_code,
@@ -561,6 +571,11 @@ struct TaskReport {
     target_file: String,
     patch_strategy: String,
     patch_chars: usize,
+    /// Whether the caller list from CodeGraph was included in the
+    /// LLM prompt for the run that produced this score. False ↔
+    /// `--no-codegraph` was set. Carried so post-hoc analysis can
+    /// segment results by experimental condition.
+    codegraph_in_prompt: bool,
     cargo_check: CargoReport,
     verdict: String,
 }

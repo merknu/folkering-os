@@ -1,6 +1,7 @@
 # LLM responses + assembled prompts. Per-run output that varies with
 # the model, sampling, and the current state of the tree — not source.
 output/
+output-*/
 
 # Persistent git worktree used for cargo-check sandboxing. Created on
 # first run by `score`/`eval`. Resetting to clean HEAD between tasks
