@@ -122,6 +122,14 @@ pub(super) extern "C" fn syscall_handler(
         // proxy's GRAPH_CALLERS command. Same packed-lengths shape
         // as fbp_patch / llm_generate.
         0x65 => syscall_graph_callers(arg1, arg2, arg3, arg4),
+        // Phase 17: autonomous-refactor cargo check. Ships a
+        // candidate file to the proxy's CARGO_CHECK command, which
+        // overwrites the live tree, runs cargo check, and restores.
+        0x66 => syscall_cargo_check(arg1, arg2, arg3, arg4),
+        // Phase 17: read a real OS source file from the host via the
+        // proxy's FETCH_SOURCE command. Lets Draug build refactor
+        // prompts without host filesystem access.
+        0x67 => syscall_fetch_source(arg1, arg2, arg3, arg4),
         // Draug bridge: push status to tcp_shell atomics, return pause flag
         // Draug bridge: producer writes status for TCP shell consumer.
         // Release ordering ensures all stores are visible before the

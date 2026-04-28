@@ -1205,3 +1205,254 @@ pub fn syscall_udp_send_recv(
     };
     crate::net::udp_send_recv(ip, port as u16, data, response, timeout_ms) as u64
 }
+
+/// Phase 17 — autonomous-refactor validation syscall.
+///
+/// Ships a real OS source file (target_file_rel + new bytes) to the
+/// host-side folkering-proxy's `CARGO_CHECK <target>` command. The
+/// proxy overwrites the file in the live tree, runs `cargo check`,
+/// restores the original, and replies with status + a stderr excerpt.
+///
+/// Sister of `syscall_fbp_patch` — same wire shape, same 4-arg
+/// packed-lengths ABI, but `CARGO_CHECK` operates on real file paths
+/// (e.g. `kernel/src/memory/physical.rs`) instead of the draug-sandbox
+/// crate, so Draug can verify a refactor against real callers.
+///
+/// Args (4):
+///   target_ptr   — UTF-8 repo-relative path
+///   content_ptr  — UTF-8 candidate Rust source
+///   result_ptr   — output buffer for the stderr excerpt
+///   packed_lens  — (target_len | (content_len<<21) | (result_max<<42))
+///
+/// Returns `(status << 32) | output_bytes_written`, or `u64::MAX` on
+/// transport failure. Status codes match `CC_STATUS_*` in the proxy
+/// (0 = OK, 1 = BUILD_FAILED, 2 = BAD_PATH, 3 = IO_ERROR,
+/// 4 = CHECK_TIMEOUT, 5 = TOO_LARGE, 6 = NOT_CONFIGURED).
+pub fn syscall_cargo_check(
+    target_ptr: u64,
+    content_ptr: u64,
+    result_ptr: u64,
+    packed_lens: u64,
+) -> u64 {
+    const PROXY_IP: [u8; 4] = [10, 0, 2, 2];
+    const PROXY_PORT: u16 = 14711;
+
+    let target_len = (packed_lens & 0x1F_FFFF) as usize;
+    let content_len = ((packed_lens >> 21) & 0x1F_FFFF) as usize;
+    let result_max = ((packed_lens >> 42) & 0x1F_FFFF) as usize;
+
+    // Proxy currently caps content at 128 KB; keep the kernel-side
+    // ceiling slightly under so a too-large request fails locally.
+    if target_len == 0 || target_len > 256
+        || content_len == 0 || content_len > 131_072
+        || result_max == 0 || result_max > 262_144
+    {
+        crate::serial_str!("[CARGO_CHECK] bad lens: tg=");
+        crate::drivers::serial::write_dec(target_len as u32);
+        crate::serial_str!(" ct=");
+        crate::drivers::serial::write_dec(content_len as u32);
+        crate::serial_str!(" rm=");
+        crate::drivers::serial::write_dec(result_max as u32);
+        crate::serial_strln!("");
+        return u64::MAX;
+    }
+    if target_ptr < 0x200000 || target_ptr >= 0x0000_8000_0000_0000 { return u64::MAX; }
+    if content_ptr < 0x200000 || content_ptr >= 0x0000_8000_0000_0000 { return u64::MAX; }
+    if result_ptr < 0x200000 || result_ptr >= 0x0000_8000_0000_0000 { return u64::MAX; }
+
+    let target_bytes = unsafe {
+        core::slice::from_raw_parts(target_ptr as *const u8, target_len)
+    };
+    let target = match core::str::from_utf8(target_bytes) {
+        Ok(s) => s,
+        Err(_) => return u64::MAX,
+    };
+    let content_bytes = unsafe {
+        core::slice::from_raw_parts(content_ptr as *const u8, content_len)
+    };
+
+    crate::serial_str!("[CARGO_CHECK] ");
+    crate::serial_str!(target);
+    crate::serial_str!(" (");
+    crate::drivers::serial::write_dec(content_len as u32);
+    crate::serial_strln!(" bytes)");
+
+    // Build outbound frame: CARGO_CHECK <target>\n<len>\n<bytes>
+    let mut req: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(
+        content_len + target.len() + 32,
+    );
+    req.extend_from_slice(b"CARGO_CHECK ");
+    req.extend_from_slice(target.as_bytes());
+    req.push(b'\n');
+
+    // Decimal encode without dragging in fmt.
+    let mut tmp = [0u8; 12];
+    let mut n = content_len;
+    let mut idx = 0;
+    if n == 0 {
+        tmp[0] = b'0';
+        idx = 1;
+    } else {
+        while n > 0 {
+            tmp[idx] = b'0' + (n % 10) as u8;
+            n /= 10;
+            idx += 1;
+        }
+    }
+    for i in 0..idx / 2 {
+        tmp.swap(i, idx - 1 - i);
+    }
+    req.extend_from_slice(&tmp[..idx]);
+    req.push(b'\n');
+    req.extend_from_slice(content_bytes);
+
+    let max_total = result_max.saturating_add(8).min(262_144);
+
+    // cargo check on a cold workspace is up to 90s on the proxy side
+    // (CHECK_TIMEOUT_SECS). Give ourselves another margin for the
+    // overwrite/restore round-trip — 180s tsc_ms ≈ 60-120s wall.
+    let response = match crate::net::tcp_plain::tcp_request_with_timeout(
+        PROXY_IP,
+        PROXY_PORT,
+        &req,
+        max_total,
+        180_000,
+    ) {
+        Ok(data) => data,
+        Err(e) => {
+            crate::serial_str!("[CARGO_CHECK] TCP failed: ");
+            crate::serial_strln!(e);
+            return u64::MAX;
+        }
+    };
+
+    if response.len() < 8 {
+        crate::serial_strln!("[CARGO_CHECK] short reply header");
+        return u64::MAX;
+    }
+    let status = u32::from_le_bytes([
+        response[0], response[1], response[2], response[3],
+    ]);
+    let output_len = u32::from_le_bytes([
+        response[4], response[5], response[6], response[7],
+    ]) as usize;
+
+    let available = response.len() - 8;
+    let copy_len = output_len.min(available).min(result_max);
+    unsafe {
+        let dst = core::slice::from_raw_parts_mut(result_ptr as *mut u8, copy_len);
+        dst.copy_from_slice(&response[8..8 + copy_len]);
+    }
+
+    crate::serial_str!("[CARGO_CHECK] status=");
+    crate::drivers::serial::write_dec(status);
+    crate::serial_str!(" output=");
+    crate::drivers::serial::write_dec(copy_len as u32);
+    crate::serial_strln!(" bytes");
+
+    ((status as u64) << 32) | (copy_len as u64)
+}
+
+/// Phase 17 — fetch the bytes of a real OS source file from the host.
+///
+/// Sends `FETCH_SOURCE <target>\n` to the proxy and copies the reply
+/// body into `result_ptr`. Lighter than `cargo_check` — there is no
+/// outbound body, so we use a 3-arg packed-lengths shape (target_len
+/// + result_max only).
+///
+/// Args (4):
+///   target_ptr   — UTF-8 repo-relative path
+///   result_ptr   — output buffer for the file bytes
+///   _unused      — kept 0 for ABI symmetry with graph_callers
+///   packed_lens  — (target_len | (result_max<<21))
+///
+/// Returns `(status << 32) | output_bytes_written`, or `u64::MAX` on
+/// transport failure. Status codes match `FS_STATUS_*` in the proxy
+/// (0 = OK, 1 = BAD_PATH, 2 = NOT_FOUND, 3 = IO_ERROR, 4 = TOO_LARGE,
+/// 5 = NOT_CONFIGURED).
+pub fn syscall_fetch_source(
+    target_ptr: u64,
+    result_ptr: u64,
+    _unused: u64,
+    packed_lens: u64,
+) -> u64 {
+    const PROXY_IP: [u8; 4] = [10, 0, 2, 2];
+    const PROXY_PORT: u16 = 14711;
+
+    let target_len = (packed_lens & 0x1F_FFFF) as usize;
+    let result_max = ((packed_lens >> 21) & 0x1F_FFFF) as usize;
+
+    if target_len == 0 || target_len > 256
+        || result_max == 0 || result_max > 262_144
+    {
+        crate::serial_str!("[FETCH_SOURCE] bad lens: tg=");
+        crate::drivers::serial::write_dec(target_len as u32);
+        crate::serial_str!(" rm=");
+        crate::drivers::serial::write_dec(result_max as u32);
+        crate::serial_strln!("");
+        return u64::MAX;
+    }
+    if target_ptr < 0x200000 || target_ptr >= 0x0000_8000_0000_0000 { return u64::MAX; }
+    if result_ptr < 0x200000 || result_ptr >= 0x0000_8000_0000_0000 { return u64::MAX; }
+
+    let target_bytes = unsafe {
+        core::slice::from_raw_parts(target_ptr as *const u8, target_len)
+    };
+    let target = match core::str::from_utf8(target_bytes) {
+        Ok(s) => s,
+        Err(_) => return u64::MAX,
+    };
+
+    crate::serial_str!("[FETCH_SOURCE] ");
+    crate::serial_strln!(target);
+
+    // Outbound: "FETCH_SOURCE <target>\n"
+    let mut req: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(target.len() + 16);
+    req.extend_from_slice(b"FETCH_SOURCE ");
+    req.extend_from_slice(target.as_bytes());
+    req.push(b'\n');
+
+    let max_total = result_max.saturating_add(8).min(262_144);
+
+    // 90s wall is plenty for a single fs::read.
+    let response = match crate::net::tcp_plain::tcp_request_with_timeout(
+        PROXY_IP,
+        PROXY_PORT,
+        &req,
+        max_total,
+        90_000,
+    ) {
+        Ok(data) => data,
+        Err(e) => {
+            crate::serial_str!("[FETCH_SOURCE] TCP failed: ");
+            crate::serial_strln!(e);
+            return u64::MAX;
+        }
+    };
+
+    if response.len() < 8 {
+        crate::serial_strln!("[FETCH_SOURCE] short reply header");
+        return u64::MAX;
+    }
+    let status = u32::from_le_bytes([
+        response[0], response[1], response[2], response[3],
+    ]);
+    let output_len = u32::from_le_bytes([
+        response[4], response[5], response[6], response[7],
+    ]) as usize;
+
+    let available = response.len() - 8;
+    let copy_len = output_len.min(available).min(result_max);
+    unsafe {
+        let dst = core::slice::from_raw_parts_mut(result_ptr as *mut u8, copy_len);
+        dst.copy_from_slice(&response[8..8 + copy_len]);
+    }
+
+    crate::serial_str!("[FETCH_SOURCE] status=");
+    crate::drivers::serial::write_dec(status);
+    crate::serial_str!(" output=");
+    crate::drivers::serial::write_dec(copy_len as u32);
+    crate::serial_strln!(" bytes");
+
+    ((status as u64) << 32) | (copy_len as u64)
+}
