@@ -496,6 +496,7 @@ fn score_one(g: &GlobalArgs, task: &Task, patch_code: &str) -> ExitCode {
         patch_strategy: format!("{:?}", applied.strategy).to_lowercase(),
         patch_chars: patch_code.len(),
         codegraph_in_prompt: !g.no_codegraph,
+        model: g.llm_model.clone(),
         cargo_check: CargoReport {
             workspace: outcome.workspace.clone(),
             exit_code: outcome.exit_code,
@@ -576,6 +577,11 @@ struct TaskReport {
     /// `--no-codegraph` was set. Carried so post-hoc analysis can
     /// segment results by experimental condition.
     codegraph_in_prompt: bool,
+    /// Model name passed on the wire to the proxy LLM endpoint
+    /// (e.g. "qwen2.5-coder:7b", "gemma4:31b-cloud"). Carried so
+    /// the aggregator can compare across models without inferring
+    /// from output dir names.
+    model: String,
     cargo_check: CargoReport,
     verdict: String,
 }

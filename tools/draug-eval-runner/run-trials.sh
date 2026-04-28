@@ -8,14 +8,23 @@
 # need to restart without reburning successful trials.
 #
 # Usage:
-#   tools/draug-eval-runner/run-trials.sh [N]   # N defaults to 3
+#   tools/draug-eval-runner/run-trials.sh [N] [MODEL] [LABEL]
 #
-# Estimated runtime: ~5 min per condition × N runs × 2 conditions.
-# At N=3 expect ~30 min wall clock.
+#   N      : trials per condition (default 3)
+#   MODEL  : LLM name passed to draug-eval --model (default qwen2.5-coder:7b)
+#   LABEL  : tag baked into output dir names (default empty for backward compat).
+#            With LABEL=g4 → output-cg-g4-r1, output-cg-g4-r2, ...
+#            Without LABEL → output-cg-r1, output-cg-r2, ... (legacy)
+#
+# Estimated runtime: ~5 min per condition × N runs × 2 conditions on
+# local 7b. Cloud-backed models (gemma4:31b-cloud) routinely take
+# 20-60 s per call → ~30-60 min total at N=3.
 
 set -uo pipefail
 
 N="${1:-3}"
+MODEL="${2:-qwen2.5-coder:7b}"
+LABEL="${3:-}"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BIN="$ROOT/tools/draug-eval-runner/target/release/draug-eval.exe"
 
@@ -39,15 +48,26 @@ trial_complete() {
     return 0
 }
 
+dir_for() {
+    # $1 = condition (cg|nocg), $2 = run idx
+    local cond="$1" idx="$2"
+    if [[ -n "$LABEL" ]]; then
+        echo "tools/draug-eval-runner/output-${cond}-${LABEL}-r${idx}"
+    else
+        echo "tools/draug-eval-runner/output-${cond}-r${idx}"
+    fi
+}
+
 run_trial() {
     local label="$1"      # cg or nocg
     local extra_flag="$2" # --no-codegraph or empty
     local i="$3"
-    local out="tools/draug-eval-runner/output-${label}-r${i}"
+    local out
+    out=$(dir_for "$label" "$i")
 
     echo
     echo "=========================================================="
-    echo "  trial: $label run $i  →  $out"
+    echo "  trial: $label run $i  model=$MODEL  →  $out"
     echo "=========================================================="
 
     if trial_complete "$out"; then
@@ -56,11 +76,13 @@ run_trial() {
     fi
 
     if [[ -n "$extra_flag" ]]; then
-        "$BIN" "$extra_flag" --output "$out" eval --all
+        "$BIN" "$extra_flag" --model "$MODEL" --output "$out" eval --all
     else
-        "$BIN" --output "$out" eval --all
+        "$BIN" --model "$MODEL" --output "$out" eval --all
     fi
 }
+
+echo "[run-trials] N=$N MODEL=$MODEL LABEL=${LABEL:-<none>}"
 
 for i in $(seq 1 "$N"); do
     run_trial "cg"   ""               "$i"
@@ -69,5 +91,10 @@ done
 
 echo
 echo "[run-trials] all $N × 2 trials done"
-echo "[run-trials] aggregate with: python tools/draug-eval-runner/aggregate.py \\"
-echo "  tools/draug-eval-runner/output-cg-r* tools/draug-eval-runner/output-nocg-r*"
+if [[ -n "$LABEL" ]]; then
+    echo "[run-trials] aggregate with: python tools/draug-eval-runner/aggregate.py \\"
+    echo "  tools/draug-eval-runner/output-cg-${LABEL}-r* tools/draug-eval-runner/output-nocg-${LABEL}-r*"
+else
+    echo "[run-trials] aggregate with: python tools/draug-eval-runner/aggregate.py \\"
+    echo "  tools/draug-eval-runner/output-cg-r* tools/draug-eval-runner/output-nocg-r*"
+fi

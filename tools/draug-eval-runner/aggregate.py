@@ -92,6 +92,14 @@ def main() -> int:
             return "nocg"
         return "cg"
 
+    def model_of(row: dict) -> str:
+        return row.get("model", "unknown")
+
+    # Group by (model, condition, task) so we can build per-model tables
+    # and overall comparisons. When all rows are from a single model,
+    # the report collapses gracefully into the one-model view.
+    models = sorted({model_of(r) for r in rows})
+
     by_cond_task: dict[tuple[str, str], list[dict]] = defaultdict(list)
     for r in rows:
         by_cond_task[(condition_of(r), r["task_id"])].append(r)
@@ -99,10 +107,25 @@ def main() -> int:
     task_ids = sorted({r["task_id"] for r in rows})
     conds = ["cg", "nocg"]
 
-    md = build_markdown(by_cond_task, task_ids, conds)
+    md_parts = []
+    if len(models) > 1:
+        # Per-model tables first, then a cross-model summary.
+        for m in models:
+            sub = [r for r in rows if model_of(r) == m]
+            sub_by_cond = defaultdict(list)
+            for r in sub:
+                sub_by_cond[(condition_of(r), r["task_id"])].append(r)
+            md_parts.append(f"## Model: `{m}`\n")
+            md_parts.append(build_markdown(sub_by_cond, task_ids, conds))
+            md_parts.append("\n\n")
+        md_parts.append("## Cross-model headline\n\n")
+        md_parts.append(cross_model_table(rows, models, condition_of, model_of))
+        md = "# Aggregated eval results — multi-model\n\n" + "".join(md_parts)
+    else:
+        md = build_markdown(by_cond_task, task_ids, conds)
     if args.md:
-        args.md.write_text(md)
-        print(f"[aggregate] wrote markdown → {args.md}", file=sys.stderr)
+        args.md.write_text(md, encoding="utf-8")
+        print(f"[aggregate] wrote markdown -> {args.md}", file=sys.stderr)
     else:
         print(md)
 
@@ -163,6 +186,28 @@ def build_markdown(by_cond_task, task_ids, conds) -> str:
     return "\n".join(lines)
 
 
+def cross_model_table(rows, models, condition_of, model_of) -> str:
+    lines = []
+    lines.append("| Model | with-CG pass | no-CG pass | diff |")
+    lines.append("|---|:-:|:-:|:-:|")
+    for m in models:
+        cg_rows = [r for r in rows if model_of(r) == m and condition_of(r) == "cg"]
+        ng_rows = [r for r in rows if model_of(r) == m and condition_of(r) == "nocg"]
+        cg_p = sum(1 for r in cg_rows if r["verdict"] == "PASS")
+        ng_p = sum(1 for r in ng_rows if r["verdict"] == "PASS")
+        cg_n = len(cg_rows)
+        ng_n = len(ng_rows)
+        cg_lbl = f"{cg_p}/{cg_n} ({fmt_pct(cg_p, cg_n)})" if cg_n else "—"
+        ng_lbl = f"{ng_p}/{ng_n} ({fmt_pct(ng_p, ng_n)})" if ng_n else "—"
+        if cg_n and ng_n:
+            diff = (cg_p / cg_n - ng_p / ng_n) * 100
+            diff_lbl = f"{diff:+.1f} pp"
+        else:
+            diff_lbl = "—"
+        lines.append(f"| `{m}` | {cg_lbl} | {ng_lbl} | {diff_lbl} |")
+    return "\n".join(lines) + "\n"
+
+
 def stats(runs):
     if not runs:
         return ("—", "—", "—")
@@ -201,7 +246,7 @@ def write_csv(path: Path, rows, condition_of):
     with path.open("w", newline="") as f:
         w = csv.writer(f)
         w.writerow([
-            "condition", "task_id", "verdict",
+            "model", "condition", "task_id", "verdict",
             "error_count", "warning_count",
             "patch_strategy", "patch_chars",
             "elapsed_secs", "source_dir",
@@ -209,6 +254,7 @@ def write_csv(path: Path, rows, condition_of):
         for r in rows:
             cc = r["cargo_check"]
             w.writerow([
+                r.get("model", "unknown"),
                 condition_of(r), r["task_id"], r["verdict"],
                 cc["error_count"], cc["warning_count"],
                 r.get("patch_strategy", ""), r.get("patch_chars", 0),
