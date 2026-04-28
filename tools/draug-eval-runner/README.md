@@ -101,6 +101,12 @@ cargo run -p draug-eval-runner --release -- eval --all
 cargo run -p draug-eval-runner --release -- \
     --no-codegraph --output output-no-cg eval --all
 
+# Model-conditional CG (small models get callers, big ones don't):
+cargo run -p draug-eval-runner --release -- \
+    --cg-policy by-model --model gemma4:31b-cloud eval --all
+# (qwen2.5-coder:7b would get callers; gemma4:31b-cloud / >=13b / cloud
+#  models get the redacted variant)
+
 # Use a different model:
 cargo run -p draug-eval-runner --release -- \
     --model gemma4:31b-cloud refactor 01_pop_i32_slot
