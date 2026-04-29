@@ -10,9 +10,16 @@ use libfolk::sys::io::write_str;
 
 /// Poll COM3 serial port for injected commands.
 /// Returns true if any work was done.
+///
+/// Cap: at most 4096 bytes are drained per call. Without this cap a
+/// QEMU/KVM (or WHPX) backend that reports LSR DR=1 indefinitely on an
+/// unconnected COM3 would lock the compositor's main loop on iteration
+/// #1 — root cause of Issue #49. Same defensive cap used by
+/// `com2_async_poll` in the kernel for the analogous COM2 ring drain.
 pub fn poll_com3(buf: &mut [u8; 512], len: &mut usize, queue: &mut Vec<String>) -> bool {
     let mut did_work = false;
-    while let Some(byte) = libfolk::sys::com3_read() {
+    for _ in 0..4096 {
+        let Some(byte) = libfolk::sys::com3_read() else { break; };
         if byte == b'\n' && *len > 0 {
             if let Ok(cmd) = alloc::str::from_utf8(&buf[..*len]) {
                 write_str("[COM3] Inject: ");
