@@ -261,7 +261,10 @@ pub fn register(linker: &mut Linker<HostState>) {
                         parts[3].parse().unwrap_or(2),
                     ]
                 } else {
-                    [10, 0, 2, 2] // QEMU gateway default
+                    // Phase 17 demo on Proxmox/KVM. 10.0.2.2 was the
+                    // QEMU SLIRP default; on a bridge to the LAN we
+                    // talk to the proxy host directly.
+                    [192, 168, 68, 150]
                 }
             };
 

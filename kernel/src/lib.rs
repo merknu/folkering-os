@@ -524,6 +524,7 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
                 let is_synapse = name.as_bytes() == b"synapse";
                 let is_compositor = name.as_bytes() == b"compositor";
                 let is_inference = name.as_bytes() == b"inference";
+                let is_draug_streamer = name.as_bytes() == b"draug-streamer";
                 if is_shell || is_synapse {
                     continue;
                 }
@@ -531,6 +532,16 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
                 // AI runs on host via LM Studio/llama.cpp, proxied through COM2.
                 if is_inference {
                     serial_strln!("[BOOT] Skipping inference server (Phase 5 Hybrid AI mode)");
+                    continue;
+                }
+                // draug-streamer hardcodes a target at 192.168.68.72:14712 and
+                // ARPs that address forever — on a real LAN where .68.72 is
+                // offline this hogs the smoltcp stack and starves Phase 17's
+                // outbound TCP. Skipping it on boot until the target becomes
+                // configurable. Re-enable by removing this guard once the
+                // streamer learns to back off after N failed connects.
+                if is_draug_streamer {
+                    serial_strln!("[BOOT] Skipping draug-streamer (target 192.168.68.72 unreachable on this LAN)");
                     continue;
                 }
                 if entry.is_elf() {
