@@ -78,7 +78,10 @@ impl Device for FolkeringDevice {
                 return None;
             }
         }
-        // Fallback to VirtIO — loop to skip dropped packets
+        // Fallback to VirtIO — loop to skip dropped packets. Capped at
+        // 256 dropped frames per receive() so a flood of denied packets
+        // (Issue #49 pattern) can't pin smoltcp's poll cycle.
+        let mut skipped = 0u32;
         loop {
             let (frame, len) = match virtio_net::receive_raw() {
                 Some(f) => f,
@@ -88,6 +91,8 @@ impl Device for FolkeringDevice {
                 let rx = FolkeringRxToken { buffer: frame[..len].to_vec() };
                 return Some((rx, FolkeringTxToken));
             }
+            skipped += 1;
+            if skipped > 256 { return None; }
         }
     }
 
