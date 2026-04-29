@@ -295,6 +295,6 @@ All contributors must sign a [Contributor License Agreement](CONTRIBUTING.md) (C
 
 ## Author
 
-**Knut Ingmar Meroedningen** -- Building the future of human-AI computing, one syscall at a time.
+**Knut Ingmar Merødningen** -- Building the future of human-AI computing, one syscall at a time.
 
 *Folkering OS: Where the machine learns to understand itself.*
