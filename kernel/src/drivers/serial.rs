@@ -36,12 +36,23 @@ pub fn com3_read_byte() -> Option<u8> {
 }
 
 /// Write a byte to COM3 via raw port I/O (uart_16550 send() is broken for COM3).
+///
+/// Capped at 1_000_000 iterations of the TX-empty wait — same defense as
+/// `com2_write` directly below. On QEMU/KVM/WHPX configurations where the
+/// COM3 backend is missing or the emulator never asserts LSR bit 5, an
+/// unbounded wait would freeze the kernel during any telemetry/IQE flush.
+/// Same bug class as Issue #49 (poll_com3 RX) — the omission was symmetric
+/// across read and write paths; this closes the write side.
 pub fn com3_write_byte(byte: u8) {
     unsafe {
-        // Wait for TX buffer empty (LSR bit 5)
+        // Wait for TX buffer empty (LSR bit 5) with timeout
+        let mut wait = 0u32;
         loop {
             let lsr: u8 = x86_64::instructions::port::Port::<u8>::new(0x3E8 + 5).read();
             if lsr & 0x20 != 0 { break; }
+            wait += 1;
+            if wait > 1_000_000 { break; } // Safety timeout — don't hang forever
+            core::hint::spin_loop();
         }
         x86_64::instructions::port::Port::<u8>::new(0x3E8).write(byte);
     }
