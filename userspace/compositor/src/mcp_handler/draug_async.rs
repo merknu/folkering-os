@@ -75,7 +75,20 @@ fn tick_idle(draug: &mut DraugDaemon, now_ms: u64) -> bool {
 
     match draug.next_task_and_level() {
         Some((task_idx, level)) => start_skill_tree(draug, task_idx, level, now_ms),
-        None => start_phase15(draug, now_ms),
+        None => {
+            // Skill-tree complete — try Phase 17 autonomous refactor
+            // before falling through to Phase 15. Refactor work is
+            // gated on (a) the task queue being loaded and (b) the
+            // per-boot iteration cap. `start_refactor_iteration`
+            // returns false when no refactor work is available, so
+            // we cleanly fall through.
+            if draug.refactor_budget_remaining()
+                && start_refactor_iteration(draug, now_ms)
+            {
+                return true;
+            }
+            start_phase15(draug, now_ms)
+        }
     }
 }
 
@@ -199,6 +212,122 @@ fn start_executor_step(draug: &mut DraugDaemon, step_idx: usize, now_ms: u64) ->
     draug.async_operation = AsyncOp::ExecutorLlm;
     draug.async_phase_started_ms = now_ms;
     start_llm_request(draug, compositor::draug::EXECUTOR_MODEL, &prompt)
+}
+
+/// Phase 17 — pick the next pending refactor task, fetch its source
+/// from the host via the FETCH_SOURCE syscall, build the refactor
+/// prompt (with model-conditional caller list), and fire LlmGenerate.
+///
+/// Returns true if the iteration started (or terminally short-
+/// circuited — no work, fetch_source failed, etc). The caller in
+/// `tick_idle` interprets `true` as "we did something this tick".
+pub(super) fn start_refactor_iteration(draug: &mut DraugDaemon, now_ms: u64) -> bool {
+    let task_idx = match draug.pick_next_refactor() {
+        Some(i) => i,
+        None => return false, // No work — caller falls through to phase15.
+    };
+
+    // Snapshot the task fields so we can drop the immutable borrow
+    // before mutating draug below.
+    let (task_id, target_file, target_fn, goal, attempts) = {
+        let tasks = draug.refactor_tasks.as_ref().unwrap();
+        let t = &tasks[task_idx];
+        (
+            t.id.clone(),
+            t.target_file.clone(),
+            t.target_fn.clone(),
+            t.goal.clone(),
+            t.attempts,
+        )
+    };
+
+    write_str("\n[Draug-async] [REFACTOR] ");
+    write_str(&task_id);
+    write_str(" attempt ");
+    write_dec(attempts + 1);
+    write_str(" → FETCH_SOURCE\n");
+
+    libfolk::sys::draug_bridge_set_task(&task_id);
+
+    // Fetch the original source from the host. Synchronous syscall —
+    // fast (single tcp_request, ≪ 1 s on the LAN). For files larger
+    // than 64 KB we'd need a chunked path; the fixture targets are
+    // all well below that.
+    let mut fetch_buf = alloc::vec::Vec::with_capacity(64 * 1024);
+    fetch_buf.resize(64 * 1024, 0u8);
+    let fetch_res = libfolk::sys::fetch_source(&target_file, &mut fetch_buf);
+    let source = match fetch_res {
+        Some(p) if p.status == libfolk::sys::FS_STATUS_OK => {
+            fetch_buf.truncate(p.output_len);
+            match alloc::string::String::from_utf8(fetch_buf) {
+                Ok(s) => s,
+                Err(_) => {
+                    write_str("[Draug-async] FETCH_SOURCE: non-UTF-8 body\n");
+                    record_refactor_failure(draug, task_idx, "non-UTF-8 source");
+                    return true;
+                }
+            }
+        }
+        Some(p) => {
+            write_str("[Draug-async] FETCH_SOURCE failed status=");
+            write_dec(p.status);
+            write_str("\n");
+            record_refactor_failure(draug, task_idx, "fetch_source non-OK");
+            return true;
+        }
+        None => {
+            write_str("[Draug-async] FETCH_SOURCE: TCP/syscall failure\n");
+            record_refactor_failure(draug, task_idx, "fetch_source transport");
+            return true;
+        }
+    };
+
+    write_str("[Draug-async] FETCH_SOURCE OK ");
+    write_dec(source.len() as u32);
+    write_str("B\n");
+
+    // Build prompt with the same shape the eval-runner uses. The
+    // caller list is pulled in only when `codegraph_for_model` says
+    // so — for qwen-coder:7b that's "yes", which improves pass-rate
+    // by +20 pp on the fixture set per cross-model trial 001.
+    let task = compositor::refactor_types::RefactorTask {
+        id: task_id.clone(),
+        target_file: target_file.clone(),
+        target_fn,
+        goal,
+        attempts,
+        last_status: compositor::refactor_types::TaskStatus::Pending,
+    };
+    let prompt = super::refactor_loop::build_refactor_prompt(
+        &task, &source, compositor::draug::REFACTOR_MODEL,
+    );
+
+    write_str("[Draug-async] prompt ");
+    write_dec(prompt.len() as u32);
+    write_str("B → LLM\n");
+
+    draug.current_refactor_idx = task_idx;
+    draug.current_refactor_target = target_file;
+    draug.async_operation = AsyncOp::RefactorLlm;
+    draug.async_phase_started_ms = now_ms;
+    draug.refactor_iterations_done = draug.refactor_iterations_done.saturating_add(1);
+    start_llm_request(draug, compositor::draug::REFACTOR_MODEL, &prompt)
+}
+
+/// Persist a refactor failure that hit before the LLM was even
+/// queried (FETCH_SOURCE failed, etc). Increments attempts +
+/// records Skip so the loop moves on instead of retrying forever.
+fn record_refactor_failure(draug: &mut DraugDaemon, task_idx: usize, _reason: &str) {
+    if let Some(tasks) = draug.refactor_tasks.as_mut() {
+        if task_idx < tasks.len() {
+            tasks[task_idx].attempts = tasks[task_idx].attempts.saturating_add(1);
+            tasks[task_idx].last_status = compositor::refactor_types::TaskStatus::Skip;
+        }
+    }
+    if let Some(ref tasks) = draug.refactor_tasks {
+        let _ = super::task_store::save(tasks);
+    }
+    draug.record_skip();
 }
 
 // ── Shared: build LLM wire frame and start TCP connect ──────────────
@@ -340,14 +469,15 @@ fn tick_processing(draug: &mut DraugDaemon, now_ms: u64) -> bool {
 }
 
 /// Phase 17 — handle the LLM's response to a refactor prompt.
-/// Extracts the rust code block from the response and is the natural
-/// place to fire the follow-up CARGO_CHECK request. Compile-only
-/// today: tick_idle does not yet drive the loop into this state.
-fn process_refactor_llm(draug: &mut DraugDaemon, response: &[u8], _now_ms: u64) -> bool {
+/// Extracts the rust code block, builds a CARGO_CHECK request frame,
+/// and fires another async TCP round-trip — same shape as the skill-
+/// tree LLM→PATCH transition.
+fn process_refactor_llm(draug: &mut DraugDaemon, response: &[u8], now_ms: u64) -> bool {
     let code = match parse_llm_response(response) {
         Some(c) => c,
         None => {
             write_str("[Draug-async] Refactor LLM: parse failed\n");
+            persist_refactor_skip(draug);
             draug.async_phase = AsyncPhase::Idle;
             draug.async_operation = AsyncOp::None;
             draug.record_skip();
@@ -357,47 +487,124 @@ fn process_refactor_llm(draug: &mut DraugDaemon, response: &[u8], _now_ms: u64) 
 
     write_str("[Draug-async] Refactor LLM OK → ");
     write_dec(code.len() as u32);
-    write_str("B (CARGO_CHECK wiring lands with tick_idle integration)\n");
+    write_str("B → CARGO_CHECK\n");
 
-    // Next session: thread `current_refactor_target` through DraugDaemon,
-    // call `super::refactor_loop::build_cargo_check_request(target, &code)`,
-    // stash into `draug.async_request`, set `async_operation = AsyncOp::CargoCheck`,
-    // and re-fire `tcp_connect_async` exactly like start_patch_request does.
-    draug.async_phase = AsyncPhase::Idle;
-    draug.async_operation = AsyncOp::None;
-    draug.record_skip();
+    // Build the proxy request. `build_cargo_check_request` is unit-
+    // tested in refactor_loop so the wire shape stays in sync with
+    // what the proxy parses.
+    let target = draug.current_refactor_target.clone();
+    let req = super::refactor_loop::build_cargo_check_request(&target, &code);
+
+    draug.async_request = req;
+    draug.async_sent = 0;
+    if draug.async_response.capacity() < 8192 {
+        draug.async_response.reserve(8192);
+    }
+    draug.async_response.clear();
+    draug.async_operation = AsyncOp::CargoCheck;
+    draug.async_phase_started_ms = now_ms;
+
+    let result = libfolk::sys::tcp_connect_async(PROXY_IP, PROXY_PORT);
+    if result == u64::MAX {
+        write_str("[Draug-async] CARGO_CHECK connect failed (no slots)\n");
+        persist_refactor_skip(draug);
+        draug.async_phase = AsyncPhase::Idle;
+        draug.async_operation = AsyncOp::None;
+        draug.record_skip();
+        return true;
+    }
+    draug.async_tcp_slot = result;
+    draug.async_phase = AsyncPhase::Sending;
     true
 }
 
+/// Persist a Skip verdict for the in-flight refactor. Used when
+/// the loop hits an infrastructure problem (LLM parse failure,
+/// connect-no-slots, etc) where we don't want the failure to count
+/// against the model's own retry budget.
+fn persist_refactor_skip(draug: &mut DraugDaemon) {
+    let idx = draug.current_refactor_idx;
+    if idx == usize::MAX { return; }
+    if let Some(tasks) = draug.refactor_tasks.as_mut() {
+        if idx < tasks.len() {
+            tasks[idx].attempts = tasks[idx].attempts.saturating_add(1);
+            tasks[idx].last_status = compositor::refactor_types::TaskStatus::Skip;
+        }
+    }
+    if let Some(ref tasks) = draug.refactor_tasks {
+        let _ = super::task_store::save(tasks);
+    }
+    draug.current_refactor_idx = usize::MAX;
+    draug.current_refactor_target.clear();
+}
+
 /// Phase 17 — handle the proxy's CARGO_CHECK reply for a refactor
-/// task. The 8-byte header gives `[u32 status LE][u32 output_len LE]`;
-/// the status maps to `AttemptVerdict` via
-/// `refactor_loop::verdict_from_cargo_check_status`. Compile-only:
-/// the persistence step (`task_store::save`) lands when tick_idle
-/// drives this state.
+/// task. Maps status to a verdict, calls `record_attempt`, persists
+/// the queue back to Synapse VFS, and clears the in-flight pointer.
 fn process_cargo_check_result(
     draug: &mut DraugDaemon,
     response: &[u8],
     _now_ms: u64,
 ) -> bool {
+    let idx = draug.current_refactor_idx;
+
     let header = super::refactor_loop::parse_cargo_check_header(response);
-    match header {
-        Some((status, output_len)) => {
+    let status = match header {
+        Some((s, output_len)) => {
             write_str("[Draug-async] CARGO_CHECK status=");
-            write_dec(status);
+            write_dec(s);
             write_str(" output=");
             write_dec(output_len);
-            write_str("B (verdict→record_attempt wiring lands next)\n");
-            // Next session: pull current task index, call
-            // `refactor_loop::record_attempt(&mut tasks[idx], verdict)`,
-            // then `task_store::save(&tasks)`. Verdict comes from
-            // `refactor_loop::verdict_from_cargo_check_status(status)`.
+            write_str("B\n");
+            s
         }
         None => {
-            write_str("[Draug-async] CARGO_CHECK: short/empty response\n");
+            write_str("[Draug-async] CARGO_CHECK: short/empty reply\n");
             draug.record_skip();
+            // Treat short reply as Skip — protocol error, not the model's fault.
+            persist_refactor_skip(draug);
+            draug.async_phase = AsyncPhase::Idle;
+            draug.async_operation = AsyncOp::None;
+            return true;
+        }
+    };
+
+    if idx == usize::MAX {
+        write_str("[Draug-async] CARGO_CHECK: stale (no in-flight idx)\n");
+        draug.async_phase = AsyncPhase::Idle;
+        draug.async_operation = AsyncOp::None;
+        return true;
+    }
+
+    let verdict = super::refactor_loop::verdict_from_cargo_check_status(status);
+    if let Some(tasks) = draug.refactor_tasks.as_mut() {
+        if idx < tasks.len() {
+            super::refactor_loop::record_attempt(&mut tasks[idx], verdict);
         }
     }
+
+    // Persist immediately so a crash mid-loop doesn't lose the verdict.
+    if let Some(ref tasks) = draug.refactor_tasks {
+        if let Err(e) = super::task_store::save(tasks) {
+            write_str("[Draug-async] task_store::save failed: ");
+            // StoreError doesn't implement no_std `core::fmt::Display`
+            // beyond Debug, so just stringify a tag.
+            let _ = e; // suppress unused warning when not displayed
+            write_str("(see prior log)\n");
+        }
+    }
+
+    // Verdict-aware tracking: bump pass/fail counters for the shell badge.
+    use super::refactor_loop::AttemptVerdict;
+    match verdict {
+        AttemptVerdict::Pass             => draug.record_refactor_pass(),
+        AttemptVerdict::FailCompile
+        | AttemptVerdict::FailCallerCompat => draug.record_refactor_fail(),
+        AttemptVerdict::Skip             => draug.record_skip(),
+    }
+
+    draug.current_refactor_idx = usize::MAX;
+    draug.current_refactor_target.clear();
     draug.async_phase = AsyncPhase::Idle;
     draug.async_operation = AsyncOp::None;
     true

@@ -43,62 +43,15 @@ extern crate alloc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+// Re-export the carriers from the lib so existing call sites
+// (`task_store::RefactorTask`, `task_store::TaskStatus`) keep working.
+// The actual definitions live in `compositor::refactor_types` because
+// `DraugDaemon` (in the lib) needs to hold a `Vec<RefactorTask>` and
+// the lib can't see this `mcp_handler` module (which is in the bin).
+pub use compositor::refactor_types::{RefactorTask, TaskStatus};
+
 const STORE_PATH: &str = "draug/refactor_tasks.txt";
 const FORMAT_VERSION: &str = "v1";
-
-/// One task in the autonomous refactor queue. Fixture data carried
-/// in static arrays before; persisted in Synapse VFS now so the
-/// autonomous loop survives reboots.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RefactorTask {
-    pub id: String,
-    pub target_file: String,
-    pub target_fn: String,
-    pub goal: String,
-    pub attempts: u32,
-    pub last_status: TaskStatus,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TaskStatus {
-    /// Never attempted. Initial state for fresh tasks.
-    Pending,
-    /// Last attempt produced a refactor that compiled and kept
-    /// callers compiling. Locked in.
-    Pass,
-    /// Last attempt produced code that didn't compile (any cargo
-    /// check error in the target file itself).
-    FailCompile,
-    /// Last attempt compiled but broke a caller. Strongest signal
-    /// for "the LLM changed the signature without updating callers".
-    FailCallerCompat,
-    /// Skipped because some pre-flight check failed (target fn not
-    /// in the graph, source extraction failed, etc).
-    Skip,
-}
-
-impl TaskStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            TaskStatus::Pending          => "Pending",
-            TaskStatus::Pass             => "Pass",
-            TaskStatus::FailCompile      => "FailCompile",
-            TaskStatus::FailCallerCompat => "FailCallerCompat",
-            TaskStatus::Skip             => "Skip",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "Pending"          => Some(TaskStatus::Pending),
-            "Pass"             => Some(TaskStatus::Pass),
-            "FailCompile"      => Some(TaskStatus::FailCompile),
-            "FailCallerCompat" => Some(TaskStatus::FailCallerCompat),
-            "Skip"             => Some(TaskStatus::Skip),
-            _ => None,
-        }
-    }
-}
 
 #[derive(Debug)]
 pub enum StoreError {
