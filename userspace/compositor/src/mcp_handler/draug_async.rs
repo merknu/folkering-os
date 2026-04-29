@@ -14,7 +14,11 @@ use compositor::draug::{AsyncPhase, AsyncOp, DraugDaemon, PlanStep};
 use super::knowledge_hunt::{write_dec, extract_rust_code_block, push_decimal, REFACTOR_TASKS};
 use super::agent_planner::COMPLEX_TASKS;
 
-const PROXY_IP: [u8; 4] = [10, 0, 2, 2];
+// Phase 17 demo on Proxmox/KVM: VM 800 talks to the proxy on the
+// Proxmox host directly via the LAN bridge, not the QEMU SLIRP
+// gateway. Set this to your proxy's LAN IP. 10.0.2.2 is the
+// historical default for `qemu -netdev user`.
+const PROXY_IP: [u8; 4] = [192, 168, 68, 150];
 const PROXY_PORT: u16 = 14711;
 
 /// Non-blocking Draug tick. Called every compositor frame (~60Hz).

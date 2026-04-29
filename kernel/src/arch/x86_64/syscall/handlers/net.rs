@@ -410,7 +410,7 @@ pub fn syscall_fbp_request(
     buf_ptr: u64,
     buf_max: u64,
 ) -> u64 {
-    const PROXY_IP: [u8; 4] = [10, 0, 2, 2];
+    const PROXY_IP: [u8; 4] = [192, 168, 68, 150];
     const PROXY_PORT: u16 = 14711;
     const MAX_REQUEST: usize = 1024;
 
@@ -521,7 +521,7 @@ pub fn syscall_fbp_interact(
     buf_max: u64,
     action_and_node: u64,
 ) -> u64 {
-    const PROXY_IP: [u8; 4] = [10, 0, 2, 2];
+    const PROXY_IP: [u8; 4] = [192, 168, 68, 150];
     const PROXY_PORT: u16 = 14711;
 
     if url_len == 0 || url_len > 512 || buf_max == 0 || buf_max > 262144 {
@@ -662,7 +662,7 @@ pub fn syscall_fbp_patch(
     result_ptr: u64,
     packed_lens: u64,
 ) -> u64 {
-    const PROXY_IP: [u8; 4] = [10, 0, 2, 2];
+    const PROXY_IP: [u8; 4] = [192, 168, 68, 150];
     const PROXY_PORT: u16 = 14711;
 
     // Unpack: 21 bits each for filename_len / content_len / result_max.
@@ -806,7 +806,7 @@ pub fn syscall_llm_generate(
     result_ptr: u64,
     packed_lens: u64,
 ) -> u64 {
-    const PROXY_IP: [u8; 4] = [10, 0, 2, 2];
+    const PROXY_IP: [u8; 4] = [192, 168, 68, 150];
     const PROXY_PORT: u16 = 14711;
 
     let model_len = (packed_lens & 0x1F_FFFF) as usize;
@@ -933,7 +933,7 @@ pub fn syscall_llm_generate(
 /// Returns Some((status, bytes_written)) on a successful proxy
 /// round-trip (any status code), None on TCP failure.
 pub fn graph_callers_inner(name: &str, result: &mut [u8]) -> Option<(u32, usize)> {
-    const PROXY_IP: [u8; 4] = [10, 0, 2, 2];
+    const PROXY_IP: [u8; 4] = [192, 168, 68, 150];
     const PROXY_PORT: u16 = 14711;
 
     crate::serial_str!("[GRAPH] callers of ");
@@ -1048,7 +1048,7 @@ pub fn syscall_graph_callers(
 /// Returns 1 if proxy responds with PONG, 0 otherwise.
 /// Used before expensive LLM calls to fail fast when proxy is down.
 pub fn syscall_proxy_ping() -> u64 {
-    const PROXY_IP: [u8; 4] = [10, 0, 2, 2];
+    const PROXY_IP: [u8; 4] = [192, 168, 68, 150];
     const PROXY_PORT: u16 = 14711;
 
     let response = match crate::net::tcp_plain::tcp_request_with_timeout(
@@ -1074,7 +1074,7 @@ pub fn syscall_proxy_ping() -> u64 {
 ///
 /// Returns `(status << 32) | wasm_bytes_written` or `u64::MAX` on failure.
 pub fn syscall_wasm_compile(buf_ptr: u64, buf_max: u64) -> u64 {
-    const PROXY_IP: [u8; 4] = [10, 0, 2, 2];
+    const PROXY_IP: [u8; 4] = [192, 168, 68, 150];
     const PROXY_PORT: u16 = 14711;
 
     if buf_max == 0 || buf_max > 262_144 {
@@ -1234,7 +1234,7 @@ pub fn syscall_cargo_check(
     result_ptr: u64,
     packed_lens: u64,
 ) -> u64 {
-    const PROXY_IP: [u8; 4] = [10, 0, 2, 2];
+    const PROXY_IP: [u8; 4] = [192, 168, 68, 150];
     const PROXY_PORT: u16 = 14711;
 
     let target_len = (packed_lens & 0x1F_FFFF) as usize;
@@ -1376,7 +1376,7 @@ pub fn syscall_fetch_source(
     _unused: u64,
     packed_lens: u64,
 ) -> u64 {
-    const PROXY_IP: [u8; 4] = [10, 0, 2, 2];
+    const PROXY_IP: [u8; 4] = [192, 168, 68, 150];
     const PROXY_PORT: u16 = 14711;
 
     let target_len = (packed_lens & 0x1F_FFFF) as usize;
