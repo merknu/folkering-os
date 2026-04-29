@@ -59,9 +59,14 @@ static NET_DEVICE: Mutex<Option<VirtIONet>> = Mutex::new(None);
 // ── MSI-X Detection ────────────────────────────────────────────────────
 
 /// Check if the PCI device has MSI-X capability
+///
+/// Capped at 32 iterations to defend against a self-referential cap
+/// pointer (real PCI devices have at most ~16 caps; the existing
+/// `virtio_gpu/pci_setup.rs` uses the same 32-cap bound).
 fn has_msix(dev: &PciDevice) -> bool {
     let mut ptr = dev.capabilities_ptr;
-    while ptr != 0 {
+    let mut iterations = 0u8;
+    while ptr != 0 && iterations < 32 {
         let cap_id = pci::pci_read8(dev.bus, dev.device, dev.function, ptr);
         if cap_id == PCI_CAP_ID_MSIX {
             // Check if MSI-X is actually enabled (bit 15 of Message Control at cap+2)
@@ -70,6 +75,7 @@ fn has_msix(dev: &PciDevice) -> bool {
         }
         let next = pci::pci_read8(dev.bus, dev.device, dev.function, ptr + 1);
         ptr = next;
+        iterations += 1;
     }
     false
 }
@@ -236,7 +242,15 @@ pub fn poll_rx() {
         None => return,
     };
 
+    // Cap at 256 packets per poll. RX queue is 1024 deep, but a
+    // continuous flood (broadcast storm, deliberate DoS) could keep
+    // refilling faster than we drain — same Issue #49 pattern. Yields
+    // back to the caller after 256 so other ISR-driven work makes
+    // progress even under flood.
+    let mut drained = 0u32;
     while let Some((frame, len)) = rx::receive_packet_inner(dev) {
+        drained += 1;
+        if drained > 256 { break; }
         let count = RX_PACKET_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
 
         // Log first 8 packets to serial for debugging
