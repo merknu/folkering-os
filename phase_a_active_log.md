@@ -83,6 +83,30 @@ LOC budget: ~7000 lines to move.
 - Adjust module structure
 - Compositor still has thin shims (e.g. `compositor::draug::stub` for old call sites that haven't been rewritten yet)
 
+#### A.4 dependency audit (2026-05-01)
+
+Started with `refactor_types.rs` (63 LOC, no deps) as a proof-of-concept for the move pattern. **Pattern works:** add `draug-daemon` as path dep on compositor, move file content to daemon, leave compositor with a `pub use draug_daemon::X::*;` shim. Both crates build clean.
+
+**Discovered during planning:** `mcp_handler/*.rs` files are NOT cleanly movable. They live in compositor's *binary* and import compositor *lib* types deeply:
+
+| File | Imports compositor lib types? | Move complexity |
+|---|---|---|
+| `task_store.rs` | minimal — only refactor_types | LOW (pure data) |
+| `token_stream.rs` | TokenRing + WindowManager + FramebufferView | STAYS in compositor (UI work) |
+| `agent_logic.rs` | DraugDaemon + WasmState + WindowManager | MEDIUM — orchestration wrapper |
+| `agent_planner.rs` | DraugDaemon, no UI types | LOW |
+| `autodream.rs` | WasmState (cache eviction) | MEDIUM |
+| `knowledge_hunt.rs` | DraugDaemon | LOW |
+| `refactor_loop.rs` | DraugDaemon | LOW |
+| `draug_async.rs` | DraugDaemon, AsyncOp, AsyncPhase | LOW (already self-contained) |
+| `draug.rs` (lib) | none non-libfolk | LOW |
+
+**Net:** ~5500 of the 7000 LOC are cleanly movable. ~1500 LOC (token_stream + parts of agent_logic, autodream) need to stay in compositor or be split.
+
+**Strategy revision:** A.4 becomes "move the cleanly-movable files first; defer the orchestration files until A.5 has rewired the call sites." This means A.4 lands in two parts:
+- **A.4a (this session):** `refactor_types.rs` (DONE), `task_store.rs`, `agent_planner.rs`, `refactor_loop.rs`, `knowledge_hunt.rs`, `draug.rs`, `draug_async.rs` — all the pure-agent + data files. ~5500 LOC.
+- **A.4b (after A.5):** the orchestration glue (`agent_logic.rs`, `autodream.rs`) once compositor's tick loop no longer drives them directly.
+
 ### A.5 — Compositor IPC client
 - Replace direct calls with `libfolk::sys::draug::*` wrappers
 - Drop `&mut draug` from RenderContext/DispatchContext/mouse/keyboard
