@@ -231,3 +231,24 @@ finds.
 - **2026-05-01:** Phase A scope confirmed. Writing skeleton first; not migrating logic until A.1+A.2+A.3 are stable.
 - **2026-05-01:** Task ID 7 chosen for draug-daemon (after 4=compositor, 5=intent, 6=inference). Will special-case spawn to make it deterministic.
 - **2026-05-01:** Status shmem chosen over IPC-pull for status reads — compositor reads counters every render frame, an IPC roundtrip per frame is wasteful.
+- **2026-05-01:** **Path A confirmed for the COM2 / MCP contention question.** Three candidate paths analysed:
+  - **A** (Direct TCP): daemon's LLM calls go via the proxy's TCP endpoint, parallel to the existing refactor / planner / etc. paths. Aligned with the dataflow direction Folkering has been moving.
+  - B (Compositor as MCP relay): adds wire protocol surface, makes compositor a forwarder.
+  - C (Per-task COM2 channels in kernel): genuine kernel feature, big effort.
+  Path A is the cleanest and is what Phase 17 already does for refactor LLM calls. Decision: migrate Draug's analysis cycle onto direct TCP, leave MCP/COM2 to compositor's user-facing agent + tool gen.
+
+#### A.5 Path A.1 — analysis cycle to direct TCP ✅ (commit `37ca1f6`)
+
+* `AsyncOp::AnalysisLlm` joins the async slot pipeline alongside the existing Phase 13/15/17 LLM ops.
+* `ANALYSIS_MODEL = "qwen2.5-coder:7b"` (same as REFACTOR_MODEL — JSON-pattern doesn't need reasoning-grade).
+* `DraugDaemon::begin_analysis_cycle` / `finish_analysis_cycle` keep the bookkeeping encapsulated.
+* `start_analysis_via_tcp` + `process_analysis_response` in draug_async.rs.
+* Daemon's `run_draug_tick` re-enables `should_analyze` (gated on async pipeline being idle so refactor takes priority).
+* Compositor's `agent_logic::tick` no longer drives Draug's analysis at all.
+* Compositor's `handle_chat_response` no longer routes to `draug.on_analysis_response`.
+
+#### Remaining Phase A work (deferred)
+
+* **Autodream migration:** harder because autodream reads `wasm.cache` and writes `wasm.state_snapshot` — both compositor-owned. Either move the decision into daemon and add IPC for cache enumeration / state migration, or accept that autodream stays in compositor. Autodream is rare (45 min idle threshold) so MCP contention isn't a real concern.
+* **Friction-sensor IPC:** `FRICTION_QUICK_CLOSE` / `FRICTION_RAGE_CLICK` signals from input handlers go to compositor's local DraugDaemon only. Daemon's friction sensor sees only WASM_CRASH. Fix is a `DRAUG_OP_FRICTION_SIGNAL { hash, weight }` op.
+* **Drop compositor's local DraugDaemon:** depends on autodream + creative-change paths moving (or being explicitly accepted as staying compositor-owned). Then drop the seven re-export shims + compositor's path dep on draug-daemon.
