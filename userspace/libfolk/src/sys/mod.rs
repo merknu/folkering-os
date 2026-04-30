@@ -36,9 +36,13 @@ pub use synapse::{SYNAPSE_TASK_ID, SynapseError, SynapseResult};
 // Re-export Draug protocol (Phase A migration: compositor talks to
 // the draug-daemon over IPC instead of holding a `&mut DraugDaemon`).
 pub use draug::{
-    DRAUG_TASK_ID, DraugError, DraugResult,
-    DRAUG_OP_PING, DRAUG_OP_USER_INPUT, DRAUG_OP_WASM_CRASH, DRAUG_OP_INSTALL_REFACTOR_TASKS,
+    DRAUG_TASK_ID, DraugError, DraugResult, AttachError as DraugAttachError,
+    DRAUG_OP_PING, DRAUG_OP_USER_INPUT, DRAUG_OP_WASM_CRASH,
+    DRAUG_OP_INSTALL_REFACTOR_TASKS, DRAUG_OP_GET_STATUS_HANDLE,
     DRAUG_STATUS_OK, DRAUG_STATUS_ERR, DRAUG_VERSION,
+    DraugStatus, DRAUG_STATUS_LAYOUT_VERSION, DRAUG_STATUS_SHMEM_SIZE,
+    DRAUG_STATUS_COMPOSITOR_VADDR,
+    DRAUG_FLAG_PLAN_MODE_ACTIVE, DRAUG_FLAG_REFACTOR_HIBERNATING, DRAUG_FLAG_INITIALISED,
 };
 
 // Re-export Compositor client

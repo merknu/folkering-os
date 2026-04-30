@@ -55,20 +55,28 @@ LOC budget: ~7000 lines to move.
 
 ## Subphases
 
-### A.1 — Skeleton crate ⏳
+### A.1 — Skeleton crate ✅ (commit `87…` on `refactor/phase-a-draug-isolation`)
 - `userspace/draug-daemon/Cargo.toml`
 - `src/main.rs` with heap + IPC dispatch loop (synapse-service template)
 - `src/lib.rs`
-- Add to workspace members
-- Build clean, no logic yet.
+- Added to workspace members
+- Builds clean to a no_std binary.
 
-### A.2 — IPC protocol
-- `libfolk::sys::draug` module: `DraugCommand`, `DraugEvent`, client wrappers
-- `DRAUG_TASK_ID` const
+### A.2 — IPC protocol ✅
+- `libfolk::sys::draug` module with `DRAUG_TASK_ID = 7`, op codes, client wrappers
+- Wire format: payload0-only (recv_async drops payload1) → 16-bit op + 48-bit data
+- Ops: PING, USER_INPUT, WASM_CRASH, INSTALL_REFACTOR_TASKS, GET_STATUS_HANDLE
+- Server-side decoders: `unpack_op`, `unpack_data48`, `unpack_shmem_size`
+- Daemon dispatches all five ops, replies with version/handle/OK/ERR
 
-### A.3 — Status shmem
-- Atomics-based shared region for live counters, mapped read-only by compositor
-- Daemon writes, compositor reads. Replaces direct field access from many sites.
+### A.3 — Status shmem ✅
+- `DraugStatus` struct (128 bytes, repr C, atomic fields) in libfolk::sys::draug
+- Layout version guard so old readers fail loudly on protocol changes
+- Daemon allocates 256-byte shmem region at boot, initialises layout_version + INITIALISED flag, grants compositor read access
+- `DRAUG_OP_GET_STATUS_HANDLE` for compositor to bootstrap the mapping
+- `attach_status() -> Result<&'static DraugStatus, AttachError>` client helper that pings, fetches handle, maps at `0x33000000`, validates layout, returns a static ref
+- Daemon vaddr `0x40000000` (well above heap, no collisions)
+- Cross-field reads can disagree by ~1 (HUD-acceptable); per-field reads consistent
 
 ### A.4 — Code move
 - Move the 9 source files listed above

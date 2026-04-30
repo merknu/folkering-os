@@ -46,6 +46,8 @@
 //! version constant for `PING`.
 
 use crate::sys::ipc;
+use crate::sys::memory::{shmem_map, ShmemError};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 // ============================================================================
 // Well-Known Task ID
@@ -84,6 +86,15 @@ pub const DRAUG_OP_WASM_CRASH: u64 = 0x0002;
 ///                    | (size << 40)                 // 24 bits
 /// Reply:    DRAUG_STATUS_OK
 pub const DRAUG_OP_INSTALL_REFACTOR_TASKS: u64 = 0x0003;
+
+/// Fetch the shmem handle of the status region. Compositor calls
+/// this once at boot, maps the handle read-only, and reads the
+/// `DraugStatus` struct via atomics on every render frame instead
+/// of round-tripping over IPC.
+/// Request:  payload0 = OP_GET_STATUS_HANDLE
+/// Reply:    shmem_handle (low 32 bits) on success, `u64::MAX` if
+///           the daemon has not yet allocated the region.
+pub const DRAUG_OP_GET_STATUS_HANDLE: u64 = 0x0004;
 
 // ============================================================================
 // Status Codes (reply payload0)
@@ -198,4 +209,149 @@ pub fn unpack_shmem_size(payload0: u64) -> (u32, u32) {
     let shmem_handle = ((payload0 >> 16) & 0xFF_FFFF) as u32;
     let total_size = ((payload0 >> 40) & 0xFF_FFFF) as u32;
     (shmem_handle, total_size)
+}
+
+// ============================================================================
+// Status shmem region (read by compositor, written by daemon)
+// ============================================================================
+
+/// Layout version of the `DraugStatus` struct. The compositor refuses
+/// to read a region whose version doesn't match what it was compiled
+/// against, so adding/reordering fields requires bumping this so old
+/// readers fail loudly instead of silently returning garbage.
+pub const DRAUG_STATUS_LAYOUT_VERSION: u32 = 1;
+
+/// Size of the status shmem region in bytes. Round number that fits
+/// the current `DraugStatus` and leaves headroom for additions.
+pub const DRAUG_STATUS_SHMEM_SIZE: usize = 256;
+
+/// Stable virtual address where the compositor maps the status
+/// region. Picked to sit alongside the existing per-shmem vaddrs
+/// (0x30000000 / 0x32000000) without overlap. Daemon-side mapping
+/// uses a different vaddr — see `draug-daemon` for `DRAUG_STATUS_DAEMON_VADDR`.
+pub const DRAUG_STATUS_COMPOSITOR_VADDR: usize = 0x33000000;
+
+/// Bit flags packed into `DraugStatus::flags`.
+pub const DRAUG_FLAG_PLAN_MODE_ACTIVE: u32   = 1 << 0;
+pub const DRAUG_FLAG_REFACTOR_HIBERNATING: u32 = 1 << 1;
+pub const DRAUG_FLAG_INITIALISED: u32        = 1 << 31;
+
+/// Live status snapshot. Daemon updates fields with `Ordering::Release`,
+/// compositor reads with `Ordering::Acquire`. Field reads are
+/// individually consistent; cross-field totals (e.g. passed + failed
+/// vs iter) can briefly disagree by ~1 — acceptable for HUD display.
+///
+/// Layout is fixed at 128 bytes with explicit padding so adding a new
+/// field forces a layout-version bump (= the old size no longer fits
+/// the struct, so the compiler complains).
+#[repr(C, align(64))]
+pub struct DraugStatus {
+    /// `DRAUG_STATUS_LAYOUT_VERSION`. Read first; if it doesn't
+    /// match, treat all other fields as invalid.
+    pub layout_version: AtomicU32,
+    /// Bit-OR of `DRAUG_FLAG_*` constants.
+    pub flags: AtomicU32,
+
+    pub refactor_iter: AtomicU32,
+    pub refactor_passed: AtomicU32,
+    pub refactor_failed: AtomicU32,
+    pub refactor_retries: AtomicU32,
+
+    pub complex_task_idx: AtomicU32,
+    pub crash_count: AtomicU32,
+
+    pub last_input_ms: AtomicU64,
+    pub last_skill_ms: AtomicU64,
+
+    pub tasks_at_l1: AtomicU32,
+    pub tasks_at_l2: AtomicU32,
+    pub tasks_at_l3: AtomicU32,
+    pub consecutive_skips: AtomicU32,
+
+    /// Per-task skill levels (0..=3). Index = task slot.
+    pub task_levels: [AtomicU8; 20],
+
+    pub _padding: [u8; 28],
+}
+
+const _: () = {
+    // Compile-time size guard: bump the layout version if this fires.
+    assert!(core::mem::size_of::<DraugStatus>() <= DRAUG_STATUS_SHMEM_SIZE);
+};
+
+impl DraugStatus {
+    /// Const-friendly initialiser used by the daemon when it carves
+    /// out the shmem region. Every counter starts at zero.
+    pub const fn zeroed() -> Self {
+        const A8: AtomicU8 = AtomicU8::new(0);
+        Self {
+            layout_version: AtomicU32::new(0),
+            flags: AtomicU32::new(0),
+            refactor_iter: AtomicU32::new(0),
+            refactor_passed: AtomicU32::new(0),
+            refactor_failed: AtomicU32::new(0),
+            refactor_retries: AtomicU32::new(0),
+            complex_task_idx: AtomicU32::new(0),
+            crash_count: AtomicU32::new(0),
+            last_input_ms: AtomicU64::new(0),
+            last_skill_ms: AtomicU64::new(0),
+            tasks_at_l1: AtomicU32::new(0),
+            tasks_at_l2: AtomicU32::new(0),
+            tasks_at_l3: AtomicU32::new(0),
+            consecutive_skips: AtomicU32::new(0),
+            task_levels: [A8; 20],
+            _padding: [0; 28],
+        }
+    }
+}
+
+/// Fetch the daemon's status shmem handle over IPC. Compositor calls
+/// this once at boot, then maps the handle and stops talking IPC for
+/// status reads.
+pub fn get_status_handle() -> DraugResult<u32> {
+    let reply = ipc::send(DRAUG_TASK_ID, DRAUG_OP_GET_STATUS_HANDLE, 0)
+        .map_err(|_| DraugError::Unreachable)?;
+    if reply == DRAUG_STATUS_ERR {
+        return Err(DraugError::Protocol(reply));
+    }
+    Ok(reply as u32)
+}
+
+/// Errors specific to attaching the status region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachError {
+    /// Daemon not yet ready or unreachable.
+    Daemon(DraugError),
+    /// `shmem_map` failed.
+    Map(ShmemError),
+    /// Layout version mismatch — daemon and client compiled against
+    /// different versions of `DraugStatus`.
+    LayoutMismatch { expected: u32, found: u32 },
+}
+
+/// Bootstrap a read-only view of the daemon's status region.
+///
+/// This is a one-shot call: the returned reference is valid for the
+/// lifetime of the process (or until daemon teardown). Subsequent
+/// reads use plain atomic loads with no IPC overhead.
+///
+/// Returns `Err(LayoutMismatch)` if the daemon's layout version does
+/// not match what this compositor was built against — the right
+/// response is to skip Draug status display rather than read garbage.
+pub fn attach_status() -> Result<&'static DraugStatus, AttachError> {
+    let handle = get_status_handle().map_err(AttachError::Daemon)?;
+    shmem_map(handle, DRAUG_STATUS_COMPOSITOR_VADDR).map_err(AttachError::Map)?;
+
+    let status: &'static DraugStatus = unsafe {
+        &*(DRAUG_STATUS_COMPOSITOR_VADDR as *const DraugStatus)
+    };
+
+    let found = status.layout_version.load(Ordering::Acquire);
+    if found != DRAUG_STATUS_LAYOUT_VERSION {
+        return Err(AttachError::LayoutMismatch {
+            expected: DRAUG_STATUS_LAYOUT_VERSION,
+            found,
+        });
+    }
+    Ok(status)
 }
