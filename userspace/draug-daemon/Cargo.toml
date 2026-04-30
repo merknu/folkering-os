@@ -14,7 +14,7 @@ name = "draug-daemon"
 path = "src/main.rs"
 
 [dependencies]
-libfolk = { path = "../libfolk" }
+libfolk = { path = "../libfolk", features = ["mcp"] }
 
 [features]
 default = []
