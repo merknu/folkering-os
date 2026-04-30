@@ -252,16 +252,28 @@ impl BuddyAllocator {
     }
 
     /// Check if a block is in the free list
+    ///
+    /// Capped at 1M iterations to defend against a corrupted free
+    /// list (double-free creating a cycle, driver-induced memory
+    /// stomp, etc). On a 4 GB machine the longest possible order-0
+    /// freelist is ~1M entries — the cap is "if you exceeded this,
+    /// the list is corrupt, fail closed instead of looping forever."
     fn is_block_free(&self, addr: usize, order: usize) -> bool {
         let virt_addr = crate::phys_to_virt(addr);
         let mut current = self.free_lists[order];
+        let mut hops = 0u32;
 
         while let Some(block_ptr) = current {
+            if hops > 1_000_000 {
+                crate::serial_strln!("[PMM] is_block_free: freelist walk exceeded 1M — list corrupt");
+                return false;
+            }
             if block_ptr.as_ptr() as usize == virt_addr {
                 return true;
             }
             let block = unsafe { block_ptr.as_ref() };
             current = block.next;
+            hops += 1;
         }
 
         false
@@ -272,8 +284,14 @@ impl BuddyAllocator {
         let target_ptr = crate::phys_to_virt(addr) as *mut FreeBlock;
         let mut prev: Option<NonNull<FreeBlock>> = None;
         let mut current = self.free_lists[order];
+        let mut hops = 0u32;
 
         while let Some(block_ptr) = current {
+            if hops > 1_000_000 {
+                crate::serial_strln!("[PMM] remove_from_free_list: walk exceeded 1M — list corrupt");
+                return;
+            }
+            hops += 1;
             if block_ptr.as_ptr() == target_ptr {
                 // Found it - remove from list
                 let block = unsafe { block_ptr.as_ref() };

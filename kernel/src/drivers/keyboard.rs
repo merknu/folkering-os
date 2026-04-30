@@ -164,11 +164,16 @@ pub const KEY_CTRL_V: u8 = 0x8B;
 /// Initialize keyboard driver
 pub fn init() {
     unsafe {
-        // Clear any pending keyboard data before enabling interrupt
+        // Clear any pending keyboard data before enabling interrupt.
+        // Capped at 256 reads — real PS/2 controllers buffer ≤16 bytes,
+        // but a broken emulator that keeps DR=1 high would otherwise
+        // freeze boot here (Issue #49 pattern, hardware-init flavour).
         let mut status = Port::<u8>::new(KEYBOARD_STATUS_PORT);
         let mut data = Port::<u8>::new(KEYBOARD_DATA_PORT);
-        while status.read() & 1 != 0 {
+        let mut drained = 0u32;
+        while status.read() & 1 != 0 && drained < 256 {
             let _ = data.read();
+            drained += 1;
         }
 
         // Enable IRQ1 (keyboard) using centralized PIC module
@@ -188,11 +193,14 @@ pub fn init_without_pic() {
     }
 
     unsafe {
-        // Clear any pending data in the keyboard buffer
+        // Clear any pending data in the keyboard buffer.
+        // Same 256-read cap as `init()` above.
         let mut status = Port::<u8>::new(KEYBOARD_STATUS_PORT);
         let mut data = Port::<u8>::new(KEYBOARD_DATA_PORT);
-        while status.read() & 1 != 0 {
+        let mut drained = 0u32;
+        while status.read() & 1 != 0 && drained < 256 {
             let _ = data.read();
+            drained += 1;
         }
 
         // Don't enable PIC IRQ - IOAPIC handles it
