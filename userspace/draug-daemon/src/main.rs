@@ -196,13 +196,11 @@ fn run_draug_tick(draug: &mut DraugDaemon, now_ms: u64) {
         draug.tick(now_ms);
     }
 
-    // Analysis cycle (LLM call). Currently ungated — see comment above.
-    if draug.should_analyze(now_ms) {
-        let _ = draug.start_analysis(now_ms);
-    }
-
-    // Wait-for-LLM timeout housekeeping.
-    let _ = draug.check_waiting_timeout(now_ms);
+    // Phase A.5 step 2.2: analysis cycle stays in compositor for now.
+    // It uses `libfolk::mcp::client::send_chat`, and the response is
+    // routed via compositor's MCP poll. Until the daemon learns to
+    // poll its own MCP queue (a separate small project), Draug's
+    // self-analysis stays single-source-of-truth in compositor.
 
     // Pattern mining — periodic insight extraction from telemetry.
     if draug.should_mine_patterns(now_ms)

@@ -19,7 +19,7 @@ use compositor::window_manager::WindowManager;
 
 use crate::util::format_usize;
 
-use super::{autodream, knowledge_hunt, rdtsc, AiTickResult};
+use super::{autodream, rdtsc, AiTickResult};
 
 pub(super) fn tick(
     mcp: &mut McpState,
@@ -106,94 +106,17 @@ pub(super) fn tick(
         }
     }
 
-    // ===== Pattern-Mining =====
-    {
-        let mine_ms = if tsc_per_us > 0 { rdtsc() / tsc_per_us / 1000 } else { 0 };
-        if draug.should_mine_patterns(mine_ms)
-            && active_agent.is_none()
-            && mcp.async_tool_gen.is_none()
-            && !draug.should_yield_tokens(active_agent.is_some(), mine_ms)
-        {
-            if let Some(insight) = draug.mine_patterns(mine_ms) {
-                write_str("[Draug] Insight: ");
-                let show_len = insight.len().min(80);
-                write_str(&insight[..show_len]);
-                write_str("\n");
-            }
-        }
-    }
-
-    // ===== Phase 7 — Knowledge Hunt =====
+    // ===== Phase A.5 step 2.2: pattern mining / knowledge hunt /
+    // refactor loop / kernel-bridge update all moved to draug-daemon.
+    // The daemon's main loop (`run_draug_tick`) drives those paths
+    // and writes status into the shmem region. Compositor's local
+    // DraugDaemon no longer participates in any TCP-bound agent
+    // work; only the MCP-routed `start_analysis` path below stays
+    // here, because compositor still owns the MCP poll/dispatch.
     //
-    // Fires once per boot when the user has been idle for ~15 s.
-    // Gated before AutoDream because it's a single cheap fetch, and
-    // we want it to land BEFORE the 45-minute AutoDream threshold so
-    // the demo is visible without a long wait.
-    {
-        let hunt_ms = if tsc_per_us > 0 { rdtsc() / tsc_per_us / 1000 } else { libfolk::sys::uptime() };
-        if draug.should_hunt_knowledge(hunt_ms)
-            && active_agent.is_none()
-            && mcp.async_tool_gen.is_none()
-        {
-            knowledge_hunt::run(draug);
-            did_work = true;
-        }
-    }
-
-    // ===== Phase 13 — Overnight refactor loop (async) =====
-    //
-    // Non-blocking: tick_async returns in <1ms via EAGAIN polling.
-    // UI renders between phases. Falls back to blocking for Phase 15.
-    {
-        let refactor_ms = if tsc_per_us > 0 { rdtsc() / tsc_per_us / 1000 } else { libfolk::sys::uptime() };
-
-        // Async state machine: <1ms per frame, never blocks UI.
-        // Handles both skill tree (L1-L3) and Phase 15 Plan-and-Solve.
-        if draug.async_phase != compositor::draug::AsyncPhase::Idle {
-            // In-progress async operation — always poll (bypass gate)
-            if super::draug_async::tick_async(draug, refactor_ms) {
-                did_work = true;
-            }
-        } else if draug.should_run_refactor_step(refactor_ms)
-            && active_agent.is_none()
-            && mcp.async_tool_gen.is_none()
-        {
-            // Start new iteration via async path
-            if super::draug_async::tick_async(draug, refactor_ms) {
-                did_work = true;
-            }
-        }
-    }
-
-    // ===== Draug Bridge: push status to kernel for TCP shell =====
-    // Rate-limited: every 60 ticks (~1/sec at 60Hz) to avoid
-    // unnecessary syscall overhead.
-    {
-        static BRIDGE_COUNTER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-        let count = BRIDGE_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if count % 60 == 0 {
-            let paused = libfolk::sys::draug_bridge_update(
-                draug.refactor_iter,
-                draug.refactor_passed,
-                draug.refactor_failed,
-                draug.refactor_retries,
-                draug.tasks_at_level(1) as u8,
-                draug.tasks_at_level(2) as u8,
-                draug.tasks_at_level(3) as u8,
-                if draug.plan_mode_active { 1 } else { 0 },
-                draug.complex_task_idx as u8,
-                if draug.refactor_hibernating { 1 } else { 0 },
-                draug.consecutive_skips.min(255) as u8,
-            );
-            if paused && draug.is_active() {
-                draug.set_active(false);
-                write_str("[Draug] PAUSED via remote shell\n");
-            } else if !paused && !draug.is_active() {
-                draug.set_active(true);
-                write_str("[Draug] RESUMED via remote shell\n");
-            }
-        }
-    }
+    // Removing these blocks eliminates the duplicate-LLM-cost issue
+    // that A.5 step 1 introduced (daemon and compositor both
+    // ticking).
 
     // ===== AutoDream cycle start (delegates to autodream module) =====
     // Phase 14: don't dream if the skill tree still has work to do —

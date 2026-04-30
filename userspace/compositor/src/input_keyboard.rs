@@ -76,6 +76,12 @@ pub fn process_keyboard(
         };
         did_work = true;
         let input_ms = if tsc_per_us > 0 { rdtsc() / tsc_per_us / 1000 } else { 0 };
+        // Phase A.5: forward to draug-daemon over IPC. Local update
+        // stays for the transition window so compositor-side HUD reads
+        // (which still target the in-process DraugDaemon) keep
+        // returning fresh values; the call goes away in step 2.4 once
+        // the local instance is dropped.
+        libfolk::sys::draug::send_user_input(input_ms);
         draug.on_user_input(input_ms);
 
         // Ctrl+G (0x07) or 'G'/'g': toggle RAM graph

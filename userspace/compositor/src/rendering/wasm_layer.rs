@@ -113,6 +113,11 @@ pub(super) fn render_fullscreen_app(ctx: &mut RenderContext) -> bool {
                             } else {
                                 write_str("[IMMUNE] Failed to send patch request\n");
                             }
+                            // Phase A.5: forward crash to draug-daemon.
+                            // Local record_crash stays for HUD coherence
+                            // until A.5 step 2.4 drops the local instance.
+                            let h = compositor::draug::DraugDaemon::key_hash_pub(k);
+                            libfolk::sys::draug::record_crash(h as u64);
                             ctx.draug.record_crash(k);
                         }
                     } else if ctx.wasm.fuel_fail_count < 3 {
@@ -131,6 +136,8 @@ pub(super) fn render_fullscreen_app(ctx: &mut RenderContext) -> bool {
                     write_str(&msg[..msg.len().min(80)]);
                     write_str("\n");
                     if let Some(ref k) = app_active_key {
+                        let h = compositor::draug::DraugDaemon::key_hash_pub(k);
+                        libfolk::sys::draug::record_crash(h as u64);
                         ctx.draug.record_crash(k);
                     }
                 }
