@@ -530,10 +530,22 @@ pub fn draug_bridge_set_task(name: &str) {
     unsafe { crate::syscall::syscall2(0xD1, name.as_ptr() as u64, len as u64); }
 }
 
-/// Stability Fix 7 — Proxy health check.
-/// Returns true if the proxy is reachable (~2s timeout).
+/// Stability Fix 7 — Proxy health check (TCP).
+/// Returns true if the proxy is reachable via TCP (~2s timeout).
+/// Note: shares smoltcp TCP state with Phase 17 — under a TCP wedge
+/// (Issue #58) this returns false even when the proxy is up. See
+/// `proxy_ping_udp()` for an independent UDP-based recovery probe.
 pub fn proxy_ping() -> bool {
     unsafe { crate::syscall::syscall0(0x64) == 1 }
+}
+
+/// Issue #58 — Proxy health check (UDP).
+/// Returns true if the proxy responds to a UDP "PING" with "PONG"
+/// within 1s. Uses smoltcp's UDP socket type, a different code path
+/// than `proxy_ping()` (TCP), so it can succeed when the TCP-side
+/// state is wedged.
+pub fn proxy_ping_udp() -> bool {
+    unsafe { crate::syscall::syscall0(0x68) == 1 }
 }
 
 /// Phase 16 — WASM compilation.
