@@ -126,7 +126,9 @@ pub(super) extern "C" fn syscall_handler(
         // Issue #58: UDP variant of proxy_ping. Uses smoltcp's UDP socket
         // type (different code path than tcp_plain) so hibernation can
         // recover from a TCP-specific wedge. Sends "PING", awaits "PONG"
-        // within 1s. Returns 1 if PONG received, 0 otherwise.
+        // (timeout is in tsc_ms units — ≈1s on a well-calibrated TSC,
+        // see syscall_proxy_ping_udp doc for caveats). Returns 1 if
+        // PONG received, 0 otherwise.
         0x68 => syscall_proxy_ping_udp(),
         // Folkering CodeGraph: query callers of a fn name via the
         // proxy's GRAPH_CALLERS command. Same packed-lengths shape

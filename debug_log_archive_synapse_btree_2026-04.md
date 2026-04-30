@@ -4,7 +4,7 @@
 `[SYNAPSE] insert: unexpected page type 0x00` when writing files to SQLite VFS.
 Blocks all persistence: WASM app caching, AutoDream, driver version control.
 
-## Session 7. april 2026
+## Session 7. April 2026
 
 ### Attempt 1: FOLKDISK header not updated after flush
 - **Hypothesis:** `flush_sqlite_to_disk()` writes new pages to disk but never updates `synapse_db_size` in sector 0 header. On reboot, fewer sectors are loaded → new pages are zeroed.
