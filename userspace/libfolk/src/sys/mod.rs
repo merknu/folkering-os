@@ -21,6 +21,7 @@ pub mod random;
 pub mod time;
 pub mod inference;
 pub mod pci;
+pub mod draug;
 
 // Re-export commonly used functions at the sys level
 pub use task::{exit, yield_cpu, get_pid, spawn, parallel_gemm, ask_gemini, http_fetch, http_post, fbp_request, fbp_interact, fbp_patch, cargo_check, CC_STATUS_OK, CC_STATUS_BUILD_FAILED, CC_STATUS_BAD_PATH, CC_STATUS_IO_ERROR, CC_STATUS_CHECK_TIMEOUT, CC_STATUS_TOO_LARGE, CC_STATUS_NOT_CONFIGURED, fetch_source, FS_STATUS_OK, FS_STATUS_BAD_PATH, FS_STATUS_NOT_FOUND, FS_STATUS_IO_ERROR, FS_STATUS_TOO_LARGE, FS_STATUS_NOT_CONFIGURED, llm_generate, graph_callers, wasm_compile, proxy_ping, proxy_ping_udp, proxy_last_verdict, draug_bridge_update, draug_bridge_set_task, tcp_connect_async, tcp_send_async, tcp_poll_recv, tcp_close_async, TCP_EAGAIN, PatchStatus, udp_send, udp_send_recv, ntp_query, audio_play, audio_beep, gpu_flush, gpu_flush_batch, gpu_vsync, gpu_info, gpu_move_cursor, com3_read, com3_write, com2_write_raw, com2_async_send, com2_async_poll, com2_async_read, com2_async_poll_legacy, wait_for_irq, get_rtc, get_rtc_packed, DateTime, memory_stats, iqe_read, iqe_tsc_freq, telemetry_log, telemetry_drain, telemetry_stats, ws_connect, ws_send, ws_poll_recv, ws_close};
@@ -31,6 +32,14 @@ pub use system::{task_list, task_list_detailed, uptime};
 
 // Re-export Synapse protocol
 pub use synapse::{SYNAPSE_TASK_ID, SynapseError, SynapseResult};
+
+// Re-export Draug protocol (Phase A migration: compositor talks to
+// the draug-daemon over IPC instead of holding a `&mut DraugDaemon`).
+pub use draug::{
+    DRAUG_TASK_ID, DraugError, DraugResult,
+    DRAUG_OP_PING, DRAUG_OP_USER_INPUT, DRAUG_OP_WASM_CRASH, DRAUG_OP_INSTALL_REFACTOR_TASKS,
+    DRAUG_STATUS_OK, DRAUG_STATUS_ERR, DRAUG_VERSION,
+};
 
 // Re-export Compositor client
 pub use compositor::{
