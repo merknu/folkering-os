@@ -663,7 +663,12 @@ impl DraugDaemon {
                     ok = libfolk::sys::proxy_ping();
                 }
                 if ok {
-                    libfolk::sys::io::write_str("[Draug-hib] proxy reachable → resetting skips, resuming\n");
+                    libfolk::sys::io::write_str("[Draug-hib] proxy reachable → flushing neighbor cache, resetting skips, resuming\n");
+                    // Issue #58 hypothesis #3: flush ARP cache so the next
+                    // TCP connect re-resolves the proxy MAC. If the wedge
+                    // was a stale neighbor entry, this gives Phase 17 a
+                    // fresh chance to actually succeed (not just wake up).
+                    libfolk::sys::net_flush_neighbors();
                     self.consecutive_skips = 0;
                     self.refactor_hibernating = false;
                     // Fall through to normal scheduling

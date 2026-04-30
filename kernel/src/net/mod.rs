@@ -41,6 +41,35 @@ pub use dns::dns_lookup;
 pub use udp::{udp_send, udp_send_recv};
 pub use ntp::ntp_query;
 
+/// Issue #58 hypothesis #3 — flush smoltcp's ARP/neighbor cache.
+///
+/// smoltcp 0.12 doesn't expose a direct `flush_neighbor_cache` on
+/// the `Interface` API; the only public path that triggers it is
+/// `update_ip_addrs`. We use a no-op closure so the IP set is left
+/// alone but the post-call `flush_neighbor_cache` side-effect runs.
+///
+/// Called from the Draug hibernation wake path as an experimental
+/// recovery step: if a stale neighbor entry is what's pinning the
+/// post-flood TCP wedge, this should let the next connect attempt
+/// re-resolve via fresh ARP. If TCP still wedges after the flush,
+/// the bug isn't in the ARP cache.
+pub fn reset_neighbor_cache() {
+    let mut attempts = 0u32;
+    let mut guard = loop {
+        if let Some(g) = NET_STATE.try_lock() { break g; }
+        attempts += 1;
+        if attempts > 1000 {
+            crate::serial_strln!("[NET] reset_neighbor_cache: NET_STATE locked, skipping");
+            return;
+        }
+        core::hint::spin_loop();
+    };
+    if let Some(state) = guard.as_mut() {
+        state.iface.update_ip_addrs(|_addrs| { /* no-op — only here for the flush side-effect */ });
+        crate::serial_strln!("[NET] neighbor cache flushed");
+    }
+}
+
 // Internal re-exports used by submodules
 pub(crate) use state::{NetState, NET_STATE};
 

@@ -548,6 +548,15 @@ pub fn proxy_ping_udp() -> bool {
     unsafe { crate::syscall::syscall0(0x68) == 1 }
 }
 
+/// Issue #58 hypothesis #3 — flush smoltcp neighbor (ARP) cache.
+/// Used from the Draug hibernation wake path as an experimental
+/// recovery step. If a stale ARP entry is what's keeping the
+/// post-flood TCP wedge alive, this should let the next connect
+/// re-resolve cleanly.
+pub fn net_flush_neighbors() {
+    unsafe { let _ = crate::syscall::syscall0(0x69); }
+}
+
 /// Phase 16 — WASM compilation.
 ///
 /// Sends `WASM_COMPILE` to the proxy which compiles the sandbox to

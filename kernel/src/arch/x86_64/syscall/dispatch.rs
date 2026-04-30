@@ -123,6 +123,14 @@ pub(super) extern "C" fn syscall_handler(
         // recover from a TCP-specific wedge. Sends "PING", awaits "PONG"
         // within 1s. Returns 1 if PONG received, 0 otherwise.
         0x68 => syscall_proxy_ping_udp(),
+        // Issue #58 hypothesis #3: flush smoltcp neighbor (ARP) cache.
+        // Called from hibernation wake as experimental recovery — if a
+        // stale ARP entry is the wedge cause, the next TCP connect
+        // re-resolves and succeeds.
+        0x69 => {
+            crate::net::reset_neighbor_cache();
+            0
+        },
         // Folkering CodeGraph: query callers of a fn name via the
         // proxy's GRAPH_CALLERS command. Same packed-lengths shape
         // as fbp_patch / llm_generate.
