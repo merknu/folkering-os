@@ -649,17 +649,26 @@ impl DraugDaemon {
         }
         // Fix 8: hibernation — stop until proxy comes back.
         // Auto-wake: try proxy ping every 60s while hibernating.
+        // Issue #58: try UDP ping first (independent of wedged TCP state),
+        // fall through to TCP. Either succeeding wakes Draug.
         if self.refactor_hibernating {
             if now_ms.saturating_sub(self.last_refactor_ms) >= 60_000 {
                 self.last_refactor_ms = now_ms;
-                libfolk::sys::io::write_str("[Draug-hib] 60s elapsed → calling proxy_ping\n");
-                if libfolk::sys::proxy_ping() {
-                    libfolk::sys::io::write_str("[Draug-hib] proxy_ping=true → resetting skips, resuming\n");
+                libfolk::sys::io::write_str("[Draug-hib] 60s elapsed → trying proxy_ping_udp first\n");
+                let mut ok = libfolk::sys::proxy_ping_udp();
+                if ok {
+                    libfolk::sys::io::write_str("[Draug-hib] UDP ping OK\n");
+                } else {
+                    libfolk::sys::io::write_str("[Draug-hib] UDP ping failed → falling back to TCP ping\n");
+                    ok = libfolk::sys::proxy_ping();
+                }
+                if ok {
+                    libfolk::sys::io::write_str("[Draug-hib] proxy reachable → resetting skips, resuming\n");
                     self.consecutive_skips = 0;
                     self.refactor_hibernating = false;
                     // Fall through to normal scheduling
                 } else {
-                    libfolk::sys::io::write_str("[Draug-hib] proxy_ping=false → still hibernating, retry in 60s\n");
+                    libfolk::sys::io::write_str("[Draug-hib] both pings failed → still hibernating, retry in 60s\n");
                     return false;
                 }
             } else {

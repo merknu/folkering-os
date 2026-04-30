@@ -1086,6 +1086,46 @@ pub fn syscall_proxy_ping() -> u64 {
     }
 }
 
+/// Issue #58 — UDP variant of proxy_ping.
+///
+/// Sends a 4-byte "PING" UDP datagram to the proxy and awaits "PONG"
+/// within 1 second. Uses smoltcp's UDP socket type, which is a
+/// different code path than `tcp_plain` — so this can succeed even
+/// when the TCP-side state is wedged (post-flood scenario from #58).
+///
+/// Returns 1 on PONG received, 0 otherwise.
+pub fn syscall_proxy_ping_udp() -> u64 {
+    const PROXY_IP: [u8; 4] = [192, 168, 68, 150];
+    const PROXY_PORT: u16 = 14711;
+
+    crate::serial_strln!("[PROXY_PING_UDP] requesting");
+
+    let mut response = [0u8; 64];
+    let n = crate::net::udp::udp_send_recv(
+        PROXY_IP, PROXY_PORT,
+        b"PING",
+        &mut response,
+        1000, // 1s timeout
+    );
+
+    if n == 0 {
+        crate::serial_strln!("[PROXY_PING_UDP] no UDP response");
+        return 0;
+    }
+
+    crate::serial_str!("[PROXY_PING_UDP] got ");
+    crate::drivers::serial::write_dec(n as u32);
+    crate::serial_strln!(" bytes");
+
+    if n >= 4 && &response[..4] == b"PONG" {
+        crate::serial_strln!("[PROXY_PING_UDP] PONG → result=1 (waking Draug)");
+        1
+    } else {
+        crate::serial_strln!("[PROXY_PING_UDP] no PONG in response → result=0");
+        0
+    }
+}
+
 /// Phase 16 — WASM compilation.
 ///
 /// Sends `WASM_COMPILE\n` to the proxy, which compiles the current
