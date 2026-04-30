@@ -92,7 +92,7 @@ impl Device for FolkeringDevice {
                 return Some((rx, FolkeringTxToken));
             }
             skipped += 1;
-            if skipped > 256 { return None; }
+            if skipped >= 256 { return None; }
         }
     }
 
