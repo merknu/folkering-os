@@ -668,22 +668,28 @@ fn main() -> ! {
         // double-writing into the bridge atomics for no benefit.
     }
 
-    // Phase 17 — load (or seed) the autonomous refactor task queue.
-    // Failures are tolerated: if Synapse VFS read returns an error,
-    // we still seed from REFACTOR_FIXTURES so the loop has work.
+    // Phase 17 — seed the autonomous refactor task queue if it's
+    // missing. Daemon picks up the same Synapse VFS file on its
+    // own boot, so we only need to make sure the file exists with
+    // the merged fixture set.
+    //
+    // Phase A.5 step 2.4: dropped the `draug.install_refactor_tasks`
+    // call that used to install the merged list into compositor's
+    // local DraugDaemon — that instance no longer drives the refactor
+    // loop (daemon does), so the install was dead code. Compositor
+    // keeps the seed-and-save so the on-disk file is up to date for
+    // the daemon's next boot.
     {
         let existing = mcp_handler::task_store::load().unwrap_or_default();
         let merged = mcp_handler::task_store::seed_or_merge(
             &existing,
             mcp_handler::refactor_loop::REFACTOR_FIXTURES,
         );
-        // Persist immediately so first-boot writes the seeded list to disk.
         let _ = mcp_handler::task_store::save(&merged);
         libfolk::sys::io::write_str("[Draug] Refactor queue: ");
         let mut nb = [0u8; 16];
         libfolk::sys::io::write_str(crate::util::format_usize(merged.len(), &mut nb));
-        libfolk::sys::io::write_str(" tasks loaded\n");
-        draug.install_refactor_tasks(merged);
+        libfolk::sys::io::write_str(" tasks persisted for daemon\n");
     }
 
     // Pillar 4: WASM warm cache — pre-compiled modules for instant response
