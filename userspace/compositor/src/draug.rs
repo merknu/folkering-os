@@ -652,11 +652,14 @@ impl DraugDaemon {
         if self.refactor_hibernating {
             if now_ms.saturating_sub(self.last_refactor_ms) >= 60_000 {
                 self.last_refactor_ms = now_ms;
+                libfolk::sys::io::write_str("[Draug-hib] 60s elapsed → calling proxy_ping\n");
                 if libfolk::sys::proxy_ping() {
+                    libfolk::sys::io::write_str("[Draug-hib] proxy_ping=true → resetting skips, resuming\n");
                     self.consecutive_skips = 0;
                     self.refactor_hibernating = false;
                     // Fall through to normal scheduling
                 } else {
+                    libfolk::sys::io::write_str("[Draug-hib] proxy_ping=false → still hibernating, retry in 60s\n");
                     return false;
                 }
             } else {
