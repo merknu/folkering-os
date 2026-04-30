@@ -155,19 +155,39 @@ pub fn syscall_tcp_connect(ip_packed: u64, port: u64) -> u64 {
         None => {
             // Issue #58 instrumentation: dump slot-pool census so we
             // can see the pool exhaustion pattern in the serial log.
+            //
+            // PR #64 review: snapshot the slot states first, then drop
+            // both NET_STATE and SLOTS locks before serialising the
+            // log. COM1 writes disable interrupts — keeping the locks
+            // across ~16 serial writes turned a small lock contention
+            // into a long critical section that could mask the wedge
+            // we were trying to diagnose.
+            let mut census: [(u8, u32); MAX_ASYNC_SLOTS] =
+                [(0u8, 0u32); MAX_ASYNC_SLOTS];
+            for i in 0..MAX_ASYNC_SLOTS {
+                let code = match slots[i].state {
+                    SlotState::Free => 0u8,
+                    SlotState::Connecting => 1u8,
+                    SlotState::Connected => 2u8,
+                };
+                census[i] = (code, slots[i].owner);
+            }
+            drop(slots);
+            drop(guard);
+
             crate::serial_strln!("[TCP_CONNECT] no free slots! pool census:");
             for i in 0..MAX_ASYNC_SLOTS {
                 crate::serial_str!("[TCP_CONNECT]   slot[");
                 crate::drivers::serial::write_dec(i as u32);
                 crate::serial_str!("] state=");
-                let label = match slots[i].state {
-                    SlotState::Free => "Free",
-                    SlotState::Connecting => "Connecting",
-                    SlotState::Connected => "Connected",
+                let label = match census[i].0 {
+                    0 => "Free",
+                    1 => "Connecting",
+                    _ => "Connected",
                 };
                 crate::serial_str!(label);
                 crate::serial_str!(" owner=");
-                crate::drivers::serial::write_dec(slots[i].owner);
+                crate::drivers::serial::write_dec(census[i].1);
                 crate::serial_strln!("");
             }
             return u64::MAX; // no free slots

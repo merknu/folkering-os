@@ -319,18 +319,28 @@ fn record_syn_attempt(ip: [u8; 4]) {
         // block threshold of 3) to fill the slot array, after which
         // their real attack IP slips through without tracking.
         //
-        // Evict the lowest-count entry that ISN'T yet blocked
-        // (count < 3). A blocked entry is load-bearing — we keep
-        // dropping that IP's traffic on every frame — so we refuse
-        // to evict it. If every slot is blocked, the table is doing
-        // its job; the new IP just isn't tracked this round.
+        // Eligible victims:
+        //  * unblocked entries (count < 3) — pick the lowest count
+        //    so we evict the least-invested tracker.
+        //  * entries whose block has already expired (`is_blocked`
+        //    won't honour them anyway). Rank these at 0 so they're
+        //    always preferred over an unblocked tracker with count
+        //    > 0 — keeps PR #64 review feedback from going stale:
+        //    if all 16 slots filled with old expired blocks, the
+        //    previous logic refused every eviction and stopped
+        //    tracking new IPs.
         let mut victim: Option<usize> = None;
-        let mut victim_count: u8 = u8::MAX;
+        let mut victim_rank: u8 = u8::MAX;
         for i in 0..MAX_BLOCKLIST {
             let c = list.0[i].1;
-            if c < 3 && c < victim_count {
-                victim_count = c;
-                victim = Some(i);
+            let is_expired_block =
+                c >= 3 && now.saturating_sub(list.0[i].2) >= BLOCK_DURATION_MS;
+            if c < 3 || is_expired_block {
+                let rank = if is_expired_block { 0 } else { c };
+                if rank < victim_rank {
+                    victim_rank = rank;
+                    victim = Some(i);
+                }
             }
         }
         if let Some(i) = victim {

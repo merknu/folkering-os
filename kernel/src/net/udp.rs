@@ -97,10 +97,22 @@ pub fn udp_send_recv(
         let _ = state.iface.poll(now, &mut dev, &mut state.sockets);
 
         let sock = state.sockets.get_mut::<udp::Socket>(handle);
-        if let Ok((n, _src)) = sock.recv_slice(response) {
+        if let Ok((n, src)) = sock.recv_slice(response) {
             if n > 0 {
-                received = n;
-                break;
+                // PR #62 review: filter by source endpoint. recv_slice
+                // returns the first datagram on the bound port
+                // regardless of sender; on a busy network this can
+                // yield false negatives (a stray packet consumed
+                // before the real reply). Drop unmatched datagrams
+                // and keep waiting until timeout. This is the right
+                // behaviour for every current caller (NTP, DNS,
+                // proxy_ping_udp) — none want to accept a reply from
+                // an unrelated peer.
+                if src.endpoint == endpoint {
+                    received = n;
+                    break;
+                }
+                // Wrong source — drop and continue waiting.
             }
         }
 
