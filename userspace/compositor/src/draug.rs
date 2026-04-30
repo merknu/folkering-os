@@ -820,13 +820,38 @@ impl DraugDaemon {
     /// Fix 5: Record a skip (Ollama down).
     pub fn record_skip(&mut self) {
         self.consecutive_skips = self.consecutive_skips.saturating_add(1);
+        // Issue #58 instrumentation: log every skip so we can correlate
+        // with serial-side TIMEOUT events and see if hibernation triggers.
+        // Uses a small inline decimal formatter to avoid pulling in the
+        // crate::util::format_usize dep which lives in the compositor
+        // binary, not the lib.
+        let mut buf = [0u8; 4];
+        let mut len = 0usize;
+        let mut n = self.consecutive_skips;
+        if n == 0 { buf[0] = b'0'; len = 1; } else {
+            let mut tmp = [0u8; 4]; let mut i = 0usize;
+            while n > 0 { tmp[i] = b'0' + (n % 10) as u8; n /= 10; i += 1; }
+            for j in 0..i { buf[j] = tmp[i - 1 - j]; }
+            len = i;
+        }
+        libfolk::sys::io::write_str("[Draug-skip] consecutive=");
+        if let Ok(s) = core::str::from_utf8(&buf[..len]) {
+            libfolk::sys::io::write_str(s);
+        }
+        libfolk::sys::io::write_str("/30\n");
         // Fix 8: hibernate after 30 consecutive skips
         if self.consecutive_skips >= 30 && !self.refactor_hibernating {
             self.refactor_hibernating = true;
+            libfolk::sys::io::write_str("[Draug-skip] >>> HIBERNATE (waiting for proxy_ping every 60s)\n");
         }
     }
     /// Fix 5: Reset skips on success.
     pub fn reset_skips(&mut self) {
+        if self.refactor_hibernating {
+            libfolk::sys::io::write_str("[Draug-skip] <<< WAKE (proxy back, skips reset)\n");
+        } else if self.consecutive_skips > 0 {
+            libfolk::sys::io::write_str("[Draug-skip] reset to 0 (PASS)\n");
+        }
         self.consecutive_skips = 0;
         self.refactor_hibernating = false;
     }
