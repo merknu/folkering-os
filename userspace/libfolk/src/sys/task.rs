@@ -541,9 +541,14 @@ pub fn proxy_ping() -> bool {
 
 /// Issue #58 — Proxy health check (UDP).
 /// Returns true if the proxy responds to a UDP "PING" with "PONG"
-/// within 1s. Uses smoltcp's UDP socket type, a different code path
-/// than `proxy_ping()` (TCP), so it can succeed when the TCP-side
-/// state is wedged.
+/// before the kernel-side probe expires. The kernel timeout is
+/// expressed in `tsc_ms` units (calibrated TSC ticks divided down
+/// to milliseconds), which is approximately wall-clock 1s on a
+/// well-calibrated TSC; on a host where IQE fell back to the 3 GHz
+/// default it can drift proportionally to the real CPU frequency.
+/// Uses smoltcp's UDP socket type, a different code path than
+/// `proxy_ping()` (TCP), so it can succeed when the TCP-side state
+/// is wedged.
 pub fn proxy_ping_udp() -> bool {
     unsafe { crate::syscall::syscall0(0x68) == 1 }
 }

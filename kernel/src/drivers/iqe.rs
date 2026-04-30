@@ -54,11 +54,14 @@ pub fn calibrate_tsc() {
 
         let tsc_start = rdtsc();
 
-        // Poll PIT Channel 2 output (bit 5 of port 0x61 goes high when done).
-        // Capped at 10M iters — at ~3 GHz that's ~3 ms wall-clock, way past
-        // the ~50 ms PIT delay. If we exit without seeing the done bit,
-        // the calibration is unreliable and we hard-code a default
-        // (Issue #56 follow-up).
+        // Poll PIT Channel 2 output (bit 5 of port 0x61 goes high when
+        // done). Capped at 10M iterations. Each iteration is one x86
+        // `IN` from port 0x61, which is bus-serialised and costs on
+        // the order of ~1 µs on real hardware (and several hundred ns
+        // even under fast hypervisors), so the cap covers comfortably
+        // more than the `DELAY_MS` (= 10) PIT window above. If we
+        // exit without seeing the done bit, calibration is unreliable
+        // and we hard-code a default (Issue #56 follow-up).
         let mut calibrated = false;
         for _ in 0..10_000_000u64 {
             let status = x86_64::instructions::port::Port::<u8>::new(0x61).read();
@@ -79,11 +82,19 @@ pub fn calibrate_tsc() {
             3000
         };
         TSC_TICKS_PER_US.store(ticks_per_us, Ordering::Relaxed);
-    }
 
-    crate::serial_str!("[IQE] TSC calibrated: ");
-    crate::drivers::serial::write_dec(TSC_TICKS_PER_US.load(Ordering::Relaxed) as u32);
-    crate::serial_strln!(" ticks/us");
+        // Be honest in the boot log about whether we actually
+        // calibrated or fell back to the default — otherwise the
+        // "TSC calibrated" message is misleading on hosts where the
+        // PIT poll timed out.
+        if calibrated {
+            crate::serial_str!("[IQE] TSC calibrated: ");
+        } else {
+            crate::serial_str!("[IQE] TSC defaulted: ");
+        }
+        crate::drivers::serial::write_dec(TSC_TICKS_PER_US.load(Ordering::Relaxed) as u32);
+        crate::serial_strln!(" ticks/us");
+    }
 }
 
 /// IQE event types — what happened

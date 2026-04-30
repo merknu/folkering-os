@@ -7,6 +7,13 @@
 
 **Audit scope:** kernel/src/, userspace/{compositor,libfolk,shell,...}/, drivers, syscall handlers. Skipped apps/ (sandboxed WASM).
 
+> ⚠️ **Note on line numbers below:** This document is a point-in-time
+> snapshot. Specific line numbers reflect the state of the code when
+> the audit was written and will drift as files change — refer to the
+> named function (e.g. `com2_async_poll`, `poll_com3`) rather than the
+> line number when looking something up. Findings remain valid; only
+> the locator format does.
+
 **Verdict scale:**
 - ✅ **SAFE** — explicit cap, finite-bounded, or HLT-yielding by design.
 - 🚩 **UNSAFE** — unbounded poll over a hardware register or syscall that can produce data forever.

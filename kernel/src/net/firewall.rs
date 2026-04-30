@@ -246,9 +246,11 @@ const MAX_BLOCKLIST: usize = 16;
 /// chances to find the proxy reachable after a flood ends.
 const BLOCK_DURATION_MS: u64 = 120_000;
 
-/// Tuple: (ip, syn_count, last_seen_ms). last_seen_ms is wall-clock
-/// at the most recent SYN attempt; if `now - last_seen_ms` exceeds
-/// `BLOCK_DURATION_MS` the entry is treated as expired.
+/// Tuple: (ip, syn_count, last_seen_ms). `last_seen_ms` is the
+/// monotonic uptime timestamp from `crate::timer::uptime_ms()` at the
+/// most recent SYN attempt (NOT a wall-clock value); if
+/// `now - last_seen_ms` exceeds `BLOCK_DURATION_MS` the entry is
+/// treated as expired.
 static BLOCKLIST: spin::Mutex<([([u8; 4], u8, u64); MAX_BLOCKLIST], usize)> =
     spin::Mutex::new(([([0u8; 4], 0u8, 0u64); MAX_BLOCKLIST], 0));
 
@@ -293,7 +295,9 @@ fn record_syn_attempt(ip: [u8; 4]) {
                 list.0[i].1 = list.0[i].1.saturating_add(1);
                 list.0[i].2 = now;
                 if list.0[i].1 == 3 {
-                    // Auto-blocked! Log it
+                    // Auto-blocked! Log it. Format the expiry window
+                    // from BLOCK_DURATION_MS so the log stays accurate
+                    // if the constant changes.
                     crate::serial_str!("[FW-AI] AUTO-BLOCKED ");
                     crate::drivers::serial::write_dec(ip[0] as u32);
                     crate::serial_str!(".");
@@ -302,7 +306,9 @@ fn record_syn_attempt(ip: [u8; 4]) {
                     crate::drivers::serial::write_dec(ip[2] as u32);
                     crate::serial_str!(".");
                     crate::drivers::serial::write_dec(ip[3] as u32);
-                    crate::serial_strln!(" (3 SYN attempts, expires in 120s)");
+                    crate::serial_str!(" (3 SYN attempts, expires in ");
+                    crate::drivers::serial::write_dec((BLOCK_DURATION_MS / 1000) as u32);
+                    crate::serial_strln!("s)");
                 }
                 return;
             }
