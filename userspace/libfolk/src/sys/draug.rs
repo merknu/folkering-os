@@ -47,17 +47,85 @@
 
 use crate::sys::ipc;
 use crate::sys::memory::{shmem_map, ShmemError};
+use crate::sys::system::task_list_detailed;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 // ============================================================================
 // Well-Known Task ID
 // ============================================================================
 
-/// draug-daemon task ID. Reserved at boot by special-case spawn order
-/// (see `kernel/src/lib.rs`). Must come AFTER compositor (task 4),
-/// intent (task 5), and inference (task 6, currently skipped) to keep
-/// the existing well-known task IDs stable.
+/// Default expected draug-daemon task ID. Phase A.6 originally
+/// proposed pinning this with a kernel-side special-case spawn (the
+/// way Synapse=2 and Shell=3 are pinned), but that would have forced
+/// shifting compositor's well-known ID. Instead we ship a fallback
+/// const here and discover the actual ID at runtime via
+/// `daemon_task_id()`, which scans `task_list_detailed` for a task
+/// named `"draug-daemon"`. The const stays as the cache seed value
+/// and as the documented "if you want to pin this, pin to 7" target.
 pub const DRAUG_TASK_ID: u32 = 7;
+
+/// Cached daemon task ID. Seeded with `DRAUG_TASK_ID`; if the first
+/// IPC fails (`Err(IpcError::Unknown)` from `send`), the next
+/// `daemon_task_id()` call re-discovers via task scan and updates
+/// the cache. Subsequent fast-path calls cost one relaxed load.
+static CACHED_DAEMON_TASK_ID: AtomicU32 = AtomicU32::new(DRAUG_TASK_ID);
+
+/// Cached "we already discovered" flag. `false` means the const seed
+/// hasn't been validated yet (or a previous discovery failed); `true`
+/// means we successfully sent at least one IPC to the cached ID.
+static DAEMON_TASK_ID_VALIDATED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Return the daemon's task ID. First call may scan `task_list_detailed`
+/// to find a task named "draug-daemon"; subsequent calls are a single
+/// relaxed atomic load.
+pub fn daemon_task_id() -> u32 {
+    if DAEMON_TASK_ID_VALIDATED.load(Ordering::Acquire) {
+        return CACHED_DAEMON_TASK_ID.load(Ordering::Relaxed);
+    }
+    // First-call slow path: try the const seed via PING. If it works,
+    // mark validated and we're done. Otherwise rescan.
+    let seed = CACHED_DAEMON_TASK_ID.load(Ordering::Relaxed);
+    if ipc::send(seed, DRAUG_OP_PING, 0).is_ok() {
+        DAEMON_TASK_ID_VALIDATED.store(true, Ordering::Release);
+        return seed;
+    }
+    if let Some(found) = scan_for_daemon() {
+        CACHED_DAEMON_TASK_ID.store(found, Ordering::Relaxed);
+        DAEMON_TASK_ID_VALIDATED.store(true, Ordering::Release);
+        return found;
+    }
+    // Discovery failed — return the seed so callers fail loudly via
+    // their existing `Unreachable` error path.
+    seed
+}
+
+/// Walk `task_list_detailed` looking for a task whose name is
+/// `"draug-daemon"`. Returns `Some(task_id)` on hit. Used as a boot-
+/// ordering fallback so libfolk callers don't have to know the
+/// daemon's spawn position.
+fn scan_for_daemon() -> Option<u32> {
+    // 64 tasks × 32 bytes per entry = 2 KiB stack buffer. Folkering
+    // doesn't run anywhere near 64 concurrent userspace tasks today,
+    // so this is comfortably oversized.
+    let mut buf = [0u8; 64 * 32];
+    let count = task_list_detailed(&mut buf) as usize;
+    let target = b"draug-daemon";
+    for i in 0..count.min(64) {
+        let off = i * 32;
+        // Layout: [task_id: u32][state: u32][name: [u8; 16]][cpu_time_ms: u64]
+        let task_id = u32::from_le_bytes([
+            buf[off], buf[off + 1], buf[off + 2], buf[off + 3]
+        ]);
+        let name = &buf[off + 8..off + 24];
+        // Names are zero-padded; trim to first NUL.
+        let nul = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+        if &name[..nul] == target {
+            return Some(task_id);
+        }
+    }
+    None
+}
 
 // ============================================================================
 // Operation Codes (low 16 bits of payload0)
@@ -129,7 +197,7 @@ pub type DraugResult<T> = Result<T, DraugError>;
 /// Liveness check. Returns `Ok(version)` if the daemon answered, `Err`
 /// otherwise. Useful for boot-order readiness probing.
 pub fn ping() -> DraugResult<u64> {
-    let reply = ipc::send(DRAUG_TASK_ID, DRAUG_OP_PING, 0)
+    let reply = ipc::send(daemon_task_id(), DRAUG_OP_PING, 0)
         .map_err(|_| DraugError::Unreachable)?;
 
     if reply == DRAUG_STATUS_ERR {
@@ -147,7 +215,7 @@ pub fn ping() -> DraugResult<u64> {
 #[inline]
 pub fn send_user_input(timestamp_ms: u64) {
     let payload = DRAUG_OP_USER_INPUT | ((timestamp_ms & 0xFFFF_FFFF_FFFF) << 16);
-    let _ = ipc::send(DRAUG_TASK_ID, payload, 0);
+    let _ = ipc::send(daemon_task_id(), payload, 0);
 }
 
 /// Notify Draug of a WASM-app crash, identified by its key hash.
@@ -156,7 +224,7 @@ pub fn send_user_input(timestamp_ms: u64) {
 #[inline]
 pub fn record_crash(key_hash: u64) {
     let payload = DRAUG_OP_WASM_CRASH | ((key_hash & 0xFFFF_FFFF_FFFF) << 16);
-    let _ = ipc::send(DRAUG_TASK_ID, payload, 0);
+    let _ = ipc::send(daemon_task_id(), payload, 0);
 }
 
 /// Hand the boot-time refactor-task list to the daemon. The caller
@@ -176,7 +244,7 @@ pub fn install_refactor_tasks(shmem_handle: u32, total_size: u32) -> DraugResult
     let payload = DRAUG_OP_INSTALL_REFACTOR_TASKS
         | ((shmem_handle as u64) << 16)
         | ((total_size as u64) << 40);
-    let reply = ipc::send(DRAUG_TASK_ID, payload, 0)
+    let reply = ipc::send(daemon_task_id(), payload, 0)
         .map_err(|_| DraugError::Unreachable)?;
 
     if reply == DRAUG_STATUS_OK {
@@ -309,7 +377,7 @@ impl DraugStatus {
 /// this once at boot, then maps the handle and stops talking IPC for
 /// status reads.
 pub fn get_status_handle() -> DraugResult<u32> {
-    let reply = ipc::send(DRAUG_TASK_ID, DRAUG_OP_GET_STATUS_HANDLE, 0)
+    let reply = ipc::send(daemon_task_id(), DRAUG_OP_GET_STATUS_HANDLE, 0)
         .map_err(|_| DraugError::Unreachable)?;
     if reply == DRAUG_STATUS_ERR {
         return Err(DraugError::Protocol(reply));

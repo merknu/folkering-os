@@ -151,11 +151,60 @@ Daemon's `main.rs` is now the authoritative driver:
 
 Compositor unchanged — still has its own local DraugDaemon and ticks it. Two-instance window is intentional: lets us land step 1 without coordinated changes elsewhere.
 
-#### A.5 steps 2-4 (next sessions)
+#### A.5 step 2 ✅ (commit `2c8dfe4`)
 
-* **Step 2:** Compositor switches HUD reads to `attach_status()` shmem. Stops calling `draug.tick()` / `start_analysis()` / `tick_async()` / `knowledge_hunt::run` / `draug_bridge_update`. Local DraugDaemon stays allocated but frozen.
-* **Step 3:** Compositor's input handlers + WASM crash recorder switch to `libfolk::sys::draug::send_user_input` / `record_crash` IPC. Adds the `COMPOSITOR_BUSY` flag write so daemon's tick can re-gate on user activity.
-* **Step 4:** Drop the local `let mut draug = DraugDaemon::new()` in `main.rs`. Drop compositor's path dep on `draug-daemon`. Drop the seven re-export shims. Lib boundary becomes purely `libfolk::sys::draug`.
+Split the tick responsibilities to eliminate the duplicate-LLM-cost
+issue from step 1:
+
+* Compositor's input handlers (input_keyboard.rs, input_mouse.rs,
+  rendering/wasm_layer.rs) now forward USER_INPUT and WASM_CRASH to
+  the daemon over IPC, alongside their existing local-Draug calls.
+* `agent_logic::tick` removed the four blocks the daemon now owns:
+  pattern mining, knowledge hunt, async refactor loop, and the
+  60-tick kernel-bridge update.
+* Daemon's `run_draug_tick` removed `start_analysis` (compositor
+  still owns the MCP-routed analysis path).
+
+Net: each LLM-bound path is now driven by exactly one side. The
+"is the user busy" gate that compositor used to enforce is
+relaxed for now; restored in a later commit via a
+`DRAUG_FLAG_COMPOSITOR_BUSY` shmem bit.
+
+#### A.5 step 2.3 ✅ (commit `fb60a0a`)
+
+Compositor calls `attach_status()` at boot and uses the returned
+`&'static DraugStatus` for HUD reads (currently just the caret
+idle calculation; more sites will switch when step 2.4 lands).
+Falls back to the local DraugDaemon if shmem isn't ready (cold
+boot ordering — see A.6).
+
+The boot-time `draug_bridge_update` got removed since the daemon
+already publishes to the bridge on every tick.
+
+#### A.6 ✅ (this commit)
+
+Kernel boot order. Originally proposed pinning draug-daemon to
+task ID 7 via a kernel-side special-case spawn (the way Synapse=2
+and Shell=3 are pinned). Decided against it because either
+compositor or intent-service would have to shift IDs, breaking
+their well-known consts.
+
+Instead: runtime discovery. `libfolk::sys::draug::daemon_task_id()`
+caches a task ID, seeded with `DRAUG_TASK_ID = 7`. First call tries
+PING against the seed; if it fails, scans `task_list_detailed` for
+a task named `"draug-daemon"` and updates the cache. Every
+subsequent call is a single relaxed atomic load. All client
+wrappers (ping, send_user_input, record_crash, install_refactor_tasks,
+get_status_handle) now route through the cached ID.
+
+`tools/nightly.sh` updated to pack the new `draug-daemon` ELF into
+`initrd.fpk` so it ends up on disk for the smoke test.
+
+Kernel boot is unchanged — `draug-daemon` is just another ramdisk
+entry, spawned naturally in the iter loop with its name set via
+`task_arc.lock().set_name(name)`. Whatever task ID it gets
+(typically 5+, after compositor=4) is what the discovery scan
+finds.
 
 ### A.6 — Kernel boot
 - Special-case spawn for `draug-daemon` after Compositor (Task 7?)
