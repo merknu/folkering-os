@@ -196,11 +196,14 @@ fn run_draug_tick(draug: &mut DraugDaemon, now_ms: u64) {
         draug.tick(now_ms);
     }
 
-    // Phase A.5 step 2.2: analysis cycle stays in compositor for now.
-    // It uses `libfolk::mcp::client::send_chat`, and the response is
-    // routed via compositor's MCP poll. Until the daemon learns to
-    // poll its own MCP queue (a separate small project), Draug's
-    // self-analysis stays single-source-of-truth in compositor.
+    // Phase A.5 (Path A): analysis cycle now runs in the daemon
+    // over direct TCP via `start_analysis_via_tcp`. Replaces the
+    // MCP/COM2 path that used to live in compositor. We only kick
+    // off a new cycle when the async pipeline is idle — refactor /
+    // knowledge-hunt work takes priority.
+    if draug.async_phase == AsyncPhase::Idle && draug.should_analyze(now_ms) {
+        let _ = draug_async::start_analysis_via_tcp(draug, now_ms);
+    }
 
     // Pattern mining — periodic insight extraction from telemetry.
     if draug.should_mine_patterns(now_ms)

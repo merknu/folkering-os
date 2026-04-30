@@ -498,8 +498,72 @@ fn tick_processing(draug: &mut DraugDaemon, now_ms: u64) -> bool {
         // them without revisiting the dispatch shape.
         AsyncOp::RefactorLlm => process_refactor_llm(draug, &response, now_ms),
         AsyncOp::CargoCheck => process_cargo_check_result(draug, &response, now_ms),
+        // Phase A.5 (Path A): Draug self-analysis. The response is
+        // an LLM-generated JSON blob — we delegate parsing to the
+        // existing `on_analysis_response` so the alert / no-action
+        // routing stays identical to the old MCP path.
+        AsyncOp::AnalysisLlm => process_analysis_response(draug, &response),
         _ => { draug.async_phase = AsyncPhase::Idle; true }
     }
+}
+
+/// Phase A.5 (Path A): kick off a Draug self-analysis cycle over
+/// direct TCP. Replaces the old MCP/COM2 path
+/// (`libfolk::mcp::client::send_chat`) so the analysis flow is
+/// cleanly co-located with refactor / knowledge-hunt / planner LLM
+/// calls — every Draug LLM round-trip now goes through the same
+/// async TCP slot pool.
+///
+/// Same shape as `start_phase15` etc.: build the prompt, set the
+/// per-cycle bookkeeping fields the existing analysis-cooldown
+/// machinery already understands (`waiting_for_llm`, `analysis_count`,
+/// `last_analysis_ms`), then hand off to `start_llm_request`.
+pub fn start_analysis_via_tcp(draug: &mut DraugDaemon, now_ms: u64) -> bool {
+    // `begin_analysis_cycle` builds the prompt AND sets the
+    // bookkeeping fields the existing `check_waiting_timeout` /
+    // cooldown machinery already understands. Replaces the old
+    // MCP path while keeping the analysis-cycle invariants.
+    let prompt = draug.begin_analysis_cycle(now_ms);
+
+    write_str("[Draug-async] *** ANALYSIS #");
+    write_dec(draug.analysis_count() as u32);
+    write_str("/5 → LLM (TCP) ***\n");
+
+    draug.async_operation = AsyncOp::AnalysisLlm;
+    draug.async_phase_started_ms = now_ms;
+    start_llm_request(draug, crate::draug::ANALYSIS_MODEL, &prompt)
+}
+
+/// Phase A.5 (Path A): handle an analysis LLM response. Routes the
+/// raw text into `DraugDaemon::on_analysis_response`, which already
+/// owned the JSON parsing and action-extraction logic on the MCP
+/// path — we just feed it from a different transport now.
+fn process_analysis_response(draug: &mut DraugDaemon, response: &[u8]) -> bool {
+    // Strip the LLM wire framing (`start_llm_request` got back the
+    // raw proxy reply, possibly with a trailing newline). The
+    // analysis prompt asks for a JSON object so we accept any UTF-8
+    // payload — `on_analysis_response` is forgiving.
+    let resp_str = match core::str::from_utf8(response) {
+        Ok(s) => s,
+        Err(_) => {
+            write_str("[Draug] Analysis response not UTF-8 — skipping\n");
+            draug.finish_analysis_cycle();
+            draug.async_phase = AsyncPhase::Idle;
+            return true;
+        }
+    };
+
+    if let Some(alert) = draug.on_analysis_response(resp_str) {
+        write_str(&alert);
+        write_str("\n");
+    } else {
+        write_str("[Draug] Analysis complete (no action needed)\n");
+    }
+    // `on_analysis_response` already clears `waiting_for_llm`, but
+    // be belt-and-braces in case a future refactor diverges.
+    draug.finish_analysis_cycle();
+    draug.async_phase = AsyncPhase::Idle;
+    true
 }
 
 /// Phase 17 — handle the LLM's response to a refactor prompt.

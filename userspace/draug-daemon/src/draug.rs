@@ -106,6 +106,13 @@ pub enum AsyncOp {
     /// CARGO_CHECK endpoint, get back a verdict on whether the
     /// patch compiles + keeps callers compiling.
     CargoCheck,
+    /// Phase A.5 (Path A): self-analysis cycle — Draug summarises
+    /// its own observation log to the LLM and parses the action
+    /// suggestion. Used to live on MCP/COM2 and reach the LLM via
+    /// `libfolk::mcp::client::send_chat`; moved to direct TCP via
+    /// the proxy so it can run in the daemon process without
+    /// touching compositor's COM2 frame queue.
+    AnalysisLlm,
 }
 
 /// Which kind of work Draug is doing right now. Lets `tick_idle`
@@ -207,6 +214,11 @@ pub const EXECUTOR_MODEL: &str = "gemma4:31b-cloud";
 /// showed gemma4:31b doesn't measurably outperform 7b on the fixture
 /// task set, while costing ~10× per call.
 pub const REFACTOR_MODEL: &str = "qwen2.5-coder:7b";
+/// Model for the Draug self-analysis cycle. Cheap and frequent —
+/// fires up to 5× per session, summarises ~3 observations into a
+/// JSON action suggestion. The 7B model is plenty for the JSON
+/// pattern; matches what MCP's default backend would have served.
+pub const ANALYSIS_MODEL: &str = "qwen2.5-coder:7b";
 pub const ACTIVE_SKILL_LEVELS: u8 = 3;
 pub const MAX_SKILL_LEVELS: u8 = 5;
 /// Number of tasks in REFACTOR_TASKS.
@@ -1106,6 +1118,12 @@ impl DraugDaemon {
 
     /// Start an analysis cycle (send prompt to LLM via MCP).
     /// Records timestamp for cooldown enforcement.
+    ///
+    /// Phase A.5 (Path A): the MCP path is now legacy. New callers
+    /// in the daemon use `begin_analysis_cycle` + the async TCP
+    /// path in `draug_async::start_analysis_via_tcp`. This method
+    /// stays for compositor's local DraugDaemon (still on MCP)
+    /// until the local instance is dropped in a later step.
     pub fn start_analysis(&mut self, now_ms: u64) -> bool {
         let prompt = self.build_analysis_prompt();
         if libfolk::mcp::client::send_chat(&prompt).is_some() {
@@ -1116,6 +1134,30 @@ impl DraugDaemon {
         } else {
             false
         }
+    }
+
+    /// Phase A.5 (Path A): begin an analysis cycle for the direct-
+    /// TCP path. Sets the same bookkeeping fields `start_analysis`
+    /// would have set (`waiting_for_llm`, `analysis_count`,
+    /// `last_analysis_ms`) and returns the prompt — the actual TCP
+    /// hand-off lives in `draug_async::start_analysis_via_tcp` so
+    /// it shares the slot pool with the rest of Draug's LLM calls.
+    pub fn begin_analysis_cycle(&mut self, now_ms: u64) -> String {
+        let prompt = self.build_analysis_prompt();
+        self.waiting_for_llm = true;
+        self.analysis_count = self.analysis_count.saturating_add(1);
+        self.last_analysis_ms = now_ms;
+        prompt
+    }
+
+    /// Phase A.5 (Path A): clear the waiting-for-LLM flag once the
+    /// async TCP processor has consumed an analysis response (or a
+    /// non-UTF-8 / parse-failure surrogate). Mirrors what
+    /// `on_analysis_response` does internally on the happy path —
+    /// kept as a separate method so the async machinery in
+    /// `draug_async` doesn't need direct field access.
+    pub fn finish_analysis_cycle(&mut self) {
+        self.waiting_for_llm = false;
     }
 
     /// Check if Draug has been waiting too long for LLM and should give up.

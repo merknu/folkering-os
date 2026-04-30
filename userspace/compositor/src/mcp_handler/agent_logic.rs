@@ -61,48 +61,21 @@ pub(super) fn tick(
         }
     }
 
-    // ===== Draug: Background AI daemon tick =====
-    {
-        let now_ms = if tsc_per_us > 0 { rdtsc() / tsc_per_us / 1000 } else { libfolk::sys::uptime() };
-        if draug.should_tick(now_ms) {
-            draug.tick(now_ms);
-            let mut nb = [0u8; 16];
-            if draug.observation_count() % 6 == 1 || draug.observation_count() <= 3 {
-                write_str("[Draug] Tick #");
-                write_str(format_usize(draug.observation_count(), &mut nb));
-                let idle_ms = now_ms.saturating_sub(draug.last_input_ms());
-                write_str(" | idle: ");
-                write_str(format_usize((idle_ms / 1000) as usize, &mut nb));
-                write_str("s | dreams: ");
-                write_str(format_usize(draug.dream_count() as usize, &mut nb));
-                write_str("/");
-                write_str(format_usize(compositor::draug::DREAM_MAX_PER_SESSION as usize, &mut nb));
-                write_str("\n");
-            }
-        }
-        if draug.should_analyze(now_ms) && active_agent.is_none() {
-            if draug.start_analysis(now_ms) {
-                let mut nb = [0u8; 16];
-                write_str("[Draug] Analysis #");
-                write_str(format_usize(draug.analysis_count() as usize, &mut nb));
-                write_str("/5 started\n");
-            }
-        }
-    }
+    // ===== Phase A.5 (Path A): Draug self-analysis moved to daemon
+    // (direct TCP via libfolk::sys::llm_generate, see
+    // draug_async::start_analysis_via_tcp). Compositor's local
+    // DraugDaemon no longer drives `should_tick` / `should_analyze`
+    // / `check_waiting_timeout` — those run in the daemon's tick
+    // loop, alongside refactor/knowledge-hunt/pattern-mining.
+    //
+    // The dream timeout housekeeping that lived here also moved
+    // (the daemon owns the analysis-wait state machine now).
 
     // ===== Tick WASM Drivers =====
     if !wasm.active_drivers.is_empty() {
         let resumed = compositor::driver_runtime::tick_drivers(&mut wasm.active_drivers);
         if resumed > 0 {
             did_work = true;
-        }
-    }
-
-    // ===== Draug/Dream timeout =====
-    {
-        let timeout_ms = if tsc_per_us > 0 { rdtsc() / tsc_per_us / 1000 } else { 0 };
-        if draug.check_waiting_timeout(timeout_ms) {
-            write_str("[Draug] Timeout — giving up on LLM response\n");
         }
     }
 
@@ -300,13 +273,6 @@ fn handle_chat_response(
             _ => {}
         }
         *need_redraw = true;
-    } else if draug.is_waiting() {
-        if let Some(alert) = draug.on_analysis_response(resp_text) {
-            write_str(&alert);
-            write_str("\n");
-        } else {
-            write_str("[Draug] Analysis complete (no action needed)\n");
-        }
     } else if draug.is_dreaming() {
         write_str("[AutoDream] Error from proxy: ");
         write_str(&resp_text[..resp_text.len().min(80)]);
