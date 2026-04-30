@@ -136,9 +136,26 @@ Each commit on `refactor/phase-a-draug-isolation` builds clean. PR #70 (draft) t
 Net: ~5500 LOC of agent code now lives in its own crate. Compositor is 7 thin shims away from being able to drop the dep entirely (in A.5).
 
 ### A.5 — Compositor IPC client
-- Replace direct calls with `libfolk::sys::draug::*` wrappers
-- Drop `&mut draug` from RenderContext/DispatchContext/mouse/keyboard
-- Compositor compiles WITHOUT the moved code
+
+Multi-step. Architectural switch from "compositor drives Draug in-process" to "daemon drives itself, compositor reads status".
+
+#### A.5 step 1 ✅ (commit `e33d0ad`)
+
+Daemon's `main.rs` is now the authoritative driver:
+* Instantiates a local `DraugDaemon`, calls `restore_state()`
+* Runs the full tick orchestration (should_tick → tick, should_analyze → start_analysis, pattern mining, knowledge hunt, async refactor) on every service-loop iteration
+* Mirrors state into the status shmem on every tick (`publish_status`)
+* IPC drain handles USER_INPUT (→ `draug.on_user_input`), WASM_CRASH (→ friction sensor), GET_STATUS_HANDLE
+* Heap bumped 256 KiB → 2 MiB
+* The `active_agent / mcp.async_tool_gen` busy gate is temporarily relaxed; restored in step 3 via a `DRAUG_FLAG_COMPOSITOR_BUSY` shmem bit
+
+Compositor unchanged — still has its own local DraugDaemon and ticks it. Two-instance window is intentional: lets us land step 1 without coordinated changes elsewhere.
+
+#### A.5 steps 2-4 (next sessions)
+
+* **Step 2:** Compositor switches HUD reads to `attach_status()` shmem. Stops calling `draug.tick()` / `start_analysis()` / `tick_async()` / `knowledge_hunt::run` / `draug_bridge_update`. Local DraugDaemon stays allocated but frozen.
+* **Step 3:** Compositor's input handlers + WASM crash recorder switch to `libfolk::sys::draug::send_user_input` / `record_crash` IPC. Adds the `COMPOSITOR_BUSY` flag write so daemon's tick can re-gate on user activity.
+* **Step 4:** Drop the local `let mut draug = DraugDaemon::new()` in `main.rs`. Drop compositor's path dep on `draug-daemon`. Drop the seven re-export shims. Lib boundary becomes purely `libfolk::sys::draug`.
 
 ### A.6 — Kernel boot
 - Special-case spawn for `draug-daemon` after Compositor (Task 7?)
