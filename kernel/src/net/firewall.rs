@@ -235,15 +235,38 @@ pub fn filter_packet(frame: &[u8]) -> FirewallAction {
 /// Dynamic blocklist: IPs that have been caught SYN-scanning repeatedly.
 /// After 3 SYN attempts from the same IP, ALL packets from that IP are dropped.
 const MAX_BLOCKLIST: usize = 16;
-static BLOCKLIST: spin::Mutex<([([u8; 4], u8); MAX_BLOCKLIST], usize)> =
-    spin::Mutex::new(([([0u8; 4], 0u8); MAX_BLOCKLIST], 0));
+
+/// Issue #58 root cause: blocklist entries used to be permanent. After a
+/// SYN flood from any IP — including a host we legitimately talk to —
+/// the IP would be auto-blocked forever, dropping every subsequent
+/// SYN-ACK reply from that host. Time-out the block so post-flood
+/// traffic recovers naturally.
+///
+/// 120 s gives Draug's hibernation cycle (60 s wake-period) two
+/// chances to find the proxy reachable after a flood ends.
+const BLOCK_DURATION_MS: u64 = 120_000;
+
+/// Tuple: (ip, syn_count, last_seen_ms). last_seen_ms is wall-clock
+/// at the most recent SYN attempt; if `now - last_seen_ms` exceeds
+/// `BLOCK_DURATION_MS` the entry is treated as expired.
+static BLOCKLIST: spin::Mutex<([([u8; 4], u8, u64); MAX_BLOCKLIST], usize)> =
+    spin::Mutex::new(([([0u8; 4], 0u8, 0u64); MAX_BLOCKLIST], 0));
 
 /// Check if an IP is in the dynamic blocklist
 fn is_blocked(ip: [u8; 4]) -> bool {
+    let now = crate::timer::uptime_ms();
     if let Some(list) = BLOCKLIST.try_lock() {
         for i in 0..list.1 {
             if list.0[i].0 == ip && list.0[i].1 >= 3 {
-                return true;
+                // Issue #58 fix: only honour the block if it hasn't
+                // expired. If `now - last_seen >= BLOCK_DURATION_MS`,
+                // the IP has been quiet long enough that we let it
+                // back in. Re-blocking happens automatically on the
+                // next 3 SYN attempts.
+                let last_seen = list.0[i].2;
+                if now.saturating_sub(last_seen) < BLOCK_DURATION_MS {
+                    return true;
+                }
             }
         }
     }
@@ -252,11 +275,23 @@ fn is_blocked(ip: [u8; 4]) -> bool {
 
 /// Record a SYN attempt from an IP. After 3 attempts, auto-block.
 fn record_syn_attempt(ip: [u8; 4]) {
+    let now = crate::timer::uptime_ms();
     if let Some(mut list) = BLOCKLIST.try_lock() {
         // Check if already tracked
         for i in 0..list.1 {
             if list.0[i].0 == ip {
+                // Issue #58: if the prior block expired, reset the
+                // counter so the IP gets a fresh chance. Otherwise
+                // keep counting up.
+                if list.0[i].1 >= 3
+                    && now.saturating_sub(list.0[i].2) >= BLOCK_DURATION_MS
+                {
+                    list.0[i].1 = 1;
+                    list.0[i].2 = now;
+                    return;
+                }
                 list.0[i].1 = list.0[i].1.saturating_add(1);
+                list.0[i].2 = now;
                 if list.0[i].1 == 3 {
                     // Auto-blocked! Log it
                     crate::serial_str!("[FW-AI] AUTO-BLOCKED ");
@@ -267,7 +302,7 @@ fn record_syn_attempt(ip: [u8; 4]) {
                     crate::drivers::serial::write_dec(ip[2] as u32);
                     crate::serial_str!(".");
                     crate::drivers::serial::write_dec(ip[3] as u32);
-                    crate::serial_strln!(" (3 SYN attempts)");
+                    crate::serial_strln!(" (3 SYN attempts, expires in 120s)");
                 }
                 return;
             }
@@ -275,7 +310,7 @@ fn record_syn_attempt(ip: [u8; 4]) {
         // New IP — add to tracker
         let idx = list.1;
         if idx < MAX_BLOCKLIST {
-            list.0[idx] = (ip, 1);
+            list.0[idx] = (ip, 1, now);
             list.1 = idx + 1;
             return;
         }
@@ -299,7 +334,7 @@ fn record_syn_attempt(ip: [u8; 4]) {
             }
         }
         if let Some(i) = victim {
-            list.0[i] = (ip, 1);
+            list.0[i] = (ip, 1, now);
         }
     }
 }

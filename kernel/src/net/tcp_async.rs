@@ -152,7 +152,26 @@ pub fn syscall_tcp_connect(ip_packed: u64, port: u64) -> u64 {
         .find(|&i| matches!(slots[i].state, SlotState::Free));
     let slot_idx = match free_slot {
         Some(i) => i,
-        None => return u64::MAX, // no free slots
+        None => {
+            // Issue #58 instrumentation: dump slot-pool census so we
+            // can see the pool exhaustion pattern in the serial log.
+            crate::serial_strln!("[TCP_CONNECT] no free slots! pool census:");
+            for i in 0..MAX_ASYNC_SLOTS {
+                crate::serial_str!("[TCP_CONNECT]   slot[");
+                crate::drivers::serial::write_dec(i as u32);
+                crate::serial_str!("] state=");
+                let label = match slots[i].state {
+                    SlotState::Free => "Free",
+                    SlotState::Connecting => "Connecting",
+                    SlotState::Connected => "Connected",
+                };
+                crate::serial_str!(label);
+                crate::serial_str!(" owner=");
+                crate::drivers::serial::write_dec(slots[i].owner);
+                crate::serial_strln!("");
+            }
+            return u64::MAX; // no free slots
+        }
     };
 
     let tcp_rx = tcp::SocketBuffer::new(alloc::vec![0u8; 8192]);
@@ -300,10 +319,30 @@ pub fn syscall_tcp_poll_recv(slot_id: u64, buf_ptr: u64, buf_max: u64) -> u64 {
 pub fn syscall_tcp_close(slot_id: u64) -> u64 {
     if slot_id as usize >= MAX_ASYNC_SLOTS { return u64::MAX; }
 
-    let mut guard = match NET_STATE.try_lock() {
-        Some(g) => g,
-        None => return EAGAIN,
+    // Issue #58 hypothesis #2: previously returned EAGAIN when
+    // NET_STATE was held by the timer ISR's poll(), causing the
+    // slot to NEVER be freed. With MAX_ASYNC_SLOTS = 4, after 4
+    // contended close attempts the pool is exhausted and Phase 17
+    // can never connect again — exactly the post-flood wedge.
+    //
+    // Fix: retry the lock for up to 1000 short spins (~few µs at
+    // 3 GHz) before giving up. Even under sustained timer-poll
+    // pressure this typically wins on the first or second retry.
+    let mut attempts = 0u32;
+    let mut guard = loop {
+        if let Some(g) = NET_STATE.try_lock() { break g; }
+        attempts += 1;
+        if attempts > 1000 {
+            crate::serial_strln!("[TCP_CLOSE] NET_STATE locked after 1000 spins — slot NOT freed");
+            return EAGAIN;
+        }
+        core::hint::spin_loop();
     };
+    if attempts > 0 {
+        crate::serial_str!("[TCP_CLOSE] won lock after ");
+        crate::drivers::serial::write_dec(attempts);
+        crate::serial_strln!(" spins");
+    }
     let state = match guard.as_mut() {
         Some(s) => s,
         None => return u64::MAX,
