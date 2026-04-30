@@ -339,15 +339,21 @@ pub fn syscall_tcp_poll_recv(slot_id: u64, buf_ptr: u64, buf_max: u64) -> u64 {
 pub fn syscall_tcp_close(slot_id: u64) -> u64 {
     if slot_id as usize >= MAX_ASYNC_SLOTS { return u64::MAX; }
 
-    // Issue #58 hypothesis #2: previously returned EAGAIN when
-    // NET_STATE was held by the timer ISR's poll(), causing the
-    // slot to NEVER be freed. With MAX_ASYNC_SLOTS = 4, after 4
-    // contended close attempts the pool is exhausted and Phase 17
-    // can never connect again — exactly the post-flood wedge.
+    // Issue #58 hypothesis #2: previously returned EAGAIN whenever
+    // NET_STATE was already held, causing the slot to NEVER be freed.
+    // With MAX_ASYNC_SLOTS = 4, after 4 contended close attempts the
+    // pool is exhausted and Phase 17 can never connect again —
+    // exactly the post-flood wedge.
+    //
+    // Note: timer::tick() does NOT poll the network stack — that ran
+    // in earlier prototypes but was moved off the timer ISR. Real
+    // contention sources today are `net::poll()` from the idle
+    // syscall, other TCP syscalls calling `iface.poll()`, and (once
+    // SMP lands) work on another core.
     //
     // Fix: retry the lock for up to 1000 short spins (~few µs at
-    // 3 GHz) before giving up. Even under sustained timer-poll
-    // pressure this typically wins on the first or second retry.
+    // 3 GHz) before giving up. Even under sustained NET_STATE
+    // contention this typically wins on the first or second retry.
     let mut attempts = 0u32;
     let mut guard = loop {
         if let Some(g) = NET_STATE.try_lock() { break g; }

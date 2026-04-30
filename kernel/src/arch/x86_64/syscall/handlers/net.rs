@@ -1044,7 +1044,12 @@ pub fn syscall_graph_callers(
 
 /// Stability Fix 7 — Proxy health check.
 ///
-/// Sends `PING\n` to the proxy with a 5_000 tsc_ms timeout (~2s).
+/// Sends `PING\n` to the proxy. Worst-case wall time = 15s connect
+/// timeout (in `tcp_plain::tcp_request_with_timeout`'s `may_send`
+/// loop) + the 5_000 `tsc_ms` read budget passed below (≈2s on a
+/// well-calibrated TSC). If the proxy is reachable but slow, return
+/// is bounded by the read budget; if it's wedged at the TCP level,
+/// return is bounded by the connect cap.
 /// Returns 1 if proxy responds with PONG, 0 otherwise.
 /// Used before expensive LLM calls to fail fast when proxy is down.
 pub fn syscall_proxy_ping() -> u64 {
@@ -1161,10 +1166,16 @@ pub fn syscall_proxy_last_verdict(buf_ptr: u64, buf_max: u64) -> u64 {
 
 /// Issue #58 — UDP variant of proxy_ping.
 ///
-/// Sends a 4-byte "PING" UDP datagram to the proxy and awaits "PONG"
-/// within 1 second. Uses smoltcp's UDP socket type, which is a
-/// different code path than `tcp_plain` — so this can succeed even
-/// when the TCP-side state is wedged (post-flood scenario from #58).
+/// Sends a 4-byte "PING" UDP datagram to the proxy and awaits "PONG".
+/// Uses smoltcp's UDP socket type, which is a different code path
+/// than `tcp_plain` — so this can succeed even when the TCP-side
+/// state is wedged (post-flood scenario from #58).
+///
+/// Timeout is 1000 in `tsc_ms` units — `udp_send_recv` polls
+/// `tls::tsc_ms()`, which is calibrated TSC ticks divided down to
+/// milliseconds (≈1s wall-clock when the IQE TSC calibration
+/// succeeded; on a fallback-to-3 GHz host the value can drift
+/// proportionally to the real CPU frequency).
 ///
 /// Returns 1 on PONG received, 0 otherwise.
 pub fn syscall_proxy_ping_udp() -> u64 {
@@ -1178,7 +1189,7 @@ pub fn syscall_proxy_ping_udp() -> u64 {
         PROXY_IP, PROXY_PORT,
         b"PING",
         &mut response,
-        1000, // 1s timeout
+        1000, // tsc_ms — see fn-doc above for the wall-clock caveat
     );
 
     if n == 0 {
