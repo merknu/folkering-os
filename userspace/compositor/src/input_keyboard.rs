@@ -58,10 +58,19 @@ pub fn process_keyboard(
     let mut need_redraw = false;
 
     // ===== Process keyboard input =====
-    // First, collect all pending keys without redrawing
+    // First, collect all pending keys without redrawing.
+    //
+    // Drain capped at 1024 keys per call (Issue #56) — practical paste
+    // bursts are <500 keys, autorepeat is ~30 keys/sec, so 1024 is well
+    // above legitimate use. Defends against a flooded COM1 (read_key
+    // falls through to serial::read_byte) pinning the compositor main
+    // loop. Unread keys stay in the kernel ring for the next tick.
     let mut execute_command = false;
     let mut win_execute_command: Option<u32> = None; // window id to execute from
+    let mut keys_processed = 0u32;
     while let Some(key) = read_key() {
+        keys_processed += 1;
+        if keys_processed > 1024 { break; }
         did_work = true;
         let input_ms = if tsc_per_us > 0 { rdtsc() / tsc_per_us / 1000 } else { 0 };
         draug.on_user_input(input_ms);

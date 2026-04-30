@@ -87,7 +87,14 @@ pub fn process_mouse(
     let mut latest_buttons: u8 = *last_buttons;
     let mut had_mouse_events = false;
 
+    // Drain capped at 1024 events per call (Issue #56). PS/2 mouse
+    // generates 3 bytes per event, kernel ring is small, so flood needs
+    // a lot to hit 1024. Above that we yield back to the main loop and
+    // pick up the rest next tick.
+    let mut events_processed = 0u32;
     while let Some(event) = read_mouse() {
+        events_processed += 1;
+        if events_processed > 1024 { break; }
         did_work = true;
         if !had_mouse_events {
             // Log first mouse event per batch to serial

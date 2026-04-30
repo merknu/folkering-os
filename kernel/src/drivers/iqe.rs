@@ -54,10 +54,15 @@ pub fn calibrate_tsc() {
 
         let tsc_start = rdtsc();
 
-        // Poll PIT Channel 2 output (bit 5 of port 0x61 goes high when done)
-        loop {
+        // Poll PIT Channel 2 output (bit 5 of port 0x61 goes high when done).
+        // Capped at 10M iters — at ~3 GHz that's ~3 ms wall-clock, way past
+        // the ~50 ms PIT delay. If we exit without seeing the done bit,
+        // the calibration is unreliable and we hard-code a default
+        // (Issue #56 follow-up).
+        let mut calibrated = false;
+        for _ in 0..10_000_000u64 {
             let status = x86_64::instructions::port::Port::<u8>::new(0x61).read();
-            if status & 0x20 != 0 { break; }
+            if status & 0x20 != 0 { calibrated = true; break; }
         }
 
         let tsc_end = rdtsc();
@@ -65,7 +70,14 @@ pub fn calibrate_tsc() {
         // Restore port 0x61
         x86_64::instructions::port::Port::<u8>::new(0x61).write(port61_val);
 
-        let ticks_per_us = (tsc_end - tsc_start) / (DELAY_MS * 1000);
+        let ticks_per_us = if calibrated {
+            (tsc_end - tsc_start) / (DELAY_MS * 1000)
+        } else {
+            // PIT didn't report done — fall back to 3 GHz default.
+            // Better a wrong-but-bounded value than a dead kernel.
+            crate::serial_strln!("[IQE] PIT calibration timeout — defaulting to 3 GHz");
+            3000
+        };
         TSC_TICKS_PER_US.store(ticks_per_us, Ordering::Relaxed);
     }
 

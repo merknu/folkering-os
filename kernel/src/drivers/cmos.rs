@@ -44,10 +44,16 @@ fn bcd_to_bin(bcd: u8) -> u8 {
 
 /// Read date/time from CMOS RTC.
 /// Handles update-in-progress and BCD/binary format detection.
+///
+/// Capped wait: real RTCs clear bit 7 of register 0x0A within ~1 ms.
+/// 100_000 polls is overkill on real silicon but defends against a
+/// virtualised RTC that never clears the bit (Issue #56 follow-up to
+/// the spin-loop audit). On overflow we read anyway — values may be
+/// torn but that's better than a dead kernel.
 pub fn read_rtc() -> DateTime {
     unsafe {
         // Wait for update-in-progress to clear
-        loop {
+        for _ in 0..100_000 {
             if (cmos_read(0x0A) & 0x80) == 0 {
                 break;
             }
@@ -156,10 +162,12 @@ pub fn unix_timestamp() -> u64 {
 
 /// Write date/time to CMOS RTC.
 /// Detects BCD vs binary format and writes accordingly.
+///
+/// Same 100_000-iter cap as `read_rtc` — see its doc-comment for why.
 pub fn write_rtc(dt: &DateTime) {
     unsafe {
         // Wait for any in-progress update to complete
-        loop {
+        for _ in 0..100_000 {
             if (cmos_read(0x0A) & 0x80) == 0 {
                 break;
             }
