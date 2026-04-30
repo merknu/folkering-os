@@ -22,3 +22,7 @@ extern crate alloc;
 pub mod refactor_types;
 pub mod task_store;
 pub mod draug;
+pub mod knowledge_hunt;
+pub mod agent_planner;
+pub mod refactor_loop;
+pub mod draug_async;

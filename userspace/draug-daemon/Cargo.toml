@@ -16,5 +16,9 @@ path = "src/main.rs"
 [dependencies]
 libfolk = { path = "../libfolk", features = ["mcp"] }
 
+# FBP protocol parser — same dep as compositor. knowledge_hunt walks
+# SemanticNode trees from the host-side proxy.
+fbp-rs = { path = "../../tools/fbp-rs", default-features = false }
+
 [features]
 default = []
