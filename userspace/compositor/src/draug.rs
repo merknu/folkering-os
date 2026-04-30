@@ -833,23 +833,12 @@ impl DraugDaemon {
     pub fn record_skip(&mut self) {
         self.consecutive_skips = self.consecutive_skips.saturating_add(1);
         // Issue #58 instrumentation: log every skip so we can correlate
-        // with serial-side TIMEOUT events and see if hibernation triggers.
-        // Uses a small inline decimal formatter to avoid pulling in the
-        // crate::util::format_usize dep which lives in the compositor
-        // binary, not the lib.
-        let mut buf = [0u8; 4];
-        let mut len = 0usize;
-        let mut n = self.consecutive_skips;
-        if n == 0 { buf[0] = b'0'; len = 1; } else {
-            let mut tmp = [0u8; 4]; let mut i = 0usize;
-            while n > 0 { tmp[i] = b'0' + (n % 10) as u8; n /= 10; i += 1; }
-            for j in 0..i { buf[j] = tmp[i - 1 - j]; }
-            len = i;
-        }
+        // with serial-side TIMEOUT events and see if hibernation
+        // triggers. Use the existing 10-byte `write_dec` helper rather
+        // than an inline 4-byte buffer — the bespoke formatter would
+        // overflow once `consecutive_skips` reached 10_000+.
         libfolk::sys::io::write_str("[Draug-skip] consecutive=");
-        if let Ok(s) = core::str::from_utf8(&buf[..len]) {
-            libfolk::sys::io::write_str(s);
-        }
+        write_dec(self.consecutive_skips);
         libfolk::sys::io::write_str("/30\n");
         // Fix 8: hibernate after 30 consecutive skips
         if self.consecutive_skips >= 30 && !self.refactor_hibernating {
