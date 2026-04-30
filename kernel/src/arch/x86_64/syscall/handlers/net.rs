@@ -1051,6 +1051,11 @@ pub fn syscall_proxy_ping() -> u64 {
     const PROXY_IP: [u8; 4] = [192, 168, 68, 150];
     const PROXY_PORT: u16 = 14711;
 
+    // Issue #58 instrumentation: log every ping attempt + outcome so we
+    // can see whether hibernation's wakeup path is itself broken under
+    // the post-flood TCP wedge.
+    crate::serial_strln!("[PROXY_PING] requesting");
+
     let response = match crate::net::tcp_plain::tcp_request_with_timeout(
         PROXY_IP,
         PROXY_PORT,
@@ -1058,12 +1063,27 @@ pub fn syscall_proxy_ping() -> u64 {
         64,
         5_000, // ~2s wall clock
     ) {
-        Ok(data) => data,
-        Err(_) => return 0,
+        Ok(data) => {
+            crate::serial_str!("[PROXY_PING] tcp_request OK, ");
+            crate::drivers::serial::write_dec(data.len() as u32);
+            crate::serial_strln!(" bytes");
+            data
+        }
+        Err(e) => {
+            crate::serial_str!("[PROXY_PING] tcp_request failed: ");
+            crate::serial_strln!(e);
+            return 0;
+        }
     };
 
     // Proxy returns "PONG\n"
-    if response.len() >= 4 && &response[..4] == b"PONG" { 1 } else { 0 }
+    if response.len() >= 4 && &response[..4] == b"PONG" {
+        crate::serial_strln!("[PROXY_PING] PONG → result=1 (waking Draug)");
+        1
+    } else {
+        crate::serial_strln!("[PROXY_PING] no PONG in response → result=0");
+        0
+    }
 }
 
 /// Phase 16 — WASM compilation.
