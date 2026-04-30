@@ -46,7 +46,39 @@ pub(super) fn tick_async(draug: &mut DraugDaemon, now_ms: u64) -> bool {
                 draug.async_tcp_slot = 0xFFFF;
             }
             draug.async_phase = AsyncPhase::Idle;
-            draug.async_operation = AsyncOp::None;
+            let stuck_op = core::mem::replace(&mut draug.async_operation, AsyncOp::None);
+
+            // Issue #55: before recording SKIP, check if the proxy
+            // already produced a verdict for this request whose reply
+            // packet got lost in transit. LAST_VERDICT looks up the
+            // cached reply by source IP. If it returns a real verdict
+            // (not the cache-miss sentinel), we can apply it instead
+            // of pretending the task is still pending.
+            //
+            // Only meaningful for ops that produce a cached verdict —
+            // FbpPatch (skill-tree / Phase 15) and CargoCheck (Phase 17).
+            if matches!(stuck_op, AsyncOp::FbpPatch | AsyncOp::CargoCheck) {
+                let mut buf = alloc::vec![0u8; 16 * 1024];
+                if let Some(p) = libfolk::sys::proxy_last_verdict(&mut buf) {
+                    write_str("[Draug-async] LAST_VERDICT recovered status=");
+                    write_dec(p.status);
+                    write_str(" output=");
+                    write_dec(p.output_len as u32);
+                    write_str("B — applying instead of skip\n");
+                    // Synthesise the wire bytes process_*_result expects:
+                    // [u32 status][u32 output_len][output bytes].
+                    let mut synth = alloc::vec::Vec::with_capacity(8 + p.output_len);
+                    synth.extend_from_slice(&p.status.to_le_bytes());
+                    synth.extend_from_slice(&(p.output_len as u32).to_le_bytes());
+                    synth.extend_from_slice(&buf[..p.output_len.min(buf.len())]);
+                    let now_for_op = now_ms;
+                    return match stuck_op {
+                        AsyncOp::FbpPatch => process_patch_result(draug, &synth, now_for_op),
+                        AsyncOp::CargoCheck => process_cargo_check_result(draug, &synth, now_for_op),
+                        _ => true,
+                    };
+                }
+            }
             draug.record_skip();
             return true;
         }

@@ -1086,6 +1086,79 @@ pub fn syscall_proxy_ping() -> u64 {
     }
 }
 
+/// Issue #55 — query the proxy for the most recent cached verdict
+/// for our source IP. Returns u64-packed `(status << 32) | output_len`
+/// on cache hit, or `u64::MAX` on transport failure / cache miss.
+///
+/// Output bytes are written into `buf_ptr`. Caller must allocate
+/// at least 16 KB. Cache miss is signalled by a server-side sentinel
+/// (status = 0xDEADBEEF, output_len = 0) which we surface as
+/// `u64::MAX` so the userspace branch is unambiguous.
+pub fn syscall_proxy_last_verdict(buf_ptr: u64, buf_max: u64) -> u64 {
+    const PROXY_IP: [u8; 4] = [192, 168, 68, 150];
+    const PROXY_PORT: u16 = 14711;
+
+    if buf_max == 0 || buf_max > 65_536 {
+        return u64::MAX;
+    }
+    const USERSPACE_TOP: u64 = 0x0000_8000_0000_0000;
+    if buf_ptr < 0x200000 || buf_ptr >= USERSPACE_TOP { return u64::MAX; }
+    let buf_end = match buf_ptr.checked_add(buf_max) {
+        Some(e) => e,
+        None => return u64::MAX,
+    };
+    if buf_end > USERSPACE_TOP { return u64::MAX; }
+
+    crate::serial_strln!("[LAST_VERDICT] requesting from proxy");
+
+    let response = match crate::net::tcp_plain::tcp_request_with_timeout(
+        PROXY_IP,
+        PROXY_PORT,
+        b"LAST_VERDICT\n",
+        16 * 1024 + 8, // header + body
+        5_000,
+    ) {
+        Ok(data) => data,
+        Err(e) => {
+            crate::serial_str!("[LAST_VERDICT] tcp_request failed: ");
+            crate::serial_strln!(e);
+            return u64::MAX;
+        }
+    };
+
+    if response.len() < 8 {
+        crate::serial_strln!("[LAST_VERDICT] short reply");
+        return u64::MAX;
+    }
+    let status = u32::from_le_bytes([response[0], response[1], response[2], response[3]]);
+    let output_len = u32::from_le_bytes([response[4], response[5], response[6], response[7]]);
+
+    if status == 0xDEADBEEF {
+        crate::serial_strln!("[LAST_VERDICT] cache miss");
+        return u64::MAX;
+    }
+
+    let body_len = (output_len as usize).min(response.len().saturating_sub(8));
+    let copy_len = body_len.min(buf_max as usize);
+    if copy_len > 0 {
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                response.as_ptr().add(8),
+                buf_ptr as *mut u8,
+                copy_len,
+            );
+        }
+    }
+
+    crate::serial_str!("[LAST_VERDICT] cache HIT status=");
+    crate::drivers::serial::write_dec(status);
+    crate::serial_str!(" output=");
+    crate::drivers::serial::write_dec(copy_len as u32);
+    crate::serial_strln!(" bytes");
+
+    ((status as u64) << 32) | (copy_len as u64)
+}
+
 /// Issue #58 — UDP variant of proxy_ping.
 ///
 /// Sends a 4-byte "PING" UDP datagram to the proxy and awaits "PONG"

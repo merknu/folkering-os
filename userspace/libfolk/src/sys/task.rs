@@ -539,6 +539,26 @@ pub fn proxy_ping() -> bool {
     unsafe { crate::syscall::syscall0(0x64) == 1 }
 }
 
+/// Issue #55 — query the proxy for our most recent cached verdict.
+///
+/// Returns `Some(PatchStatus { status, output_len })` if the proxy
+/// has a cached verdict for our source IP. Returns `None` on
+/// transport failure or cache miss. The verdict body is written
+/// into `buf` (caller must allocate at least 16 KB).
+pub fn proxy_last_verdict(buf: &mut [u8]) -> Option<PatchStatus> {
+    let ret = unsafe {
+        crate::syscall::syscall2(
+            0x6A,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+        )
+    };
+    if ret == u64::MAX { return None; }
+    let status = ((ret >> 32) & 0xFFFF_FFFF) as u32;
+    let output_len = (ret & 0xFFFF_FFFF) as usize;
+    Some(PatchStatus { status, output_len })
+}
+
 /// Issue #58 — Proxy health check (UDP).
 /// Returns true if the proxy responds to a UDP "PING" with "PONG"
 /// within 1s. Uses smoltcp's UDP socket type, a different code path
