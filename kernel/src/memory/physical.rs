@@ -264,7 +264,7 @@ impl BuddyAllocator {
         let mut hops = 0u32;
 
         while let Some(block_ptr) = current {
-            if hops > 1_000_000 {
+            if hops >= 1_000_000 {
                 crate::serial_strln!("[PMM] is_block_free: freelist walk exceeded 1M — list corrupt");
                 return false;
             }
@@ -287,7 +287,7 @@ impl BuddyAllocator {
         let mut hops = 0u32;
 
         while let Some(block_ptr) = current {
-            if hops > 1_000_000 {
+            if hops >= 1_000_000 {
                 crate::serial_strln!("[PMM] remove_from_free_list: walk exceeded 1M — list corrupt");
                 return;
             }

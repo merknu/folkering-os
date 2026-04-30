@@ -247,10 +247,12 @@ pub fn poll_rx() {
     // refilling faster than we drain — same Issue #49 pattern. Yields
     // back to the caller after 256 so other ISR-driven work makes
     // progress even under flood.
-    let mut drained = 0u32;
-    while let Some((frame, len)) = rx::receive_packet_inner(dev) {
-        drained += 1;
-        if drained > 256 { break; }
+    // Bounded for-loop so the 257th packet is never dequeued under flood.
+    for _ in 0..256 {
+        let (frame, len) = match rx::receive_packet_inner(dev) {
+            Some(packet) => packet,
+            None => break,
+        };
         let count = RX_PACKET_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
 
         // Log first 8 packets to serial for debugging
