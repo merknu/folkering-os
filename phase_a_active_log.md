@@ -107,6 +107,34 @@ Started with `refactor_types.rs` (63 LOC, no deps) as a proof-of-concept for the
 - **A.4a (this session):** `refactor_types.rs` (DONE), `task_store.rs`, `agent_planner.rs`, `refactor_loop.rs`, `knowledge_hunt.rs`, `draug.rs`, `draug_async.rs` — all the pure-agent + data files. ~5500 LOC.
 - **A.4b (after A.5):** the orchestration glue (`agent_logic.rs`, `autodream.rs`) once compositor's tick loop no longer drives them directly.
 
+#### A.4a — completed 2026-05-01
+
+Final code distribution after A.4a:
+
+| Crate | File | LOC |
+|---|---|---:|
+| draug-daemon | draug.rs | 1845 |
+| draug-daemon | draug_async.rs | 977 |
+| draug-daemon | knowledge_hunt.rs | 1070 |
+| draug-daemon | agent_planner.rs | 553 |
+| draug-daemon | refactor_loop.rs | 430 |
+| draug-daemon | task_store.rs | 366 |
+| draug-daemon | refactor_types.rs | 64 |
+| draug-daemon | main.rs | 251 |
+| draug-daemon | lib.rs | 28 |
+| **draug-daemon TOTAL** |  | **5584** |
+| compositor | draug.rs (shim) | 7 |
+| compositor | refactor_types.rs (shim) | 9 |
+| compositor | mcp_handler/{4 shims} | 23 |
+| compositor | mcp_handler/agent_logic.rs (stays) | 427 |
+| compositor | mcp_handler/autodream.rs (stays) | 740 |
+| compositor | mcp_handler/token_stream.rs (stays) | 411 |
+| compositor | mcp_handler/mod.rs (stays) | 116 |
+
+Each commit on `refactor/phase-a-draug-isolation` builds clean. PR #70 (draft) tracks the foundation; A.4a commits are pushed to the same branch so the PR diff grows incrementally.
+
+Net: ~5500 LOC of agent code now lives in its own crate. Compositor is 7 thin shims away from being able to drop the dep entirely (in A.5).
+
 ### A.5 — Compositor IPC client
 - Replace direct calls with `libfolk::sys::draug::*` wrappers
 - Drop `&mut draug` from RenderContext/DispatchContext/mouse/keyboard
