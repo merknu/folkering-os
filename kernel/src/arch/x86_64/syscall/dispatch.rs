@@ -118,6 +118,11 @@ pub(super) extern "C" fn syscall_handler(
         0x63 => syscall_wasm_compile(arg1, arg2),
         // Proxy health check (Stability Fix 7)
         0x64 => syscall_proxy_ping(),
+        // Issue #55: query proxy for cached verdict by source IP.
+        // Used after a TIMEOUT to recover a verdict whose response
+        // packet was lost in transit, so Phase 17 can record the
+        // real outcome instead of falling back to SKIP.
+        0x6A => syscall_proxy_last_verdict(arg1, arg2),
         // Issue #58: UDP variant of proxy_ping. Uses smoltcp's UDP socket
         // type (different code path than tcp_plain) so hibernation can
         // recover from a TCP-specific wedge. Sends "PING", awaits "PONG"
