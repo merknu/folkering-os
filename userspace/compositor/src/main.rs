@@ -628,7 +628,31 @@ fn main() -> ! {
     // tz_offset_minutes, tz_synced, tz_sync_pending now in mcp
     let mut active_agent: Option<compositor::agent::AgentSession> = None; // ReAct agentic loop
     let mut draug = compositor::draug::DraugDaemon::new();
-    // Stability Fix 1: restore state from previous session
+
+    // Phase A.5 step 2.3: read draug state from the daemon's status
+    // shmem instead of the local DraugDaemon for the fields the
+    // daemon owns now (refactor counts, task_levels, last_input_ms,
+    // hibernation flags). Compositor's local DraugDaemon stays
+    // allocated until step 2.4 because the analysis-cycle path and
+    // a few HUD callsites still read from it.
+    //
+    // `attach_status()` returns `Err` if draug-daemon hasn't booted
+    // yet — that's expected during cold boot since compositor
+    // currently spawns before draug-daemon (Phase A.6 fixes the
+    // ordering). Treat as `None` and fall back to local reads.
+    let draug_status: Option<&'static libfolk::sys::draug::DraugStatus> =
+        libfolk::sys::draug::attach_status().ok();
+    if draug_status.is_some() {
+        libfolk::sys::io::write_str("[Draug] status shmem attached — HUD reads from daemon\n");
+    } else {
+        libfolk::sys::io::write_str("[Draug] status shmem not yet ready (daemon booting?) — HUD falls back to local\n");
+    }
+
+    // Stability Fix 1: restore state from previous session. Daemon
+    // also restores from the same Synapse file at its own boot — no
+    // contention because save_state writes only fire from the
+    // daemon's tick path now (compositor's local DraugDaemon is
+    // dormant on those code paths).
     if draug.restore_state() {
         libfolk::sys::io::write_str("[Draug] Restored state: iter=");
         let mut nb = [0u8; 16];
@@ -639,16 +663,9 @@ fn main() -> ! {
             libfolk::sys::io::write_str(crate::util::format_usize(draug.task_levels[i] as usize, &mut nb));
         }
         libfolk::sys::io::write_str("]\n");
-
-        // Push restored state to kernel bridge so TCP shell shows correct values
-        libfolk::sys::draug_bridge_update(
-            draug.refactor_iter, draug.refactor_passed, draug.refactor_failed,
-            draug.refactor_retries,
-            draug.tasks_at_level(1) as u8, draug.tasks_at_level(2) as u8,
-            draug.tasks_at_level(3) as u8,
-            if draug.plan_mode_active { 1 } else { 0 },
-            draug.complex_task_idx as u8, 0, 0,
-        );
+        // The kernel-bridge push that used to live here is now done
+        // by draug-daemon on every tick — the boot-time push was
+        // double-writing into the bridge atomics for no benefit.
     }
 
     // Phase 17 — load (or seed) the autonomous refactor task queue.
@@ -906,7 +923,14 @@ fn main() -> ! {
         // Freeze caret when idle >10s — prevents infinite 150ms redraw loop
         {
             let caret_ms = if tsc_per_us > 0 { rdtsc() / tsc_per_us / 1000 } else { uptime() };
-            let idle_secs = caret_ms.saturating_sub(draug.last_input_ms()) / 1000;
+            // Phase A.5 step 2.3: prefer the daemon's last_input_ms
+            // from shmem (cross-process source of truth). Fall back
+            // to compositor's local DraugDaemon if shmem isn't
+            // attached (boot-order race with draug-daemon).
+            let last_input_ms = draug_status
+                .map(|s| s.last_input_ms.load(core::sync::atomic::Ordering::Acquire))
+                .unwrap_or_else(|| draug.last_input_ms());
+            let idle_secs = caret_ms.saturating_sub(last_input_ms) / 1000;
             if idle_secs < 10 && caret_ms.saturating_sub(input.last_caret_flip_ms) >= CARET_BLINK_MS {
                 input.caret_visible = !input.caret_visible;
                 input.last_caret_flip_ms = caret_ms;
