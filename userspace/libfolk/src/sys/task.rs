@@ -559,6 +559,20 @@ pub fn proxy_last_verdict(buf: &mut [u8]) -> Option<PatchStatus> {
     Some(PatchStatus { status, output_len })
 }
 
+/// Issue #55 — explicit ACK that the daemon has persisted a verdict.
+///
+/// Tells the proxy to drop its cached per-source-IP verdict. Call
+/// this AFTER `save_state` / Synapse persist completes successfully
+/// — at that point the daemon no longer needs the proxy's safety
+/// net for this task, and the cache slot can be reused.
+///
+/// Returns `true` if the proxy ACK'd (or had nothing cached). Soft
+/// fails to `false` on transport error; the proxy's 30-day TTL
+/// backstop garbage-collects unack'd entries either way.
+pub fn proxy_ack_verdict() -> bool {
+    unsafe { crate::syscall::syscall0(0x6B) == 1 }
+}
+
 /// Issue #58 — Proxy health check (UDP).
 /// Returns true if the proxy responds to a UDP "PING" with "PONG"
 /// before the kernel-side probe expires. The kernel timeout is

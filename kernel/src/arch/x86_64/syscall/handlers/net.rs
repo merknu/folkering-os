@@ -1164,6 +1164,62 @@ pub fn syscall_proxy_last_verdict(buf_ptr: u64, buf_max: u64) -> u64 {
     ((status as u64) << 32) | (copy_len as u64)
 }
 
+/// Issue #55 — application-level acknowledgement of a verdict.
+///
+/// PR #65 added the `LAST_VERDICT` recovery path: if the VM times
+/// out before reading a PATCH/CARGO_CHECK reply, it can ask the
+/// proxy "what did you last archive for me?". That recovery is
+/// gated only by a 30-day TTL on the proxy side. Once the daemon
+/// has actually persisted the verdict to Synapse, it should tell
+/// the proxy to drop its cached entry — the daemon no longer needs
+/// the safety net for that task. This is the "ACK_VERDICT" half of
+/// the explicit-ack pattern from the Dora-rs analysis.
+///
+/// Wire shape:
+///   VM → proxy: ACK_VERDICT\n
+///   proxy → VM: OK\n  (always returns OK, even if cache was empty)
+///
+/// Cache is per-source-IP (one entry deep). The implicit ACK target
+/// is whatever verdict the proxy last archived for our IP. No body
+/// or task_id needed on the wire — if a future bug needs that, we'll
+/// extend with a payload.
+///
+/// Returns 1 on successful ACK (proxy acknowledged or cache was
+/// already empty), 0 on transport failure.
+pub fn syscall_proxy_ack_verdict() -> u64 {
+    const PROXY_IP: [u8; 4] = [192, 168, 68, 150];
+    const PROXY_PORT: u16 = 14711;
+
+    crate::serial_strln!("[ACK_VERDICT] sending to proxy");
+
+    let response = match crate::net::tcp_plain::tcp_request_with_timeout(
+        PROXY_IP,
+        PROXY_PORT,
+        b"ACK_VERDICT\n",
+        16, // expect "OK\n" or similar — small reply
+        5_000,
+    ) {
+        Ok(data) => data,
+        Err(e) => {
+            crate::serial_str!("[ACK_VERDICT] tcp_request failed: ");
+            crate::serial_strln!(e);
+            // Soft-fail: the cache will eventually GC via the 30-day
+            // backstop. Logging the failure is enough — the daemon
+            // doesn't need to retry, since by the time it's calling
+            // this, the verdict is already persisted locally.
+            return 0;
+        }
+    };
+
+    let ok = response.starts_with(b"OK");
+    if ok {
+        crate::serial_strln!("[ACK_VERDICT] proxy ACK'd");
+    } else {
+        crate::serial_strln!("[ACK_VERDICT] unexpected reply (treated as no-op)");
+    }
+    if ok { 1 } else { 0 }
+}
+
 /// Issue #58 — UDP variant of proxy_ping.
 ///
 /// Sends a 4-byte "PING" UDP datagram to the proxy and awaits "PONG".

@@ -616,6 +616,23 @@ fn process_refactor_llm(draug: &mut DraugDaemon, response: &[u8], now_ms: u64) -
     true
 }
 
+/// Issue #55 — explicit application-level ACK to the proxy after we
+/// have persisted a verdict to Synapse. Tells the proxy it can drop
+/// its cached `LAST_VERDICT` entry for our source IP.
+///
+/// This is the "ACK" half of the explicit-ack pattern from the
+/// Dora-rs analysis. The proxy still has a 30-day TTL backstop in
+/// case ACKs are lost, so an occasional transport failure here
+/// degrades to GC instead of permanent leak.
+///
+/// Wrapped behind a function so each terminal-state code path can
+/// say `ack_verdict_persisted()` rather than spell out the syscall
+/// shape inline. The kernel-side syscall logs success/failure on
+/// serial — no need to log here too.
+fn ack_verdict_persisted() {
+    let _ = libfolk::sys::proxy_ack_verdict();
+}
+
 /// Persist a Skip verdict for the in-flight refactor. Used when
 /// the loop hits an infrastructure problem (LLM parse failure,
 /// connect-no-slots, etc) where we don't want the failure to count
@@ -705,6 +722,13 @@ fn process_cargo_check_result(
     draug.current_refactor_target.clear();
     draug.async_phase = AsyncPhase::Idle;
     draug.async_operation = AsyncOp::None;
+
+    // Issue #55: verdict is now persisted to Synapse and our internal
+    // counters are updated. Tell the proxy it can drop its cached
+    // entry — we no longer need the LAST_VERDICT recovery net for
+    // this task. Soft-fail on transport error: the proxy's 30-day
+    // backstop garbage-collects unack'd entries either way.
+    ack_verdict_persisted();
     true
 }
 
@@ -884,6 +908,9 @@ fn process_patch_result(draug: &mut DraugDaemon, response: &[u8], now_ms: u64) -
 
     draug.async_phase = AsyncPhase::Idle;
     draug.async_operation = AsyncOp::None;
+
+    // Issue #55: see comment in process_cargo_check_result.
+    ack_verdict_persisted();
     true
 }
 

@@ -123,6 +123,11 @@ pub(super) extern "C" fn syscall_handler(
         // packet was lost in transit, so Phase 17 can record the
         // real outcome instead of falling back to SKIP.
         0x6A => syscall_proxy_last_verdict(arg1, arg2),
+        // Issue #55: explicit application-level ACK after the daemon
+        // has persisted a verdict to Synapse. Tells the proxy it can
+        // drop its per-source-IP cache entry. Hybrid model — proxy
+        // still has a 30-day TTL backstop in case ACKs are lost.
+        0x6B => syscall_proxy_ack_verdict(),
         // Issue #58: UDP variant of proxy_ping. Uses smoltcp's UDP socket
         // type (different code path than tcp_plain) so hibernation can
         // recover from a TCP-specific wedge. Sends "PING", awaits "PONG"
