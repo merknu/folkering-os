@@ -17,7 +17,6 @@
 extern crate alloc;
 
 use compositor::damage::DamageTracker;
-use compositor::draug::DraugDaemon;
 use compositor::framebuffer::FramebufferView;
 use compositor::state::{
     Category, CursorState, IqeState, InputState, McpState, RenderState, StreamState,
@@ -82,7 +81,6 @@ pub struct RenderContext<'a> {
     pub mcp: &'a mut McpState,
     pub iqe: &'a IqeState,
     pub damage: &'a mut DamageTracker,
-    pub draug: &'a mut DraugDaemon,
     pub categories: &'a [Category],
     pub layout: &'a RenderLayout,
     pub cursor: &'a CursorState,

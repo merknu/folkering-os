@@ -19,7 +19,6 @@ extern crate alloc;
 use compositor::Compositor;
 use compositor::agent::AgentSession;
 use compositor::damage::DamageTracker;
-use compositor::draug::DraugDaemon;
 use compositor::framebuffer::FramebufferView;
 use compositor::state::{McpState, StreamState, WasmState};
 use compositor::window_manager::WindowManager;
@@ -92,7 +91,6 @@ pub fn tick_ai_systems(
     wasm: &mut WasmState,
     wm: &mut WindowManager,
     stream: &mut StreamState,
-    draug: &mut DraugDaemon,
     briefing: &mut compositor::briefing::BriefingState,
     draug_status: Option<&'static libfolk::sys::draug::DraugStatus>,
     fb: &mut FramebufferView,
@@ -102,7 +100,7 @@ pub fn tick_ai_systems(
     tsc_per_us: u64,
 ) -> AiTickResult {
     agent_logic::tick(
-        mcp, wasm, wm, stream, draug, briefing, draug_status, fb, damage, active_agent, drivers_seeded, tsc_per_us,
+        mcp, wasm, wm, stream, briefing, draug_status, fb, damage, active_agent, drivers_seeded, tsc_per_us,
     )
 }
 
