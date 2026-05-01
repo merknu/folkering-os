@@ -14,6 +14,7 @@ pub mod firewall;
 pub mod gemini;
 pub mod github;
 pub mod json;
+pub mod proxy_config;
 pub mod tls;
 pub mod tls_verify;
 pub mod tcp_plain;

@@ -35,9 +35,7 @@ fn libfolk_yield() {
     for _ in 0..5000 { core::hint::spin_loop(); }
 }
 
-/// Host proxy IP: Proxmox host on LAN (bridge networking, not SLIRP)
-const PROXY_IP: [u8; 4] = [192, 168, 68, 150];
-const PROXY_PORT: u16 = 8080;
+use super::proxy_config::{PROXY_IP, GEMINI_PORT as PROXY_PORT};
 
 pub fn ask_gemini(prompt: &str) -> Result<Vec<u8>, &'static str> {
     // Build the request payload (same format for both TCP and COM2)
