@@ -300,9 +300,6 @@ pub enum ObservationEvent {
     BootComplete,
 }
 
-/// Maximum command history entries for prediction
-pub const MAX_CMD_HISTORY: usize = 16;
-
 // ── Friction Sensor: Frustration-Driven Evolution ──────────────────────
 
 /// Signal weights for friction tracking
@@ -406,11 +403,6 @@ pub struct DraugDaemon {
     waiting_for_llm: bool,
     analysis_count: u32,
     last_analysis_ms: u64,
-
-    /// Command history for prediction (Pillar 4)
-    cmd_history: [Option<alloc::string::String>; MAX_CMD_HISTORY],
-    cmd_head: usize,
-    cmd_count: usize,
 
     /// AutoDream state
     dream_count: u32,
@@ -576,9 +568,6 @@ impl DraugDaemon {
             waiting_for_llm: false,
             analysis_count: 0,
             last_analysis_ms: 0,
-            cmd_history: [const { None }; MAX_CMD_HISTORY],
-            cmd_head: 0,
-            cmd_count: 0,
             dream_count: 0,
             last_dream_ms: 0,
             dreaming: false,
@@ -960,60 +949,7 @@ impl DraugDaemon {
         self.knowledge_hunted = true;
     }
 
-    /// Record a user command for prediction history.
-    pub fn record_command(&mut self, cmd: &str) {
-        self.cmd_history[self.cmd_head] = Some(String::from(cmd));
-        self.cmd_head = (self.cmd_head + 1) % MAX_CMD_HISTORY;
-        if self.cmd_count < MAX_CMD_HISTORY { self.cmd_count += 1; }
-    }
 
-    /// Predict what the user might ask next based on command history.
-    /// Simple frequency analysis: returns the most common command that
-    /// followed the last command, if pattern is strong enough (>50% match).
-    pub fn predict_next(&self) -> Option<&str> {
-        if self.cmd_count < 4 { return None; } // Need enough history
-
-        // Get the last command
-        let last_idx = (self.cmd_head + MAX_CMD_HISTORY - 1) % MAX_CMD_HISTORY;
-        let last_cmd = self.cmd_history[last_idx].as_deref()?;
-
-        // Count what follows `last_cmd` in history
-        let mut best: Option<&str> = None;
-        let mut best_count = 0u32;
-        let mut total_follows = 0u32;
-
-        for i in 0..self.cmd_count.saturating_sub(1) {
-            let idx = (self.cmd_head + MAX_CMD_HISTORY - self.cmd_count + i) % MAX_CMD_HISTORY;
-            let next_idx = (idx + 1) % MAX_CMD_HISTORY;
-            if let (Some(cmd), Some(next)) = (&self.cmd_history[idx], &self.cmd_history[next_idx]) {
-                if cmd.as_str() == last_cmd {
-                    total_follows += 1;
-                    // Count this "next" command
-                    let mut count = 0u32;
-                    for j in 0..self.cmd_count.saturating_sub(1) {
-                        let ji = (self.cmd_head + MAX_CMD_HISTORY - self.cmd_count + j) % MAX_CMD_HISTORY;
-                        let jn = (ji + 1) % MAX_CMD_HISTORY;
-                        if let (Some(jc), Some(jnc)) = (&self.cmd_history[ji], &self.cmd_history[jn]) {
-                            if jc.as_str() == last_cmd && jnc.as_str() == next.as_str() {
-                                count += 1;
-                            }
-                        }
-                    }
-                    if count > best_count {
-                        best_count = count;
-                        best = Some(next.as_str());
-                    }
-                }
-            }
-        }
-
-        // Only predict if >50% confidence
-        if total_follows >= 2 && best_count * 2 > total_follows {
-            best
-        } else {
-            None
-        }
-    }
 
     /// Record user input activity (resets idle timer)
     pub fn on_user_input(&mut self, now_ms: u64) {
@@ -1034,7 +970,7 @@ impl DraugDaemon {
         // Decay friction scores over time
         self.friction.decay(now_ms);
 
-        let (total_mb, used_mb, mem_pct) = libfolk::sys::memory_stats();
+        let (_total_mb, _used_mb, mem_pct) = libfolk::sys::memory_stats();
         let uptime_s = (now_ms / 1000) as u32;
 
         // Determine event type

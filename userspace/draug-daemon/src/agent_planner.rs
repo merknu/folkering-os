@@ -537,17 +537,3 @@ fn deploy_wasm(task_id: &str) {
     }
 }
 
-fn push_dec(out: &mut String, mut v: u32) {
-    if v == 0 { out.push('0'); return; }
-    let mut buf = [0u8; 10];
-    let mut i = 0;
-    while v > 0 {
-        buf[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-        i += 1;
-    }
-    while i > 0 {
-        i -= 1;
-        out.push(buf[i] as char);
-    }
-}

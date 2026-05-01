@@ -31,7 +31,7 @@
 //! Both are deferred to the session that does the boot-verify, so
 //! we don't ship placebo-integration today.
 
-use alloc::string::{String, ToString};
+use alloc::string::String;
 
 use crate::agent_planner::{codegraph_for_model, fetch_callers_summary};
 use crate::task_store::{RefactorTask, TaskStatus};

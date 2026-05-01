@@ -868,7 +868,7 @@ fn process_patch_result(draug: &mut DraugDaemon, response: &[u8], now_ms: u64) -
             }
         } else {
             // Skill tree PASS
-            let iter = draug.advance_refactor(now_ms);
+            draug.advance_refactor(now_ms);
             draug.record_refactor_pass();
             draug.advance_task_level(draug.async_task_idx);
             draug.reset_skips();

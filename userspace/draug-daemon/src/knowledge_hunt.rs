@@ -28,7 +28,6 @@
 //! only runs while the user is idle anyway.
 
 use alloc::string::String;
-use alloc::vec::Vec;
 use libfolk::sys::io::write_str;
 
 use crate::draug::{
@@ -262,7 +261,6 @@ pub const REFACTOR_TASKS: &[(&str, &str)] = &[
 ///   L3: Optimize prior code with MemPalace context (cargo check)
 pub fn run_refactor_step(draug: &mut crate::draug::DraugDaemon, now_ms: u64) {
     use libfolk::sys::{fbp_patch, llm_generate};
-    use crate::agent_planner;
 
     // NOTE: advance_refactor() is called AFTER proxy check to avoid
     // counting skips toward REFACTOR_MAX_ITER. Without this, ~4-16
