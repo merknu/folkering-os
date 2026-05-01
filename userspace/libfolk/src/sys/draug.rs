@@ -54,15 +54,13 @@ use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 // Well-Known Task ID
 // ============================================================================
 
-/// Default expected draug-daemon task ID. Phase A.6 originally
-/// proposed pinning this with a kernel-side special-case spawn (the
-/// way Synapse=2 and Shell=3 are pinned), but that would have forced
-/// shifting compositor's well-known ID. Instead we ship a fallback
-/// const here and discover the actual ID at runtime via
-/// `daemon_task_id()`, which scans `task_list_detailed` for a task
-/// named `"draug-daemon"`. The const stays as the cache seed value
-/// and as the documented "if you want to pin this, pin to 7" target.
-pub const DRAUG_TASK_ID: u32 = 7;
+/// Pinned draug-daemon task ID. Phase A.6 added an explicit
+/// kernel-side spawn between shell (task 3) and the generic ramdisk
+/// loop, so the daemon now lands on task 4 deterministically. The
+/// `daemon_task_id()` discovery helper still scans `task_list_detailed`
+/// as a fallback in case spawn order changes again, but the seed
+/// here matches the actual ID on a fresh boot.
+pub const DRAUG_TASK_ID: u32 = 4;
 
 /// Cached daemon task ID. Seeded with `DRAUG_TASK_ID`; if the first
 /// IPC fails (`Err(IpcError::Unknown)` from `send`), the next

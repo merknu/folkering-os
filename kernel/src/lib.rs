@@ -516,7 +516,49 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
                 serial_strln!("[BOOT] WARNING: Shell not found in ramdisk!");
             }
 
-            // Spawn any additional ELF entries (skip synapse and shell)
+            // Spawn Draug daemon (Task 4) — Phase A.6 boot ordering.
+            // Compositor's `attach_status()` reads from the daemon's
+            // status shmem on its first tick; spawning the daemon
+            // before compositor means the shmem region is allocated
+            // and the read-grant is in place by the time compositor
+            // gets its first time slice. Without this explicit step,
+            // ramdisk entry order decided spawn order — compositor
+            // fell through the cold-boot fallback path until the
+            // daemon caught up.
+            if let Some(entry) = rd.find("draug-daemon") {
+                serial_strln!("[BOOT] Spawning Task 4 (draug-daemon)...");
+                let daemon_elf = rd.read(entry);
+                serial_str!("[BOOT] draug-daemon ELF size: ");
+                drivers::serial::write_dec(daemon_elf.len() as u32);
+                serial_strln!(" bytes");
+                match task::spawn(daemon_elf, &[]) {
+                    Ok(task_id) => {
+                        if let Some(task_arc) = task::task::get_task(task_id) {
+                            task_arc.lock().set_name("draug-daemon");
+                        }
+                        serial_str!("[BOOT] draug-daemon spawned, id=");
+                        drivers::serial::write_dec(task_id);
+                        serial_strln!("");
+                        // Daemon talks IPC to compositor (status shmem
+                        // grant), Synapse (state restore), and the
+                        // proxy-bound TCP path via libfolk syscalls.
+                        let _ = capability::grant_ipc_send_any(task_id);
+                    }
+                    Err(e) => {
+                        serial_str!("[BOOT] draug-daemon spawn FAILED: ");
+                        match e {
+                            task::SpawnError::InvalidElf(_) => { serial_strln!("InvalidElf"); }
+                            task::SpawnError::OutOfMemory => { serial_strln!("OutOfMemory"); }
+                            task::SpawnError::PermissionDenied => { serial_strln!("PermissionDenied"); }
+                            task::SpawnError::NotFound => { serial_strln!("NotFound"); }
+                        }
+                    }
+                }
+            } else {
+                serial_strln!("[BOOT] WARNING: draug-daemon not found in ramdisk!");
+            }
+
+            // Spawn any additional ELF entries (skip synapse, shell, draug-daemon)
             for entry in rd.entries() {
                 let name = entry.name_str();
                 // Use byte comparison to avoid potential str comparison issues
@@ -525,7 +567,8 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
                 let is_compositor = name.as_bytes() == b"compositor";
                 let is_inference = name.as_bytes() == b"inference";
                 let is_draug_streamer = name.as_bytes() == b"draug-streamer";
-                if is_shell || is_synapse {
+                let is_draug_daemon = name.as_bytes() == b"draug-daemon";
+                if is_shell || is_synapse || is_draug_daemon {
                     continue;
                 }
                 // Phase 5 Hybrid AI: skip built-in inference server to save ~400MB RAM.
