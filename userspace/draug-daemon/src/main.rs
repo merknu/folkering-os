@@ -214,6 +214,15 @@ fn log_alive_if_due(draug: &DraugDaemon, now_ms: u64) {
             stats.dealloc_count,
         );
     }
+    // PMM (physical-page) view — distinct from `heap_walk`, which only
+    // sees the 32 MB kernel LockedHeap pool. Phase A bug #54 was a
+    // virtio-net TX page leak that grew the VM's overall memory
+    // footprint without ever touching the LockedHeap; PR #97 fixed it,
+    // but only because this line surfaced "PMM grew 82 → 154 MB while
+    // HEAP stayed flat at 140 K". Keep the metric in the periodic log
+    // so the next allocator-but-not-heap leak shows up in plain sight.
+    let (total_mb, used_mb, pct) = libfolk::sys::memory_stats();
+    println!("[PMM] used={}MB / {}MB ({}%)", used_mb, total_mb, pct);
 }
 
 /// Allocate, map, initialise, and grant compositor read access to
