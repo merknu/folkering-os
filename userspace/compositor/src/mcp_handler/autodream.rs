@@ -11,7 +11,12 @@
 extern crate alloc;
 
 use libfolk::sys::io::write_str;
-use libfolk::sys::{shmem_destroy, shmem_map, shmem_unmap};
+use libfolk::sys::{shmem_create, shmem_destroy, shmem_grant, shmem_map, shmem_unmap};
+use libfolk::sys::draug::{
+    daemon_task_id, request_dream_decision,
+    DREAM_MODE_REFACTOR, DREAM_MODE_CREATIVE, DREAM_MODE_NIGHTMARE,
+    DREAM_MODE_DRIVER_REFACTOR, DREAM_MODE_DRIVER_NIGHTMARE,
+};
 
 use compositor::damage::DamageTracker;
 use compositor::draug::DraugDaemon;
@@ -32,8 +37,11 @@ pub(super) struct ChunkResult {
 
 /// Stage 4 — Start an AutoDream cycle (called by `agent_logic::tick`).
 ///
-/// Selects a target app, snapshots its state for migration, builds the
-/// `--tweak` prompt, and sends a WasmGenRequest via MCP.
+/// The DECISION (which app + which mode) now happens in the daemon over
+/// `DRAUG_OP_DREAM_DECIDE` IPC; compositor still owns the EXECUTION
+/// (state snapshot, MCP send, chunk reassembly) for now. Subsequent
+/// Phase A.5 steps move execution and result-tracking too, then drop
+/// the compositor-local `DraugDaemon` entirely.
 pub(super) fn start_dream_cycle(
     mcp: &mut McpState,
     wasm: &mut WasmState,
@@ -42,7 +50,12 @@ pub(super) fn start_dream_cycle(
     dream_ms: u64,
 ) {
     let keys: alloc::vec::Vec<&str> = wasm.cache.keys().map(|k| k.as_str()).collect();
-    let Some((target, mode)) = draug.start_dream(&keys, dream_ms) else {
+    if keys.is_empty() {
+        write_str("[AutoDream] cache empty — nothing to dream about\n");
+        return;
+    }
+
+    let Some((target, mode, dream_count)) = ask_daemon_for_dream(&keys, dream_ms) else {
         write_str("[AutoDream] All systems stable. Sleeping.\n");
         return;
     };
@@ -75,7 +88,7 @@ pub(super) fn start_dream_cycle(
     write_str("[AutoDream] ========================================\n");
     write_str("[AutoDream] DREAM #");
     let mut nb = [0u8; 16];
-    write_str(format_usize(draug.dream_count() as usize, &mut nb));
+    write_str(format_usize(dream_count as usize, &mut nb));
     write_str(" | Mode: ");
     write_str(mode_str);
     write_str(" | Target: ");
@@ -99,7 +112,7 @@ pub(super) fn start_dream_cycle(
     write_str("[AutoDream] Cache: ");
     write_str(format_usize(wasm.cache.len(), &mut nb));
     write_str(" apps | Draug dreams: ");
-    write_str(format_usize(draug.dream_count() as usize, &mut nb));
+    write_str(format_usize(dream_count as usize, &mut nb));
     write_str("/");
     write_str(format_usize(compositor::draug::DREAM_MAX_PER_SESSION as usize, &mut nb));
     write_str("\n");
@@ -136,6 +149,113 @@ pub(super) fn start_dream_cycle(
         write_str("[AutoDream] Send failed — cancelling dream\n");
         draug.on_dream_complete(dream_ms);
     }
+}
+
+/// Wire-format constants for the `DREAM_DECIDE` shmem layout. Mirror
+/// of the daemon-side caps so a misformatted payload can't push the
+/// daemon past its read window.
+const DREAM_DECIDE_MAX_KEYS: usize = 32;
+const DREAM_DECIDE_MAX_KEY_LEN: usize = 64;
+/// Stable scratch vaddr for compositor-side mapping of the dream-decide
+/// shmem. Sits next to `VFS_DREAM_VADDR` (0x50070000) without overlap.
+const DREAM_DECIDE_COMP_VADDR: usize = 0x50080000;
+
+/// Ask the daemon (`DRAUG_OP_DREAM_DECIDE`) which app + mode to dream
+/// about right now. Returns `Some((target_string, mode, dream_count))`
+/// if the daemon picked something, `None` if all systems are stable or
+/// the IPC failed.
+///
+/// Allocates a per-call shmem region with the key list serialised in
+/// the format the daemon expects, grants the daemon read access,
+/// performs the IPC, then unmaps + destroys.
+fn ask_daemon_for_dream(
+    keys: &[&str],
+    dream_ms: u64,
+) -> Option<(alloc::string::String, compositor::draug::DreamMode, u32)> {
+    let n = keys.len().min(DREAM_DECIDE_MAX_KEYS);
+    if n == 0 {
+        return None;
+    }
+
+    // Compute exact serialised size: 8-byte header + per-key (4 + len).
+    let mut total: usize = 8;
+    for k in keys.iter().take(n) {
+        total += 4 + k.as_bytes().len().min(DREAM_DECIDE_MAX_KEY_LEN);
+    }
+
+    let handle = match shmem_create(total) {
+        Ok(h) => h,
+        Err(_) => {
+            write_str("[AutoDream] shmem_create failed\n");
+            return None;
+        }
+    };
+
+    if shmem_map(handle, DREAM_DECIDE_COMP_VADDR).is_err() {
+        let _ = shmem_destroy(handle);
+        write_str("[AutoDream] shmem_map failed\n");
+        return None;
+    }
+
+    // Serialise: [u32 num_keys][u32 reserved] then per key
+    // [u16 len][u16 reserved][len bytes]. Bounds-checked on the daemon
+    // side too — we just need to write within the allocation.
+    unsafe {
+        let buf = core::slice::from_raw_parts_mut(DREAM_DECIDE_COMP_VADDR as *mut u8, total);
+        buf[0..4].copy_from_slice(&(n as u32).to_le_bytes());
+        buf[4..8].copy_from_slice(&0u32.to_le_bytes());
+        let mut off = 8usize;
+        for k in keys.iter().take(n) {
+            let bytes = k.as_bytes();
+            let len = bytes.len().min(DREAM_DECIDE_MAX_KEY_LEN);
+            buf[off..off + 2].copy_from_slice(&(len as u16).to_le_bytes());
+            buf[off + 2..off + 4].copy_from_slice(&0u16.to_le_bytes());
+            off += 4;
+            buf[off..off + len].copy_from_slice(&bytes[..len]);
+            off += len;
+        }
+    }
+
+    if shmem_grant(handle, daemon_task_id()).is_err() {
+        let _ = shmem_unmap(handle, DREAM_DECIDE_COMP_VADDR);
+        let _ = shmem_destroy(handle);
+        write_str("[AutoDream] shmem_grant failed\n");
+        return None;
+    }
+
+    // Idle-time hint. 24-bit budget = ~6 months of seconds — comfortably
+    // larger than any uptime we've ever seen, so a cheap saturating cast
+    // is fine.
+    let idle_seconds = ((dream_ms / 1000) & 0xFF_FFFF) as u32;
+    let decision = request_dream_decision(handle, idle_seconds);
+
+    let _ = shmem_unmap(handle, DREAM_DECIDE_COMP_VADDR);
+    let _ = shmem_destroy(handle);
+
+    let decision = decision?;
+    if !decision.should_dream() {
+        return None;
+    }
+
+    let idx = decision.target_index as usize;
+    if idx >= keys.len() {
+        write_str("[AutoDream] daemon returned out-of-range target_index\n");
+        return None;
+    }
+
+    let mode = match decision.mode {
+        m if m == DREAM_MODE_REFACTOR        => compositor::draug::DreamMode::Refactor,
+        m if m == DREAM_MODE_CREATIVE        => compositor::draug::DreamMode::Creative,
+        m if m == DREAM_MODE_NIGHTMARE       => compositor::draug::DreamMode::Nightmare,
+        m if m == DREAM_MODE_DRIVER_REFACTOR => compositor::draug::DreamMode::DriverRefactor,
+        m if m == DREAM_MODE_DRIVER_NIGHTMARE=> compositor::draug::DreamMode::DriverNightmare,
+        _ => {
+            write_str("[AutoDream] unknown mode from daemon — skipping\n");
+            return None;
+        }
+    };
+
+    Some((alloc::string::String::from(keys[idx]), mode, decision.dream_count))
 }
 
 /// Handle a `WasmChunk` MCP response. Reassembles, verifies signature,
