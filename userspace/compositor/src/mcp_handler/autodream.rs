@@ -13,9 +13,10 @@ extern crate alloc;
 use libfolk::sys::io::write_str;
 use libfolk::sys::{shmem_create, shmem_destroy, shmem_grant, shmem_map, shmem_unmap};
 use libfolk::sys::draug::{
-    daemon_task_id, request_dream_decision,
+    daemon_task_id, request_dream_decision, notify_dream_result,
     DREAM_MODE_REFACTOR, DREAM_MODE_CREATIVE, DREAM_MODE_NIGHTMARE,
     DREAM_MODE_DRIVER_REFACTOR, DREAM_MODE_DRIVER_NIGHTMARE,
+    DREAM_RESULT_COMPLETE, DREAM_RESULT_CANCEL,
 };
 
 use compositor::damage::DamageTracker;
@@ -59,6 +60,11 @@ pub(super) fn start_dream_cycle(
         write_str("[AutoDream] All systems stable. Sleeping.\n");
         return;
     };
+
+    // Authoritative dream context for the chunk-receive path. Replaces
+    // the stale `draug.is_dreaming/dream_target/current_dream_mode`
+    // reads that broke when step 1 stopped calling local `start_dream`.
+    mcp.current_dream = Some((target.clone(), mode));
 
     let mode_str = match mode {
         compositor::draug::DreamMode::Refactor => "Refactor",
@@ -147,7 +153,10 @@ pub(super) fn start_dream_cycle(
         write_str("[AutoDream] Request sent\n");
     } else {
         write_str("[AutoDream] Send failed — cancelling dream\n");
-        draug.on_dream_complete(dream_ms);
+        notify_dream_result(DREAM_RESULT_CANCEL);
+        mcp.current_dream = None;
+        let _ = draug; // local lifecycle no longer driven from this path
+        let _ = dream_ms;
     }
 }
 
@@ -506,7 +515,10 @@ pub(super) fn handle_wasm_chunk(
     }
 
     // ── AutoDream evaluation ──
-    if draug.is_dreaming() && !tool_prompt.is_empty() {
+    // Authoritative dream context lives in `mcp.current_dream` since
+    // Phase A.5 step 2; the local `DraugDaemon::is_dreaming()` flag is
+    // no longer consulted from this path.
+    if mcp.current_dream.is_some() && !tool_prompt.is_empty() {
         evaluate_dream_result(&wasm_bytes, &tool_prompt, mcp, wasm, draug, fb, tsc_per_us);
     }
     // ── Normal cache storage (non-dream) ──
@@ -596,19 +608,26 @@ pub(super) fn handle_wasm_chunk(
 fn evaluate_dream_result(
     wasm_bytes: &[u8],
     tool_prompt: &str,
-    _mcp: &mut McpState,
+    mcp: &mut McpState,
     wasm: &mut WasmState,
     draug: &mut DraugDaemon,
     fb: &FramebufferView,
     tsc_per_us: u64,
 ) {
-    let orig_key_owned = draug.dream_target()
-        .map(alloc::string::String::from)
-        .unwrap_or_else(|| alloc::string::String::from(
-            tool_prompt.rsplit(' ').next().unwrap_or(tool_prompt)
-        ));
+    // Pull dream context from `mcp.current_dream` — set by
+    // `start_dream_cycle` from the daemon's DREAM_DECIDE reply.
+    // Falls back to parsing the tail of `tool_prompt` only if the
+    // context was lost (shouldn't happen in normal flow; defensive).
+    let (orig_key_owned, dream_mode) = match mcp.current_dream {
+        Some((ref t, m)) => (t.clone(), m),
+        None => (
+            alloc::string::String::from(
+                tool_prompt.rsplit(' ').next().unwrap_or(tool_prompt)
+            ),
+            compositor::draug::DreamMode::Refactor,
+        ),
+    };
     let orig_key = orig_key_owned.as_str();
-    let dream_mode = draug.current_dream_mode();
     let mut nb = [0u8; 16];
 
     match dream_mode {
@@ -644,8 +663,8 @@ fn evaluate_dream_result(
     }
 
     write_str("[AutoDream] ========== DREAM COMPLETE ==========\n");
-    let done_ms = if tsc_per_us > 0 { rdtsc() / tsc_per_us / 1000 } else { 0 };
-    draug.on_dream_complete(done_ms);
+    notify_dream_result(DREAM_RESULT_COMPLETE);
+    mcp.current_dream = None;
 
     // State Migration: hot-swap running app if it was the dream target
     if let Some(ref snapshot) = wasm.state_snapshot {

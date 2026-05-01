@@ -201,6 +201,18 @@ pub const DRAUG_OP_FRICTION_SIGNAL: u64 = 0x0005;
 ///   bits 32..64  daemon's dream_count (for compositor HUD)
 pub const DRAUG_OP_DREAM_DECIDE: u64 = 0x0006;
 
+/// Autodream lifecycle event from compositor — "the dream that
+/// daemon picked just finished". `status` = 0 means success (daemon
+/// records `on_dream_complete`, bumps `dream_count`, updates
+/// `last_dream_ms`); `status` = 1 means cancel (daemon calls
+/// `wake_up`, no count bump). Compositor sends this after evaluation
+/// or on send-failure / wake-on-input, then drops its local
+/// `current_dream` context.
+///
+/// Request:  payload0 = OP_DREAM_RESULT | (status << 16)
+/// Reply:    DRAUG_STATUS_OK
+pub const DRAUG_OP_DREAM_RESULT: u64 = 0x0007;
+
 // DreamMode wire encoding — must match the order of variants in
 // `draug_daemon::draug::DreamMode`. Stable ABI.
 pub const DREAM_MODE_REFACTOR: u8 = 0;
@@ -211,6 +223,10 @@ pub const DREAM_MODE_DRIVER_NIGHTMARE: u8 = 4;
 
 pub const DREAM_ACTION_SKIP: u8 = 0;
 pub const DREAM_ACTION_DREAM: u8 = 1;
+
+/// `DRAUG_OP_DREAM_RESULT` status byte values.
+pub const DREAM_RESULT_COMPLETE: u8 = 0;
+pub const DREAM_RESULT_CANCEL: u8 = 1;
 
 // ============================================================================
 // Status Codes (reply payload0)
@@ -400,6 +416,24 @@ pub fn unpack_dream_decide(payload0: u64) -> (u32, u32) {
     let shmem = ((payload0 >> 16) & 0xFF_FFFF) as u32;
     let idle = ((payload0 >> 40) & 0xFF_FFFF) as u32;
     (shmem, idle)
+}
+
+/// Decode the status byte from a `DREAM_RESULT` payload0.
+#[inline]
+pub fn unpack_dream_result_status(payload0: u64) -> u8 {
+    ((payload0 >> 16) & 0xFF) as u8
+}
+
+/// Notify the daemon that a dream cycle finished. `status` is one of
+/// `DREAM_RESULT_COMPLETE` / `DREAM_RESULT_CANCEL`. Fire-and-forget;
+/// reply is ignored. A dropped notification leaves the daemon's
+/// `dreaming` flag stuck on `true` until the next `DREAM_DECIDE`
+/// overwrites it — annoying but not catastrophic, and rare enough
+/// that we don't need a retry loop here.
+#[inline]
+pub fn notify_dream_result(status: u8) {
+    let payload = DRAUG_OP_DREAM_RESULT | ((status as u64) << 16);
+    let _ = ipc::send(daemon_task_id(), payload, 0);
 }
 
 /// Encode the daemon-side reply for `DRAUG_OP_DREAM_DECIDE`.
