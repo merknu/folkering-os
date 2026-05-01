@@ -914,7 +914,7 @@ fn main() -> ! {
             };
             let mr = input_mouse::process_mouse(
                 &mut cursor, &mut wm, &mut wasm, &mut input, &mut render,
-                &mut stream, &mut draug, &mut fb, &mut damage,
+                &mut stream, &mut fb, &mut damage,
                 &mut cursor_drawn, &mut last_buttons, &mut cursor_bg.0,
                 tsc_per_us, &categories[..], &mouse_layout,
             );
@@ -1013,7 +1013,7 @@ fn main() -> ! {
             };
             input_keyboard::process_keyboard(
                 &mut input, &mut wasm, &mut wm, &mut render,
-                &mut fb, &mut damage, &mut draug,
+                &mut fb, &mut damage,
                 tsc_per_us, &kb_layout,
             )
         };

@@ -6,7 +6,6 @@
 extern crate alloc;
 
 use compositor::damage::DamageTracker;
-use compositor::draug::DraugDaemon;
 use compositor::framebuffer::FramebufferView;
 use compositor::state::{CursorState, InputState, RenderState, StreamState, WasmState, Category};
 use compositor::window_manager::{WindowManager, HitZone, BORDER_W, TITLE_BAR_H};
@@ -67,7 +66,6 @@ pub fn process_mouse(
     input: &mut InputState,
     render: &mut RenderState,
     stream: &mut StreamState,
-    draug: &mut DraugDaemon,
     fb: &mut FramebufferView,
     damage: &mut DamageTracker,
     cursor_drawn: &mut bool,
@@ -112,11 +110,7 @@ pub fn process_mouse(
     if had_mouse_events {
         // Tell Draug the user is actively interacting
         let input_ms = if tsc_per_us > 0 { rdtsc() / tsc_per_us / 1000 } else { 0 };
-        // Phase A.5: forward to draug-daemon over IPC. Local update
-        // stays for the transition window — see input_keyboard.rs for
-        // the full rationale.
         libfolk::sys::draug::send_user_input(input_ms);
-        draug.on_user_input(input_ms);
         // Hover detection for folder preview (home view)
         if render.open_folder < 0 && wasm.active_app.is_none() {
             let old_hover = render.hover_folder;
@@ -173,12 +167,8 @@ pub fn process_mouse(
                 if recent > 5 {
                     if let Some(ref k) = wasm.active_app_key {
                         let h = compositor::draug::DraugDaemon::key_hash_pub(k);
-                        // Phase A.5 Path A.2: forward to draug-daemon.
-                        // Local call kept for autodream gating until
-                        // autodream migrates.
                         libfolk::sys::draug::send_friction_signal(
                             h, compositor::draug::FRICTION_RAGE_CLICK);
-                        draug.friction.record_signal(h, compositor::draug::FRICTION_RAGE_CLICK);
                         write_str("[Friction] rage_click for '");
                         write_str(&k[..k.len().min(30)]);
                         write_str("'\n");

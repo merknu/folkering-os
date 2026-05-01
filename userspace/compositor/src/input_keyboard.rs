@@ -6,7 +6,6 @@
 extern crate alloc;
 
 use compositor::damage::DamageTracker;
-use compositor::draug::DraugDaemon;
 use compositor::framebuffer::FramebufferView;
 use compositor::state::{InputState, RenderState, WasmState};
 use compositor::window_manager::WindowManager;
@@ -50,7 +49,6 @@ pub fn process_keyboard(
     render: &mut RenderState,
     fb: &mut FramebufferView,
     damage: &mut DamageTracker,
-    draug: &mut DraugDaemon,
     tsc_per_us: u64,
     layout: &KeyboardLayout,
 ) -> KeyboardResult {
@@ -76,13 +74,7 @@ pub fn process_keyboard(
         };
         did_work = true;
         let input_ms = if tsc_per_us > 0 { rdtsc() / tsc_per_us / 1000 } else { 0 };
-        // Phase A.5: forward to draug-daemon over IPC. Local update
-        // stays for the transition window so compositor-side HUD reads
-        // (which still target the in-process DraugDaemon) keep
-        // returning fresh values; the call goes away in step 2.4 once
-        // the local instance is dropped.
         libfolk::sys::draug::send_user_input(input_ms);
-        draug.on_user_input(input_ms);
 
         // Ctrl+G (0x07) or 'G'/'g': toggle RAM graph
         if key == 0x07 || (wasm.active_app.is_none() && (key == b'G' || key == b'g') && !input.omnibar_visible) {
@@ -108,15 +100,8 @@ pub fn process_keyboard(
                     if open_duration < 3000 {
                         if let Some(ref k) = wasm.active_app_key {
                             let h = compositor::draug::DraugDaemon::key_hash_pub(k);
-                            // Phase A.5 Path A.2: forward friction
-                            // signal to draug-daemon so its friction
-                            // map sees the same input pattern. Local
-                            // call stays for autodream's gating
-                            // (which still consults compositor's local
-                            // DraugDaemon) until autodream migrates.
                             libfolk::sys::draug::send_friction_signal(
                                 h, compositor::draug::FRICTION_QUICK_CLOSE);
-                            draug.friction.record_signal(h, compositor::draug::FRICTION_QUICK_CLOSE);
                             write_str("[Friction] quick_close for '");
                             write_str(&k[..k.len().min(30)]);
                             write_str("'\n");

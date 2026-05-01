@@ -1200,7 +1200,6 @@ pub(super) fn dispatch_legacy_command(
                     win.push_line("  --force: skip WASM cache");
                     win.push_line("  --tweak \"change\": modify cached version");
                 } else {
-                    ctx.draug.record_command(prompt);
                     if !flags.force {
                         if let Some(cached_wasm) = ctx.wasm.cache.get(prompt) {
                             win.push_line(&alloc::format!("[Cache] Hit: {} bytes", cached_wasm.len()));
