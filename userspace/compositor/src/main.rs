@@ -864,7 +864,7 @@ fn main() -> ! {
         {
             let ai = mcp_handler::tick_ai_systems(
                 &mut mcp, &mut wasm, &mut wm, &mut stream,
-                &mut draug, &mut briefing, &mut fb, &mut damage,
+                &mut draug, &mut briefing, draug_status, &mut fb, &mut damage,
                 &mut active_agent, &mut drivers_seeded,
                 tsc_per_us,
             );
