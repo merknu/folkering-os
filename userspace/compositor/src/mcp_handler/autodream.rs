@@ -14,13 +14,13 @@ use libfolk::sys::io::write_str;
 use libfolk::sys::{shmem_create, shmem_destroy, shmem_grant, shmem_map, shmem_unmap};
 use libfolk::sys::draug::{
     daemon_task_id, request_dream_decision, notify_dream_result,
+    notify_strike_add, notify_strike_reset,
     DREAM_MODE_REFACTOR, DREAM_MODE_CREATIVE, DREAM_MODE_NIGHTMARE,
     DREAM_MODE_DRIVER_REFACTOR, DREAM_MODE_DRIVER_NIGHTMARE,
     DREAM_RESULT_COMPLETE, DREAM_RESULT_CANCEL,
 };
 
 use compositor::damage::DamageTracker;
-use compositor::draug::DraugDaemon;
 use compositor::framebuffer::FramebufferView;
 use compositor::state::{McpState, WasmState};
 use compositor::window_manager::WindowManager;
@@ -46,7 +46,6 @@ pub(super) struct ChunkResult {
 pub(super) fn start_dream_cycle(
     mcp: &mut McpState,
     wasm: &mut WasmState,
-    draug: &mut DraugDaemon,
     fb: &FramebufferView,
     dream_ms: u64,
 ) {
@@ -155,7 +154,6 @@ pub(super) fn start_dream_cycle(
         write_str("[AutoDream] Send failed — cancelling dream\n");
         notify_dream_result(DREAM_RESULT_CANCEL);
         mcp.current_dream = None;
-        let _ = draug; // local lifecycle no longer driven from this path
         let _ = dream_ms;
     }
 }
@@ -275,7 +273,6 @@ pub(super) fn handle_wasm_chunk(
     mcp: &mut McpState,
     wasm: &mut WasmState,
     wm: &mut WindowManager,
-    draug: &mut DraugDaemon,
     briefing: &mut compositor::briefing::BriefingState,
     fb: &mut FramebufferView,
     damage: &mut DamageTracker,
@@ -520,7 +517,7 @@ pub(super) fn handle_wasm_chunk(
     // Phase A.5 step 2; the local `DraugDaemon::is_dreaming()` flag is
     // no longer consulted from this path.
     if mcp.current_dream.is_some() && !tool_prompt.is_empty() {
-        evaluate_dream_result(&wasm_bytes, &tool_prompt, mcp, wasm, draug, briefing, fb, tsc_per_us);
+        evaluate_dream_result(&wasm_bytes, &tool_prompt, mcp, wasm, briefing, fb, tsc_per_us);
     }
     // ── Normal cache storage (non-dream) ──
     else if !tool_prompt.is_empty() {
@@ -611,7 +608,6 @@ fn evaluate_dream_result(
     tool_prompt: &str,
     mcp: &mut McpState,
     wasm: &mut WasmState,
-    draug: &mut DraugDaemon,
     briefing: &mut compositor::briefing::BriefingState,
     fb: &FramebufferView,
     tsc_per_us: u64,
@@ -634,7 +630,7 @@ fn evaluate_dream_result(
 
     match dream_mode {
         compositor::draug::DreamMode::Refactor => {
-            evaluate_refactor(wasm_bytes, orig_key, wasm, draug, fb, tsc_per_us, &mut nb);
+            evaluate_refactor(wasm_bytes, orig_key, wasm, fb, tsc_per_us, &mut nb);
         }
         compositor::draug::DreamMode::Creative => {
             write_str("[AutoDream] ---- CREATIVE RESULT ----\n");
@@ -695,11 +691,16 @@ fn evaluate_refactor(
     wasm_bytes: &[u8],
     orig_key: &str,
     wasm: &mut WasmState,
-    draug: &mut DraugDaemon,
     fb: &FramebufferView,
     tsc_per_us: u64,
     nb: &mut [u8; 16],
 ) {
+    // Strike state lives on the daemon (Phase A.5 step 5). Compositor
+    // owns the V1-vs-V2 evaluation pipeline since the WASM runtime
+    // lives here, but the strike counters that gate `start_dream`
+    // priority-3 ("skip perfected apps") are daemon state — we IPC
+    // them across.
+    let key_hash = compositor::draug::DraugDaemon::key_hash_pub(orig_key);
     write_str("[AutoDream] ---- REFACTOR RESULT ----\n");
     // Amnesia fix: load V1 from VFS if not in cache
     if !wasm.cache.contains_key(orig_key) {
@@ -740,14 +741,14 @@ fn evaluate_refactor(
         write_str("[AutoDream] VERDICT: STRIKE (Lobotomy — V2 draws 0 commands vs V1:");
         write_str(format_usize(v1_cmds, nb));
         write_str(")\n");
-        draug.add_strike(orig_key);
+        notify_strike_add(key_hash);
     } else if v1_cmds > 0 && (v2_cmds * 2) < v1_cmds {
         write_str("[AutoDream] VERDICT: STRIKE (Degradation — V2:");
         write_str(format_usize(v2_cmds, nb));
         write_str(" cmds vs V1:");
         write_str(format_usize(v1_cmds, nb));
         write_str(")\n");
-        draug.add_strike(orig_key);
+        notify_strike_add(key_hash);
     } else {
         write_str("[AutoDream] Sanity: V1=");
         write_str(format_usize(v1_cmds, nb));
@@ -788,7 +789,7 @@ fn evaluate_refactor(
             }
             if !fuzz_pass {
                 write_str("[AutoDream] VERDICT: STRIKE (failed edge-case fuzz)\n");
-                draug.add_strike(orig_key);
+                notify_strike_add(key_hash);
             } else {
                 let pct = ((v1_us - v2_us) * 100 / v1_us.max(1)) as usize;
                 write_str("[AutoDream] VERDICT: EVOLVED! ");
@@ -796,16 +797,17 @@ fn evaluate_refactor(
                 write_str("% faster (fuzz: OK)\n");
                 wasm.cache.insert(alloc::string::String::from(orig_key),
                     alloc::vec::Vec::from(wasm_bytes));
-                draug.reset_strikes(orig_key);
+                notify_strike_reset(key_hash);
             }
         } else {
             write_str("[AutoDream] VERDICT: STRIKE (V2 not faster)\n");
-            draug.add_strike(orig_key);
+            notify_strike_add(key_hash);
         }
     }
-    if draug.is_perfected(orig_key) {
-        write_str("[AutoDream] STATUS: PERFECTED\n");
-    }
+    // The "STATUS: PERFECTED" cosmetic print used to read local
+    // `draug.is_perfected(orig_key)` — dropped along with the local
+    // strike state. The daemon's `start_dream` filters perfected apps
+    // out of dream targeting, which is the only behaviour that matters.
 }
 
 fn evaluate_nightmare(wasm_bytes: &[u8], orig_key: &str, wasm: &mut WasmState) {

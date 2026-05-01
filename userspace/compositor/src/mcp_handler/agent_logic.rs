@@ -129,7 +129,7 @@ pub(super) fn tick(
             && draug.complex_task_idx >= compositor::draug::COMPLEX_TASK_COUNT
     };
     if dream_gate_open {
-        autodream::start_dream_cycle(mcp, wasm, draug, fb, dream_ms);
+        autodream::start_dream_cycle(mcp, wasm, fb, dream_ms);
     }
 
     // Wake Draug from dream if user interacts. Authoritative dream
@@ -209,7 +209,7 @@ pub(super) fn tick(
                 } => {
                     // Delegate WasmChunk handling to autodream module
                     let result = autodream::handle_wasm_chunk(
-                        total_chunks, &data[..], mcp, wasm, wm, draug, briefing, fb, damage,
+                        total_chunks, &data[..], mcp, wasm, wm, briefing, fb, damage,
                         drivers_seeded, tsc_per_us, &mut need_redraw,
                     );
                     if result.early_return {

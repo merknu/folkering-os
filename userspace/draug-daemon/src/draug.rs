@@ -1233,7 +1233,13 @@ impl DraugDaemon {
 
     /// Record a refactoring failure (strike)
     pub fn add_strike(&mut self, key: &str) {
-        let h = Self::key_hash(key);
+        self.add_strike_by_hash(Self::key_hash(key));
+    }
+
+    /// Same as `add_strike` but takes the precomputed hash directly.
+    /// Used by the IPC handler so we don't have to ship the key string
+    /// over the wire.
+    pub fn add_strike_by_hash(&mut self, h: u32) {
         // Find existing entry or empty slot
         for slot in &mut self.strikes {
             if let Some((k, c)) = slot {
@@ -1248,7 +1254,11 @@ impl DraugDaemon {
 
     /// Reset strikes for an app (e.g., after user tweaks it)
     pub fn reset_strikes(&mut self, key: &str) {
-        let h = Self::key_hash(key);
+        self.reset_strikes_by_hash(Self::key_hash(key));
+    }
+
+    /// Same as `reset_strikes` but takes the precomputed hash directly.
+    pub fn reset_strikes_by_hash(&mut self, h: u32) {
         for slot in &mut self.strikes {
             if let Some((k, _)) = slot {
                 if *k == h { *slot = None; return; }
