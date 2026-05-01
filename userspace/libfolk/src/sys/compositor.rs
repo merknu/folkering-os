@@ -25,12 +25,19 @@ use crate::syscall::{syscall3, SYS_IPC_SEND};
 
 /// Compositor service task ID (spawned at boot as Task 4)
 ///
-/// Task layout:
+/// Task layout (post Phase A.6, PR #84):
 /// - Task 1: Idle/kernel
 /// - Task 2: Synapse (Data Kernel)
 /// - Task 3: Shell
-/// - Task 4: Compositor (Semantic Mirror)
-pub const COMPOSITOR_TASK_ID: u32 = 4;
+/// - Task 4: draug-daemon (explicit kernel spawn from ramdisk)
+/// - Task 5: Compositor (first entry in the generic ramdisk loop)
+///
+/// Pre-A.6 compositor was task 4. Without bumping this const after
+/// #84, daemon's `shmem_grant(handle, COMPOSITOR_TASK_ID)` granted
+/// to itself, and compositor's later `shmem_map` returned `Unknown`.
+/// The retry path in `attach_status_with_retry` couldn't help — the
+/// grant target was wrong, not just slow.
+pub const COMPOSITOR_TASK_ID: u32 = 5;
 
 // ============================================================================
 // Operation Codes (must match compositor/src/main.rs)
