@@ -27,3 +27,4 @@ pub mod agent_planner;
 pub mod refactor_loop;
 pub mod draug_async;
 pub mod prevalidate;
+pub mod project;
