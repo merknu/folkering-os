@@ -17,6 +17,12 @@ path = "src/lib.rs"
 # Core Folkering userspace library
 libfolk = { path = "../libfolk", features = ["mcp"] }
 
+# Draug daemon (lib half) — Phase A migration: shared data types
+# (RefactorTask, TaskStatus, …) move here as they're extracted out of
+# compositor. Compositor will lose this dep entirely in Phase A.5
+# once all communication switches to IPC + status shmem.
+draug-daemon = { path = "../draug-daemon" }
+
 # AccessKit schema for UI tree
 libaccesskit-folk = { path = "../libaccesskit-folk" }
 

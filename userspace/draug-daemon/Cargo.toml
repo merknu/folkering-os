@@ -1,0 +1,24 @@
+[package]
+name = "draug-daemon"
+version = "0.1.0"
+edition = "2021"
+description = "Draug — autonomous AI agent for Folkering OS, isolated from compositor"
+authors = ["Folkering OS Team"]
+
+[lib]
+name = "draug_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "draug-daemon"
+path = "src/main.rs"
+
+[dependencies]
+libfolk = { path = "../libfolk", features = ["mcp"] }
+
+# FBP protocol parser — same dep as compositor. knowledge_hunt walks
+# SemanticNode trees from the host-side proxy.
+fbp-rs = { path = "../../tools/fbp-rs", default-features = false }
+
+[features]
+default = []

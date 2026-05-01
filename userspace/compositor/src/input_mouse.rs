@@ -112,6 +112,10 @@ pub fn process_mouse(
     if had_mouse_events {
         // Tell Draug the user is actively interacting
         let input_ms = if tsc_per_us > 0 { rdtsc() / tsc_per_us / 1000 } else { 0 };
+        // Phase A.5: forward to draug-daemon over IPC. Local update
+        // stays for the transition window — see input_keyboard.rs for
+        // the full rationale.
+        libfolk::sys::draug::send_user_input(input_ms);
         draug.on_user_input(input_ms);
         // Hover detection for folder preview (home view)
         if render.open_folder < 0 && wasm.active_app.is_none() {

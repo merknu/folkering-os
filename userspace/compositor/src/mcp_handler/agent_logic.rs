@@ -19,7 +19,7 @@ use compositor::window_manager::WindowManager;
 
 use crate::util::format_usize;
 
-use super::{autodream, knowledge_hunt, rdtsc, AiTickResult};
+use super::{autodream, rdtsc, AiTickResult};
 
 pub(super) fn tick(
     mcp: &mut McpState,
@@ -61,34 +61,15 @@ pub(super) fn tick(
         }
     }
 
-    // ===== Draug: Background AI daemon tick =====
-    {
-        let now_ms = if tsc_per_us > 0 { rdtsc() / tsc_per_us / 1000 } else { libfolk::sys::uptime() };
-        if draug.should_tick(now_ms) {
-            draug.tick(now_ms);
-            let mut nb = [0u8; 16];
-            if draug.observation_count() % 6 == 1 || draug.observation_count() <= 3 {
-                write_str("[Draug] Tick #");
-                write_str(format_usize(draug.observation_count(), &mut nb));
-                let idle_ms = now_ms.saturating_sub(draug.last_input_ms());
-                write_str(" | idle: ");
-                write_str(format_usize((idle_ms / 1000) as usize, &mut nb));
-                write_str("s | dreams: ");
-                write_str(format_usize(draug.dream_count() as usize, &mut nb));
-                write_str("/");
-                write_str(format_usize(compositor::draug::DREAM_MAX_PER_SESSION as usize, &mut nb));
-                write_str("\n");
-            }
-        }
-        if draug.should_analyze(now_ms) && active_agent.is_none() {
-            if draug.start_analysis(now_ms) {
-                let mut nb = [0u8; 16];
-                write_str("[Draug] Analysis #");
-                write_str(format_usize(draug.analysis_count() as usize, &mut nb));
-                write_str("/5 started\n");
-            }
-        }
-    }
+    // ===== Phase A.5 (Path A): Draug self-analysis moved to daemon
+    // (direct TCP via libfolk::sys::llm_generate, see
+    // draug_async::start_analysis_via_tcp). Compositor's local
+    // DraugDaemon no longer drives `should_tick` / `should_analyze`
+    // / `check_waiting_timeout` — those run in the daemon's tick
+    // loop, alongside refactor/knowledge-hunt/pattern-mining.
+    //
+    // The dream timeout housekeeping that lived here also moved
+    // (the daemon owns the analysis-wait state machine now).
 
     // ===== Tick WASM Drivers =====
     if !wasm.active_drivers.is_empty() {
@@ -98,102 +79,17 @@ pub(super) fn tick(
         }
     }
 
-    // ===== Draug/Dream timeout =====
-    {
-        let timeout_ms = if tsc_per_us > 0 { rdtsc() / tsc_per_us / 1000 } else { 0 };
-        if draug.check_waiting_timeout(timeout_ms) {
-            write_str("[Draug] Timeout — giving up on LLM response\n");
-        }
-    }
-
-    // ===== Pattern-Mining =====
-    {
-        let mine_ms = if tsc_per_us > 0 { rdtsc() / tsc_per_us / 1000 } else { 0 };
-        if draug.should_mine_patterns(mine_ms)
-            && active_agent.is_none()
-            && mcp.async_tool_gen.is_none()
-            && !draug.should_yield_tokens(active_agent.is_some(), mine_ms)
-        {
-            if let Some(insight) = draug.mine_patterns(mine_ms) {
-                write_str("[Draug] Insight: ");
-                let show_len = insight.len().min(80);
-                write_str(&insight[..show_len]);
-                write_str("\n");
-            }
-        }
-    }
-
-    // ===== Phase 7 — Knowledge Hunt =====
+    // ===== Phase A.5 step 2.2: pattern mining / knowledge hunt /
+    // refactor loop / kernel-bridge update all moved to draug-daemon.
+    // The daemon's main loop (`run_draug_tick`) drives those paths
+    // and writes status into the shmem region. Compositor's local
+    // DraugDaemon no longer participates in any TCP-bound agent
+    // work; only the MCP-routed `start_analysis` path below stays
+    // here, because compositor still owns the MCP poll/dispatch.
     //
-    // Fires once per boot when the user has been idle for ~15 s.
-    // Gated before AutoDream because it's a single cheap fetch, and
-    // we want it to land BEFORE the 45-minute AutoDream threshold so
-    // the demo is visible without a long wait.
-    {
-        let hunt_ms = if tsc_per_us > 0 { rdtsc() / tsc_per_us / 1000 } else { libfolk::sys::uptime() };
-        if draug.should_hunt_knowledge(hunt_ms)
-            && active_agent.is_none()
-            && mcp.async_tool_gen.is_none()
-        {
-            knowledge_hunt::run(draug);
-            did_work = true;
-        }
-    }
-
-    // ===== Phase 13 — Overnight refactor loop (async) =====
-    //
-    // Non-blocking: tick_async returns in <1ms via EAGAIN polling.
-    // UI renders between phases. Falls back to blocking for Phase 15.
-    {
-        let refactor_ms = if tsc_per_us > 0 { rdtsc() / tsc_per_us / 1000 } else { libfolk::sys::uptime() };
-
-        // Async state machine: <1ms per frame, never blocks UI.
-        // Handles both skill tree (L1-L3) and Phase 15 Plan-and-Solve.
-        if draug.async_phase != compositor::draug::AsyncPhase::Idle {
-            // In-progress async operation — always poll (bypass gate)
-            if super::draug_async::tick_async(draug, refactor_ms) {
-                did_work = true;
-            }
-        } else if draug.should_run_refactor_step(refactor_ms)
-            && active_agent.is_none()
-            && mcp.async_tool_gen.is_none()
-        {
-            // Start new iteration via async path
-            if super::draug_async::tick_async(draug, refactor_ms) {
-                did_work = true;
-            }
-        }
-    }
-
-    // ===== Draug Bridge: push status to kernel for TCP shell =====
-    // Rate-limited: every 60 ticks (~1/sec at 60Hz) to avoid
-    // unnecessary syscall overhead.
-    {
-        static BRIDGE_COUNTER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-        let count = BRIDGE_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if count % 60 == 0 {
-            let paused = libfolk::sys::draug_bridge_update(
-                draug.refactor_iter,
-                draug.refactor_passed,
-                draug.refactor_failed,
-                draug.refactor_retries,
-                draug.tasks_at_level(1) as u8,
-                draug.tasks_at_level(2) as u8,
-                draug.tasks_at_level(3) as u8,
-                if draug.plan_mode_active { 1 } else { 0 },
-                draug.complex_task_idx as u8,
-                if draug.refactor_hibernating { 1 } else { 0 },
-                draug.consecutive_skips.min(255) as u8,
-            );
-            if paused && draug.is_active() {
-                draug.set_active(false);
-                write_str("[Draug] PAUSED via remote shell\n");
-            } else if !paused && !draug.is_active() {
-                draug.set_active(true);
-                write_str("[Draug] RESUMED via remote shell\n");
-            }
-        }
-    }
+    // Removing these blocks eliminates the duplicate-LLM-cost issue
+    // that A.5 step 1 introduced (daemon and compositor both
+    // ticking).
 
     // ===== AutoDream cycle start (delegates to autodream module) =====
     // Phase 14: don't dream if the skill tree still has work to do —
@@ -377,13 +273,6 @@ fn handle_chat_response(
             _ => {}
         }
         *need_redraw = true;
-    } else if draug.is_waiting() {
-        if let Some(alert) = draug.on_analysis_response(resp_text) {
-            write_str(&alert);
-            write_str("\n");
-        } else {
-            write_str("[Draug] Analysis complete (no action needed)\n");
-        }
     } else if draug.is_dreaming() {
         write_str("[AutoDream] Error from proxy: ");
         write_str(&resp_text[..resp_text.len().min(80)]);
