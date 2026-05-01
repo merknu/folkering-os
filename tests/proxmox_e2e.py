@@ -7,15 +7,19 @@ Tests: boot, DHCP, DNS, WASM gen, firewall, AutoDream, COM3 injection, stress.
 Usage: python tests/proxmox_e2e.py
 """
 
+import os
 import socket
 import time
 import sys
 import subprocess
 
-PROXMOX = "192.168.68.150"
-VM_ID = 900
-COM3_PORT = 4568
-SERIAL_LOG = "/tmp/folkering-serial.log"
+# Override via FOLKERING_PROXMOX_HOST / FOLKERING_VM_ID. Defaults match
+# the historical demo target so `python tests/proxmox_e2e.py` still
+# works on the original setup.
+PROXMOX = os.environ.get("FOLKERING_PROXMOX_HOST", "192.168.68.150")
+VM_ID = int(os.environ.get("FOLKERING_VM_ID", "900"))
+COM3_PORT = int(os.environ.get("FOLKERING_COM3_PORT", "4568"))
+SERIAL_LOG = os.environ.get("FOLKERING_SERIAL_LOG", "/tmp/folkering-serial.log")
 
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")

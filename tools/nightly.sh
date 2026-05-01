@@ -7,8 +7,13 @@
 # Cron:  0 3 * * * cd /c/Users/merkn/folkering/folkering-os && bash tools/nightly.sh >> logs/nightly.log 2>&1
 
 set -e
-PROXMOX="root@192.168.68.150"
-VMID=900
+# Override via env: FOLKERING_PROXMOX_HOST / _USER / _VM_ID. Defaults
+# are the historical demo target so a bare `bash tools/nightly.sh`
+# still works on the original setup.
+PROXMOX_USER="${FOLKERING_PROXMOX_USER:-root}"
+PROXMOX_HOST="${FOLKERING_PROXMOX_HOST:-192.168.68.150}"
+PROXMOX="${PROXMOX_USER}@${PROXMOX_HOST}"
+VMID="${FOLKERING_VM_ID:-900}"
 PROJECT="/c/Users/merkn/folkering/folkering-os"
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 
