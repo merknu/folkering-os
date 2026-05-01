@@ -93,6 +93,7 @@ pub fn tick_ai_systems(
     wm: &mut WindowManager,
     stream: &mut StreamState,
     draug: &mut DraugDaemon,
+    briefing: &mut compositor::briefing::BriefingState,
     fb: &mut FramebufferView,
     damage: &mut DamageTracker,
     active_agent: &mut Option<AgentSession>,
@@ -100,7 +101,7 @@ pub fn tick_ai_systems(
     tsc_per_us: u64,
 ) -> AiTickResult {
     agent_logic::tick(
-        mcp, wasm, wm, stream, draug, fb, damage, active_agent, drivers_seeded, tsc_per_us,
+        mcp, wasm, wm, stream, draug, briefing, fb, damage, active_agent, drivers_seeded, tsc_per_us,
     )
 }
 

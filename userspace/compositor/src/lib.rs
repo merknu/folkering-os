@@ -69,6 +69,7 @@ pub mod window_manager;
 pub mod agent;
 pub mod draug;
 pub mod refactor_types;
+pub mod briefing;
 
 extern crate alloc;
 

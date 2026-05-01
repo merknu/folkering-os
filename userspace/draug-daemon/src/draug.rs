@@ -276,18 +276,6 @@ pub enum DreamMode {
     DriverNightmare,
 }
 
-/// Pending creative changes awaiting user approval ("Morning Briefing")
-pub struct PendingCreative {
-    pub app_name: alloc::string::String,
-    pub description: alloc::string::String, // what changed
-    pub wasm_bytes: alloc::vec::Vec<u8>,
-    pub accepted: Option<bool>, // None = pending, Some(true) = accepted, Some(false) = rejected
-}
-
-/// Maximum pending creative changes
-/// Cap pending creative items to limit heap use (~50KB WASM each).
-pub const MAX_PENDING_CREATIVE: usize = 3;
-
 /// System observation snapshot
 pub struct Observation {
     pub timestamp_ms: u64,
@@ -437,9 +425,6 @@ pub struct DraugDaemon {
 
     /// Dream journal: tracks which app was dreamt about most recently.
     dream_journal: [Option<(u32, u32)>; 16],
-
-    /// Morning Briefing: creative changes pending user approval
-    pub pending_creative: alloc::vec::Vec<PendingCreative>,
 
     /// Friction Sensor: tracks user frustration per app
     pub friction: FrictionTracker,
@@ -601,7 +586,6 @@ impl DraugDaemon {
             dream_mode: DreamMode::Refactor,
             strikes: [const { None }; 8],
             dream_journal: [const { None }; 16],
-            pending_creative: alloc::vec::Vec::new(),
             friction: FrictionTracker::new(),
             crash_hashes: [(0, 0); 8],
             last_pattern_mine_ms: 0,
@@ -1624,67 +1608,9 @@ impl DraugDaemon {
     pub fn is_waiting(&self) -> bool { self.waiting_for_llm }
     pub fn analysis_count(&self) -> u32 { self.analysis_count }
 
-    // ═══════ Morning Briefing: User Approval of Creative Changes ════════
-
-    /// Queue a creative change for user approval (NOT auto-accepted).
-    pub fn queue_creative(&mut self, app_name: &str, description: &str, wasm: alloc::vec::Vec<u8>) {
-        if self.pending_creative.len() >= MAX_PENDING_CREATIVE {
-            self.pending_creative.remove(0); // Drop oldest
-        }
-        self.pending_creative.push(PendingCreative {
-            app_name: String::from(app_name),
-            description: String::from(description),
-            wasm_bytes: wasm,
-            accepted: None,
-        });
-    }
-
-    /// Check if there are pending creative changes to show the user.
-    pub fn has_pending_creative(&self) -> bool {
-        self.pending_creative.iter().any(|p| p.accepted.is_none())
-    }
-
-    /// Get pending creative changes for the Morning Briefing.
-    pub fn pending_count(&self) -> usize {
-        self.pending_creative.iter().filter(|p| p.accepted.is_none()).count()
-    }
-
-    /// Accept a pending creative change by index.
-    pub fn accept_creative(&mut self, idx: usize) {
-        if idx < self.pending_creative.len() {
-            self.pending_creative[idx].accepted = Some(true);
-        }
-    }
-
-    /// Reject a pending creative change by index.
-    pub fn reject_creative(&mut self, idx: usize) {
-        if idx < self.pending_creative.len() {
-            self.pending_creative[idx].accepted = Some(false);
-        }
-    }
-
-    /// Accept all pending creative changes.
-    pub fn accept_all_creative(&mut self) {
-        for p in &mut self.pending_creative {
-            if p.accepted.is_none() { p.accepted = Some(true); }
-        }
-    }
-
-    /// Get accepted creative WASMs (to apply to cache) and clear them.
-    pub fn drain_accepted(&mut self) -> alloc::vec::Vec<(String, alloc::vec::Vec<u8>)> {
-        let mut result = alloc::vec::Vec::new();
-        self.pending_creative.retain(|p| {
-            if p.accepted == Some(true) {
-                result.push((p.app_name.clone(), p.wasm_bytes.clone()));
-                false // remove from pending
-            } else if p.accepted == Some(false) {
-                false // remove rejected too
-            } else {
-                true // keep pending
-            }
-        });
-        result
-    }
+    // Morning Briefing (`pending_creative` queue) was extracted into
+    // `compositor::briefing::BriefingState` in Phase A.5 step 3 — it
+    // was always compositor UI state, never agent state.
 
     // ═══════ Token Scheduler: Attention-Based LLM Priority ══════════
     //

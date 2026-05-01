@@ -63,6 +63,7 @@ pub struct DispatchContext<'a> {
     pub mcp: &'a mut McpState,
     pub stream: &'a mut StreamState,
     pub draug: &'a mut DraugDaemon,
+    pub briefing: &'a mut compositor::briefing::BriefingState,
     pub fb: &'a mut FramebufferView,
     pub damage: &'a mut DamageTracker,
     pub com3_queue: &'a mut Vec<String>,

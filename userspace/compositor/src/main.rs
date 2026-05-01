@@ -628,6 +628,7 @@ fn main() -> ! {
     // tz_offset_minutes, tz_synced, tz_sync_pending now in mcp
     let mut active_agent: Option<compositor::agent::AgentSession> = None; // ReAct agentic loop
     let mut draug = compositor::draug::DraugDaemon::new();
+    let mut briefing = compositor::briefing::BriefingState::new();
 
     // Phase A.5 step 2.3: read draug state from the daemon's status
     // shmem instead of the local DraugDaemon for the fields the
@@ -863,7 +864,7 @@ fn main() -> ! {
         {
             let ai = mcp_handler::tick_ai_systems(
                 &mut mcp, &mut wasm, &mut wm, &mut stream,
-                &mut draug, &mut fb, &mut damage,
+                &mut draug, &mut briefing, &mut fb, &mut damage,
                 &mut active_agent, &mut drivers_seeded,
                 tsc_per_us,
             );
@@ -1032,6 +1033,7 @@ fn main() -> ! {
                 mcp: &mut mcp,
                 stream: &mut stream,
                 draug: &mut draug,
+                briefing: &mut briefing,
                 fb: &mut fb,
                 damage: &mut damage,
                 com3_queue: &mut com3_queue,

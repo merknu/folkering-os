@@ -668,8 +668,8 @@ pub(super) fn dispatch_legacy_command(
                     win.push_line("Example: revert ball 1");
                 }
             } else if cmd_str == "dream accept all" || cmd_str == "dream accept" {
-                ctx.draug.accept_all_creative();
-                let accepted = ctx.draug.drain_accepted();
+                ctx.briefing.accept_all();
+                let accepted = ctx.briefing.drain_accepted();
                 for (name, wasm_bytes) in &accepted {
                     ctx.wasm.cache.insert(name.clone(), wasm_bytes.clone());
                     win.push_line(&alloc::format!("[Dream] Accepted: {}", &name[..name.len().min(30)]));
@@ -678,16 +678,16 @@ pub(super) fn dispatch_legacy_command(
                     win.push_line("[Dream] No pending changes");
                 }
             } else if cmd_str == "dream reject all" || cmd_str == "dream reject" {
-                for i in 0..ctx.draug.pending_creative.len() {
-                    ctx.draug.reject_creative(i);
+                for i in 0..ctx.briefing.items.len() {
+                    ctx.briefing.reject(i);
                 }
-                ctx.draug.drain_accepted();
+                ctx.briefing.drain_accepted();
                 win.push_line("[Dream] All creative changes rejected");
             } else if cmd_str.starts_with("dream accept ") {
                 if let Ok(idx) = cmd_str[13..].trim().parse::<usize>() {
-                    if idx > 0 && idx <= ctx.draug.pending_creative.len() {
-                        ctx.draug.accept_creative(idx - 1);
-                        let accepted = ctx.draug.drain_accepted();
+                    if idx > 0 && idx <= ctx.briefing.items.len() {
+                        ctx.briefing.accept(idx - 1);
+                        let accepted = ctx.briefing.drain_accepted();
                         for (name, wasm_bytes) in &accepted {
                             ctx.wasm.cache.insert(name.clone(), wasm_bytes.clone());
                             win.push_line(&alloc::format!("[Dream] Accepted: {}", name));
@@ -698,9 +698,9 @@ pub(super) fn dispatch_legacy_command(
                 }
             } else if cmd_str.starts_with("dream reject ") {
                 if let Ok(idx) = cmd_str[13..].trim().parse::<usize>() {
-                    if idx > 0 && idx <= ctx.draug.pending_creative.len() {
-                        ctx.draug.reject_creative(idx - 1);
-                        ctx.draug.drain_accepted();
+                    if idx > 0 && idx <= ctx.briefing.items.len() {
+                        ctx.briefing.reject(idx - 1);
+                        ctx.briefing.drain_accepted();
                         win.push_line("[Dream] Rejected");
                     }
                 }
