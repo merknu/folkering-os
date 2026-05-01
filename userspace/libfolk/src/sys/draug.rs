@@ -164,6 +164,19 @@ pub const DRAUG_OP_INSTALL_REFACTOR_TASKS: u64 = 0x0003;
 ///           the daemon has not yet allocated the region.
 pub const DRAUG_OP_GET_STATUS_HANDLE: u64 = 0x0004;
 
+/// Friction-sensor signal — compositor's input handlers detect
+/// frustration patterns (ESC <3s after open, rage-click bursts) and
+/// forward them so the daemon's friction map sees the same signals
+/// the local DraugDaemon does. Until this op landed, daemon's
+/// friction sensor only saw `WASM_CRASH` events; autodream's
+/// "is this app problematic?" gating in compositor-local Draug had
+/// a complete picture, daemon-local Draug did not.
+/// Request:  payload0 = OP_FRICTION_SIGNAL
+///                    | (key_hash << 16)        // 32 bits
+///                    | (weight  << 48)         // 16 bits
+/// Reply:    DRAUG_STATUS_OK
+pub const DRAUG_OP_FRICTION_SIGNAL: u64 = 0x0005;
+
 // ============================================================================
 // Status Codes (reply payload0)
 // ============================================================================
@@ -227,6 +240,22 @@ pub fn record_crash(key_hash: u64) {
     let _ = ipc::send(daemon_task_id(), payload, 0);
 }
 
+/// Forward a friction-sensor signal to the daemon. Compositor's
+/// input handlers detect ESC-quick-close and rage-click patterns;
+/// without this forwarding the daemon's friction map sees only
+/// `WASM_CRASH` events.
+///
+/// Fire-and-forget — the IPC reply is ignored. Losing one signal
+/// just means the daemon's friction estimate is one tick stale,
+/// which the decay path absorbs.
+#[inline]
+pub fn send_friction_signal(key_hash: u32, weight: u16) {
+    let payload = DRAUG_OP_FRICTION_SIGNAL
+        | ((key_hash as u64) << 16)
+        | ((weight as u64) << 48);
+    let _ = ipc::send(daemon_task_id(), payload, 0);
+}
+
 /// Hand the boot-time refactor-task list to the daemon. The caller
 /// owns a shmem region containing the serialised tasks; this function
 /// transfers a handle.
@@ -277,6 +306,15 @@ pub fn unpack_shmem_size(payload0: u64) -> (u32, u32) {
     let shmem_handle = ((payload0 >> 16) & 0xFF_FFFF) as u32;
     let total_size = ((payload0 >> 40) & 0xFF_FFFF) as u32;
     (shmem_handle, total_size)
+}
+
+/// Decode `(key_hash, weight)` from a payload0 that uses the
+/// `FRICTION_SIGNAL` packing.
+#[inline]
+pub fn unpack_friction(payload0: u64) -> (u32, u16) {
+    let hash = ((payload0 >> 16) & 0xFFFF_FFFF) as u32;
+    let weight = ((payload0 >> 48) & 0xFFFF) as u16;
+    (hash, weight)
 }
 
 // ============================================================================
