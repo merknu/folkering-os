@@ -13,9 +13,19 @@ pub(super) fn transmit_packet_inner(dev: &mut VirtIONet, frame: &[u8]) -> Result
         return Err(NetError::DeviceFailed);
     }
 
-    // Drain any completed TX descriptors first
+    // Drain any completed TX descriptors first.
+    // Each descriptor has a 4 KB physical page bound to its `addr`
+    // field — `free_desc` only releases the descriptor index back
+    // to the queue's free list. We must free the page too, otherwise
+    // every outbound packet leaks 4 KB. Under sustained TCP/UDP
+    // flood at 200 pps, the leak compounds to ~70 MB/min — see #54
+    // for the live-Proxmox repro that surfaced this.
     while let Some((done_idx, _)) = dev.tx_queue.pop_used() {
+        let desc_addr = unsafe { (*dev.tx_queue.desc(done_idx)).addr } as usize;
         dev.tx_queue.free_desc(done_idx);
+        if desc_addr != 0 {
+            crate::memory::physical::free_page(desc_addr);
+        }
     }
 
     // Allocate a descriptor
