@@ -632,17 +632,35 @@ fn main() -> ! {
     // Phase A.5 step 6: compositor's local `DraugDaemon` is gone.
     // All agent state lives in the daemon process; reads come over
     // the status shmem. Phase A.6 (#84) pinned daemon to task 4 so
-    // it boots before compositor — `attach_status` should succeed
-    // on the first try in normal flow. The `None` branch below is
-    // a defensive fallback for the IPC path being broken altogether
-    // (e.g. daemon ELF missing from the ramdisk).
+    // it boots before compositor — but "spawn order" doesn't
+    // guarantee "init order", and on a cold boot the scheduler can
+    // hand compositor a time slice before daemon has finished
+    // `boot_status_shmem`. Use the retry variant so the IPC path
+    // gets up to ~50 yields to settle before we give up.
     let draug_status: Option<&'static libfolk::sys::draug::DraugStatus> =
-        libfolk::sys::draug::attach_status().ok();
-    if draug_status.is_some() {
-        libfolk::sys::io::write_str("[Draug] status shmem attached — HUD reads from daemon\n");
-    } else {
-        libfolk::sys::io::write_str("[Draug] WARNING: status shmem unavailable — autodream gate stays closed\n");
-    }
+        match libfolk::sys::draug::attach_status_with_retry(50) {
+            Ok(s) => {
+                libfolk::sys::io::write_str("[Draug] status shmem attached — HUD reads from daemon\n");
+                Some(s)
+            }
+            Err(libfolk::sys::draug::AttachError::Daemon(_)) => {
+                libfolk::sys::io::write_str("[Draug] WARNING: daemon IPC unreachable after retries\n");
+                None
+            }
+            Err(libfolk::sys::draug::AttachError::Map(_)) => {
+                libfolk::sys::io::write_str("[Draug] WARNING: shmem_map failed\n");
+                None
+            }
+            Err(libfolk::sys::draug::AttachError::LayoutMismatch { expected, found }) => {
+                libfolk::sys::io::write_str("[Draug] WARNING: layout mismatch (expected v");
+                let mut nb = [0u8; 16];
+                libfolk::sys::io::write_str(crate::util::format_usize(expected as usize, &mut nb));
+                libfolk::sys::io::write_str(", found v");
+                libfolk::sys::io::write_str(crate::util::format_usize(found as usize, &mut nb));
+                libfolk::sys::io::write_str(")\n");
+                None
+            }
+        };
 
     // `restore_state` runs in the daemon (`draug-daemon::main`)
     // against the same Synapse file. The boot-time print of restored

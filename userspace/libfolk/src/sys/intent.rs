@@ -25,9 +25,17 @@ use crate::syscall::{syscall3, SYS_IPC_SEND};
 // Well-Known Task ID
 // ============================================================================
 
-/// Intent Service task ID (spawned after compositor)
-/// Task layout: 1=Idle, 2=Synapse, 3=Shell, 4=Compositor, 5=IntentService
-pub const INTENT_TASK_ID: u32 = 5;
+/// Intent Service task ID. Phase A.6 (#84) inserted draug-daemon at
+/// task 4, shifting everything in the generic ramdisk loop by one.
+/// Task layout (post-A.6):
+///   1 = Idle / kernel
+///   2 = Synapse
+///   3 = Shell
+///   4 = draug-daemon  (explicit kernel spawn)
+///   5 = Compositor    (first generic-loop entry)
+///   6 = Intent Service (next generic-loop entry)
+///   7 = draug-streamer
+pub const INTENT_TASK_ID: u32 = 6;
 
 // ============================================================================
 // Operation Codes

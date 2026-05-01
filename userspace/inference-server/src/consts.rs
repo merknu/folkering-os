@@ -4,7 +4,12 @@ use libfolk::sys::block::SECTOR_SIZE;
 
 // ── IPC opcodes (must match libfolk::sys::inference) ───────────────────
 
-pub const INFERENCE_TASK_ID: u32 = 6;
+// Phase A.6 (#84) shifted task slots: draug-daemon now occupies 4
+// (explicit kernel spawn), so the generic-loop entries start at 5.
+// In Phase 5 Hybrid AI mode the kernel skips inference entirely, so
+// this const is mostly a fallback. If the skip is removed, inference
+// would land at 7 (after compositor=5, intent-service=6).
+pub const INFERENCE_TASK_ID: u32 = 7;
 
 pub const INFER_OP_PING: u64 = 0;
 pub const INFER_OP_GENERATE: u64 = 1;

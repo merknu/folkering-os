@@ -660,3 +660,38 @@ pub fn attach_status() -> Result<&'static DraugStatus, AttachError> {
     }
     Ok(status)
 }
+
+/// `attach_status` with retry. Phase A.6 (#84) made the kernel spawn
+/// draug-daemon before compositor, but "spawn order" doesn't
+/// guarantee "init order" — when the scheduler hands compositor a
+/// time slice before daemon has finished `boot_status_shmem`, the
+/// `GET_STATUS_HANDLE` IPC returns ERR (or `Unreachable` if the
+/// daemon's IPC loop hasn't started yet) and the gate stays closed
+/// for the rest of the session.
+///
+/// This wrapper retries with `yield_cpu()` between attempts, giving
+/// the daemon a chance to catch up. `max_attempts = 50` × 1 ms-ish
+/// scheduler ticks puts a ~50 ms cap on boot delay, which is well
+/// below human perception and well above any plausible boot-race
+/// window.
+pub fn attach_status_with_retry(
+    max_attempts: u32,
+) -> Result<&'static DraugStatus, AttachError> {
+    let mut last_err = AttachError::Daemon(DraugError::Unreachable);
+    for _ in 0..max_attempts {
+        match attach_status() {
+            Ok(status) => return Ok(status),
+            Err(e @ AttachError::LayoutMismatch { .. }) => return Err(e),
+            // For Daemon (IPC unreachable / status err) and Map
+            // errors: retry. The first happens during the boot race;
+            // the second can happen if the handle came back stale —
+            // either way, yielding lets the daemon drive its boot
+            // sequence forward.
+            Err(e) => {
+                last_err = e;
+                crate::sys::yield_cpu();
+            }
+        }
+    }
+    Err(last_err)
+}
