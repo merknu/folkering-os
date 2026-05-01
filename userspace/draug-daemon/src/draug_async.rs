@@ -417,6 +417,30 @@ fn start_patch_request(draug: &mut DraugDaemon, code: &str) -> bool {
     draug.async_response.clear();
     draug.async_operation = AsyncOp::FbpPatch;
 
+    // Pre-validate: cheap bracket-balance + literal-state check on
+    // the LLM output. Catches the obvious truncation / mismatched-
+    // brace cases without burning a Proxmox round-trip + cargo cycle.
+    // On failure we synthesise a fake build-failed response in the
+    // exact shape the regular processing path expects, then jump
+    // straight to `Processing`. The retry-with-feedback path already
+    // pulls error text out of `response[8..]` and feeds it to the
+    // LLM, so the diagnostic flows naturally into the next attempt.
+    let prevalidate = crate::prevalidate::check(code);
+    if !prevalidate.is_ok() {
+        write_str("[Draug-async] PRE-VALIDATE REJECT — skipping cargo cycle\n");
+        let diag = prevalidate.diagnostic();
+        let diag_bytes = diag.as_bytes();
+        let cap = diag_bytes.len().min(1024);
+        let mut response = Vec::with_capacity(8 + cap);
+        // status=1 → build failed (matches the cargo-fail wire shape)
+        response.extend_from_slice(&1u32.to_le_bytes());
+        response.extend_from_slice(&(cap as u32).to_le_bytes());
+        response.extend_from_slice(&diag_bytes[..cap]);
+        draug.async_response = response;
+        draug.async_phase = AsyncPhase::Processing;
+        return true;
+    }
+
     // PATCH_DEDUP fast path. SHA-256 the source bytes, ask the proxy
     // if it has a cached verdict. On HIT, synthesise the response in
     // the same `[u32 status][u32 output_len][output bytes]` shape the
