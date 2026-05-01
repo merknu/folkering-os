@@ -109,6 +109,12 @@ pub struct McpState {
     pub tz_offset_minutes: i32,
     pub deferred_tool_gen: Option<(u32, String)>,
     pub async_tool_gen: Option<(u32, String)>,
+    /// Live dream context. Set by `start_dream_cycle` from the
+    /// daemon's `DREAM_DECIDE` reply, cleared on dream completion or
+    /// cancel. Authoritative source of `is_dreaming` / `dream_target`
+    /// / `dream_mode` for compositor — replaces stale reads of the
+    /// local `DraugDaemon` post-Phase-A.5-step-1.
+    pub current_dream: Option<(String, crate::draug::DreamMode)>,
     pub immune_patching: Option<String>,
     pub pending_adapter: Option<String>,
     pub pending_driver_device: Option<libfolk::sys::pci::PciDeviceInfo>,
@@ -126,6 +132,7 @@ impl McpState {
             tz_offset_minutes: 0,
             deferred_tool_gen: None,
             async_tool_gen: None,
+            current_dream: None,
             immune_patching: None,
             pending_adapter: None,
             pending_driver_device: None,

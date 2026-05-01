@@ -62,13 +62,14 @@ use libfolk::sys::compositor::COMPOSITOR_TASK_ID;
 use libfolk::sys::ipc::{recv_async, reply_with_token};
 use libfolk::sys::draug::{
     unpack_op, unpack_data48, unpack_shmem_size, unpack_friction,
-    unpack_dream_decide, pack_dream_decision,
+    unpack_dream_decide, pack_dream_decision, unpack_dream_result_status,
     DRAUG_OP_PING, DRAUG_OP_USER_INPUT, DRAUG_OP_WASM_CRASH,
     DRAUG_OP_INSTALL_REFACTOR_TASKS, DRAUG_OP_GET_STATUS_HANDLE,
-    DRAUG_OP_FRICTION_SIGNAL, DRAUG_OP_DREAM_DECIDE,
+    DRAUG_OP_FRICTION_SIGNAL, DRAUG_OP_DREAM_DECIDE, DRAUG_OP_DREAM_RESULT,
     DREAM_ACTION_SKIP, DREAM_ACTION_DREAM,
     DREAM_MODE_REFACTOR, DREAM_MODE_CREATIVE, DREAM_MODE_NIGHTMARE,
     DREAM_MODE_DRIVER_REFACTOR, DREAM_MODE_DRIVER_NIGHTMARE,
+    DREAM_RESULT_COMPLETE, DREAM_RESULT_CANCEL,
     DRAUG_STATUS_OK, DRAUG_STATUS_ERR, DRAUG_VERSION,
     DRAUG_STATUS_LAYOUT_VERSION, DRAUG_STATUS_SHMEM_SIZE,
     DRAUG_FLAG_INITIALISED, DRAUG_FLAG_PLAN_MODE_ACTIVE,
@@ -330,6 +331,17 @@ fn handle_command(payload0: u64, draug: &mut DraugDaemon) -> u64 {
         DRAUG_OP_DREAM_DECIDE => {
             let (handle, _idle_seconds) = unpack_dream_decide(payload0);
             handle_dream_decide(handle, draug)
+        }
+
+        DRAUG_OP_DREAM_RESULT => {
+            let status = unpack_dream_result_status(payload0);
+            let now_ms = uptime();
+            match status {
+                DREAM_RESULT_COMPLETE => draug.on_dream_complete(now_ms),
+                DREAM_RESULT_CANCEL   => draug.wake_up(),
+                _ => return DRAUG_STATUS_ERR,
+            }
+            DRAUG_STATUS_OK
         }
 
         _ => DRAUG_STATUS_ERR,

@@ -104,14 +104,16 @@ pub(super) fn tick(
         autodream::start_dream_cycle(mcp, wasm, draug, fb, dream_ms);
     }
 
-    // Wake Draug from dream if user interacts
-    if did_work && draug.is_dreaming() {
-        draug.wake_up();
+    // Wake Draug from dream if user interacts. Authoritative dream
+    // context lives in `mcp.current_dream` since A.5 step 2.
+    if did_work && mcp.current_dream.is_some() {
+        libfolk::sys::draug::notify_dream_result(libfolk::sys::draug::DREAM_RESULT_CANCEL);
+        mcp.current_dream = None;
         write_str("[AutoDream] User woke up — dream cancelled\n");
     }
 
     // Morning Briefing
-    if did_work && draug.has_pending_creative() && !draug.is_dreaming() {
+    if did_work && draug.has_pending_creative() && mcp.current_dream.is_none() {
         let count = draug.pending_count();
         write_str("[Morning Briefing] Draug has ");
         let mut nb2 = [0u8; 16];
@@ -163,7 +165,7 @@ pub(super) fn tick(
                 libfolk::mcp::types::McpRequest::ChatResponse { text } => {
                     if let Ok(resp_text) = core::str::from_utf8(&text) {
                         handle_chat_response(
-                            resp_text, mcp, wasm, wm, draug, active_agent, tsc_per_us,
+                            resp_text, mcp, wasm, wm, active_agent,
                             &mut need_redraw,
                         );
                     }
@@ -197,9 +199,7 @@ fn handle_chat_response(
     mcp: &mut McpState,
     wasm: &mut WasmState,
     wm: &mut WindowManager,
-    draug: &mut DraugDaemon,
     active_agent: &mut Option<AgentSession>,
-    tsc_per_us: u64,
     need_redraw: &mut bool,
 ) {
     if let Some(agent) = &mut *active_agent {
@@ -273,12 +273,12 @@ fn handle_chat_response(
             _ => {}
         }
         *need_redraw = true;
-    } else if draug.is_dreaming() {
+    } else if mcp.current_dream.is_some() {
         write_str("[AutoDream] Error from proxy: ");
         write_str(&resp_text[..resp_text.len().min(80)]);
         write_str("\n");
-        let done_ms = if tsc_per_us > 0 { rdtsc() / tsc_per_us / 1000 } else { 0 };
-        draug.on_dream_complete(done_ms);
+        libfolk::sys::draug::notify_dream_result(libfolk::sys::draug::DREAM_RESULT_CANCEL);
+        mcp.current_dream = None;
         if mcp.async_tool_gen.is_some() {
             mcp.async_tool_gen = None;
         }
