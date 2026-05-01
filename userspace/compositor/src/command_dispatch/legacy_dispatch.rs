@@ -492,6 +492,53 @@ pub(super) fn dispatch_legacy_command(
                 let mut buf = [0u8; 32];
                 let time_str = format_uptime(ms, &mut buf);
                 win.push_line(time_str);
+            } else if cmd_str == "heap" {
+                // Kernel-heap X-ray (PR #74). Syscall 0x85 fills a
+                // KernelHeapStats struct with both inner-allocator and
+                // requested-bytes views, plus high-water counter.
+                // Used to investigate Issue #54 (memory growth under
+                // flood). Mirrors `commands::basic::cmd_heap` in shell
+                // — duplicated here so COM3 god-mode injection from
+                // outside the VM can drive it without going through a
+                // shell IPC hop.
+                if let Some(stats) = libfolk::sys::heap_walk() {
+                    let mut nb = [0u8; 16];
+                    let total_kib = stats.total_bytes / 1024;
+                    let used_kib = stats.used_bytes / 1024;
+                    let free_kib = stats.free_bytes / 1024;
+                    let req_kib = stats.requested_bytes / 1024;
+                    let hw_kib = stats.high_water_bytes / 1024;
+                    let overhead_kib = stats.overhead_bytes() / 1024;
+                    let pmille = stats.used_per_mille();
+                    win.push_line(&alloc::format!(
+                        "Heap v{} | total {}K used {}K ({}.{}%) free {}K",
+                        stats.layout_version,
+                        total_kib, used_kib, pmille / 10, pmille % 10, free_kib,
+                    ));
+                    win.push_line(&alloc::format!(
+                        "  requested {}K | high-water {}K | overhead {}K",
+                        req_kib, hw_kib, overhead_kib,
+                    ));
+                    win.push_line(&alloc::format!(
+                        "  alloc={} dealloc={} live={}",
+                        stats.alloc_count, stats.dealloc_count, stats.live_allocs(),
+                    ));
+                    // Also write to serial so external scrapers can
+                    // grep [HEAP] tags from socat captures.
+                    libfolk::sys::io::write_str("[HEAP] ");
+                    libfolk::sys::io::write_str(crate::util::format_usize(used_kib as usize, &mut nb));
+                    libfolk::sys::io::write_str("K used / ");
+                    libfolk::sys::io::write_str(crate::util::format_usize(total_kib as usize, &mut nb));
+                    libfolk::sys::io::write_str("K total / hw=");
+                    libfolk::sys::io::write_str(crate::util::format_usize(hw_kib as usize, &mut nb));
+                    libfolk::sys::io::write_str("K req=");
+                    libfolk::sys::io::write_str(crate::util::format_usize(req_kib as usize, &mut nb));
+                    libfolk::sys::io::write_str("K live=");
+                    libfolk::sys::io::write_str(crate::util::format_usize(stats.live_allocs() as usize, &mut nb));
+                    libfolk::sys::io::write_str("\n");
+                } else {
+                    win.push_line("[heap] syscall failed or layout mismatch");
+                }
             } else if cmd_str == "help" {
                 win.push_line("Commands: ls, cat, ps, uptime, mem");
                 win.push_line("lspci, drivers, generate driver [v:d]");

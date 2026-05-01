@@ -179,6 +179,11 @@ fn main() -> ! {
 /// of kernel uptime. Surfaces the load-bearing decision flags so a
 /// reader can tell *why* the loop isn't producing work — instead of
 /// staring at silence.
+///
+/// Also emits a `[HEAP]` companion line per Issue #54 — kernel-heap
+/// stats over time without requiring a shell command injection from
+/// outside the VM. Lets us watch high-water vs requested vs live
+/// allocations across an idle session or a stress flood.
 fn log_alive_if_due(draug: &DraugDaemon, now_ms: u64) {
     let last = unsafe { LAST_ALIVE_LOG_MS };
     if now_ms.saturating_sub(last) < ALIVE_LOG_INTERVAL_MS {
@@ -197,6 +202,18 @@ fn log_alive_if_due(draug: &DraugDaemon, now_ms: u64) {
         draug.refactor_iter,
         draug.complex_task_idx,
     );
+    if let Some(stats) = libfolk::sys::heap_walk() {
+        println!(
+            "[HEAP] used={}K total={}K hw={}K req={}K live={} alloc={} dealloc={}",
+            stats.used_bytes / 1024,
+            stats.total_bytes / 1024,
+            stats.high_water_bytes / 1024,
+            stats.requested_bytes / 1024,
+            stats.live_allocs(),
+            stats.alloc_count,
+            stats.dealloc_count,
+        );
+    }
 }
 
 /// Allocate, map, initialise, and grant compositor read access to
