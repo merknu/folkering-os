@@ -57,14 +57,18 @@ static ALLOCATOR: BumpAllocator = BumpAllocator {
 // ── Imports ────────────────────────────────────────────────────────────
 
 use libfolk::{entry, println};
-use libfolk::sys::{yield_cpu, get_pid, shmem_create, shmem_map, shmem_grant, uptime};
+use libfolk::sys::{yield_cpu, get_pid, shmem_create, shmem_map, shmem_unmap, shmem_grant, uptime};
 use libfolk::sys::compositor::COMPOSITOR_TASK_ID;
 use libfolk::sys::ipc::{recv_async, reply_with_token};
 use libfolk::sys::draug::{
     unpack_op, unpack_data48, unpack_shmem_size, unpack_friction,
+    unpack_dream_decide, pack_dream_decision,
     DRAUG_OP_PING, DRAUG_OP_USER_INPUT, DRAUG_OP_WASM_CRASH,
     DRAUG_OP_INSTALL_REFACTOR_TASKS, DRAUG_OP_GET_STATUS_HANDLE,
-    DRAUG_OP_FRICTION_SIGNAL,
+    DRAUG_OP_FRICTION_SIGNAL, DRAUG_OP_DREAM_DECIDE,
+    DREAM_ACTION_SKIP, DREAM_ACTION_DREAM,
+    DREAM_MODE_REFACTOR, DREAM_MODE_CREATIVE, DREAM_MODE_NIGHTMARE,
+    DREAM_MODE_DRIVER_REFACTOR, DREAM_MODE_DRIVER_NIGHTMARE,
     DRAUG_STATUS_OK, DRAUG_STATUS_ERR, DRAUG_VERSION,
     DRAUG_STATUS_LAYOUT_VERSION, DRAUG_STATUS_SHMEM_SIZE,
     DRAUG_FLAG_INITIALISED, DRAUG_FLAG_PLAN_MODE_ACTIVE,
@@ -72,7 +76,7 @@ use libfolk::sys::draug::{
     DraugStatus,
 };
 
-use draug_daemon::draug::{DraugDaemon, AsyncPhase};
+use draug_daemon::draug::{DraugDaemon, AsyncPhase, DreamMode};
 use draug_daemon::draug_async;
 use draug_daemon::knowledge_hunt;
 
@@ -83,6 +87,12 @@ entry!(main);
 // Mapped at this vaddr inside the daemon (well above the bump heap).
 
 const DRAUG_STATUS_DAEMON_VADDR: usize = 0x40000000;
+
+/// Daemon-side scratch vaddr for `DREAM_DECIDE` shmem mappings.
+/// Compositor allocates a fresh shmem per request, hands it over, we
+/// map here, parse, then unmap. One slot is enough — `DREAM_DECIDE`
+/// is dispatched serially from `handle_command` so there's no overlap.
+const DREAM_DECIDE_DAEMON_VADDR: usize = 0x41000000;
 
 static mut STATUS_HANDLE: u32 = 0;
 static mut STATUS_PTR: *mut DraugStatus = core::ptr::null_mut();
@@ -317,6 +327,138 @@ fn handle_command(payload0: u64, draug: &mut DraugDaemon) -> u64 {
             DRAUG_STATUS_OK
         }
 
+        DRAUG_OP_DREAM_DECIDE => {
+            let (handle, _idle_seconds) = unpack_dream_decide(payload0);
+            handle_dream_decide(handle, draug)
+        }
+
         _ => DRAUG_STATUS_ERR,
     }
+}
+
+/// Hard cap on key-list size — sized for the autodream call site, not
+/// for general shmem framing. Compositor's wasm.cache rarely exceeds a
+/// dozen apps; 32 leaves comfortable headroom and keeps stack costs low.
+const DREAM_DECIDE_MAX_KEYS: usize = 32;
+/// Hard cap on per-key length, matching the compositor's cache-key
+/// conventions (app names + short tweak hashes). Anything longer is a
+/// bug or hostile compositor.
+const DREAM_DECIDE_MAX_KEY_LEN: usize = 64;
+/// Bytes the daemon will read from the shmem region. Larger than the
+/// worst-case 32 × (4 + 64) = 2176, smaller than a 4 KiB page so we
+/// never run off the end of the smallest shmem the kernel can give us.
+const DREAM_DECIDE_MAX_SHMEM_BYTES: usize = 4096;
+
+/// DREAM_DECIDE handler — maps the compositor-supplied shmem, parses
+/// the key list, asks `DraugDaemon::start_dream` for a decision, and
+/// packs the reply in the wire format documented next to
+/// `DRAUG_OP_DREAM_DECIDE` in `libfolk::sys::draug`.
+///
+/// All failure paths return `DRAUG_STATUS_ERR`; the caller treats that
+/// as "skip this dream cycle". We never panic out — corrupting the
+/// daemon would defeat Phase A's whole point.
+fn handle_dream_decide(handle: u32, draug: &mut DraugDaemon) -> u64 {
+    if handle == 0 {
+        return DRAUG_STATUS_ERR;
+    }
+    if shmem_map(handle, DREAM_DECIDE_DAEMON_VADDR).is_err() {
+        return DRAUG_STATUS_ERR;
+    }
+
+    // From here we MUST unmap before returning. Wrap the body so the
+    // unmap is single-pathed.
+    let reply = parse_and_decide(draug);
+    let _ = shmem_unmap(handle, DREAM_DECIDE_DAEMON_VADDR);
+    reply
+}
+
+/// Inner half of `handle_dream_decide`, run with the shmem mapped at
+/// `DREAM_DECIDE_DAEMON_VADDR`. Splitting this out keeps the unmap
+/// path single-exit.
+fn parse_and_decide(draug: &mut DraugDaemon) -> u64 {
+    // Snapshot bytes from shmem into a stack buffer. Avoids holding
+    // raw pointers into shmem across the `start_dream` call (which
+    // can allocate, friction-decay, etc.) and bounds the reads
+    // tightly to what we'll consult.
+    let mut buf = [0u8; DREAM_DECIDE_MAX_SHMEM_BYTES];
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            DREAM_DECIDE_DAEMON_VADDR as *const u8,
+            buf.as_mut_ptr(),
+            DREAM_DECIDE_MAX_SHMEM_BYTES,
+        );
+    }
+
+    // Header: [u32 num_keys][u32 reserved]
+    if buf.len() < 8 {
+        return DRAUG_STATUS_ERR;
+    }
+    let num_keys = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    if num_keys == 0 || num_keys > DREAM_DECIDE_MAX_KEYS {
+        return DRAUG_STATUS_ERR;
+    }
+
+    // Owned copy of each key string. `start_dream` takes &[&str]; we
+    // build the &str slice from these owned Strings just before the
+    // call so lifetimes work out cleanly.
+    let mut owned: alloc::vec::Vec<alloc::string::String> =
+        alloc::vec::Vec::with_capacity(num_keys);
+
+    let mut off = 8usize;
+    for _ in 0..num_keys {
+        if off + 4 > buf.len() {
+            return DRAUG_STATUS_ERR;
+        }
+        let len = u16::from_le_bytes([buf[off], buf[off + 1]]) as usize;
+        off += 4; // u16 len + u16 reserved
+        if len == 0 || len > DREAM_DECIDE_MAX_KEY_LEN || off + len > buf.len() {
+            return DRAUG_STATUS_ERR;
+        }
+        let bytes = &buf[off..off + len];
+        let s = match core::str::from_utf8(bytes) {
+            Ok(s) => alloc::string::String::from(s),
+            Err(_) => return DRAUG_STATUS_ERR,
+        };
+        owned.push(s);
+        off += len;
+    }
+
+    let keys: alloc::vec::Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+    let now_ms = uptime();
+    let dream_count = draug.dream_count();
+
+    let Some((target, mode)) = draug.start_dream(&keys, now_ms) else {
+        // No dream — reply with SKIP. dream_count stays current so
+        // compositor's HUD doesn't lose sync.
+        return pack_dream_decision(DREAM_ACTION_SKIP, 0, 0, dream_count);
+    };
+
+    // Find the target's index in the original key list. Linear scan;
+    // num_keys ≤ 32 so this is trivial.
+    let mut target_index: u16 = 0;
+    let mut found = false;
+    for (i, k) in keys.iter().enumerate() {
+        if *k == target.as_str() {
+            target_index = i as u16;
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        // start_dream returned a key we didn't ship. Treat as protocol
+        // error: roll back the dream so compositor doesn't try to
+        // execute a target it can't reference, and surface ERR.
+        draug.on_dream_complete(now_ms);
+        return DRAUG_STATUS_ERR;
+    }
+
+    let mode_u8 = match mode {
+        DreamMode::Refactor        => DREAM_MODE_REFACTOR,
+        DreamMode::Creative        => DREAM_MODE_CREATIVE,
+        DreamMode::Nightmare       => DREAM_MODE_NIGHTMARE,
+        DreamMode::DriverRefactor  => DREAM_MODE_DRIVER_REFACTOR,
+        DreamMode::DriverNightmare => DREAM_MODE_DRIVER_NIGHTMARE,
+    };
+
+    pack_dream_decision(DREAM_ACTION_DREAM, mode_u8, target_index, draug.dream_count())
 }

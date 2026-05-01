@@ -177,6 +177,41 @@ pub const DRAUG_OP_GET_STATUS_HANDLE: u64 = 0x0004;
 /// Reply:    DRAUG_STATUS_OK
 pub const DRAUG_OP_FRICTION_SIGNAL: u64 = 0x0005;
 
+/// Autodream decision query. Compositor publishes the current
+/// `wasm.cache` key list into a freshly-allocated shmem region,
+/// grants the daemon access, then sends this op with the handle and
+/// the user-idle timestamp. Daemon maps the shmem, runs its own
+/// `should_dream` + `start_dream` logic on the supplied keys, and
+/// replies with the decision. Compositor still owns the dream
+/// EXECUTION (memory snapshot, MCP send, chunk reassembly) — this
+/// op only moves the DECISION (which app + which mode) to the
+/// daemon, where Draug's friction sensor and idle accounting live.
+///
+/// Request: payload0 = OP_DREAM_DECIDE
+///                   | (shmem_handle << 16)   // 24 bits
+///                   | (idle_seconds << 40)   // 24 bits, ≈ 6 months
+/// Shmem layout:
+///   [u32 num_keys][u32 reserved]
+///   per key: [u16 len][u16 reserved][len bytes UTF-8]
+///
+/// Reply payload0:
+///   bits  0..8   action (DREAM_ACTION_SKIP / DREAM_ACTION_DREAM)
+///   bits  8..16  mode (DREAM_MODE_*)
+///   bits 16..32  target_index (which key in the list)
+///   bits 32..64  daemon's dream_count (for compositor HUD)
+pub const DRAUG_OP_DREAM_DECIDE: u64 = 0x0006;
+
+// DreamMode wire encoding — must match the order of variants in
+// `draug_daemon::draug::DreamMode`. Stable ABI.
+pub const DREAM_MODE_REFACTOR: u8 = 0;
+pub const DREAM_MODE_CREATIVE: u8 = 1;
+pub const DREAM_MODE_NIGHTMARE: u8 = 2;
+pub const DREAM_MODE_DRIVER_REFACTOR: u8 = 3;
+pub const DREAM_MODE_DRIVER_NIGHTMARE: u8 = 4;
+
+pub const DREAM_ACTION_SKIP: u8 = 0;
+pub const DREAM_ACTION_DREAM: u8 = 1;
+
 // ============================================================================
 // Status Codes (reply payload0)
 // ============================================================================
@@ -256,6 +291,56 @@ pub fn send_friction_signal(key_hash: u32, weight: u16) {
     let _ = ipc::send(daemon_task_id(), payload, 0);
 }
 
+/// Decoded autodream decision from `request_dream_decision`.
+#[derive(Debug, Clone, Copy)]
+pub struct DreamDecision {
+    /// `DREAM_ACTION_SKIP` or `DREAM_ACTION_DREAM`.
+    pub action: u8,
+    /// `DREAM_MODE_*` (only meaningful when action == DREAM).
+    pub mode: u8,
+    /// Index into the key list compositor sent (only meaningful
+    /// when action == DREAM).
+    pub target_index: u16,
+    /// Daemon's running dream_count, for compositor's HUD.
+    pub dream_count: u32,
+}
+
+impl DreamDecision {
+    pub fn should_dream(&self) -> bool { self.action == DREAM_ACTION_DREAM }
+}
+
+/// Ask the daemon whether to start a dream cycle right now and, if
+/// yes, which app + mode to target. Compositor must have already
+/// allocated `shmem_handle` and written the key list there in the
+/// format documented for `DRAUG_OP_DREAM_DECIDE`. The handle's read
+/// permission must already be granted to the daemon
+/// (`shmem_grant(handle, daemon_task_id())`).
+///
+/// `idle_seconds` is the time since last user input as compositor
+/// observed it (rdtsc → seconds since boot would also work — the
+/// daemon only uses the value via subtraction against its own
+/// timestamps).
+///
+/// Returns `None` on transport failure or shmem-handle overflow.
+pub fn request_dream_decision(shmem_handle: u32, idle_seconds: u32) -> Option<DreamDecision> {
+    if shmem_handle >> 24 != 0 || idle_seconds >> 24 != 0 {
+        return None;
+    }
+    let payload = DRAUG_OP_DREAM_DECIDE
+        | ((shmem_handle as u64) << 16)
+        | ((idle_seconds as u64) << 40);
+    let reply = ipc::send(daemon_task_id(), payload, 0).ok()?;
+    if reply == DRAUG_STATUS_ERR {
+        return None;
+    }
+    Some(DreamDecision {
+        action: (reply & 0xFF) as u8,
+        mode: ((reply >> 8) & 0xFF) as u8,
+        target_index: ((reply >> 16) & 0xFFFF) as u16,
+        dream_count: ((reply >> 32) & 0xFFFF_FFFF) as u32,
+    })
+}
+
 /// Hand the boot-time refactor-task list to the daemon. The caller
 /// owns a shmem region containing the serialised tasks; this function
 /// transfers a handle.
@@ -306,6 +391,24 @@ pub fn unpack_shmem_size(payload0: u64) -> (u32, u32) {
     let shmem_handle = ((payload0 >> 16) & 0xFF_FFFF) as u32;
     let total_size = ((payload0 >> 40) & 0xFF_FFFF) as u32;
     (shmem_handle, total_size)
+}
+
+/// Decode `(shmem_handle, idle_seconds)` from a payload0 that uses
+/// the `DREAM_DECIDE` packing. Both fields are 24 bits.
+#[inline]
+pub fn unpack_dream_decide(payload0: u64) -> (u32, u32) {
+    let shmem = ((payload0 >> 16) & 0xFF_FFFF) as u32;
+    let idle = ((payload0 >> 40) & 0xFF_FFFF) as u32;
+    (shmem, idle)
+}
+
+/// Encode the daemon-side reply for `DRAUG_OP_DREAM_DECIDE`.
+#[inline]
+pub fn pack_dream_decision(action: u8, mode: u8, target_idx: u16, dream_count: u32) -> u64 {
+    (action as u64)
+        | ((mode as u64) << 8)
+        | ((target_idx as u64) << 16)
+        | ((dream_count as u64) << 32)
 }
 
 /// Decode `(key_hash, weight)` from a payload0 that uses the
