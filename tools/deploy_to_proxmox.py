@@ -13,7 +13,8 @@ Usage:
 
 Prerequisites:
   - SSH key access to Proxmox (pi_key or password)
-  - Proxmox host: 192.168.68.150
+  - Proxmox host: configured via FOLKERING_PROXMOX_HOST env var
+    (default: 192.168.68.150 — the historical demo node)
   - VM ID 900 reserved for Folkering OS
 """
 
@@ -24,11 +25,17 @@ import time
 import argparse
 
 # ── Configuration ────────────────────────────────────────────────────────
+#
+# Defaults match the historical demo target (Proxmox node at .68.150,
+# VM 900). Override with env vars at invocation time, e.g.:
+#   FOLKERING_PROXMOX_HOST=10.0.0.50 python tools/deploy_to_proxmox.py deploy
 
-PROXMOX_HOST = "192.168.68.150"
-PROXMOX_USER = "root"  # Proxmox root access for qm commands
-PROXMOX_SSH_KEY = os.path.expanduser("~/.ssh/id_rsa")  # Try default key
-VM_ID = 900
+PROXMOX_HOST = os.environ.get("FOLKERING_PROXMOX_HOST", "192.168.68.150")
+PROXMOX_USER = os.environ.get("FOLKERING_PROXMOX_USER", "root")
+PROXMOX_SSH_KEY = os.path.expanduser(
+    os.environ.get("FOLKERING_PROXMOX_SSH_KEY", "~/.ssh/id_rsa")
+)
+VM_ID = int(os.environ.get("FOLKERING_VM_ID", "900"))
 VM_NAME = "folkering-os"
 VM_MEMORY = 512  # MB
 VM_CORES = 4

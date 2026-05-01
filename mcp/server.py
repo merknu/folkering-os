@@ -598,9 +598,14 @@ TOOLS = [
 ]
 
 # ── Tool implementations ───────────────────────────────────────────────────────
+#
+# Override via FOLKERING_PROXMOX_HOST / FOLKERING_SERIAL_LOG. Defaults
+# match the historical demo target (Proxmox node at .68.150). Set
+# `FOLKERING_PROXMOX_HOST=10.0.0.50` to point the MCP tools at a
+# different Proxmox host without editing the file.
 
-PROXMOX_HOST = "192.168.68.150"
-SERIAL_LOG_REMOTE = "/tmp/folkering-serial.log"
+PROXMOX_HOST = os.environ.get("FOLKERING_PROXMOX_HOST", "192.168.68.150")
+SERIAL_LOG_REMOTE = os.environ.get("FOLKERING_SERIAL_LOG", "/tmp/folkering-serial.log")
 
 def _ssh_cmd(cmd: str, timeout: int = 10) -> str:
     """Run a command on Proxmox via SSH."""
