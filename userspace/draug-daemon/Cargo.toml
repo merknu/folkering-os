@@ -20,5 +20,12 @@ libfolk = { path = "../libfolk", features = ["mcp"] }
 # SemanticNode trees from the host-side proxy.
 fbp-rs = { path = "../../tools/fbp-rs", default-features = false }
 
+# SHA-256 for the PATCH_DEDUP cache lookup. The daemon hashes the
+# source it's about to ship and asks the proxy "have you compiled
+# this exact code before?" — saves a full cargo cycle on retries
+# with byte-identical source. no_std build (no std::io / no std hash
+# RNG); pure-Rust impl, no asm.
+sha2 = { version = "0.10", default-features = false }
+
 [features]
 default = []

@@ -397,6 +397,12 @@ fn start_llm_request(draug: &mut DraugDaemon, model: &str, prompt: &str) -> bool
 }
 
 fn start_patch_request(draug: &mut DraugDaemon, code: &str) -> bool {
+    // Build the PATCH wire frame upfront. Used both for the
+    // sync-fast-path (cache hit) where we skip TCP entirely AND
+    // the regular async path where we send it byte-by-byte.
+    // `extract_code_from_patch_request` (called downstream) parses
+    // these bytes back, so the same shape must be present in
+    // `async_request` regardless of cache outcome.
     let mut req = Vec::with_capacity(code.len() + 64);
     req.extend_from_slice(b"PATCH draug_latest.rs\n");
     encode_decimal(&mut req, code.len());
@@ -405,14 +411,33 @@ fn start_patch_request(draug: &mut DraugDaemon, code: &str) -> bool {
 
     draug.async_request = req;
     draug.async_sent = 0;
-    // Pre-allocate 8KB to avoid repeated realloc during reads
     if draug.async_response.capacity() < 8192 {
         draug.async_response.reserve(8192);
     }
     draug.async_response.clear();
     draug.async_operation = AsyncOp::FbpPatch;
-    // Timestamp set by caller (tick_idle passes now_ms from compositor clock)
 
+    // PATCH_DEDUP fast path. SHA-256 the source bytes, ask the proxy
+    // if it has a cached verdict. On HIT, synthesise the response in
+    // the same `[u32 status][u32 output_len][output bytes]` shape the
+    // tick_reading → tick_processing path produces, jump directly to
+    // Processing, and skip the TCP round-trip + cargo cycle entirely.
+    // On MISS / proxy-old / transport-error we fall through to the
+    // regular async send.
+    let hash_hex = sha256_hex(code.as_bytes());
+    let mut hit_buf = [0u8; 16 * 1024];
+    if let Some(hit) = libfolk::sys::proxy_patch_dedup(&hash_hex, &mut hit_buf) {
+        write_str("[Draug-async] PATCH_DEDUP HIT — skipping cargo cycle\n");
+        let mut response = Vec::with_capacity(8 + hit.output_len);
+        response.extend_from_slice(&hit.status.to_le_bytes());
+        response.extend_from_slice(&(hit.output_len as u32).to_le_bytes());
+        response.extend_from_slice(&hit_buf[..hit.output_len]);
+        draug.async_response = response;
+        draug.async_phase = AsyncPhase::Processing;
+        return true;
+    }
+
+    // Miss → regular async TCP path.
     let result = tcp_connect_async(PROXY_IP, PROXY_PORT);
     if result == u64::MAX {
         write_str("[Draug-async] connect failed (no slots)\n");
@@ -423,6 +448,23 @@ fn start_patch_request(draug: &mut DraugDaemon, code: &str) -> bool {
     draug.async_tcp_slot = result;
     draug.async_phase = AsyncPhase::Sending;
     true
+}
+
+/// Hex-encode a SHA-256 digest of `input`. Returns 64 lowercase hex
+/// chars with no separators, matching what the proxy's
+/// `parse_hex_hash` expects on the PATCH_DEDUP wire.
+fn sha256_hex(input: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(input);
+    let digest = hasher.finalize();
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for &b in digest.iter() {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0F) as usize] as char);
+    }
+    out
 }
 
 // ── SENDING / READING ────────────────────────────────────────────────
