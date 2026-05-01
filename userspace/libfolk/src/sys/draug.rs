@@ -213,6 +213,24 @@ pub const DRAUG_OP_DREAM_DECIDE: u64 = 0x0006;
 /// Reply:    DRAUG_STATUS_OK
 pub const DRAUG_OP_DREAM_RESULT: u64 = 0x0007;
 
+/// Refactor-failure strike against an app, identified by its key
+/// hash. Compositor's V1-vs-V2 dream evaluator runs in the WASM
+/// runtime (compositor-only), so the strike signal flows from
+/// compositor *into* the daemon — without this IPC, daemon's
+/// `start_dream` priority-3 ("skip perfected apps") would never see
+/// any strikes and would re-pick the same broken app forever.
+///
+/// Request:  payload0 = OP_STRIKE_ADD | (key_hash << 16)
+/// Reply:    DRAUG_STATUS_OK
+pub const DRAUG_OP_STRIKE_ADD: u64 = 0x0008;
+
+/// Reset strikes for an app — sent by compositor when a dream
+/// successfully evolves the app (V2 faster than V1, fuzz passes).
+///
+/// Request:  payload0 = OP_STRIKE_RESET | (key_hash << 16)
+/// Reply:    DRAUG_STATUS_OK
+pub const DRAUG_OP_STRIKE_RESET: u64 = 0x0009;
+
 // DreamMode wire encoding — must match the order of variants in
 // `draug_daemon::draug::DreamMode`. Stable ABI.
 pub const DREAM_MODE_REFACTOR: u8 = 0;
@@ -424,6 +442,13 @@ pub fn unpack_dream_result_status(payload0: u64) -> u8 {
     ((payload0 >> 16) & 0xFF) as u8
 }
 
+/// Decode a 32-bit key hash from a payload0 that uses the `STRIKE_*`
+/// packing (`OP | (key_hash << 16)`).
+#[inline]
+pub fn unpack_key_hash(payload0: u64) -> u32 {
+    ((payload0 >> 16) & 0xFFFF_FFFF) as u32
+}
+
 /// Notify the daemon that a dream cycle finished. `status` is one of
 /// `DREAM_RESULT_COMPLETE` / `DREAM_RESULT_CANCEL`. Fire-and-forget;
 /// reply is ignored. A dropped notification leaves the daemon's
@@ -433,6 +458,23 @@ pub fn unpack_dream_result_status(payload0: u64) -> u8 {
 #[inline]
 pub fn notify_dream_result(status: u8) {
     let payload = DRAUG_OP_DREAM_RESULT | ((status as u64) << 16);
+    let _ = ipc::send(daemon_task_id(), payload, 0);
+}
+
+/// Bump the daemon's strike counter for an app, keyed by its hash.
+/// Fire-and-forget. Sent from compositor's V1-vs-V2 evaluator after
+/// a refactor attempt fails sanity / benchmark / fuzz.
+#[inline]
+pub fn notify_strike_add(key_hash: u32) {
+    let payload = DRAUG_OP_STRIKE_ADD | ((key_hash as u64) << 16);
+    let _ = ipc::send(daemon_task_id(), payload, 0);
+}
+
+/// Clear the daemon's strike counter for an app. Sent from compositor
+/// when a dream successfully evolves the app.
+#[inline]
+pub fn notify_strike_reset(key_hash: u32) {
+    let payload = DRAUG_OP_STRIKE_RESET | ((key_hash as u64) << 16);
     let _ = ipc::send(daemon_task_id(), payload, 0);
 }
 

@@ -63,9 +63,11 @@ use libfolk::sys::ipc::{recv_async, reply_with_token};
 use libfolk::sys::draug::{
     unpack_op, unpack_data48, unpack_shmem_size, unpack_friction,
     unpack_dream_decide, pack_dream_decision, unpack_dream_result_status,
+    unpack_key_hash,
     DRAUG_OP_PING, DRAUG_OP_USER_INPUT, DRAUG_OP_WASM_CRASH,
     DRAUG_OP_INSTALL_REFACTOR_TASKS, DRAUG_OP_GET_STATUS_HANDLE,
     DRAUG_OP_FRICTION_SIGNAL, DRAUG_OP_DREAM_DECIDE, DRAUG_OP_DREAM_RESULT,
+    DRAUG_OP_STRIKE_ADD, DRAUG_OP_STRIKE_RESET,
     DREAM_ACTION_SKIP, DREAM_ACTION_DREAM,
     DREAM_MODE_REFACTOR, DREAM_MODE_CREATIVE, DREAM_MODE_NIGHTMARE,
     DREAM_MODE_DRIVER_REFACTOR, DREAM_MODE_DRIVER_NIGHTMARE,
@@ -348,6 +350,16 @@ fn handle_command(payload0: u64, draug: &mut DraugDaemon) -> u64 {
                 DREAM_RESULT_CANCEL   => draug.wake_up(),
                 _ => return DRAUG_STATUS_ERR,
             }
+            DRAUG_STATUS_OK
+        }
+
+        DRAUG_OP_STRIKE_ADD => {
+            draug.add_strike_by_hash(unpack_key_hash(payload0));
+            DRAUG_STATUS_OK
+        }
+
+        DRAUG_OP_STRIKE_RESET => {
+            draug.reset_strikes_by_hash(unpack_key_hash(payload0));
             DRAUG_STATUS_OK
         }
 
