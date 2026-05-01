@@ -1164,6 +1164,117 @@ pub fn syscall_proxy_last_verdict(buf_ptr: u64, buf_max: u64) -> u64 {
     ((status as u64) << 32) | (copy_len as u64)
 }
 
+/// PATCH_DEDUP — content-addressed verdict cache lookup.
+///
+/// Daemon computes SHA-256 of the source it's about to ship and
+/// passes the hex string to this syscall. Kernel forwards to the
+/// proxy as `PATCH_DEDUP <hex>\n`. Proxy responds with either:
+///   * cached verdict bytes `[u32 status][u32 output_len][output]`, or
+///   * miss sentinel `[u32 status=0xCACED15D][u32 output_len=0]`.
+///
+/// On hit: copies the output bytes into `buf_ptr` and returns the
+/// usual packed `(status << 32) | output_len`.
+/// On miss / transport failure / old proxy that doesn't know the
+/// command: returns `u64::MAX` so the userspace path falls through
+/// to the regular PATCH flow.
+pub fn syscall_proxy_patch_dedup(
+    hash_ptr: u64, hash_len: u64,
+    buf_ptr: u64, buf_max: u64,
+) -> u64 {
+    const PROXY_IP: [u8; 4] = [192, 168, 68, 150];
+    const PROXY_PORT: u16 = 14711;
+    const MISS_SENTINEL: u32 = 0xCACE_D15D;
+
+    // Pointer + length sanity. Hash is fixed at 64 hex chars; reject
+    // anything else loudly so callers that mis-encode get u64::MAX
+    // instead of an opaque "miss".
+    if hash_len != 64 || buf_max == 0 || buf_max > 65_536 {
+        return u64::MAX;
+    }
+    const USERSPACE_TOP: u64 = 0x0000_8000_0000_0000;
+    if hash_ptr < 0x200000 || hash_ptr >= USERSPACE_TOP { return u64::MAX; }
+    if buf_ptr < 0x200000 || buf_ptr >= USERSPACE_TOP { return u64::MAX; }
+    let hash_end = match hash_ptr.checked_add(hash_len) {
+        Some(e) => e,
+        None => return u64::MAX,
+    };
+    let buf_end = match buf_ptr.checked_add(buf_max) {
+        Some(e) => e,
+        None => return u64::MAX,
+    };
+    if hash_end > USERSPACE_TOP || buf_end > USERSPACE_TOP {
+        return u64::MAX;
+    }
+
+    // Build `PATCH_DEDUP <hex>\n` on the kernel stack — small,
+    // deterministic, no heap allocation needed for the request.
+    let hash_bytes = unsafe {
+        core::slice::from_raw_parts(hash_ptr as *const u8, 64)
+    };
+    // Validate the hex chars upfront so a malformed daemon-side
+    // build can't smuggle garbage into the proxy's parser.
+    for &b in hash_bytes {
+        let ok = matches!(b, b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F');
+        if !ok { return u64::MAX; }
+    }
+
+    let mut req = [0u8; 12 + 64 + 1];
+    req[..12].copy_from_slice(b"PATCH_DEDUP ");
+    req[12..76].copy_from_slice(hash_bytes);
+    req[76] = b'\n';
+
+    crate::serial_strln!("[PATCH_DEDUP] querying proxy");
+
+    let response = match crate::net::tcp_plain::tcp_request_with_timeout(
+        PROXY_IP,
+        PROXY_PORT,
+        &req,
+        16 * 1024 + 8, // header + body, matches LAST_VERDICT
+        5_000,
+    ) {
+        Ok(data) => data,
+        Err(e) => {
+            crate::serial_str!("[PATCH_DEDUP] tcp_request failed: ");
+            crate::serial_strln!(e);
+            return u64::MAX;
+        }
+    };
+
+    if response.len() < 8 {
+        // Old proxy that doesn't know PATCH_DEDUP returns a 4-byte
+        // error frame. Treat as miss — caller falls back to PATCH.
+        crate::serial_strln!("[PATCH_DEDUP] short reply (proxy lacks command?) → MISS");
+        return u64::MAX;
+    }
+    let status = u32::from_le_bytes([response[0], response[1], response[2], response[3]]);
+    let output_len = u32::from_le_bytes([response[4], response[5], response[6], response[7]]);
+
+    if status == MISS_SENTINEL {
+        crate::serial_strln!("[PATCH_DEDUP] cache miss");
+        return u64::MAX;
+    }
+
+    let body_len = (output_len as usize).min(response.len().saturating_sub(8));
+    let copy_len = body_len.min(buf_max as usize);
+    if copy_len > 0 {
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                response.as_ptr().add(8),
+                buf_ptr as *mut u8,
+                copy_len,
+            );
+        }
+    }
+
+    crate::serial_str!("[PATCH_DEDUP] cache HIT status=");
+    crate::drivers::serial::write_dec(status);
+    crate::serial_str!(" output=");
+    crate::drivers::serial::write_dec(copy_len as u32);
+    crate::serial_strln!(" bytes");
+
+    ((status as u64) << 32) | (copy_len as u64)
+}
+
 /// Issue #55 — application-level acknowledgement of a verdict.
 ///
 /// PR #65 added the `LAST_VERDICT` recovery path: if the VM times

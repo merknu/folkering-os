@@ -128,6 +128,10 @@ pub(super) extern "C" fn syscall_handler(
         // drop its per-source-IP cache entry. Hybrid model — proxy
         // still has a 30-day TTL backstop in case ACKs are lost.
         0x6B => syscall_proxy_ack_verdict(),
+        // PATCH_DEDUP — content-addressed verdict cache lookup.
+        // 4 args: (hash_ptr, hash_len, buf_ptr, buf_max). Same packed
+        // response shape as 0x6A LAST_VERDICT.
+        0x6C => syscall_proxy_patch_dedup(arg1, arg2, arg3, arg4),
         // Issue #58: UDP variant of proxy_ping. Uses smoltcp's UDP socket
         // type (different code path than tcp_plain) so hibernation can
         // recover from a TCP-specific wedge. Sends "PING", awaits "PONG"

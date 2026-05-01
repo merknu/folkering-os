@@ -559,6 +559,38 @@ pub fn proxy_last_verdict(buf: &mut [u8]) -> Option<PatchStatus> {
     Some(PatchStatus { status, output_len })
 }
 
+/// PATCH_DEDUP — query the proxy for a cached verdict by content hash.
+///
+/// Daemon hashes the source it's about to ship (SHA-256, hex-encoded
+/// 64 chars) and asks the proxy "have you compiled this exact code
+/// before?". On hit, the cached PATCH-wire bytes land in `buf` and
+/// the daemon can dispatch them directly through its existing
+/// `process_patch_result` path — saving a full cargo cycle.
+///
+/// Returns `Some(PatchStatus { status, output_len })` on hit, `None`
+/// on miss / transport failure / old proxy that doesn't understand
+/// the command. Treat all `None` paths identically: fall back to a
+/// regular PATCH request.
+///
+/// `hash_hex` must be exactly 64 lowercase hex chars; anything else
+/// fails fast at the syscall.
+pub fn proxy_patch_dedup(hash_hex: &str, buf: &mut [u8]) -> Option<PatchStatus> {
+    if hash_hex.len() != 64 { return None; }
+    let ret = unsafe {
+        crate::syscall::syscall4(
+            0x6C,
+            hash_hex.as_ptr() as u64,
+            hash_hex.len() as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+        )
+    };
+    if ret == u64::MAX { return None; }
+    let status = ((ret >> 32) & 0xFFFF_FFFF) as u32;
+    let output_len = (ret & 0xFFFF_FFFF) as usize;
+    Some(PatchStatus { status, output_len })
+}
+
 /// Issue #55 — explicit ACK that the daemon has persisted a verdict.
 ///
 /// Tells the proxy to drop its cached per-source-IP verdict. Call
