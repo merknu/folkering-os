@@ -462,7 +462,13 @@ pub fn unpack_friction(payload0: u64) -> (u32, u16) {
 /// to read a region whose version doesn't match what it was compiled
 /// against, so adding/reordering fields requires bumping this so old
 /// readers fail loudly instead of silently returning garbage.
-pub const DRAUG_STATUS_LAYOUT_VERSION: u32 = 1;
+///
+/// v2 (Phase A.5 step 4): added `DRAUG_FLAG_WAITING_FOR_LLM`,
+/// `DRAUG_FLAG_DREAM_READY`, `DRAUG_FLAG_SKILL_TREE_HAS_WORK`. Struct
+/// layout itself is unchanged — only flag-bit semantics — but readers
+/// of the new flags need the new version to interpret them correctly,
+/// and old readers ignoring the bits are still safe.
+pub const DRAUG_STATUS_LAYOUT_VERSION: u32 = 2;
 
 /// Size of the status shmem region in bytes. Round number that fits
 /// the current `DraugStatus` and leaves headroom for additions.
@@ -475,9 +481,25 @@ pub const DRAUG_STATUS_SHMEM_SIZE: usize = 256;
 pub const DRAUG_STATUS_COMPOSITOR_VADDR: usize = 0x33000000;
 
 /// Bit flags packed into `DraugStatus::flags`.
-pub const DRAUG_FLAG_PLAN_MODE_ACTIVE: u32   = 1 << 0;
+pub const DRAUG_FLAG_PLAN_MODE_ACTIVE: u32     = 1 << 0;
 pub const DRAUG_FLAG_REFACTOR_HIBERNATING: u32 = 1 << 1;
-pub const DRAUG_FLAG_INITIALISED: u32        = 1 << 31;
+/// Daemon's `DraugDaemon::is_waiting()` — set while an LLM round-trip
+/// is in flight. Compositor consults this to decide whether to keep
+/// polling MCP for a response.
+pub const DRAUG_FLAG_WAITING_FOR_LLM: u32      = 1 << 2;
+/// Daemon's `should_dream(now_ms)` returned true at last publish —
+/// idle long enough, dream budget not exhausted, not currently
+/// dreaming, not waiting for LLM. Compositor uses this as the
+/// authoritative gate for `start_dream_cycle`; replaces the
+/// compositor-local `draug.should_dream` call which was returning
+/// stale results because the local instance no longer ticks dream
+/// state (since #76 / #78).
+pub const DRAUG_FLAG_DREAM_READY: u32          = 1 << 3;
+/// Daemon has a skill-tree task at L1 / L2 / L3 still un-PASSed.
+/// Compositor uses this to gate AutoDream behind the refactor loop:
+/// when there's still skill-tree work, dreaming is suppressed.
+pub const DRAUG_FLAG_SKILL_TREE_HAS_WORK: u32  = 1 << 4;
+pub const DRAUG_FLAG_INITIALISED: u32          = 1 << 31;
 
 /// Live status snapshot. Daemon updates fields with `Ordering::Release`,
 /// compositor reads with `Ordering::Acquire`. Field reads are

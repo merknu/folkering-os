@@ -73,7 +73,8 @@ use libfolk::sys::draug::{
     DRAUG_STATUS_OK, DRAUG_STATUS_ERR, DRAUG_VERSION,
     DRAUG_STATUS_LAYOUT_VERSION, DRAUG_STATUS_SHMEM_SIZE,
     DRAUG_FLAG_INITIALISED, DRAUG_FLAG_PLAN_MODE_ACTIVE,
-    DRAUG_FLAG_REFACTOR_HIBERNATING,
+    DRAUG_FLAG_REFACTOR_HIBERNATING, DRAUG_FLAG_WAITING_FOR_LLM,
+    DRAUG_FLAG_DREAM_READY, DRAUG_FLAG_SKILL_TREE_HAS_WORK,
     DraugStatus,
 };
 
@@ -271,9 +272,15 @@ fn publish_status(draug: &DraugDaemon) {
 
     // Flags. Daemon owns the lower bits; compositor (later A.5 step)
     // will own bit 16 = COMPOSITOR_BUSY.
+    let now_ms = uptime();
     let mut flags = DRAUG_FLAG_INITIALISED;
-    if draug.plan_mode_active        { flags |= DRAUG_FLAG_PLAN_MODE_ACTIVE; }
-    if draug.refactor_hibernating    { flags |= DRAUG_FLAG_REFACTOR_HIBERNATING; }
+    if draug.plan_mode_active     { flags |= DRAUG_FLAG_PLAN_MODE_ACTIVE; }
+    if draug.refactor_hibernating { flags |= DRAUG_FLAG_REFACTOR_HIBERNATING; }
+    if draug.is_waiting()         { flags |= DRAUG_FLAG_WAITING_FOR_LLM; }
+    if draug.should_dream(now_ms) { flags |= DRAUG_FLAG_DREAM_READY; }
+    if draug.next_task_and_level().is_some() {
+        flags |= DRAUG_FLAG_SKILL_TREE_HAS_WORK;
+    }
     // Preserve any compositor-owned upper bits via fetch_update equivalents.
     // For now compositor doesn't write here, so a plain store is fine;
     // when the busy flag lands we'll switch to fetch_or / fetch_and.

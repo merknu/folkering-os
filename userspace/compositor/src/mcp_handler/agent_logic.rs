@@ -29,6 +29,7 @@ pub(super) fn tick(
     stream: &mut StreamState,
     draug: &mut DraugDaemon,
     briefing: &mut BriefingState,
+    draug_status: Option<&'static libfolk::sys::draug::DraugStatus>,
     fb: &mut FramebufferView,
     damage: &mut DamageTracker,
     active_agent: &mut Option<AgentSession>,
@@ -96,13 +97,38 @@ pub(super) fn tick(
     // ===== AutoDream cycle start (delegates to autodream module) =====
     // Phase 14: don't dream if the skill tree still has work to do —
     // the refactor loop takes priority over AutoDream.
+    //
+    // Gate state lives in the daemon's status shmem (Phase A.5 step 4):
+    // `DRAUG_FLAG_DREAM_READY` collapses `should_dream` + `should_yield_tokens`,
+    // `DRAUG_FLAG_SKILL_TREE_HAS_WORK` and `DRAUG_FLAG_PLAN_MODE_ACTIVE`
+    // gate against the refactor / planner loops, and `complex_task_idx`
+    // gates the boot-time complex-task warmup. Compositor-local
+    // `DraugDaemon` is consulted only as a cold-boot fallback before the
+    // daemon's shmem region is attached.
     let dream_ms = if tsc_per_us > 0 { rdtsc() / tsc_per_us / 1000 } else { 0 };
-    if draug.should_dream(dream_ms) && active_agent.is_none() && mcp.async_tool_gen.is_none()
-        && !draug.should_yield_tokens(active_agent.is_some(), dream_ms)
-        && draug.next_task_and_level().is_none()
-        && !draug.plan_mode_active
-        && draug.complex_task_idx >= compositor::draug::COMPLEX_TASK_COUNT
-    {
+    let dream_gate_open = if active_agent.is_some() || mcp.async_tool_gen.is_some() {
+        false
+    } else if let Some(s) = draug_status {
+        let flags = s.flags.load(core::sync::atomic::Ordering::Acquire);
+        let dream_ready    = flags & libfolk::sys::draug::DRAUG_FLAG_DREAM_READY != 0;
+        let plan_active    = flags & libfolk::sys::draug::DRAUG_FLAG_PLAN_MODE_ACTIVE != 0;
+        let skill_has_work = flags & libfolk::sys::draug::DRAUG_FLAG_SKILL_TREE_HAS_WORK != 0;
+        let complex_done = s.complex_task_idx.load(core::sync::atomic::Ordering::Relaxed)
+            >= compositor::draug::COMPLEX_TASK_COUNT as u32;
+        dream_ready && !plan_active && !skill_has_work && complex_done
+    } else {
+        // Fallback: shmem not attached yet (boot-order race with
+        // draug-daemon). Read from compositor-local DraugDaemon — its
+        // values can drift from the daemon's, but for this gate the
+        // cost of being wrong is one wasted DREAM_DECIDE IPC, which the
+        // daemon then short-circuits with SKIP. Acceptable.
+        draug.should_dream(dream_ms)
+            && !draug.should_yield_tokens(active_agent.is_some(), dream_ms)
+            && draug.next_task_and_level().is_none()
+            && !draug.plan_mode_active
+            && draug.complex_task_idx >= compositor::draug::COMPLEX_TASK_COUNT
+    };
+    if dream_gate_open {
         autodream::start_dream_cycle(mcp, wasm, draug, fb, dream_ms);
     }
 
@@ -146,8 +172,14 @@ pub(super) fn tick(
     }
 
     // ===== MCP: Poll for responses =====
+    let daemon_waiting = if let Some(s) = draug_status {
+        let flags = s.flags.load(core::sync::atomic::Ordering::Acquire);
+        flags & libfolk::sys::draug::DRAUG_FLAG_WAITING_FOR_LLM != 0
+    } else {
+        draug.is_waiting()
+    };
     if mcp.tz_sync_pending || mcp.async_tool_gen.is_some() || active_agent.is_some()
-        || draug.is_waiting() || mcp.pending_shell_jit.is_some()
+        || daemon_waiting || mcp.pending_shell_jit.is_some()
     {
         if let Some(response) = libfolk::mcp::client::poll() {
             did_work = true;
