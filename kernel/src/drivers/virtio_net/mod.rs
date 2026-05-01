@@ -12,6 +12,8 @@
 //! - `rx.rs` — RX buffer population, packet receive, recycling
 //! - `tx.rs` — packet transmit
 
+extern crate alloc;
+
 mod io;
 mod queue;
 mod rx;
@@ -249,14 +251,15 @@ pub fn poll_rx() {
     // progress even under flood.
     // Bounded for-loop so the 257th packet is never dequeued under flood.
     for _ in 0..256 {
-        let (frame, len) = match rx::receive_packet_inner(dev) {
+        let frame = match rx::receive_packet_inner(dev) {
             Some(packet) => packet,
             None => break,
         };
+        let len = frame.len();
         let count = RX_PACKET_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
 
         // Log first 8 packets to serial for debugging
-        if count <= 8 {
+        if count <= 8 && len >= 14 {
             crate::serial_str!("[NET RX] Packet #");
             crate::drivers::serial::write_dec(count);
             crate::serial_str!(", ");
@@ -283,7 +286,11 @@ pub fn poll_rx() {
 
 /// Receive a single raw Ethernet frame (without VirtIO header).
 /// Returns None if no packet is available. Used by the smoltcp device wrapper.
-pub fn receive_raw() -> Option<([u8; 1514], usize)> {
+///
+/// The returned `Vec<u8>` is sized to the actual frame length (no
+/// 1514-byte stack copy on the way out — see `receive_packet_inner`'s
+/// comment for the allocation profile rationale).
+pub fn receive_raw() -> Option<alloc::vec::Vec<u8>> {
     let mut guard = NET_DEVICE.lock();
     let dev = guard.as_mut()?;
     rx::receive_packet_inner(dev)
