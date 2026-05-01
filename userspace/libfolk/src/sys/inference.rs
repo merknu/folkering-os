@@ -18,8 +18,14 @@ pub fn set_inference_task_id(new_id: u32) {
     INFERENCE_TASK.store(new_id, core::sync::atomic::Ordering::Relaxed);
 }
 
-/// Default task ID (backward compatibility for shmem_grant etc.)
-pub const INFERENCE_TASK_ID: u32 = 6;
+/// Default task ID — used by `shmem_grant` etc. before the runtime
+/// setter `set_inference_task_id` fires. Inference is skipped at
+/// boot in Phase 5 Hybrid AI mode (kernel `lib.rs` `if is_inference
+/// { continue }`), so the const is mostly a fallback for code paths
+/// that respawn the server dynamically. Phase A.6 (#84) shifted task
+/// 6 to intent-service; if inference were re-enabled today it'd land
+/// at task 7 (after draug-streamer which currently takes that slot).
+pub const INFERENCE_TASK_ID: u32 = 7;
 
 // ============================================================================
 // IPC Opcodes
