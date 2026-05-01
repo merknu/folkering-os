@@ -86,23 +86,119 @@ static ALLOCATOR: BumpAllocator = BumpAllocator {
 
 // ── Target ──────────────────────────────────────────────────────────
 
-/// Pi-side `a64-stream-daemon` address. Smoltcp installs a default
-/// IPv4 route from the DHCP offer (gateway 10.0.2.2), so off-subnet
-/// destinations should NAT out through SLIRP automatically. If that
-/// proves unreliable, fall back to the host relay at `10.0.2.2:14712`
-/// (see `tools/a64-streamer/src/bin/relay.rs`).
-const DAEMON_IP: [u8; 4] = [192, 168, 68, 72];
-const DAEMON_PORT: u16 = 14712;
+/// Pi-side `a64-stream-daemon` address, configured at compile time
+/// via `FOLKERING_STREAMER_IP` and `FOLKERING_STREAMER_PORT`. Default
+/// is the SLIRP gateway (`10.0.2.2:14712`) where the host relay runs;
+/// override with `FOLKERING_STREAMER_IP=192.168.68.72` to talk to a
+/// physical Pi on the LAN.
+///
+/// Pre-cleanup the streamer hardcoded `[192, 168, 68, 72]:14712` and
+/// ARPed it forever on boot — when the target was offline this
+/// pegged smoltcp's ARP cache and starved Phase 17's outbound TCP.
+/// Now combined with `BACKOFF_*` below: at most `MAX_ATTEMPTS`
+/// connect attempts, then we exit to idle yield without burning more
+/// network resources.
+const DAEMON_IP: [u8; 4] = match option_env!("FOLKERING_STREAMER_IP") {
+    Some(s) => parse_ipv4(s),
+    None => [10, 0, 2, 2],
+};
+const DAEMON_PORT: u16 = match option_env!("FOLKERING_STREAMER_PORT") {
+    Some(s) => parse_u16(s),
+    None => 14712,
+};
+
+/// Hard cap on connect / reconnect attempts. After this many
+/// transport-layer failures we stop trying and idle the task — the
+/// kernel's smoltcp stack stops being woken by our connect calls,
+/// which un-pegs ARP for everything else (notably the Phase 17
+/// outbound TCP that the proxy depends on).
+const MAX_ATTEMPTS: u32 = 5;
+
+/// Initial backoff before the second attempt, in milliseconds.
+/// Doubles each attempt: 2s, 4s, 8s, 16s, 32s (capped). Total wait
+/// across `MAX_ATTEMPTS = 5` is ~62s, after which we give up.
+const BACKOFF_INITIAL_MS: u64 = 2_000;
+/// Cap backoff so very-long sessions don't sleep silently for
+/// minutes. 32 s is the largest doubling under MAX_ATTEMPTS = 5.
+const BACKOFF_CAP_MS: u64 = 32_000;
+
+const fn parse_ipv4(s: &str) -> [u8; 4] {
+    let bytes = s.as_bytes();
+    let mut out = [0u8; 4];
+    let mut octet: usize = 0;
+    let mut acc: u32 = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'.' {
+            if octet < 4 { out[octet] = acc as u8; }
+            octet += 1;
+            acc = 0;
+        } else if b >= b'0' && b <= b'9' {
+            acc = acc * 10 + (b - b'0') as u32;
+        }
+        i += 1;
+    }
+    if octet < 4 { out[octet] = acc as u8; }
+    out
+}
+
+const fn parse_u16(s: &str) -> u16 {
+    let bytes = s.as_bytes();
+    let mut acc: u32 = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b >= b'0' && b <= b'9' {
+            acc = acc * 10 + (b - b'0') as u32;
+        }
+        i += 1;
+    }
+    acc as u16
+}
 
 entry!(main);
 
 fn main() -> ! {
-    println!("[DRAUG-STREAMER] === ENTRY === (PID {})", get_pid());
-    match run() {
-        Ok(()) => println!("[DRAUG-STREAMER] stream complete — idle."),
-        Err(e) => println!("[DRAUG-STREAMER] fatal: {:?}", e),
+    println!("[DRAUG-STREAMER] === ENTRY === (PID {}) target={}.{}.{}.{}:{}",
+        get_pid(),
+        DAEMON_IP[0], DAEMON_IP[1], DAEMON_IP[2], DAEMON_IP[3], DAEMON_PORT);
+
+    let mut attempt: u32 = 0;
+    let mut backoff_ms: u64 = BACKOFF_INITIAL_MS;
+    loop {
+        attempt += 1;
+        match run() {
+            Ok(()) => {
+                println!("[DRAUG-STREAMER] stream complete — idle.");
+                break;
+            }
+            Err(e) => {
+                println!("[DRAUG-STREAMER] attempt {}/{} failed: {:?}",
+                    attempt, MAX_ATTEMPTS, e);
+                if attempt >= MAX_ATTEMPTS {
+                    println!("[DRAUG-STREAMER] giving up after {} attempts — idle.",
+                        MAX_ATTEMPTS);
+                    break;
+                }
+                println!("[DRAUG-STREAMER] backing off {} ms before retry...", backoff_ms);
+                sleep_ms_yielding(backoff_ms);
+                backoff_ms = (backoff_ms * 2).min(BACKOFF_CAP_MS);
+            }
+        }
     }
     loop {
+        yield_cpu();
+    }
+}
+
+/// Yield-loop sleep. Folkering doesn't have a kernel-side `sleep_ms`
+/// syscall, so we busy-wait on `uptime()` and yield the CPU on every
+/// pass. The granularity is whatever the scheduler tick is; for the
+/// 2 s – 32 s ranges we use that's plenty.
+fn sleep_ms_yielding(ms: u64) {
+    let target = uptime().saturating_add(ms);
+    while uptime() < target {
         yield_cpu();
     }
 }
