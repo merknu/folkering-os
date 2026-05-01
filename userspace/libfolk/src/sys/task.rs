@@ -801,6 +801,97 @@ pub fn get_rtc() -> DateTime {
     }
 }
 
+/// Magic constant in `KernelHeapStats::magic`. Wrong value → caller
+/// should treat the buffer as undefined and call again.
+pub const HEAP_WALK_MAGIC: u32 = 0xF01F_4EAB;
+pub const HEAP_WALK_LAYOUT_VERSION: u32 = 1;
+
+/// Snapshot of the kernel heap allocator. Wire layout matches
+/// `kernel::arch::x86_64::syscall::handlers::memory::KernelHeapStats`
+/// — the syscall writes this struct directly into our buffer.
+///
+/// Two views of "used":
+/// * `used_bytes` — what the underlying `linked_list_allocator`
+///   reports (includes alignment padding + free-list bookkeeping).
+/// * `requested_bytes` — sum of `layout.size()` for live allocs as
+///   tracked by the wrapper. The delta `(used - requested)` is the
+///   allocator's bookkeeping overhead.
+///
+/// `high_water_bytes` is the peak `requested_bytes` seen since
+/// boot — vital for "did the heap ever grow this big" analysis
+/// after the system has GC'd back down to a smaller working set
+/// (the Issue #54 question shape).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct KernelHeapStats {
+    pub magic: u32,
+    pub layout_version: u32,
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+    pub free_bytes: u64,
+    pub requested_bytes: u64,
+    pub high_water_bytes: u64,
+    pub alloc_count: u64,
+    pub dealloc_count: u64,
+    pub _reserved: [u64; 4],
+}
+
+impl KernelHeapStats {
+    /// Allocations currently held but not yet freed.
+    pub fn live_allocs(&self) -> u64 {
+        self.alloc_count.saturating_sub(self.dealloc_count)
+    }
+    /// Bookkeeping overhead = used - requested. Positive means the
+    /// allocator is storing free-list metadata + alignment padding
+    /// for live blocks.
+    pub fn overhead_bytes(&self) -> u64 {
+        self.used_bytes.saturating_sub(self.requested_bytes)
+    }
+    /// Fraction of total heap currently allocated, 0..=1000 (per-mille
+    /// to avoid f32 in no_std).
+    pub fn used_per_mille(&self) -> u32 {
+        if self.total_bytes == 0 { return 0; }
+        ((self.used_bytes * 1000) / self.total_bytes) as u32
+    }
+}
+
+/// Snapshot kernel heap state. Returns `None` only on syscall
+/// failure or magic-mismatch (e.g., kernel was rebuilt with a new
+/// layout but userspace wasn't). Cheap (~96 byte copy) — call as
+/// often as you need.
+pub fn heap_walk() -> Option<KernelHeapStats> {
+    // Initialize all fields with sentinel values that we'll
+    // overwrite via syscall. Using zeros so a partial-write at
+    // least gives us magic=0 → mismatch detection.
+    let mut stats = KernelHeapStats {
+        magic: 0,
+        layout_version: 0,
+        total_bytes: 0,
+        used_bytes: 0,
+        free_bytes: 0,
+        requested_bytes: 0,
+        high_water_bytes: 0,
+        alloc_count: 0,
+        dealloc_count: 0,
+        _reserved: [0; 4],
+    };
+    let needed = core::mem::size_of::<KernelHeapStats>() as u64;
+    let written = unsafe {
+        crate::syscall::syscall2(
+            0x85,
+            &mut stats as *mut _ as u64,
+            needed,
+        )
+    };
+    if written != needed {
+        return None;
+    }
+    if stats.magic != HEAP_WALK_MAGIC {
+        return None;
+    }
+    Some(stats)
+}
+
 /// Get system memory statistics: (total_mb, used_mb, usage_percent)
 pub fn memory_stats() -> (u32, u32, u32) {
     let raw = unsafe { syscall0(0x84) };

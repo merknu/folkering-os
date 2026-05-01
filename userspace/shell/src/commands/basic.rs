@@ -8,6 +8,7 @@ pub fn cmd_help() {
     println!("  help              - Show this help message");
     println!("  echo              - Echo text back");
     println!("  ls                - List files in ramdisk");
+    println!("  heap              - Kernel heap diagnostics (X-ray)");
     println!("  cat <file>        - Display file contents");
     println!("  sql \"...\"         - Execute SQL query on files database");
     println!("  search <keyword>  - Search files by keyword");
@@ -88,6 +89,50 @@ pub fn cmd_uptime() {
 
 pub fn cmd_pid() {
     println!("PID: {}", get_pid());
+}
+
+/// `heap` — kernel-heap X-ray. Reads the syscall-0x85 stats struct
+/// and prints both the inner-allocator view (with alignment padding)
+/// and the requested-bytes tracker (raw user-code demand). The
+/// high-water line is the load-bearing bit for #54-style "did the
+/// heap ever grow this big" investigations after the system has
+/// GC'd back to a smaller working set.
+///
+/// Format is plain integer KiB so we don't need `alloc::format!` —
+/// shell binary has no global allocator. Number gymnastics happen
+/// in the kernel's `KernelHeapStats` view.
+pub fn cmd_heap() {
+    let stats = match libfolk::sys::heap_walk() {
+        Some(s) => s,
+        None => {
+            println!("[heap] syscall failed or layout-version mismatch");
+            return;
+        }
+    };
+
+    let total_kib = stats.total_bytes / 1024;
+    let used_kib = stats.used_bytes / 1024;
+    let free_kib = stats.free_bytes / 1024;
+    let requested_kib = stats.requested_bytes / 1024;
+    let high_water_kib = stats.high_water_bytes / 1024;
+    let overhead_kib = stats.overhead_bytes() / 1024;
+    let pmille = stats.used_per_mille();
+
+    println!("");
+    println!("Kernel heap (layout v{}):", stats.layout_version);
+    println!("  Total              : {} KiB", total_kib);
+    println!("  Used (alloc view)  : {} KiB  ({}.{}%)",
+             used_kib, pmille / 10, pmille % 10);
+    println!("  Free               : {} KiB", free_kib);
+    println!("  Requested (live)   : {} KiB", requested_kib);
+    println!("  High-water         : {} KiB   <-- peak since boot",
+             high_water_kib);
+    println!("  Overhead (padding) : {} KiB", overhead_kib);
+    println!("");
+    println!("  Allocs             : {}", stats.alloc_count);
+    println!("  Deallocs           : {}", stats.dealloc_count);
+    println!("  Live allocations   : {}", stats.live_allocs());
+    println!("");
 }
 
 pub fn cmd_clear() {

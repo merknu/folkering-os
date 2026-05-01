@@ -453,3 +453,70 @@ pub fn syscall_map_physical(phys_addr: u64, virt_addr: u64, size: u64, flags: u6
     crate::serial_println!("[MAP_PHYSICAL] Successfully mapped {} pages", num_pages);
     0
 }
+
+/// Layout magic constant. Bumped when `KernelHeapStats` changes
+/// shape so old userspace decoders fail loudly instead of returning
+/// wrong fields.
+pub const HEAP_WALK_MAGIC: u32 = 0xF01F_4EAB;
+pub const HEAP_WALK_LAYOUT_VERSION: u32 = 1;
+
+/// Wire layout for the `heap_walk` syscall reply. Mirrored 1:1 in
+/// `libfolk::sys::KernelHeapStats` so the userspace consumer can
+/// `core::ptr::read` the buffer directly.
+#[repr(C)]
+pub struct KernelHeapStats {
+    pub magic: u32,
+    pub layout_version: u32,
+    pub total_bytes: u64,
+    pub used_bytes: u64,           // from inner heap (with alignment padding)
+    pub free_bytes: u64,
+    pub requested_bytes: u64,      // from atomic tracker
+    pub high_water_bytes: u64,     // peak `requested_bytes` since boot
+    pub alloc_count: u64,
+    pub dealloc_count: u64,
+    pub _reserved: [u64; 4],       // future expansion w/o layout bump
+}
+
+/// Diagnostic syscall: write the kernel-heap-stats struct into a
+/// userspace buffer. Returns the byte count written, or `u64::MAX`
+/// on a bad pointer / undersized buffer.
+///
+/// This is the X-ray syscall behind Issue #54 investigation —
+/// without it we can't see whether the 240 MB grows in kernel
+/// allocations or somewhere else (smoltcp socket buffers, userspace
+/// task heaps). Cheap on the wire (~96 bytes), call as often as
+/// you like.
+pub fn syscall_heap_walk(buf_ptr: u64, buf_max: u64) -> u64 {
+    let needed = core::mem::size_of::<KernelHeapStats>() as u64;
+    if buf_max < needed {
+        return u64::MAX;
+    }
+    const USERSPACE_TOP: u64 = 0x0000_8000_0000_0000;
+    if buf_ptr < 0x200000 || buf_ptr >= USERSPACE_TOP { return u64::MAX; }
+    let buf_end = match buf_ptr.checked_add(needed) {
+        Some(e) => e,
+        None => return u64::MAX,
+    };
+    if buf_end > USERSPACE_TOP { return u64::MAX; }
+
+    let alloc = &crate::memory::heap::ALLOCATOR;
+    let (total, used, free) = alloc.inner_snapshot();
+
+    let stats = KernelHeapStats {
+        magic: HEAP_WALK_MAGIC,
+        layout_version: HEAP_WALK_LAYOUT_VERSION,
+        total_bytes: total as u64,
+        used_bytes: used as u64,
+        free_bytes: free as u64,
+        requested_bytes: alloc.requested_bytes(),
+        high_water_bytes: alloc.high_water(),
+        alloc_count: alloc.alloc_count(),
+        dealloc_count: alloc.dealloc_count(),
+        _reserved: [0; 4],
+    };
+
+    unsafe {
+        core::ptr::write_unaligned(buf_ptr as *mut KernelHeapStats, stats);
+    }
+    needed
+}
