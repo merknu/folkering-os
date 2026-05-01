@@ -83,6 +83,7 @@ pub fn execute_command() {
         "ps" => commands::basic::cmd_ps(),
         "uptime" => commands::basic::cmd_uptime(),
         "pid" => commands::basic::cmd_pid(),
+        "heap" => commands::basic::cmd_heap(),
         "clear" => commands::basic::cmd_clear(),
         "exit" => commands::basic::cmd_exit(),
         "poweroff" | "shutdown" => commands::system::cmd_poweroff(),
