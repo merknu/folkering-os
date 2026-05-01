@@ -627,47 +627,27 @@ fn main() -> ! {
     // last_clock_second now in render (RenderState)
     // tz_offset_minutes, tz_synced, tz_sync_pending now in mcp
     let mut active_agent: Option<compositor::agent::AgentSession> = None; // ReAct agentic loop
-    let mut draug = compositor::draug::DraugDaemon::new();
     let mut briefing = compositor::briefing::BriefingState::new();
 
-    // Phase A.5 step 2.3: read draug state from the daemon's status
-    // shmem instead of the local DraugDaemon for the fields the
-    // daemon owns now (refactor counts, task_levels, last_input_ms,
-    // hibernation flags). Compositor's local DraugDaemon stays
-    // allocated until step 2.4 because the analysis-cycle path and
-    // a few HUD callsites still read from it.
-    //
-    // `attach_status()` returns `Err` if draug-daemon hasn't booted
-    // yet — that's expected during cold boot since compositor
-    // currently spawns before draug-daemon (Phase A.6 fixes the
-    // ordering). Treat as `None` and fall back to local reads.
+    // Phase A.5 step 6: compositor's local `DraugDaemon` is gone.
+    // All agent state lives in the daemon process; reads come over
+    // the status shmem. Phase A.6 (#84) pinned daemon to task 4 so
+    // it boots before compositor — `attach_status` should succeed
+    // on the first try in normal flow. The `None` branch below is
+    // a defensive fallback for the IPC path being broken altogether
+    // (e.g. daemon ELF missing from the ramdisk).
     let draug_status: Option<&'static libfolk::sys::draug::DraugStatus> =
         libfolk::sys::draug::attach_status().ok();
     if draug_status.is_some() {
         libfolk::sys::io::write_str("[Draug] status shmem attached — HUD reads from daemon\n");
     } else {
-        libfolk::sys::io::write_str("[Draug] status shmem not yet ready (daemon booting?) — HUD falls back to local\n");
+        libfolk::sys::io::write_str("[Draug] WARNING: status shmem unavailable — autodream gate stays closed\n");
     }
 
-    // Stability Fix 1: restore state from previous session. Daemon
-    // also restores from the same Synapse file at its own boot — no
-    // contention because save_state writes only fire from the
-    // daemon's tick path now (compositor's local DraugDaemon is
-    // dormant on those code paths).
-    if draug.restore_state() {
-        libfolk::sys::io::write_str("[Draug] Restored state: iter=");
-        let mut nb = [0u8; 16];
-        libfolk::sys::io::write_str(crate::util::format_usize(draug.refactor_iter as usize, &mut nb));
-        libfolk::sys::io::write_str(" levels=[");
-        for i in 0..20 {
-            if i > 0 { libfolk::sys::io::write_str(","); }
-            libfolk::sys::io::write_str(crate::util::format_usize(draug.task_levels[i] as usize, &mut nb));
-        }
-        libfolk::sys::io::write_str("]\n");
-        // The kernel-bridge push that used to live here is now done
-        // by draug-daemon on every tick — the boot-time push was
-        // double-writing into the bridge atomics for no benefit.
-    }
+    // `restore_state` runs in the daemon (`draug-daemon::main`)
+    // against the same Synapse file. The boot-time print of restored
+    // counters is gone because the daemon logs the same info — no
+    // value in duplicating it on the compositor side.
 
     // Phase 17 — seed the autonomous refactor task queue if it's
     // missing. Daemon picks up the same Synapse VFS file on its
@@ -864,7 +844,7 @@ fn main() -> ! {
         {
             let ai = mcp_handler::tick_ai_systems(
                 &mut mcp, &mut wasm, &mut wm, &mut stream,
-                &mut draug, &mut briefing, draug_status, &mut fb, &mut damage,
+                &mut briefing, draug_status, &mut fb, &mut damage,
                 &mut active_agent, &mut drivers_seeded,
                 tsc_per_us,
             );
@@ -930,13 +910,15 @@ fn main() -> ! {
         // Freeze caret when idle >10s — prevents infinite 150ms redraw loop
         {
             let caret_ms = if tsc_per_us > 0 { rdtsc() / tsc_per_us / 1000 } else { uptime() };
-            // Phase A.5 step 2.3: prefer the daemon's last_input_ms
-            // from shmem (cross-process source of truth). Fall back
-            // to compositor's local DraugDaemon if shmem isn't
-            // attached (boot-order race with draug-daemon).
+            // Read user-input timestamp from the daemon's status shmem.
+            // If shmem isn't attached (defensive — Phase A.6 boot order
+            // makes this a should-not-happen), default to 0; the
+            // resulting "huge idle" reading freezes the caret, which
+            // is the same observable behaviour as the existing
+            // 10-second idle freeze.
             let last_input_ms = draug_status
                 .map(|s| s.last_input_ms.load(core::sync::atomic::Ordering::Acquire))
-                .unwrap_or_else(|| draug.last_input_ms());
+                .unwrap_or(0);
             let idle_secs = caret_ms.saturating_sub(last_input_ms) / 1000;
             if idle_secs < 10 && caret_ms.saturating_sub(input.last_caret_flip_ms) >= CARET_BLINK_MS {
                 input.caret_visible = !input.caret_visible;
@@ -1032,7 +1014,6 @@ fn main() -> ! {
                 wm: &mut wm,
                 mcp: &mut mcp,
                 stream: &mut stream,
-                draug: &mut draug,
                 briefing: &mut briefing,
                 fb: &mut fb,
                 damage: &mut damage,
@@ -1113,8 +1094,7 @@ fn main() -> ! {
                     mcp: &mut mcp,
                     iqe: &iqe,
                     damage: &mut damage,
-                    draug: &mut draug,
-                    categories: &categories[..],
+                        categories: &categories[..],
                     layout: &rl,
                     cursor: &cursor,
                     cursor_drawn,
