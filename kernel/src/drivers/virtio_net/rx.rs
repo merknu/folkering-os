@@ -1,5 +1,8 @@
 //! Receive path for VirtIO-net: buffer population, packet receive, recycling.
 
+extern crate alloc;
+use alloc::vec::Vec;
+
 use crate::drivers::virtio::{Virtqueue, VRING_DESC_F_WRITE};
 use super::{NetError, VirtIONet};
 use super::io::*;
@@ -72,9 +75,27 @@ pub(super) fn populate_rx_queue(
 }
 
 /// Try to receive a packet from the RX queue.
-/// Returns a copy of the Ethernet frame (without VirtIO header) if available.
-/// The RX buffer is recycled back into the queue immediately.
-pub(super) fn receive_packet_inner(dev: &mut VirtIONet) -> Option<([u8; 1514], usize)> {
+///
+/// Returns the Ethernet frame (without the 10-byte VirtIO header) as a
+/// `Vec<u8>` sized to the actual frame length. The descriptor's
+/// physical buffer is recycled back into the queue before we return.
+///
+/// Allocation profile vs. the pre-2026-05-01 path: we used to memcpy
+/// the buffer into a stack-resident `[u8; 1514]` then immediately
+/// `to_vec(&[..len])` it inside the smoltcp device wrapper. That was
+/// two copies and a 1514-byte zero-init per packet, regardless of
+/// frame size. The current path zero-inits nothing and copies once
+/// directly into a `Vec` of exactly `frame_len` bytes — halving RX
+/// memory bandwidth and dropping the 1514-byte stack pressure.
+///
+/// The buffer is still recycled synchronously, so the RX queue has the
+/// same depth-budget behaviour as before; no semantic change to the
+/// virtio descriptor lifecycle, just a tighter copy path. A future
+/// pass can replace this with an RAII guard that defers recycling
+/// until smoltcp's `RxToken::consume` runs (true zero-copy), but that
+/// requires reworking `FolkeringDevice::receive` to thread a borrow
+/// through smoltcp's `Device` trait — out of scope here.
+pub(super) fn receive_packet_inner(dev: &mut VirtIONet) -> Option<Vec<u8>> {
     let (desc_idx, total_len) = dev.rx_queue.pop_used()?;
 
     // The descriptor index tells us which buffer was filled
@@ -95,18 +116,24 @@ pub(super) fn receive_packet_inner(dev: &mut VirtIONet) -> Option<([u8; 1514], u
     }
 
     let frame_len = total - VIRTIO_NET_HDR_SIZE;
+    // 1514 is the standard non-jumbo Ethernet payload cap (1500 MTU
+    // + 14 header). Same upper bound the old `[u8; 1514]` path
+    // enforced — anything beyond that came from a misconfigured peer
+    // or a truncation bug, and we'd rather drop the tail than
+    // surprise the upper stack.
     let max_copy = frame_len.min(1514);
 
-    let mut frame = [0u8; 1514];
+    let mut frame: Vec<u8> = Vec::with_capacity(max_copy);
     unsafe {
         let src = (buf_virt + VIRTIO_NET_HDR_SIZE) as *const u8;
         core::ptr::copy_nonoverlapping(src, frame.as_mut_ptr(), max_copy);
+        frame.set_len(max_copy);
     }
 
     // Recycle buffer back into RX queue
     recycle_rx_buffer(dev, desc_idx, buf_phys);
 
-    Some((frame, max_copy))
+    Some(frame)
 }
 
 /// Recycle an RX buffer back into the queue so the device can reuse it.

@@ -81,14 +81,20 @@ impl Device for FolkeringDevice {
         // Fallback to VirtIO — loop to skip dropped packets. Capped at
         // 256 dropped frames per receive() so a flood of denied packets
         // (Issue #49 pattern) can't pin smoltcp's poll cycle.
+        //
+        // `virtio_net::receive_raw` now returns the frame as a `Vec<u8>`
+        // sized exactly to the on-wire payload — we move it straight
+        // into the RxToken instead of copying through a 1514-byte
+        // stack buffer first. Same observable behaviour for smoltcp,
+        // half the RX-path memcpy cost.
         let mut skipped = 0u32;
         loop {
-            let (frame, len) = match virtio_net::receive_raw() {
+            let frame = match virtio_net::receive_raw() {
                 Some(f) => f,
                 None => return None,
             };
-            if firewall::filter_packet(&frame[..len]) == firewall::FirewallAction::Allow {
-                let rx = FolkeringRxToken { buffer: frame[..len].to_vec() };
+            if firewall::filter_packet(&frame) == firewall::FirewallAction::Allow {
+                let rx = FolkeringRxToken { buffer: frame };
                 return Some((rx, FolkeringTxToken));
             }
             skipped += 1;
