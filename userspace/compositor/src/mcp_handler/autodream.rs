@@ -276,6 +276,7 @@ pub(super) fn handle_wasm_chunk(
     wasm: &mut WasmState,
     wm: &mut WindowManager,
     draug: &mut DraugDaemon,
+    briefing: &mut compositor::briefing::BriefingState,
     fb: &mut FramebufferView,
     damage: &mut DamageTracker,
     _drivers_seeded: &mut bool,
@@ -519,7 +520,7 @@ pub(super) fn handle_wasm_chunk(
     // Phase A.5 step 2; the local `DraugDaemon::is_dreaming()` flag is
     // no longer consulted from this path.
     if mcp.current_dream.is_some() && !tool_prompt.is_empty() {
-        evaluate_dream_result(&wasm_bytes, &tool_prompt, mcp, wasm, draug, fb, tsc_per_us);
+        evaluate_dream_result(&wasm_bytes, &tool_prompt, mcp, wasm, draug, briefing, fb, tsc_per_us);
     }
     // ── Normal cache storage (non-dream) ──
     else if !tool_prompt.is_empty() {
@@ -611,6 +612,7 @@ fn evaluate_dream_result(
     mcp: &mut McpState,
     wasm: &mut WasmState,
     draug: &mut DraugDaemon,
+    briefing: &mut compositor::briefing::BriefingState,
     fb: &FramebufferView,
     tsc_per_us: u64,
 ) {
@@ -647,7 +649,7 @@ fn evaluate_dream_result(
             write_str("[AutoDream] New render: ");
             write_str(&summary[..summary.len().min(200)]);
             write_str("\n[AutoDream] VERDICT: QUEUED for user approval (Morning Briefing)\n");
-            draug.queue_creative(orig_key, &summary[..summary.len().min(100)],
+            briefing.queue(orig_key, &summary[..summary.len().min(100)],
                 alloc::vec::Vec::from(wasm_bytes));
         }
         compositor::draug::DreamMode::Nightmare => {

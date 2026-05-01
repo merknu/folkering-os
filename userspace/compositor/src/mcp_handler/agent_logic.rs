@@ -12,6 +12,7 @@ use libfolk::sys::io::write_str;
 
 use compositor::agent::AgentSession;
 use compositor::damage::DamageTracker;
+use compositor::briefing::BriefingState;
 use compositor::draug::DraugDaemon;
 use compositor::framebuffer::FramebufferView;
 use compositor::state::{McpState, StreamState, WasmState};
@@ -27,6 +28,7 @@ pub(super) fn tick(
     wm: &mut WindowManager,
     stream: &mut StreamState,
     draug: &mut DraugDaemon,
+    briefing: &mut BriefingState,
     fb: &mut FramebufferView,
     damage: &mut DamageTracker,
     active_agent: &mut Option<AgentSession>,
@@ -113,8 +115,8 @@ pub(super) fn tick(
     }
 
     // Morning Briefing
-    if did_work && draug.has_pending_creative() && mcp.current_dream.is_none() {
-        let count = draug.pending_count();
+    if did_work && briefing.has_pending() && mcp.current_dream.is_none() {
+        let count = briefing.pending_count();
         write_str("[Morning Briefing] Draug has ");
         let mut nb2 = [0u8; 16];
         write_str(format_usize(count, &mut nb2));
@@ -124,7 +126,7 @@ pub(super) fn tick(
         if let Some(win) = wm.get_window_mut(brief_win) {
             win.push_line("Good morning! Draug dreamt overnight:");
             win.push_line("");
-            for (i, p) in draug.pending_creative.iter().enumerate() {
+            for (i, p) in briefing.items.iter().enumerate() {
                 if p.accepted.is_none() {
                     let line = alloc::format!(
                         "  {}. '{}': {}",
@@ -175,7 +177,7 @@ pub(super) fn tick(
                 } => {
                     // Delegate WasmChunk handling to autodream module
                     let result = autodream::handle_wasm_chunk(
-                        total_chunks, &data[..], mcp, wasm, wm, draug, fb, damage,
+                        total_chunks, &data[..], mcp, wasm, wm, draug, briefing, fb, damage,
                         drivers_seeded, tsc_per_us, &mut need_redraw,
                     );
                     if result.early_return {
