@@ -12,12 +12,10 @@ use crate::draug::{AsyncPhase, AsyncOp, DraugDaemon, PlanStep};
 use crate::knowledge_hunt::{write_dec, extract_rust_code_block, push_decimal, REFACTOR_TASKS};
 use crate::agent_planner::COMPLEX_TASKS;
 
-// Phase 17 demo on Proxmox/KVM: VM 800 talks to the proxy on the
-// Proxmox host directly via the LAN bridge, not the QEMU SLIRP
-// gateway. Set this to your proxy's LAN IP. 10.0.2.2 is the
-// historical default for `qemu -netdev user`.
-const PROXY_IP: [u8; 4] = [192, 168, 68, 150];
-const PROXY_PORT: u16 = 14711;
+// Build-time configurable proxy target — set `FOLKERING_PROXY_IP=<ip>`
+// at compile time for the Proxmox / bridged-LAN demo. Defaults to the
+// SLIRP `10.0.2.2:14711` so local QEMU runs work out of the box.
+use libfolk::proxy_config::{PROXY_IP, PROXY_PORT};
 
 /// Non-blocking Draug tick. Called every compositor frame (~60Hz).
 pub fn tick_async(draug: &mut DraugDaemon, now_ms: u64) -> bool {

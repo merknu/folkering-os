@@ -1,5 +1,13 @@
 //! Network syscalls: ICMP ping, DNS, HTTPS/HTTP fetch, GitHub helpers,
 //! UDP send/recv, NTP query.
+//!
+//! All host-bound TCP calls (NAVIGATE, PATCH, LLM relay, etc.) target
+//! `crate::net::proxy_config::{PROXY_IP, PROXY_PORT}` — configurable
+//! at build time via `FOLKERING_PROXY_IP` / `FOLKERING_PROXY_PORT`,
+//! defaulting to the SLIRP `10.0.2.2:14711` so local QEMU runs work
+//! out of the box.
+
+use crate::net::proxy_config::{PROXY_IP, PROXY_PORT};
 
 pub fn syscall_ping(ip_packed: u64) -> u64 {
     let a = (ip_packed & 0xFF) as u8;
@@ -410,8 +418,6 @@ pub fn syscall_fbp_request(
     buf_ptr: u64,
     buf_max: u64,
 ) -> u64 {
-    const PROXY_IP: [u8; 4] = [192, 168, 68, 150];
-    const PROXY_PORT: u16 = 14711;
     const MAX_REQUEST: usize = 1024;
 
     if url_len == 0 || url_len > 512 || buf_max == 0 || buf_max > 262144 {
@@ -521,8 +527,6 @@ pub fn syscall_fbp_interact(
     buf_max: u64,
     action_and_node: u64,
 ) -> u64 {
-    const PROXY_IP: [u8; 4] = [192, 168, 68, 150];
-    const PROXY_PORT: u16 = 14711;
 
     if url_len == 0 || url_len > 512 || buf_max == 0 || buf_max > 262144 {
         return u64::MAX;
@@ -662,8 +666,6 @@ pub fn syscall_fbp_patch(
     result_ptr: u64,
     packed_lens: u64,
 ) -> u64 {
-    const PROXY_IP: [u8; 4] = [192, 168, 68, 150];
-    const PROXY_PORT: u16 = 14711;
 
     // Unpack: 21 bits each for filename_len / content_len / result_max.
     // See `libfolk::sys::fbp_patch` for the matching pack step.
@@ -806,8 +808,6 @@ pub fn syscall_llm_generate(
     result_ptr: u64,
     packed_lens: u64,
 ) -> u64 {
-    const PROXY_IP: [u8; 4] = [192, 168, 68, 150];
-    const PROXY_PORT: u16 = 14711;
 
     let model_len = (packed_lens & 0x1F_FFFF) as usize;
     let prompt_len = ((packed_lens >> 21) & 0x1F_FFFF) as usize;
@@ -933,8 +933,6 @@ pub fn syscall_llm_generate(
 /// Returns Some((status, bytes_written)) on a successful proxy
 /// round-trip (any status code), None on TCP failure.
 pub fn graph_callers_inner(name: &str, result: &mut [u8]) -> Option<(u32, usize)> {
-    const PROXY_IP: [u8; 4] = [192, 168, 68, 150];
-    const PROXY_PORT: u16 = 14711;
 
     crate::serial_str!("[GRAPH] callers of ");
     crate::serial_strln!(name);
@@ -1053,8 +1051,6 @@ pub fn syscall_graph_callers(
 /// Returns 1 if proxy responds with PONG, 0 otherwise.
 /// Used before expensive LLM calls to fail fast when proxy is down.
 pub fn syscall_proxy_ping() -> u64 {
-    const PROXY_IP: [u8; 4] = [192, 168, 68, 150];
-    const PROXY_PORT: u16 = 14711;
 
     // Issue #58 instrumentation: log every ping attempt + outcome so we
     // can see whether hibernation's wakeup path is itself broken under
@@ -1100,8 +1096,6 @@ pub fn syscall_proxy_ping() -> u64 {
 /// (status = 0xDEADBEEF, output_len = 0) which we surface as
 /// `u64::MAX` so the userspace branch is unambiguous.
 pub fn syscall_proxy_last_verdict(buf_ptr: u64, buf_max: u64) -> u64 {
-    const PROXY_IP: [u8; 4] = [192, 168, 68, 150];
-    const PROXY_PORT: u16 = 14711;
 
     if buf_max == 0 || buf_max > 65_536 {
         return u64::MAX;
@@ -1181,8 +1175,6 @@ pub fn syscall_proxy_patch_dedup(
     hash_ptr: u64, hash_len: u64,
     buf_ptr: u64, buf_max: u64,
 ) -> u64 {
-    const PROXY_IP: [u8; 4] = [192, 168, 68, 150];
-    const PROXY_PORT: u16 = 14711;
     const MISS_SENTINEL: u32 = 0xCACE_D15D;
 
     // Pointer + length sanity. Hash is fixed at 64 hex chars; reject
@@ -1298,8 +1290,6 @@ pub fn syscall_proxy_patch_dedup(
 /// Returns 1 on successful ACK (proxy acknowledged or cache was
 /// already empty), 0 on transport failure.
 pub fn syscall_proxy_ack_verdict() -> u64 {
-    const PROXY_IP: [u8; 4] = [192, 168, 68, 150];
-    const PROXY_PORT: u16 = 14711;
 
     crate::serial_strln!("[ACK_VERDICT] sending to proxy");
 
@@ -1346,8 +1336,6 @@ pub fn syscall_proxy_ack_verdict() -> u64 {
 ///
 /// Returns 1 on PONG received, 0 otherwise.
 pub fn syscall_proxy_ping_udp() -> u64 {
-    const PROXY_IP: [u8; 4] = [192, 168, 68, 150];
-    const PROXY_PORT: u16 = 14711;
 
     crate::serial_strln!("[PROXY_PING_UDP] requesting");
 
@@ -1385,8 +1373,6 @@ pub fn syscall_proxy_ping_udp() -> u64 {
 ///
 /// Returns `(status << 32) | wasm_bytes_written` or `u64::MAX` on failure.
 pub fn syscall_wasm_compile(buf_ptr: u64, buf_max: u64) -> u64 {
-    const PROXY_IP: [u8; 4] = [192, 168, 68, 150];
-    const PROXY_PORT: u16 = 14711;
 
     if buf_max == 0 || buf_max > 262_144 {
         return u64::MAX;
@@ -1545,8 +1531,6 @@ pub fn syscall_cargo_check(
     result_ptr: u64,
     packed_lens: u64,
 ) -> u64 {
-    const PROXY_IP: [u8; 4] = [192, 168, 68, 150];
-    const PROXY_PORT: u16 = 14711;
 
     let target_len = (packed_lens & 0x1F_FFFF) as usize;
     let content_len = ((packed_lens >> 21) & 0x1F_FFFF) as usize;
@@ -1687,8 +1671,6 @@ pub fn syscall_fetch_source(
     _unused: u64,
     packed_lens: u64,
 ) -> u64 {
-    const PROXY_IP: [u8; 4] = [192, 168, 68, 150];
-    const PROXY_PORT: u16 = 14711;
 
     let target_len = (packed_lens & 0x1F_FFFF) as usize;
     let result_max = ((packed_lens >> 21) & 0x1F_FFFF) as usize;

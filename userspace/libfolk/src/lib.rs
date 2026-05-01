@@ -45,6 +45,7 @@ pub mod ui;
 pub mod mcp;
 pub mod json;
 pub mod crypto;
+pub mod proxy_config;
 
 // Re-export print macros at crate root
 pub use fmt::_print;
