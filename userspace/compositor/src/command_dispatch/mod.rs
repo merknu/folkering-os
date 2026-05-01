@@ -24,7 +24,6 @@ use alloc::vec::Vec;
 
 use compositor::agent::AgentSession;
 use compositor::damage::DamageTracker;
-use compositor::draug::DraugDaemon;
 use compositor::framebuffer::FramebufferView;
 use compositor::state::{CursorState, InputState, McpState, StreamState, WasmState};
 use compositor::window_manager::WindowManager;
@@ -62,7 +61,6 @@ pub struct DispatchContext<'a> {
     pub wm: &'a mut WindowManager,
     pub mcp: &'a mut McpState,
     pub stream: &'a mut StreamState,
-    pub draug: &'a mut DraugDaemon,
     pub briefing: &'a mut compositor::briefing::BriefingState,
     pub fb: &'a mut FramebufferView,
     pub damage: &'a mut DamageTracker,
