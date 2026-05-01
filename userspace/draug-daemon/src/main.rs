@@ -101,6 +101,15 @@ const DREAM_DECIDE_DAEMON_VADDR: usize = 0x41000000;
 static mut STATUS_HANDLE: u32 = 0;
 static mut STATUS_PTR: *mut DraugStatus = core::ptr::null_mut();
 
+/// Throttle window for the periodic "I'm still alive" log. The
+/// daemon's tick loop is otherwise silent when no work fires
+/// (idle skill tree, autodream gated by user activity, no
+/// knowledge hunt pending), which makes silent-but-fine
+/// indistinguishable from silent-because-stuck. See issue #94.
+const ALIVE_LOG_INTERVAL_MS: u64 = 30_000;
+static mut LAST_ALIVE_LOG_MS: u64 = 0;
+static mut TICK_COUNT: u64 = 0;
+
 fn main() -> ! {
     let pid = get_pid();
     println!("[DRAUG-DAEMON] starting (PID: {})", pid);
@@ -149,15 +158,45 @@ fn main() -> ! {
         // 2. Draug ticks.
         let now_ms = uptime();
         run_draug_tick(&mut draug, now_ms);
+        unsafe { TICK_COUNT += 1; }
 
         // 3. Mirror state to status shmem so compositor reads see fresh
         //    counters. Cheap (a handful of relaxed atomic stores).
         publish_status(&draug);
 
+        // Periodic alive log. Without this, a silent tick loop is
+        // indistinguishable from a hung one — issue #94. Throttled
+        // to one line per 30 s so it doesn't drown legitimate work.
+        log_alive_if_due(&draug, now_ms);
+
         // 4. Yield. The kernel scheduler will run other tasks; we get
         //    re-scheduled when the timer ISR sees us as runnable.
         yield_cpu();
     }
+}
+
+/// Print a one-line liveness summary every `ALIVE_LOG_INTERVAL_MS`
+/// of kernel uptime. Surfaces the load-bearing decision flags so a
+/// reader can tell *why* the loop isn't producing work — instead of
+/// staring at silence.
+fn log_alive_if_due(draug: &DraugDaemon, now_ms: u64) {
+    let last = unsafe { LAST_ALIVE_LOG_MS };
+    if now_ms.saturating_sub(last) < ALIVE_LOG_INTERVAL_MS {
+        return;
+    }
+    unsafe { LAST_ALIVE_LOG_MS = now_ms; }
+    let ticks = unsafe { TICK_COUNT };
+    let idle_s = now_ms.saturating_sub(draug.last_input_ms()) / 1000;
+    println!(
+        "[DRAUG-DAEMON] alive uptime={}s ticks={} dreaming={} waiting_llm={} idle={}s refactor_iter={} complex_idx={}",
+        now_ms / 1000,
+        ticks,
+        draug.is_dreaming() as u8,
+        draug.is_waiting() as u8,
+        idle_s,
+        draug.refactor_iter,
+        draug.complex_task_idx,
+    );
 }
 
 /// Allocate, map, initialise, and grant compositor read access to
