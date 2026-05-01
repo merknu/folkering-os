@@ -61,9 +61,10 @@ use libfolk::sys::{yield_cpu, get_pid, shmem_create, shmem_map, shmem_grant, upt
 use libfolk::sys::compositor::COMPOSITOR_TASK_ID;
 use libfolk::sys::ipc::{recv_async, reply_with_token};
 use libfolk::sys::draug::{
-    unpack_op, unpack_data48, unpack_shmem_size,
+    unpack_op, unpack_data48, unpack_shmem_size, unpack_friction,
     DRAUG_OP_PING, DRAUG_OP_USER_INPUT, DRAUG_OP_WASM_CRASH,
     DRAUG_OP_INSTALL_REFACTOR_TASKS, DRAUG_OP_GET_STATUS_HANDLE,
+    DRAUG_OP_FRICTION_SIGNAL,
     DRAUG_STATUS_OK, DRAUG_STATUS_ERR, DRAUG_VERSION,
     DRAUG_STATUS_LAYOUT_VERSION, DRAUG_STATUS_SHMEM_SIZE,
     DRAUG_FLAG_INITIALISED, DRAUG_FLAG_PLAN_MODE_ACTIVE,
@@ -308,6 +309,12 @@ fn handle_command(payload0: u64, draug: &mut DraugDaemon) -> u64 {
         DRAUG_OP_GET_STATUS_HANDLE => {
             let h = unsafe { STATUS_HANDLE };
             if h == 0 { DRAUG_STATUS_ERR } else { h as u64 }
+        }
+
+        DRAUG_OP_FRICTION_SIGNAL => {
+            let (hash, weight) = unpack_friction(payload0);
+            draug.friction.record_signal(hash, weight);
+            DRAUG_STATUS_OK
         }
 
         _ => DRAUG_STATUS_ERR,

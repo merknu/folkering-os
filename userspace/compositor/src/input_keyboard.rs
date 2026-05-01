@@ -108,6 +108,14 @@ pub fn process_keyboard(
                     if open_duration < 3000 {
                         if let Some(ref k) = wasm.active_app_key {
                             let h = compositor::draug::DraugDaemon::key_hash_pub(k);
+                            // Phase A.5 Path A.2: forward friction
+                            // signal to draug-daemon so its friction
+                            // map sees the same input pattern. Local
+                            // call stays for autodream's gating
+                            // (which still consults compositor's local
+                            // DraugDaemon) until autodream migrates.
+                            libfolk::sys::draug::send_friction_signal(
+                                h, compositor::draug::FRICTION_QUICK_CLOSE);
                             draug.friction.record_signal(h, compositor::draug::FRICTION_QUICK_CLOSE);
                             write_str("[Friction] quick_close for '");
                             write_str(&k[..k.len().min(30)]);

@@ -173,6 +173,11 @@ pub fn process_mouse(
                 if recent > 5 {
                     if let Some(ref k) = wasm.active_app_key {
                         let h = compositor::draug::DraugDaemon::key_hash_pub(k);
+                        // Phase A.5 Path A.2: forward to draug-daemon.
+                        // Local call kept for autodream gating until
+                        // autodream migrates.
+                        libfolk::sys::draug::send_friction_signal(
+                            h, compositor::draug::FRICTION_RAGE_CLICK);
                         draug.friction.record_signal(h, compositor::draug::FRICTION_RAGE_CLICK);
                         write_str("[Friction] rage_click for '");
                         write_str(&k[..k.len().min(30)]);
