@@ -120,6 +120,11 @@ pub enum AsyncOp {
     /// `proj/<project>/` namespace. First demo of Draug authoring
     /// beyond a single function.
     PhaseCMultiFile,
+    /// Phase C v2: ship the freshly-authored multi-file project to
+    /// the proxy's MULTI_PATCH command. Proxy lays out the crate +
+    /// runs `cargo test`; reply uses the same status/output shape
+    /// as PATCH so the kernel-side decoder is unchanged.
+    PhaseCMultiPatch,
 }
 
 /// Which kind of work Draug is doing right now. Lets `tick_idle`

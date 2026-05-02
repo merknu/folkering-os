@@ -581,6 +581,7 @@ fn tick_processing(draug: &mut DraugDaemon, now_ms: u64) -> bool {
         // routing stays identical to the old MCP path.
         AsyncOp::AnalysisLlm => process_analysis_response(draug, &response),
         AsyncOp::PhaseCMultiFile => process_phase_c_response(draug, &response, now_ms),
+        AsyncOp::PhaseCMultiPatch => process_phase_c_multi_patch_response(draug, &response),
         _ => { draug.async_phase = AsyncPhase::Idle; true }
     }
 }
@@ -643,6 +644,133 @@ fn process_phase_c_response(draug: &mut DraugDaemon, response: &[u8], _now_ms: u
     let summary = crate::phase_c::summary_line(project_id, written, files.len());
     write_str(&summary);
     write_str("\n");
+
+    // Phase C v2: ship the freshly-authored crate to the proxy's
+    // MULTI_PATCH command for cargo test. This closes the loop —
+    // Draug authors AND verifies the multi-file project on her own.
+    // If the wire-frame build or TCP connect fails, fall back to
+    // idle (don't wedge the loop on transport errors).
+    if written > 0 && start_phase_c_multi_patch_request(draug, project_id, &files) {
+        // start_phase_c_multi_patch_request set phase = Sending and
+        // pushed our wire frame; tick_sending picks it up next call.
+        // Do NOT advance phase_c_idx yet — wait for the cargo verdict.
+        return true;
+    }
+
+    write_str("[Phase-C] could not start MULTI_PATCH — skipping cargo test\n");
+    draug.phase_c_idx = draug.phase_c_idx.saturating_add(1);
+    draug.async_phase = AsyncPhase::Idle;
+    draug.async_operation = AsyncOp::None;
+    true
+}
+
+/// Phase C v2 — build the MULTI_PATCH wire frame from the parsed
+/// project files and kick off the TCP send. Mirrors `start_patch_request`
+/// for the single-file path; the wire shape is documented in
+/// `folkering-proxy/src/patch_multi.rs`.
+fn start_phase_c_multi_patch_request(
+    draug: &mut DraugDaemon,
+    project_id: &str,
+    files: &[crate::phase_c::MultiFileEntry],
+) -> bool {
+    use libfolk::sys::tcp_connect_async;
+
+    let mut req: Vec<u8> = Vec::with_capacity(2048);
+    req.extend_from_slice(b"MULTI_PATCH ");
+    req.extend_from_slice(project_id.as_bytes());
+    req.push(b'\n');
+    encode_decimal(&mut req, files.len());
+    req.push(b'\n');
+
+    // Per-file header: <path>\n<byte_len>\n
+    for f in files {
+        req.extend_from_slice(f.path.as_bytes());
+        req.push(b'\n');
+        encode_decimal(&mut req, f.content.len());
+        req.push(b'\n');
+    }
+    // Bodies in declaration order
+    for f in files {
+        req.extend_from_slice(f.content.as_bytes());
+    }
+
+    write_str("[Phase-C] MULTI_PATCH → proxy (");
+    write_dec(req.len() as u32);
+    write_str(" bytes)\n");
+
+    draug.async_request = req;
+    draug.async_sent = 0;
+    if draug.async_response.capacity() < 8192 {
+        draug.async_response.reserve(8192);
+    }
+    draug.async_response.clear();
+
+    let result = tcp_connect_async(PROXY_IP, PROXY_PORT);
+    if result == u64::MAX {
+        write_str("[Phase-C] MULTI_PATCH connect failed (no slots)\n");
+        return false;
+    }
+    draug.async_tcp_slot = result;
+    draug.async_phase = AsyncPhase::Sending;
+    draug.async_operation = AsyncOp::PhaseCMultiPatch;
+    true
+}
+
+/// Phase C v2 — handle the proxy's reply to MULTI_PATCH. Same wire
+/// shape as PATCH (`[u32 status][u32 len][bytes]`). On success,
+/// logs the cargo test summary; on failure, logs first ~200 bytes
+/// of stderr so the operator can see why. Always advances
+/// `phase_c_idx` so the autonomous loop moves on.
+fn process_phase_c_multi_patch_response(draug: &mut DraugDaemon, response: &[u8]) -> bool {
+    if response.len() < 8 {
+        write_str("[Phase-C] MULTI_PATCH reply truncated (");
+        write_dec(response.len() as u32);
+        write_str(" bytes)\n");
+        draug.phase_c_idx = draug.phase_c_idx.saturating_add(1);
+        draug.async_phase = AsyncPhase::Idle;
+        draug.async_operation = AsyncOp::None;
+        return true;
+    }
+    let status = u32::from_le_bytes([response[0], response[1], response[2], response[3]]);
+    let output_len = u32::from_le_bytes([response[4], response[5], response[6], response[7]]) as usize;
+    let body_end = 8usize.saturating_add(output_len).min(response.len());
+    let body = &response[8..body_end];
+
+    let idx = draug.phase_c_idx as usize;
+    let (project_id, _) = crate::phase_c::MULTI_FILE_PROJECTS[idx];
+
+    if status == 0 {
+        write_str("[Phase-C] ✓ ");
+        write_str(project_id);
+        write_str(" cargo test PASS (");
+        write_dec(output_len as u32);
+        write_str(" bytes of output)\n");
+        // Show a one-line summary if we can find the "test result:"
+        // line cargo prints — it's the most useful single line.
+        if let Ok(s) = core::str::from_utf8(body) {
+            for line in s.lines().filter(|l| l.contains("test result:")).take(2) {
+                write_str("[Phase-C]   ");
+                write_str(line);
+                write_str("\n");
+            }
+        }
+    } else {
+        write_str("[Phase-C] ✗ ");
+        write_str(project_id);
+        write_str(" cargo test FAIL (status=");
+        write_dec(status);
+        write_str(")\n");
+        if let Ok(s) = core::str::from_utf8(body) {
+            // Surface the first error line so the operator can see
+            // what went wrong without scrolling the full stderr.
+            for line in s.lines().filter(|l| l.contains("error")).take(3) {
+                write_str("[Phase-C]   ");
+                let truncated = if line.len() > 160 { &line[..160] } else { line };
+                write_str(truncated);
+                write_str("\n");
+            }
+        }
+    }
 
     draug.phase_c_idx = draug.phase_c_idx.saturating_add(1);
     draug.async_phase = AsyncPhase::Idle;
