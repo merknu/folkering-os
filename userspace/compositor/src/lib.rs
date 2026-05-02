@@ -53,6 +53,7 @@
 // Graphics modules (Phase 6.2)
 pub mod blend;
 pub mod damage;
+pub mod render_graph;
 pub mod framebuffer;
 pub mod font;
 pub mod intent;
