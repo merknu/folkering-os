@@ -62,8 +62,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use libfolk::sys::synapse::{
-    list_files, read_file_by_name, read_file_chunk, write_file, write_file_get_rowid,
-    SynapseError, SynapseResult, LIST_FILES_ENTRY_SIZE, LIST_FILES_NAME_BYTES,
+    delete_file, list_files, read_file_by_name, read_file_chunk, write_file,
+    write_file_get_rowid, SynapseError, SynapseResult, LIST_FILES_ENTRY_SIZE,
+    LIST_FILES_NAME_BYTES,
 };
 use libfolk::sys::{shmem_destroy, shmem_map, shmem_unmap};
 
@@ -147,19 +148,34 @@ impl Project {
         Ok(out)
     }
 
-    /// Soft-delete `file` by overwriting it with empty content. The
-    /// row stays in Synapse's `files` table (real eviction needs the
-    /// btree DELETE primitive tracked in Issue #100); enumeration
-    /// callers filter tombstones via `ProjectFile::is_deleted`.
+    /// Delete `file` from Synapse's `files` table.
     ///
-    /// Returns `Ok` even if the file did not exist — this matches
-    /// Draug's "make sure it's gone" intent better than an error
-    /// path callers would have to suppress anyway.
+    /// Tries the real btree DELETE primitive first (Issue #100); if
+    /// that fails (older Synapse build that doesn't recognise
+    /// SYN_OP_DELETE_FILE, or the row was already gone), falls back
+    /// to the original soft-delete-via-empty-content. Either way the
+    /// row stops being visible to `read_file_by_name` lookups.
+    ///
+    /// Returns `Ok` whether the file existed or not — Draug's
+    /// "make sure it's gone" intent is what callers want; an error
+    /// for "wasn't there to begin with" would just get suppressed.
     pub fn delete(&self, file: &str) -> SynapseResult<()> {
-        match write_file(&self.qualify(file), &[]) {
+        let qualified = self.qualify(file);
+        match delete_file(&qualified) {
             Ok(()) => Ok(()),
             Err(SynapseError::NotFound) => Ok(()),
-            Err(e) => Err(e),
+            Err(_) => {
+                // Fall back to soft-delete (overwrite with empty).
+                // Useful both when the synapse-service binary is
+                // older than this libfolk client AND when the btree
+                // delete reports a non-fatal failure (e.g. corrupt
+                // page in the leaf walk).
+                match write_file(&qualified, &[]) {
+                    Ok(()) => Ok(()),
+                    Err(SynapseError::NotFound) => Ok(()),
+                    Err(e) => Err(e),
+                }
+            }
         }
     }
 

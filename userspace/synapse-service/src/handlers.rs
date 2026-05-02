@@ -14,7 +14,8 @@ use libfolk::sys::synapse::{
     SYN_OP_FILE_INFO, SYN_OP_READ_FILE, SYN_OP_READ_FILE_BY_NAME, SYN_OP_READ_FILE_CHUNK,
     SYN_OP_READ_FILE_SHMEM, SYN_OP_SQL_QUERY,
     SYN_OP_VECTOR_SEARCH, SYN_OP_GET_EMBEDDING, SYN_OP_EMBEDDING_COUNT,
-    SYN_OP_WRITE_FILE, SYN_OP_WRITE_INTENT, SYN_OP_READ_INTENT, SYN_OP_QUERY_MIME,
+    SYN_OP_WRITE_FILE, SYN_OP_DELETE_FILE,
+    SYN_OP_WRITE_INTENT, SYN_OP_READ_INTENT, SYN_OP_QUERY_MIME,
     SYN_OP_QUERY_INTENT,
     SYN_OP_UPSERT_ENTITY, SYN_OP_UPSERT_EDGE, SYN_OP_GRAPH_WALK,
     SYN_STATUS_NOT_FOUND, SYN_STATUS_INVALID, SYN_STATUS_ERROR,
@@ -30,6 +31,7 @@ use libsqlite::vector::{
 use crate::btree::{
     overwrite_blob_inplace, sqlite_insert_file, sqlite_insert_intent, sqlite_read_intent,
     sqlite_insert_entity, sqlite_insert_edge, sqlite_expire_edge, sqlite_graph_walk,
+    sqlite_delete_file_by_rowid,
 };
 use crate::cache::{
     count_sqlite_files, find_max_rowid, get_file_size, open_db, refresh_fpk_cache,
@@ -77,6 +79,7 @@ pub fn handle_request<T: TokenSource>(
         SYN_OP_READ_FILE_SHMEM => handle_read_file_shmem(msg, src, sqlite, cache, backend),
         SYN_OP_SQL_QUERY => handle_sql_query(msg, src, sqlite, backend),
         SYN_OP_WRITE_FILE => handle_write_file(msg, src, sqlite, cache, backend),
+        SYN_OP_DELETE_FILE => handle_delete_file(msg, src, sqlite, cache, backend),
         SYN_OP_WRITE_INTENT => handle_write_intent(msg, src, sqlite, backend),
         SYN_OP_READ_INTENT => handle_read_intent(msg, src, sqlite),
         SYN_OP_QUERY_MIME => handle_query_mime(msg, src, sqlite),
@@ -495,6 +498,95 @@ fn handle_sql_query<T: TokenSource>(
         },
         Backend::Fpk => { let _ = reply(src, SYN_STATUS_INVALID, 0); }
     }
+}
+
+// ── Delete handler ────────────────────────────────────────────────────
+
+/// Phase C / Issue #100: delete a file row from the `files` table by
+/// name hash. Resolves the hash to a rowid via `table_scan` (same
+/// path `read_file_by_name` uses), then calls `sqlite_delete_file_by_rowid`
+/// to remove the leaf-page cell pointer + decrement cell_count.
+///
+/// Wire shape: `op | (name_hash << 16)`. Reply is one of:
+///   - 0          — success
+///   - NOT_FOUND  — no row with matching name hash
+///   - ERROR      — btree corruption or backend mismatch
+///
+/// After a successful delete the dir cache is invalidated so
+/// subsequent listings reflect the smaller set; refresh happens
+/// lazily on the next file-listing request.
+fn handle_delete_file<T: TokenSource>(
+    msg: AsyncIpcMessage,
+    src: &mut T,
+    sqlite: &mut SafeSqliteBuffer,
+    cache: &mut DirCacheState,
+    backend: Backend,
+) {
+    if backend != Backend::Sqlite {
+        let _ = reply(src, SYN_STATUS_ERROR, 0);
+        return;
+    }
+    let name_hash = ((msg.payload0 >> 16) & 0xFFFFFFFF) as u32;
+
+    // Phase 1: resolve name hash → rowid via a table_scan view.
+    // Hash collisions are technically possible (FNV-1a 32-bit) but the
+    // file count is small and the cost of a wrong delete is low (the
+    // operator can re-write the file). First match wins, same policy
+    // `read_file_by_name` already follows.
+    let rowid: i64 = {
+        let db = match open_db(sqlite) {
+            Some(db) => db,
+            None => {
+                let _ = reply(src, SYN_STATUS_ERROR, 0);
+                return;
+            }
+        };
+        let scanner = match db.table_scan("files") {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = reply(src, SYN_STATUS_ERROR, 0);
+                return;
+            }
+        };
+        let mut found: Option<i64> = None;
+        for result in scanner {
+            if let Ok(record) = result {
+                if let Some(Value::Text(rec_name)) = record.get(1) {
+                    if hash_name(rec_name) == name_hash {
+                        if let Some(id) = record.get(0).and_then(|v| v.as_int()) {
+                            found = Some(id);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        match found {
+            Some(id) => id,
+            None => {
+                let _ = reply(src, SYN_STATUS_NOT_FOUND, 0);
+                return;
+            }
+        }
+    };
+
+    // Phase 2: remove the cell. (sqlite_delete_file_by_rowid takes
+    // &mut SafeSqliteBuffer, so the table_scan borrow above had to
+    // drop before this call — hence the inner scope.)
+    if !sqlite_delete_file_by_rowid(sqlite, rowid) {
+        let _ = reply(src, SYN_STATUS_ERROR, 0);
+        return;
+    }
+
+    // Phase 3: invalidate the dir cache so the next listing picks
+    // up the smaller set. Lazy refresh happens on first list/scan.
+    cache.valid = false;
+
+    println!(
+        "[SYNAPSE] delete_file: removed rowid={} (name_hash=0x{:x})",
+        rowid, name_hash
+    );
+    let _ = reply(src, 0, 0);
 }
 
 // ── Write handler ─────────────────────────────────────────────────────
