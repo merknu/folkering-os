@@ -12,6 +12,13 @@ use std::path::PathBuf;
 use std::{env, fs};
 
 fn main() {
+    // Re-evaluate `option_env!` constants when these toggle (#99).
+    // draug-streamer hard-codes the SLIRP target unless overridden;
+    // without these directives cargo silently kept the old value
+    // baked in across rebuilds.
+    println!("cargo:rerun-if-env-changed=FOLKERING_STREAMER_IP");
+    println!("cargo:rerun-if-env-changed=FOLKERING_STREAMER_PORT");
+
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let dest = out_dir.join("secret.key");
 

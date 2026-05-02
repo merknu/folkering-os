@@ -7,6 +7,17 @@ fn main() {
     println!("cargo:rustc-link-arg=-Tlinker.ld");
     println!("cargo:rerun-if-changed=linker.ld");
 
+    // Re-evaluate `option_env!` constants when these toggle. Without
+    // these directives cargo's incremental cache silently keeps the
+    // last-baked PROXY_IP / GEMINI_PORT / etc., which previously cost
+    // four debug sessions on Issue #99 (daemon kept SYN'ing the SLIRP
+    // gateway because the env var changed but the old IP stayed in
+    // the binary). Same list lives in userspace/libfolk/build.rs and
+    // userspace/draug-streamer/build.rs — keep all three in sync.
+    println!("cargo:rerun-if-env-changed=FOLKERING_PROXY_IP");
+    println!("cargo:rerun-if-env-changed=FOLKERING_PROXY_PORT");
+    println!("cargo:rerun-if-env-changed=FOLKERING_GEMINI_PORT");
+
     // Resolve the shared HMAC key used by `kernel::jit` to sign CODE
     // frames sent to the Pi-side a64-stream-daemon. Same priority list
     // as tools/a64-streamer/build.rs so the two stay aligned.
