@@ -13,36 +13,71 @@ pub(super) fn transmit_packet_inner(dev: &mut VirtIONet, frame: &[u8]) -> Result
         return Err(NetError::DeviceFailed);
     }
 
-    // Issue #99 diagnostic: log the dst port for any TCP frame headed
-    // at the proxy. If smoltcp is producing the daemon's SYN we'll see
-    // dst=14711 here; absence in this log proves the SYN never reaches
-    // the virtio queue (i.e. iface.poll's TX path isn't running for
-    // task 4's socket). Filter cheap on the IPv4 + TCP shape so we
-    // don't drown the serial in ARP / IPv6 / ICMP noise.
-    if frame.len() >= 14 + 20 + 20 {
-        let ethertype = ((frame[12] as u16) << 8) | frame[13] as u16;
-        if ethertype == 0x0800 {
-            // IPv4 header — first byte is version+IHL, IHL is low 4 bits
-            // measured in 32-bit words.
-            let ihl = ((frame[14] & 0x0F) as usize) * 4;
-            let tcp_off = 14 + ihl;
-            // protocol == 6 (TCP)
-            if frame.len() >= tcp_off + 20 && frame[14 + 9] == 6 {
-                let dst_port = ((frame[tcp_off + 2] as u16) << 8)
-                    | frame[tcp_off + 3] as u16;
-                if dst_port == 14711 {
-                    let src_port = ((frame[tcp_off + 0] as u16) << 8)
-                        | frame[tcp_off + 1] as u16;
-                    let flags = frame[tcp_off + 13];
-                    crate::serial_str!("[VIRTIO_TX] sport=");
-                    crate::drivers::serial::write_dec(src_port as u32);
-                    crate::serial_str!(" dport=14711 flags=0x");
-                    crate::drivers::serial::write_hex(flags as u64);
-                    crate::serial_str!(" len=");
-                    crate::drivers::serial::write_dec(frame.len() as u32);
-                    crate::serial_strln!("");
+    // Issue #99 diagnostic: log every TX so we can see ARP / TCP / etc.
+    // If daemon's SYN isn't reaching here at all (no TCP dst=14711),
+    // we see what smoltcp DOES emit instead — could be ARP requests
+    // for .150, neighbor solicitations, or nothing. Throttle is via
+    // post-boot counter so the boot-time storm doesn't drown serial.
+    if frame.len() >= 14 {
+        static TX_LOG_COUNT: core::sync::atomic::AtomicU32 =
+            core::sync::atomic::AtomicU32::new(0);
+        let n = TX_LOG_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        // Log: first 50 packets after boot, then every 50th.
+        let should_log = n < 50 || (n % 50) == 0;
+        if should_log {
+            let ethertype = ((frame[12] as u16) << 8) | frame[13] as u16;
+            crate::serial_str!("[VIRTIO_TX] #");
+            crate::drivers::serial::write_dec(n);
+            crate::serial_str!(" eth=0x");
+            crate::drivers::serial::write_hex(ethertype as u64);
+            if ethertype == 0x0806 {
+                // ARP — print sender/target IP if frame is long enough
+                if frame.len() >= 42 {
+                    let op = ((frame[20] as u16) << 8) | frame[21] as u16;
+                    let tip = &frame[38..42];
+                    crate::serial_str!(" ARP op=");
+                    crate::drivers::serial::write_dec(op as u32);
+                    crate::serial_str!(" tip=");
+                    crate::drivers::serial::write_dec(tip[0] as u32);
+                    crate::serial_str!(".");
+                    crate::drivers::serial::write_dec(tip[1] as u32);
+                    crate::serial_str!(".");
+                    crate::drivers::serial::write_dec(tip[2] as u32);
+                    crate::serial_str!(".");
+                    crate::drivers::serial::write_dec(tip[3] as u32);
+                }
+            } else if ethertype == 0x0800 && frame.len() >= 34 {
+                let proto = frame[14 + 9];
+                let dip = &frame[30..34];
+                crate::serial_str!(" IPv4 proto=");
+                crate::drivers::serial::write_dec(proto as u32);
+                crate::serial_str!(" dip=");
+                crate::drivers::serial::write_dec(dip[0] as u32);
+                crate::serial_str!(".");
+                crate::drivers::serial::write_dec(dip[1] as u32);
+                crate::serial_str!(".");
+                crate::drivers::serial::write_dec(dip[2] as u32);
+                crate::serial_str!(".");
+                crate::drivers::serial::write_dec(dip[3] as u32);
+                if proto == 6 && frame.len() >= 14 + 20 + 20 {
+                    let ihl = ((frame[14] & 0x0F) as usize) * 4;
+                    let tcp_off = 14 + ihl;
+                    if frame.len() >= tcp_off + 20 {
+                        let src_port = ((frame[tcp_off] as u16) << 8)
+                            | frame[tcp_off + 1] as u16;
+                        let dst_port = ((frame[tcp_off + 2] as u16) << 8)
+                            | frame[tcp_off + 3] as u16;
+                        let flags = frame[tcp_off + 13];
+                        crate::serial_str!(" TCP ");
+                        crate::drivers::serial::write_dec(src_port as u32);
+                        crate::serial_str!("→");
+                        crate::drivers::serial::write_dec(dst_port as u32);
+                        crate::serial_str!(" flags=0x");
+                        crate::drivers::serial::write_hex(flags as u64);
+                    }
                 }
             }
+            crate::serial_strln!("");
         }
     }
 
