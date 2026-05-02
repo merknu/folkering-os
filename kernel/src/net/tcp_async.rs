@@ -13,6 +13,8 @@
 //! The EAGAIN value is 0xFFFF_FFFE (distinct from 0xFFFF_FFFF = error).
 //! iface.poll() is called on every syscall to drive the TCP state machine.
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use smoltcp::socket::tcp;
 use smoltcp::wire::{IpAddress, Ipv4Address};
 use smoltcp::time::Instant;
@@ -42,14 +44,92 @@ struct AsyncSlot {
     /// "unowned" (slot is Free or was allocated before ownership
     /// tracking landed — legacy path).
     owner: u32,
+    /// Wall-clock timestamp (ms via `tsc_ms`) when this slot last
+    /// transitioned into `Connecting`. Used by the stuck-handshake
+    /// diagnostic in `syscall_tcp_send` to throttle a one-line log
+    /// per slot per stuck-window — see Issue #99 for the symptom
+    /// (Draug-async TIMEOUT after 90s in Sending). `0` when the slot
+    /// is Free or has already been promoted past Connecting.
+    connecting_since_ms: u64,
 }
 
 static SLOTS: Mutex<[AsyncSlot; MAX_ASYNC_SLOTS]> = Mutex::new([
-    AsyncSlot { state: SlotState::Free, handle: None, owner: 0 },
-    AsyncSlot { state: SlotState::Free, handle: None, owner: 0 },
-    AsyncSlot { state: SlotState::Free, handle: None, owner: 0 },
-    AsyncSlot { state: SlotState::Free, handle: None, owner: 0 },
+    AsyncSlot { state: SlotState::Free, handle: None, owner: 0, connecting_since_ms: 0 },
+    AsyncSlot { state: SlotState::Free, handle: None, owner: 0, connecting_since_ms: 0 },
+    AsyncSlot { state: SlotState::Free, handle: None, owner: 0, connecting_since_ms: 0 },
+    AsyncSlot { state: SlotState::Free, handle: None, owner: 0, connecting_since_ms: 0 },
 ]);
+
+/// Issue #99 diagnostic: last wall-clock ms we logged a stuck slot,
+/// per slot. Throttle to one entry per 5 s so a 90 s timeout window
+/// produces ~18 lines on the serial — enough to see the pattern,
+/// not enough to drown anything else.
+static LAST_STUCK_LOG_MS: [AtomicU64; MAX_ASYNC_SLOTS] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// Print one line describing why slot `slot_id` is still Connecting,
+/// reading state straight off the smoltcp socket. Throttled to one
+/// log per slot per 5 s. Caller must already hold `state.sockets`
+/// borrows in a sane shape (we take a fresh `&` borrow here).
+fn log_stuck_connecting(
+    slot_id: usize,
+    slot: &AsyncSlot,
+    socket: &tcp::Socket,
+    now_ms: u64,
+) {
+    let last = LAST_STUCK_LOG_MS[slot_id].load(Ordering::Relaxed);
+    if now_ms.saturating_sub(last) < 5_000 {
+        return;
+    }
+    LAST_STUCK_LOG_MS[slot_id].store(now_ms, Ordering::Relaxed);
+
+    let elapsed = now_ms.saturating_sub(slot.connecting_since_ms);
+
+    crate::serial_str!("[TCP_ASYNC] slot ");
+    crate::drivers::serial::write_dec(slot_id as u32);
+    crate::serial_str!(" stuck Connecting for ");
+    crate::drivers::serial::write_dec((elapsed / 1000) as u32);
+    crate::serial_str!("s (owner=");
+    crate::drivers::serial::write_dec(slot.owner);
+    crate::serial_str!(", state=");
+    crate::serial_str!(state_name(socket.state()));
+    crate::serial_str!(", may_send=");
+    crate::serial_str!(if socket.may_send() { "1" } else { "0" });
+    crate::serial_str!(", can_send=");
+    crate::serial_str!(if socket.can_send() { "1" } else { "0" });
+    crate::serial_str!(", is_active=");
+    crate::serial_str!(if socket.is_active() { "1" } else { "0" });
+    if let Some(remote) = socket.remote_endpoint() {
+        crate::serial_str!(", remote=");
+        crate::drivers::serial::write_dec(remote.port as u32);
+    }
+    if let Some(local) = socket.local_endpoint() {
+        crate::serial_str!(", local_port=");
+        crate::drivers::serial::write_dec(local.port as u32);
+    }
+    crate::serial_strln!(")");
+}
+
+fn state_name(s: tcp::State) -> &'static str {
+    use smoltcp::socket::tcp::State;
+    match s {
+        State::Closed => "Closed",
+        State::Listen => "Listen",
+        State::SynSent => "SynSent",
+        State::SynReceived => "SynReceived",
+        State::Established => "Established",
+        State::FinWait1 => "FinWait1",
+        State::FinWait2 => "FinWait2",
+        State::CloseWait => "CloseWait",
+        State::Closing => "Closing",
+        State::LastAck => "LastAck",
+        State::TimeWait => "TimeWait",
+    }
+}
 
 /// Create — or re-poll — a non-blocking TCP connection.
 ///
@@ -132,6 +212,7 @@ pub fn syscall_tcp_connect(ip_packed: u64, port: u64) -> u64 {
         let socket = state.sockets.get_mut::<tcp::Socket>(h);
         if socket.may_send() {
             slots[i].state = SlotState::Connected;
+            slots[i].connecting_since_ms = 0;
             return i as u64;
         }
         if !socket.is_active() {
@@ -141,6 +222,7 @@ pub fn syscall_tcp_connect(ip_packed: u64, port: u64) -> u64 {
             state.sockets.remove(h);
             slots[i].state = SlotState::Free;
             slots[i].handle = None;
+            slots[i].connecting_since_ms = 0;
             return u64::MAX;
         }
         return EAGAIN;
@@ -211,6 +293,8 @@ pub fn syscall_tcp_connect(ip_packed: u64, port: u64) -> u64 {
     slots[slot_idx].state = SlotState::Connecting;
     slots[slot_idx].handle = Some(tcp_handle);
     slots[slot_idx].owner = current_task;
+    slots[slot_idx].connecting_since_ms = tsc_ms() as u64;
+    LAST_STUCK_LOG_MS[slot_idx].store(0, Ordering::Relaxed);
 
     // Return slot_id immediately. Connection completes asynchronously.
     // Subsequent polls on the same (ip, port) will return this slot
@@ -258,12 +342,18 @@ pub fn syscall_tcp_send(slot_id: u64, data_ptr: u64, data_len: u64) -> u64 {
         let socket = state.sockets.get_mut::<tcp::Socket>(h);
         if socket.may_send() {
             slot.state = SlotState::Connected;
+            slot.connecting_since_ms = 0;
         } else if !socket.is_active() {
             state.sockets.remove(h);
             slot.state = SlotState::Free;
             slot.handle = None;
+            slot.connecting_since_ms = 0;
             return u64::MAX;
         } else {
+            // Issue #99 diagnostic: surface the stuck handshake on
+            // serial so we can tell SynSent vs CloseWait vs other
+            // without re-running with a debug build.
+            log_stuck_connecting(slot_id as usize, slot, &*socket, tsc_ms() as u64);
             return EAGAIN; // still connecting
         }
     }
