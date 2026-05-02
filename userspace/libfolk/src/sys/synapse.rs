@@ -112,6 +112,19 @@ pub const SYN_OP_EMBEDDING_COUNT: u64 = 0x0022;
 /// Reply: 0 = success, SYN_STATUS_ERROR = failure
 pub const SYN_OP_WRITE_FILE: u64 = 0x0030;
 
+/// Phase C: delete a file row from Synapse's `files` table.
+/// Request: op | (name_hash << 16)
+/// Reply: 0 on success, SYN_STATUS_NOT_FOUND if no row matches the
+/// hash, SYN_STATUS_ERROR on btree corruption / IO failure.
+///
+/// Counterpart to write_file. The btree implementation removes the
+/// row's leaf-page cell pointer; the cell's payload bytes become
+/// dead space until the next page rewrite (page-level reclamation
+/// is the open follow-up). Overflow page chains attached to the
+/// row are NOT walked + freed yet — small cost given Synapse's
+/// 256 KB max-db cap, but issue #100 leaves it as the next step.
+pub const SYN_OP_DELETE_FILE: u64 = 0x0036;
+
 /// Write intent metadata for a file (Semantic VFS)
 /// Request: op | (shmem_handle << 16) | (total_size << 32)
 ///   shmem contains: [file_id: u32 LE][mime_len: u16 LE][mime: bytes][json: bytes]
@@ -360,6 +373,37 @@ pub fn hash_name(name: &str) -> u32 {
 pub struct FileInfo {
     pub file_id: u16,
     pub size: u32,
+}
+
+/// Phase C: delete a file from Synapse's `files` table by name.
+///
+/// Wire format: op | (name_hash << 16). The synapse-service handler
+/// finds the matching rowid via name_hash, then calls the btree
+/// `sqlite_delete_file_by_rowid` to remove the cell pointer.
+///
+/// Returns `Ok(())` on successful delete, `Err(SynapseError::NotFound)`
+/// if no row matches, `Err(SynapseError::IpcFailed)` on btree errors.
+/// Idempotent at the SynapseError::NotFound level — caller can treat
+/// "not found" as the same shape as "deleted" if that's what they
+/// need (Project::delete does this).
+pub fn delete_file(name: &str) -> SynapseResult<()> {
+    let name_hash = hash_name(name);
+    let request = SYN_OP_DELETE_FILE | ((name_hash as u64) << 16);
+
+    let ret = unsafe {
+        syscall3(SYS_IPC_SEND, SYNAPSE_TASK_ID as u64, request, 0)
+    };
+
+    if ret == u64::MAX {
+        return Err(SynapseError::ServiceUnavailable);
+    }
+    if ret == SYN_STATUS_NOT_FOUND {
+        return Err(SynapseError::NotFound);
+    }
+    if ret == SYN_STATUS_ERROR {
+        return Err(SynapseError::IpcFailed);
+    }
+    Ok(())
 }
 
 /// Look up a file by name and get its ID and size

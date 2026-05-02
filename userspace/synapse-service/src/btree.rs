@@ -402,6 +402,201 @@ pub fn overwrite_blob_inplace(buf: &mut SafeSqliteBuffer, name: &str, new_data: 
     true
 }
 
+/// Walk every leaf page reachable from `root_page` and append page
+/// numbers into `out`. Used by the DELETE path to scan the tree
+/// without committing to a particular cell layout up front.
+///
+/// Bounded recursion (depth 10, branch fan-out per page) so a
+/// pathological / corrupted tree can't pin the kernel.
+fn collect_leaf_pages(
+    buf: &SafeSqliteBuffer,
+    root_page: u32,
+    page_size: usize,
+    out: &mut Vec<u32>,
+) {
+    let page_count = buf.page_count() as usize;
+    // Stack-based DFS, depth-bounded.
+    let mut stack: Vec<u32> = Vec::with_capacity(16);
+    stack.push(root_page);
+    let mut visited = 0usize;
+    while let Some(page) = stack.pop() {
+        visited += 1;
+        if visited > 256 {
+            println!("[SYNAPSE] delete: leaf walk hit visit cap (256), stopping");
+            return;
+        }
+        if page == 0 || (page as usize) > page_count {
+            continue;
+        }
+        let page_off = (page as usize - 1) * page_size;
+        let hdr_off = if page == 1 { 100 } else { 0 };
+        let ptype = match buf.read_byte(page_off + hdr_off) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        match ptype {
+            0x0d => out.push(page),
+            0x05 => {
+                // Interior: cell_count children + 1 right-pointer.
+                let cell_count = buf.read_be_u16(page_off + hdr_off + 3).unwrap_or(0) as usize;
+                let right_ptr = buf.read_be_u32(page_off + hdr_off + 8).unwrap_or(0);
+                if right_ptr != 0 {
+                    stack.push(right_ptr);
+                }
+                // Each interior cell is `[child_page: u32 BE][rowid: varint]`,
+                // pointed to by the cell-pointer array starting at hdr+12.
+                for i in 0..cell_count.min(64) {
+                    let ptr_off = page_off + hdr_off + 12 + i * 2;
+                    if let Ok(cell_offset) = buf.read_be_u16(ptr_off) {
+                        let cell_start = page_off + cell_offset as usize;
+                        if let Ok(child) = buf.read_be_u32(cell_start) {
+                            if child != 0 {
+                                stack.push(child);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {} // unknown page type; skip
+        }
+    }
+}
+
+/// Decode an SQLite varint. Returns (value, byte_count). Bounded to
+/// 9 bytes per the on-disk format.
+fn decode_varint(buf: &SafeSqliteBuffer, start: usize) -> (u64, usize) {
+    let mut value: u64 = 0;
+    for i in 0..9 {
+        let b = buf.read_byte(start + i).unwrap_or(0);
+        if i == 8 {
+            value = (value << 8) | b as u64;
+            return (value, 9);
+        }
+        value = (value << 7) | (b & 0x7f) as u64;
+        if b & 0x80 == 0 {
+            return (value, i + 1);
+        }
+    }
+    (value, 9)
+}
+
+/// Delete the cell with the given `rowid` from the `files` table.
+///
+/// Walks every leaf page, parses each cell's rowid varint, and on
+/// match removes the cell pointer from the page's pointer array
+/// (shifts subsequent pointers left by 2 bytes, decrements
+/// cell_count). The cell's payload bytes become dead space — SQLite's
+/// freeblock list isn't maintained here, so the space won't be
+/// reused by future inserts within the same page; it gets reclaimed
+/// on the next page rewrite. Acceptable for our small files.db
+/// (Issue #100 follow-up: page-level reclamation + overflow chain
+/// freeing on delete).
+///
+/// Returns `true` if a cell with the matching rowid was found and
+/// removed, `false` otherwise. Increments the SQLite change counter
+/// so other readers see the delete.
+pub fn sqlite_delete_file_by_rowid(buf: &mut SafeSqliteBuffer, rowid: i64) -> bool {
+    if !buf.is_valid() {
+        return false;
+    }
+
+    // Phase 1: get table root + page_size from a temporary view.
+    let (root_page, page_size) = {
+        let db = match SqliteDb::open(buf.loaded()) {
+            Ok(db) => db,
+            Err(_) => return false,
+        };
+        let root = match db.find_table_root("files") {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        (root, db.page_size() as usize)
+    };
+
+    // Phase 2: collect all leaf pages.
+    let mut leaves: Vec<u32> = Vec::with_capacity(8);
+    collect_leaf_pages(buf, root_page, page_size, &mut leaves);
+    if leaves.is_empty() {
+        return false;
+    }
+
+    // Phase 3: find the leaf that contains the matching rowid.
+    let target_rowid = rowid as u64;
+    for leaf_page in leaves {
+        let page_off = (leaf_page as usize - 1) * page_size;
+        let hdr_off = if leaf_page == 1 { 100 } else { 0 };
+        let hdr = page_off + hdr_off;
+
+        let cell_count = buf.read_be_u16(hdr + 3).unwrap_or(0) as usize;
+        let mut found_cell: Option<usize> = None;
+
+        for i in 0..cell_count {
+            let ptr_off = page_off + hdr_off + 8 + i * 2;
+            let cell_offset = buf.read_be_u16(ptr_off).unwrap_or(0) as usize;
+            if cell_offset == 0 {
+                continue;
+            }
+            let cell_start = page_off + cell_offset;
+            // Skip the payload_size varint; rowid varint follows.
+            let (_payload_size, ps_len) = decode_varint(buf, cell_start);
+            let (cell_rowid, _) = decode_varint(buf, cell_start + ps_len);
+            if cell_rowid == target_rowid {
+                found_cell = Some(i);
+                break;
+            }
+        }
+
+        if let Some(cell_idx) = found_cell {
+            return remove_cell_pointer(buf, leaf_page, page_size, cell_idx);
+        }
+    }
+
+    false
+}
+
+/// Remove the cell pointer at index `cell_idx` from the leaf page's
+/// pointer array. Shifts subsequent pointers left by 2 bytes and
+/// decrements `cell_count`. Does NOT compact cell content area —
+/// see `sqlite_delete_file_by_rowid` doc-comment.
+fn remove_cell_pointer(
+    buf: &mut SafeSqliteBuffer,
+    leaf_page: u32,
+    page_size: usize,
+    cell_idx: usize,
+) -> bool {
+    let page_off = (leaf_page as usize - 1) * page_size;
+    let hdr_off = if leaf_page == 1 { 100 } else { 0 };
+    let hdr = page_off + hdr_off;
+
+    let cell_count = buf.read_be_u16(hdr + 3).unwrap_or(0) as usize;
+    if cell_idx >= cell_count {
+        return false;
+    }
+
+    // Shift pointers at indices > cell_idx left by 2 bytes.
+    let ptr_array = page_off + hdr_off + 8;
+    for i in cell_idx..(cell_count - 1) {
+        let next_ptr = match buf.read_be_u16(ptr_array + (i + 1) * 2) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        if buf.write_be_u16(ptr_array + i * 2, next_ptr).is_err() {
+            return false;
+        }
+    }
+    // Zero out the now-unused last pointer slot for hygiene.
+    let _ = buf.write_be_u16(ptr_array + (cell_count - 1) * 2, 0);
+
+    // Decrement cell_count.
+    if buf.write_be_u16(hdr + 3, (cell_count - 1) as u16).is_err() {
+        return false;
+    }
+
+    buf.increment_change_counter();
+    buf.mark_page_dirty(leaf_page as usize - 1);
+    true
+}
+
 /// Insert a new row into the `files` table.
 ///
 /// Cell format for inline payloads:
