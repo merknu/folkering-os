@@ -829,6 +829,7 @@ fn process_skill_llm(draug: &mut DraugDaemon, response: &[u8], now_ms: u64) -> b
                     write_str(" parse failures\n");
                     draug.advance_task_level(task_idx);
                     draug.task_parse_fails[task_idx] = 0;
+                    draug.force_advance_count = draug.force_advance_count.saturating_add(1);
                     draug.save_state();
                 }
             }
@@ -925,7 +926,18 @@ fn process_patch_result(draug: &mut DraugDaemon, response: &[u8], now_ms: u64) -
             write_dec(at_l2 as u32);
             write_str("/20 L3=");
             write_dec(at_l3 as u32);
-            write_str("/20\n");
+            write_str("/20");
+            // Distinguish real PASSes from levels we force-advanced
+            // past after repeated failures. Skipped tasks count toward
+            // tasks_at_level (they had to, otherwise next_task_and_level
+            // re-picks them forever) — this suffix tells the operator
+            // how much of the headline number is genuine progress.
+            if draug.force_advance_count > 0 {
+                write_str(" (");
+                write_dec(draug.force_advance_count);
+                write_str(" force-advanced)");
+            }
+            write_str("\n");
         }
     } else {
         // FAIL — attempt error-driven retry (max 2)
@@ -1000,6 +1012,7 @@ fn process_patch_result(draug: &mut DraugDaemon, response: &[u8], now_ms: u64) -
 
             // Force-advance the level so next_task_and_level moves on
             draug.advance_task_level(task_idx);
+            draug.force_advance_count = draug.force_advance_count.saturating_add(1);
             draug.save_state();
         }
     }

@@ -474,6 +474,12 @@ pub struct DraugDaemon {
     /// instead of looping on it forever until the global 30-skip
     /// hibernation kicks in. See `process_skill_llm` for the wiring.
     pub task_parse_fails: [u32; TASK_COUNT],
+    /// Cumulative count of force-advance events (parse-fail SKIPs +
+    /// cargo-fail SKIPs). Reported in the Skill: line so an operator
+    /// can tell at a glance how much of `tasks_at_level(N)` is real
+    /// PASS vs a level the daemon gave up on. Doesn't persist across
+    /// boots — diagnostic only.
+    pub force_advance_count: u32,
     /// Cached proxy ping result (avoid 2s TCP per iteration).
     pub last_ping_ms: u64,
     pub last_ping_ok: bool,
@@ -602,6 +608,7 @@ impl DraugDaemon {
             consecutive_skips: 0,
             refactor_hibernating: false,
             task_parse_fails: [0u32; TASK_COUNT],
+            force_advance_count: 0,
             last_ping_ms: 0,
             last_ping_ok: false,
             async_phase: AsyncPhase::Idle,
