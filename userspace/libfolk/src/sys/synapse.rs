@@ -264,6 +264,54 @@ pub fn file_count() -> SynapseResult<usize> {
     Ok(ret as usize)
 }
 
+/// Reply struct for `list_files` — mirrors Synapse's wire shape.
+/// Caller is responsible for `shmem_destroy(shmem_handle)` once done.
+///
+/// Each entry in the shmem buffer is 32 bytes:
+///   [name(24) zero-padded][size: u32 LE][entry_type: u32 LE]
+///
+/// **Name truncation**: Synapse's directory cache stores names in a
+/// 32-byte field but only the first 24 bytes are copied into shmem.
+/// Names longer than 24 bytes are silently truncated. Phase C
+/// callers (e.g. `Project::list`) should keep project + filename
+/// combinations within that budget for now.
+#[derive(Debug, Clone)]
+pub struct ListFilesResponse {
+    pub count: usize,
+    pub shmem_handle: u32,
+}
+
+/// Layout of one entry inside the `list_files` shmem buffer.
+pub const LIST_FILES_ENTRY_SIZE: usize = 32;
+/// How many bytes of the entry are name (zero-padded).
+pub const LIST_FILES_NAME_BYTES: usize = 24;
+
+/// Enumerate every file Synapse knows about.
+///
+/// Returns the count and a shmem handle to a buffer of
+/// `count × LIST_FILES_ENTRY_SIZE` bytes. The caller maps the shmem
+/// (e.g. via `shmem_map`), walks the entries, then destroys the shmem.
+///
+/// Higher-level wrappers (`Project::list`) should be preferred for
+/// most callers; this is the raw IPC primitive.
+pub fn list_files() -> SynapseResult<ListFilesResponse> {
+    let ret = unsafe {
+        syscall3(SYS_IPC_SEND, SYNAPSE_TASK_ID as u64, SYN_OP_LIST_FILES, 0)
+    };
+
+    if ret == u64::MAX {
+        return Err(SynapseError::ServiceUnavailable);
+    }
+
+    // Wire format: ((count << 32) | shmem_handle). Empty cache or
+    // shmem_create failure both return 0 in the low 32 bits — caller
+    // should treat that as "no files" rather than an error.
+    let count = ((ret >> 32) & 0xFFFF_FFFF) as usize;
+    let shmem_handle = (ret & 0xFFFF_FFFF) as u32;
+
+    Ok(ListFilesResponse { count, shmem_handle })
+}
+
 /// Get file entry by index
 pub fn file_by_index(index: usize) -> SynapseResult<FileEntry> {
     let ret = unsafe {

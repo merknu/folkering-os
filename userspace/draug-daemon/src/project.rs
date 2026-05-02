@@ -62,9 +62,10 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use libfolk::sys::synapse::{
-    read_file_by_name, read_file_chunk, write_file, write_file_get_rowid,
-    SynapseError, SynapseResult,
+    list_files, read_file_by_name, read_file_chunk, write_file, write_file_get_rowid,
+    SynapseError, SynapseResult, LIST_FILES_ENTRY_SIZE, LIST_FILES_NAME_BYTES,
 };
+use libfolk::sys::{shmem_destroy, shmem_map, shmem_unmap};
 
 /// One file entry inside a project. `size == 0` is the tombstone
 /// encoding (see module note + Issue #100).
@@ -182,6 +183,108 @@ impl Project {
     /// don't re-allocate just to read it back.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Enumerate the files Draug has authored under this project.
+    ///
+    /// Implementation: calls Synapse's `list_files` (returns a shmem
+    /// of every file in the data store), maps the buffer, and
+    /// filters the entries whose qualified name starts with this
+    /// project's prefix. The qualified names are stripped back to
+    /// project-local paths in the result.
+    ///
+    /// **Caveats**:
+    /// - Synapse's wire format truncates names at
+    ///   `LIST_FILES_NAME_BYTES` (24 bytes). Files whose qualified
+    ///   path exceeds 24 bytes appear truncated; callers should
+    ///   keep project+filename short until #100 lands a real
+    ///   `LIST_FILES_BY_PREFIX` op with a wider name field.
+    /// - Tombstone entries (size == 0, see `delete()`) are
+    ///   *included* — caller filters via `ProjectFile::is_deleted()`
+    ///   if they want only live files. This matches Draug's
+    ///   common case ("show me everything I've ever written under
+    ///   this project, dead or alive") better than silently hiding
+    ///   them.
+    pub fn list(&self) -> SynapseResult<Vec<ProjectFile>> {
+        let response = list_files()?;
+        if response.count == 0 || response.shmem_handle == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Map the shmem somewhere we know is unused. The same
+        // virtual address is used by other transient mappings
+        // (`read_file_shmem`, etc.) but since this entire function
+        // owns the mapping start-to-finish, there's no aliasing risk
+        // — the unmap at the end always pairs with this map.
+        const LIST_VADDR: usize = 0x21000000;
+        let total_size = response.count * LIST_FILES_ENTRY_SIZE;
+        if shmem_map(response.shmem_handle, LIST_VADDR).is_err() {
+            let _ = shmem_destroy(response.shmem_handle);
+            return Err(SynapseError::IpcFailed);
+        }
+
+        let prefix = self.prefix();
+        let prefix_bytes = prefix.as_bytes();
+        let mut out: Vec<ProjectFile> = Vec::new();
+
+        // SAFETY: shmem buffer is valid for `total_size` bytes for
+        // the duration of this scope (we own the mapping until the
+        // shmem_unmap call below). Synapse populated it in
+        // `handle_list_files`.
+        let buf = unsafe {
+            core::slice::from_raw_parts(LIST_VADDR as *const u8, total_size)
+        };
+
+        for i in 0..response.count {
+            let off = i * LIST_FILES_ENTRY_SIZE;
+            let name_field = &buf[off..off + LIST_FILES_NAME_BYTES];
+            // Find the zero terminator, or take the full 24 bytes.
+            let name_end = name_field.iter()
+                .position(|&b| b == 0)
+                .unwrap_or(LIST_FILES_NAME_BYTES);
+            // Skip non-UTF8 — defensive only; Synapse stores names
+            // as ASCII / UTF-8 paths.
+            let qualified = match core::str::from_utf8(&name_field[..name_end]) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            // Prefix-filter: belongs to this project iff it starts
+            // with `proj/<name>/`.
+            if !qualified.as_bytes().starts_with(prefix_bytes) {
+                continue;
+            }
+            let local_name = String::from(&qualified[prefix.len()..]);
+            // Skip the directory marker if Synapse ever introduces
+            // one — empty local_name = the project's "root", which
+            // the caller's mental model probably doesn't expect to
+            // see in `list()`.
+            if local_name.is_empty() {
+                continue;
+            }
+            let size = u32::from_le_bytes([
+                buf[off + LIST_FILES_NAME_BYTES],
+                buf[off + LIST_FILES_NAME_BYTES + 1],
+                buf[off + LIST_FILES_NAME_BYTES + 2],
+                buf[off + LIST_FILES_NAME_BYTES + 3],
+            ]);
+            // entry_type at off+28..32 is currently always 0 for
+            // data files; ignore for now. ProjectFile doesn't have
+            // a slot for it because the project abstraction treats
+            // every file uniformly.
+
+            out.push(ProjectFile {
+                name: local_name,
+                rowid: 0, // not exposed by list_files wire format
+                size,
+            });
+        }
+
+        // Always unmap + destroy, even on error in the loop above
+        // (the iterator is total — `?` doesn't escape).
+        let _ = shmem_unmap(response.shmem_handle, LIST_VADDR);
+        let _ = shmem_destroy(response.shmem_handle);
+
+        Ok(out)
     }
 }
 
