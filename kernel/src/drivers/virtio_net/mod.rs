@@ -296,6 +296,41 @@ pub fn receive_raw() -> Option<alloc::vec::Vec<u8>> {
     rx::receive_packet_inner(dev)
 }
 
+/// Result of `receive_raw_zero_copy` — bookkeeping the smoltcp Device
+/// wrapper hands back to `recycle_rx_descriptor` once the frame has
+/// been consumed. The buffer at `buf_virt + VIRTIO_NET_HDR_SIZE` is
+/// guaranteed valid for `len` bytes for the lifetime of the descriptor
+/// "checkout" (i.e. between this call and the matching recycle): the
+/// device cannot write to a descriptor that isn't in the avail ring.
+pub struct RxFrameInfo {
+    pub desc_idx: u16,
+    pub buf_phys: usize,
+    pub buf_virt: usize,
+    pub frame_offset: usize,
+    pub len: usize,
+}
+
+/// Zero-copy receive: pop the next used descriptor and hand back its
+/// bookkeeping without copying the bytes. Caller MUST eventually call
+/// `recycle_rx_descriptor` with the returned `desc_idx` + `buf_phys`,
+/// or the descriptor stays parked out of the avail ring until next
+/// reboot. RAII wrapper (e.g. `FolkeringRxToken` in `net::device`)
+/// is the recommended consumer.
+pub fn receive_raw_zero_copy() -> Option<RxFrameInfo> {
+    let mut guard = NET_DEVICE.lock();
+    let dev = guard.as_mut()?;
+    rx::receive_packet_zero_copy_inner(dev)
+}
+
+/// Recycle a descriptor previously returned by `receive_raw_zero_copy`.
+/// Acquires NET_DEVICE briefly. Safe to call from a Drop impl.
+pub fn recycle_rx_descriptor(desc_idx: u16, buf_phys: usize) {
+    let mut guard = NET_DEVICE.lock();
+    if let Some(dev) = guard.as_mut() {
+        rx::recycle_rx_buffer_pub(dev, desc_idx, buf_phys);
+    }
+}
+
 /// Transmit a raw Ethernet frame. Public API.
 pub fn transmit_packet(frame: &[u8]) -> Result<(), NetError> {
     let mut guard = NET_DEVICE.lock();

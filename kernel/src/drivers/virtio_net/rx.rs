@@ -136,6 +136,51 @@ pub(super) fn receive_packet_inner(dev: &mut VirtIONet) -> Option<Vec<u8>> {
     Some(frame)
 }
 
+/// Zero-copy variant of `receive_packet_inner`: pops the next used
+/// descriptor and hands back its bookkeeping (descriptor id + phys
+/// + virt + frame length) without copying. Caller is responsible for
+/// recycling via `recycle_rx_buffer_pub` once the frame has been
+/// consumed.
+///
+/// The descriptor is NOT in the avail ring while it's "checked out"
+/// — virtio device cannot write to it — so the buffer at `buf_virt +
+/// VIRTIO_NET_HDR_SIZE` is exclusive read access for the consumer.
+pub(super) fn receive_packet_zero_copy_inner(
+    dev: &mut VirtIONet,
+) -> Option<super::RxFrameInfo> {
+    let (desc_idx, total_len) = dev.rx_queue.pop_used()?;
+    let buf_phys = unsafe { (*dev.rx_queue.desc(desc_idx)).addr as usize };
+    let buf_virt = match dev.rx_bufs_phys.iter().position(|&p| p == buf_phys) {
+        Some(idx) => dev.rx_bufs_virt[idx],
+        None => crate::phys_to_virt(buf_phys),
+    };
+
+    let total = total_len as usize;
+    if total <= VIRTIO_NET_HDR_SIZE {
+        // Header-only or invalid — recycle and skip.
+        recycle_rx_buffer(dev, desc_idx, buf_phys);
+        return None;
+    }
+    let frame_len = total - VIRTIO_NET_HDR_SIZE;
+    let max_len = frame_len.min(1514);
+
+    Some(super::RxFrameInfo {
+        desc_idx,
+        buf_phys,
+        buf_virt,
+        frame_offset: VIRTIO_NET_HDR_SIZE,
+        len: max_len,
+    })
+}
+
+/// Public wrapper around `recycle_rx_buffer` for callers outside this
+/// module (e.g. an RxToken's Drop impl that owns a checked-out
+/// descriptor and must return it to the avail ring once the consumer
+/// is done with the buffer).
+pub(super) fn recycle_rx_buffer_pub(dev: &mut VirtIONet, desc_idx: u16, buf_phys: usize) {
+    recycle_rx_buffer(dev, desc_idx, buf_phys);
+}
+
 /// Recycle an RX buffer back into the queue so the device can reuse it.
 fn recycle_rx_buffer(dev: &mut VirtIONet, desc_idx: u16, buf_phys: usize) {
     // Reconfigure the descriptor for device-write
