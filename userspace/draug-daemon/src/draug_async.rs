@@ -804,6 +804,34 @@ fn process_skill_llm(draug: &mut DraugDaemon, response: &[u8], now_ms: u64) -> b
             write_str("[Draug-async] LLM parse failed\n");
             draug.async_phase = AsyncPhase::Idle;
             draug.record_skip();
+
+            // Force-advance the task level after repeated parse-stage
+            // failures on the same task. Without this, daemon keeps
+            // re-picking the same task every cycle (next_task_and_level
+            // looks at task_levels only, which the parse-fail path
+            // doesn't bump), wasting LLM round-trips and burning
+            // toward the 30-skip global hibernation. Threshold of 3
+            // is empirical: fewer is too aggressive (one transient
+            // proxy hiccup gives up), more is too patient (we saw
+            // ~13 same-task fails before this was wired in).
+            const PARSE_FAIL_LIMIT: u32 = 3;
+            let task_idx = draug.async_task_idx;
+            if task_idx < crate::draug::TASK_COUNT {
+                draug.task_parse_fails[task_idx] =
+                    draug.task_parse_fails[task_idx].saturating_add(1);
+                if draug.task_parse_fails[task_idx] >= PARSE_FAIL_LIMIT {
+                    write_str("[Draug-async] task ");
+                    write_str(crate::knowledge_hunt::REFACTOR_TASKS[task_idx].0);
+                    write_str(" advancing past L");
+                    write_dec(draug.async_level as u32);
+                    write_str(" after ");
+                    write_dec(draug.task_parse_fails[task_idx]);
+                    write_str(" parse failures\n");
+                    draug.advance_task_level(task_idx);
+                    draug.task_parse_fails[task_idx] = 0;
+                    draug.save_state();
+                }
+            }
             return true;
         }
     };
@@ -815,6 +843,12 @@ fn process_skill_llm(draug: &mut DraugDaemon, response: &[u8], now_ms: u64) -> b
     if draug.async_level == 1 {
         draug.store_task_code(draug.async_task_idx, code.clone());
         draug.save_task_code(draug.async_task_idx);
+    }
+
+    // Reset per-task parse-fail counter on a clean parse — the rest
+    // of the path (PATCH, cargo test) decides PASS/SKIP from there.
+    if draug.async_task_idx < crate::draug::TASK_COUNT {
+        draug.task_parse_fails[draug.async_task_idx] = 0;
     }
 
     draug.async_phase_started_ms = now_ms;
