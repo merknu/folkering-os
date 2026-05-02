@@ -105,6 +105,19 @@ fn tick_idle(draug: &mut DraugDaemon, now_ms: u64) -> bool {
     if !draug.should_run_refactor_step(now_ms) { return false; }
     draug.last_refactor_ms = now_ms;
 
+    // Phase C — one-shot multi-file project authoring. Fires once
+    // per project from `phase_c::MULTI_FILE_PROJECTS` after the
+    // daemon has at least one L1 PASS (so we know LLM round-trips
+    // work) but before falling through to the skill-tree picker.
+    // Doesn't block subsequent skill-tree work — sets phase_c_idx
+    // forward on success or unconditional advance on parse fail
+    // so the demo never wedges the loop.
+    if (draug.phase_c_idx as usize) < crate::phase_c::MULTI_FILE_PROJECTS.len()
+        && draug.tasks_at_level(1) > 0
+    {
+        return start_phase_c_project(draug, now_ms);
+    }
+
     match draug.next_task_and_level() {
         Some((task_idx, level)) => start_skill_tree(draug, task_idx, level, now_ms),
         None => {
@@ -567,8 +580,74 @@ fn tick_processing(draug: &mut DraugDaemon, now_ms: u64) -> bool {
         // existing `on_analysis_response` so the alert / no-action
         // routing stays identical to the old MCP path.
         AsyncOp::AnalysisLlm => process_analysis_response(draug, &response),
+        AsyncOp::PhaseCMultiFile => process_phase_c_response(draug, &response, now_ms),
         _ => { draug.async_phase = AsyncPhase::Idle; true }
     }
+}
+
+/// Phase C — kick off a multi-file project authoring cycle.
+/// Picks the next entry from `phase_c::MULTI_FILE_PROJECTS`, builds
+/// the marker-format prompt, fires the LLM round-trip. Response is
+/// handled by `process_phase_c_response`.
+fn start_phase_c_project(draug: &mut DraugDaemon, now_ms: u64) -> bool {
+    let idx = draug.phase_c_idx as usize;
+    let (project_id, body) = crate::phase_c::MULTI_FILE_PROJECTS[idx];
+
+    write_str("\n[Phase-C] starting project: ");
+    write_str(project_id);
+    write_str("\n");
+
+    let prompt = crate::phase_c::build_multi_file_prompt(project_id, body);
+
+    draug.async_operation = AsyncOp::PhaseCMultiFile;
+    draug.async_phase_started_ms = now_ms;
+    // Use the same model the skill-tree L1 path uses — qwen2.5-coder
+    // is the only one we've validated for instruction-following on
+    // the Proxmox demo loop.
+    start_llm_request(draug, crate::draug::model_for_level(1), &prompt)
+}
+
+/// Phase C — handle the LLM response: parse, persist, advance the
+/// project index regardless of success so the demo never wedges
+/// the autonomous loop.
+fn process_phase_c_response(draug: &mut DraugDaemon, response: &[u8], _now_ms: u64) -> bool {
+    let raw_text = match parse_llm_response(response) {
+        Some(t) => t,
+        None => {
+            write_str("[Phase-C] LLM parse failed — skipping project\n");
+            // Advance the project index so we don't loop on the same
+            // project forever; matches the skill-tree force-advance
+            // contract from #106.
+            draug.phase_c_idx = draug.phase_c_idx.saturating_add(1);
+            draug.async_phase = AsyncPhase::Idle;
+            draug.async_operation = AsyncOp::None;
+            return true;
+        }
+    };
+
+    let idx = draug.phase_c_idx as usize;
+    let (project_id, _) = crate::phase_c::MULTI_FILE_PROJECTS[idx];
+
+    let files = crate::phase_c::parse_multi_file_response(&raw_text);
+    if files.is_empty() {
+        write_str("[Phase-C] no FILE markers in response — model didn't follow format\n");
+        // Same advance contract — model couldn't shape its output,
+        // we don't keep retrying the same project blind.
+        draug.phase_c_idx = draug.phase_c_idx.saturating_add(1);
+        draug.async_phase = AsyncPhase::Idle;
+        draug.async_operation = AsyncOp::None;
+        return true;
+    }
+
+    let written = crate::phase_c::persist_multi_file_project(project_id, &files);
+    let summary = crate::phase_c::summary_line(project_id, written, files.len());
+    write_str(&summary);
+    write_str("\n");
+
+    draug.phase_c_idx = draug.phase_c_idx.saturating_add(1);
+    draug.async_phase = AsyncPhase::Idle;
+    draug.async_operation = AsyncOp::None;
+    true
 }
 
 /// Phase A.5 (Path A): kick off a Draug self-analysis cycle over

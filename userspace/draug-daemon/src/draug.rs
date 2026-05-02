@@ -113,6 +113,13 @@ pub enum AsyncOp {
     /// the proxy so it can run in the daemon process without
     /// touching compositor's COM2 frame queue.
     AnalysisLlm,
+    /// Phase C: ask the LLM for a multi-file Rust project (lib.rs +
+    /// tests.rs + Cargo.toml etc.) split by `// === FILE: <path>`
+    /// markers, parse the response into separate files, and write
+    /// each into Synapse via `Project::write` under a
+    /// `proj/<project>/` namespace. First demo of Draug authoring
+    /// beyond a single function.
+    PhaseCMultiFile,
 }
 
 /// Which kind of work Draug is doing right now. Lets `tick_idle`
@@ -480,6 +487,13 @@ pub struct DraugDaemon {
     /// PASS vs a level the daemon gave up on. Doesn't persist across
     /// boots — diagnostic only.
     pub force_advance_count: u32,
+    /// Phase C: index of the next multi-file project Draug should
+    /// attempt from `phase_c::MULTI_FILE_PROJECTS`. Once this hits
+    /// the list length, the autonomous loop stops trying new
+    /// projects (one-shot per project, success or fail). In-memory
+    /// only — Phase C resets each boot, which is fine for the
+    /// initial demo since proj/<id>/ persistence is up to Synapse.
+    pub phase_c_idx: u8,
     /// Cached proxy ping result (avoid 2s TCP per iteration).
     pub last_ping_ms: u64,
     pub last_ping_ok: bool,
@@ -609,6 +623,7 @@ impl DraugDaemon {
             refactor_hibernating: false,
             task_parse_fails: [0u32; TASK_COUNT],
             force_advance_count: 0,
+            phase_c_idx: 0,
             last_ping_ms: 0,
             last_ping_ok: false,
             async_phase: AsyncPhase::Idle,
