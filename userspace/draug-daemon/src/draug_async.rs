@@ -1065,19 +1065,60 @@ fn process_executor_llm(draug: &mut DraugDaemon, response: &[u8], now_ms: u64) -
 
 /// Parse [u32 status][u32 len][text] from LLM response.
 /// Returns None on any parse failure — never panics.
+///
+/// On every failure path, surfaces a one-line diagnostic on serial so
+/// the next debug session can tell *why* parse failed (truncated
+/// response, non-zero LLM status, missing code fence, etc.) without
+/// having to redeploy with extra prints. Same observability principle
+/// as the kernel-side TCP_ASYNC stuck-Connecting log from #99.
 fn parse_llm_response(response: &[u8]) -> Option<String> {
-    if response.len() < 8 { return None; }
+    if response.len() < 8 {
+        write_str("[Draug-async] parse: response truncated (");
+        write_dec(response.len() as u32);
+        write_str(" bytes, need 8)\n");
+        return None;
+    }
     let status = u32::from_le_bytes([response[0], response[1], response[2], response[3]]);
-    if status != 0 { return None; }
+    if status != 0 {
+        write_str("[Draug-async] parse: LLM status=");
+        write_dec(status);
+        write_str("\n");
+        return None;
+    }
     let output_len = u32::from_le_bytes([response[4], response[5], response[6], response[7]]) as usize;
     // Guard: cap at actual response length (prevents overflow if output_len is corrupt)
     let text_end = 8usize.saturating_add(output_len).min(response.len());
-    let raw = core::str::from_utf8(&response[8..text_end]).ok()?;
+    let raw = match core::str::from_utf8(&response[8..text_end]) {
+        Ok(s) => s,
+        Err(_) => {
+            write_str("[Draug-async] parse: body not UTF-8 (output_len=");
+            write_dec(output_len as u32);
+            write_str(", text_end=");
+            write_dec(text_end as u32);
+            write_str(")\n");
+            return None;
+        }
+    };
     let code = extract_rust_code_block(raw);
     if code.is_empty() && raw.contains("STEP|") {
         // Planner response — return raw text
         Some(String::from(raw))
     } else if code.is_empty() {
+        // Most useful diagnostic: dump the first ~120 chars of raw so
+        // we can see what the LLM actually returned. The daemon retry
+        // loop hammers the same task forever otherwise (#99-followup).
+        write_str("[Draug-async] parse: code-block empty (output_len=");
+        write_dec(output_len as u32);
+        write_str(", body_len=");
+        write_dec(raw.len() as u32);
+        write_str(") preview: ");
+        let preview = if raw.len() > 120 { &raw[..120] } else { raw };
+        // Strip newlines so the preview stays one line on serial.
+        for b in preview.bytes() {
+            let c = if b == b'\n' || b == b'\r' { b'|' } else { b };
+            libfolk::sys::io::write_char(c);
+        }
+        write_str("\n");
         None
     } else {
         Some(code)
