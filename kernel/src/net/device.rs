@@ -15,8 +15,26 @@ use crate::drivers::virtio_net;
 
 pub(crate) struct FolkeringDevice;
 
-pub(crate) struct FolkeringRxToken {
-    buffer: Vec<u8>,
+/// RX token variants. The virtio path now defaults to true zero-copy
+/// (Delayed Requeueing) — we hand smoltcp a reference to the DMA
+/// buffer directly and defer the descriptor recycle until the token
+/// is dropped. The WASM-net path stays on the owned-buffer model
+/// because its underlying ring already gives us a `Vec<u8>`.
+pub(crate) enum FolkeringRxToken {
+    /// Zero-copy: holds the descriptor checkout for a virtio frame.
+    /// On Drop (whether via `consume` returning or smoltcp dropping
+    /// without consuming), the descriptor is recycled into the avail
+    /// ring so the virtio device can reuse the page.
+    VirtioZeroCopy {
+        desc_idx: u16,
+        buf_phys: usize,
+        buf_virt: usize,
+        frame_offset: usize,
+        len: usize,
+    },
+    /// Owned bytes (WASM-net path that doesn't have virtio
+    /// descriptors to recycle).
+    Owned(Vec<u8>),
 }
 
 impl phy::RxToken for FolkeringRxToken {
@@ -24,7 +42,36 @@ impl phy::RxToken for FolkeringRxToken {
     where
         F: FnOnce(&[u8]) -> R,
     {
-        f(&self.buffer)
+        match &self {
+            FolkeringRxToken::VirtioZeroCopy {
+                buf_virt, frame_offset, len, ..
+            } => {
+                // SAFETY: the descriptor is currently checked out
+                // (not in the avail ring) — virtio device cannot
+                // write to this buffer until our Drop puts it back.
+                // The buf_virt + frame_offset slice is therefore
+                // exclusive read access for the duration of `f`.
+                let ptr = (*buf_virt + *frame_offset) as *const u8;
+                let slice = unsafe { core::slice::from_raw_parts(ptr, *len) };
+                f(slice)
+                // Drop runs after this returns and recycles the
+                // descriptor — see `Drop for FolkeringRxToken`.
+            }
+            FolkeringRxToken::Owned(bytes) => f(bytes),
+        }
+    }
+}
+
+impl Drop for FolkeringRxToken {
+    fn drop(&mut self) {
+        // Zero-copy tokens recycle the virtio descriptor whether
+        // smoltcp consumed it (consume drops self at end of scope)
+        // or dropped it without consuming (e.g., routing rejected
+        // the frame). Owned tokens drop their Vec<u8> normally —
+        // no descriptor to return.
+        if let FolkeringRxToken::VirtioZeroCopy { desc_idx, buf_phys, .. } = *self {
+            virtio_net::recycle_rx_descriptor(desc_idx, buf_phys);
+        }
     }
 }
 
@@ -70,7 +117,7 @@ impl Device for FolkeringDevice {
                         drop(ring);
                         return None;
                     }
-                    let rx = FolkeringRxToken { buffer: data[..len].to_vec() };
+                    let rx = FolkeringRxToken::Owned(data[..len].to_vec());
                     drop(ring);
                     return Some((rx, FolkeringTxToken));
                 }
@@ -78,25 +125,42 @@ impl Device for FolkeringDevice {
                 return None;
             }
         }
-        // Fallback to VirtIO — loop to skip dropped packets. Capped at
-        // 256 dropped frames per receive() so a flood of denied packets
-        // (Issue #49 pattern) can't pin smoltcp's poll cycle.
+        // VirtIO path — true zero-copy via Delayed Requeueing.
+        // virtio_net::receive_raw_zero_copy returns the descriptor
+        // checkout info; the FolkeringRxToken's Drop impl (or
+        // explicit recycle below for filter-drop) returns the
+        // descriptor to the avail ring.
         //
-        // `virtio_net::receive_raw` now returns the frame as a `Vec<u8>`
-        // sized exactly to the on-wire payload — we move it straight
-        // into the RxToken instead of copying through a 1514-byte
-        // stack buffer first. Same observable behaviour for smoltcp,
-        // half the RX-path memcpy cost.
+        // 256-frame skip cap so a flood of firewall-denied packets
+        // can't pin smoltcp's poll (Issue #49 pattern).
         let mut skipped = 0u32;
         loop {
-            let frame = match virtio_net::receive_raw() {
+            let info = match virtio_net::receive_raw_zero_copy() {
                 Some(f) => f,
                 None => return None,
             };
-            if firewall::filter_packet(&frame) == firewall::FirewallAction::Allow {
-                let rx = FolkeringRxToken { buffer: frame };
+            // Firewall check needs to read the slice while holding
+            // the descriptor checkout. Build a temporary view (no
+            // copy — same pointer math as the token uses).
+            let slice = unsafe {
+                core::slice::from_raw_parts(
+                    (info.buf_virt + info.frame_offset) as *const u8,
+                    info.len,
+                )
+            };
+            if firewall::filter_packet(slice) == firewall::FirewallAction::Allow {
+                let rx = FolkeringRxToken::VirtioZeroCopy {
+                    desc_idx: info.desc_idx,
+                    buf_phys: info.buf_phys,
+                    buf_virt: info.buf_virt,
+                    frame_offset: info.frame_offset,
+                    len: info.len,
+                };
                 return Some((rx, FolkeringTxToken));
             }
+            // Filter dropped the frame — recycle immediately so the
+            // descriptor goes straight back into the avail ring.
+            virtio_net::recycle_rx_descriptor(info.desc_idx, info.buf_phys);
             skipped += 1;
             if skipped >= 256 { return None; }
         }
