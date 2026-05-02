@@ -276,8 +276,14 @@ pub fn syscall_tcp_connect(ip_packed: u64, port: u64) -> u64 {
         }
     };
 
-    let tcp_rx = tcp::SocketBuffer::new(alloc::vec![0u8; 8192]);
-    let tcp_tx = tcp::SocketBuffer::new(alloc::vec![0u8; 4096]);
+    // Issue #99 fix candidate: match tcp_plain.rs's 65536/8192. The
+    // earlier 8192/4096 was the smallest of any TCP path in the
+    // codebase — and tcp_plain.rs (which works) goes 8x bigger on RX.
+    // Smoltcp's SYN handshake bookkeeping may need more headroom than
+    // the tiny SYN packet itself; bumping eliminates that as a source
+    // of the SynSent-forever symptom.
+    let tcp_rx = tcp::SocketBuffer::new(alloc::vec![0u8; 65536]);
+    let tcp_tx = tcp::SocketBuffer::new(alloc::vec![0u8; 8192]);
     let tcp_socket = tcp::Socket::new(tcp_rx, tcp_tx);
     let tcp_handle = state.sockets.add(tcp_socket);
 

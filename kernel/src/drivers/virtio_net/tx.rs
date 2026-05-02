@@ -13,6 +13,39 @@ pub(super) fn transmit_packet_inner(dev: &mut VirtIONet, frame: &[u8]) -> Result
         return Err(NetError::DeviceFailed);
     }
 
+    // Issue #99 diagnostic: log the dst port for any TCP frame headed
+    // at the proxy. If smoltcp is producing the daemon's SYN we'll see
+    // dst=14711 here; absence in this log proves the SYN never reaches
+    // the virtio queue (i.e. iface.poll's TX path isn't running for
+    // task 4's socket). Filter cheap on the IPv4 + TCP shape so we
+    // don't drown the serial in ARP / IPv6 / ICMP noise.
+    if frame.len() >= 14 + 20 + 20 {
+        let ethertype = ((frame[12] as u16) << 8) | frame[13] as u16;
+        if ethertype == 0x0800 {
+            // IPv4 header — first byte is version+IHL, IHL is low 4 bits
+            // measured in 32-bit words.
+            let ihl = ((frame[14] & 0x0F) as usize) * 4;
+            let tcp_off = 14 + ihl;
+            // protocol == 6 (TCP)
+            if frame.len() >= tcp_off + 20 && frame[14 + 9] == 6 {
+                let dst_port = ((frame[tcp_off + 2] as u16) << 8)
+                    | frame[tcp_off + 3] as u16;
+                if dst_port == 14711 {
+                    let src_port = ((frame[tcp_off + 0] as u16) << 8)
+                        | frame[tcp_off + 1] as u16;
+                    let flags = frame[tcp_off + 13];
+                    crate::serial_str!("[VIRTIO_TX] sport=");
+                    crate::drivers::serial::write_dec(src_port as u32);
+                    crate::serial_str!(" dport=14711 flags=0x");
+                    crate::drivers::serial::write_hex(flags as u64);
+                    crate::serial_str!(" len=");
+                    crate::drivers::serial::write_dec(frame.len() as u32);
+                    crate::serial_strln!("");
+                }
+            }
+        }
+    }
+
     // Drain any completed TX descriptors first.
     // Each descriptor has a 4 KB physical page bound to its `addr`
     // field — `free_desc` only releases the descriptor index back
