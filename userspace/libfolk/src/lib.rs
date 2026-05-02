@@ -37,6 +37,7 @@
 #![no_std]
 
 pub mod entry;
+pub mod gfx;
 pub mod syscall;
 pub mod fmt;
 pub mod sys;
