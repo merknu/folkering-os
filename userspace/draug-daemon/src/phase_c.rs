@@ -46,12 +46,18 @@ use crate::project::Project;
 pub const MULTI_FILE_PROJECTS: &[(&str, &str)] = &[
     (
         "demo-calc",
-        "a tiny no_std calculator library. Two files: \
-         `src/lib.rs` defines `pub fn add(a: i32, b: i32) -> i32` \
-         and `pub fn sub(a: i32, b: i32) -> i32`; \
-         `src/tests.rs` is a `#[cfg(test)] mod` with three tests \
-         that verify add and sub via assert_eq! including a negative \
-         case. Both files compile as parts of a no_std `lib.rs` crate.",
+        "a tiny calculator library split across two files. \
+         `src/lib.rs` MUST start with the line \
+         `#[cfg(test)] mod tests;` so the separate test file gets \
+         picked up by cargo. After that line, lib.rs defines \
+         `pub fn add(a: i32, b: i32) -> i32` and \
+         `pub fn sub(a: i32, b: i32) -> i32`. \
+         `src/tests.rs` is the body of that test module — \
+         `use crate::*;` followed by three `#[test]` functions \
+         that verify add and sub via assert_eq! including a \
+         negative case. The crate compiles as a normal lib (the \
+         `#[cfg(test)] mod tests;` declaration is what links \
+         tests.rs in; without it, `cargo test` finds zero tests).",
     ),
 ];
 
@@ -70,12 +76,15 @@ pub fn build_multi_file_prompt(_project_id: &str, body: &str) -> String {
     p.push_str("Format your response as a single Rust source listing ");
     p.push_str("with each file separated by a marker line of the exact form:\n");
     p.push_str("    // === FILE: <relative-path>\n");
-    p.push_str("Example:\n");
+    p.push_str("Example output for a two-file crate (mind the `mod tests;` ");
+    p.push_str("line — without it, cargo test runs zero tests from tests.rs):\n");
     p.push_str("    // === FILE: src/lib.rs\n");
-    p.push_str("    pub fn foo() {}\n");
+    p.push_str("    #[cfg(test)] mod tests;\n");
+    p.push_str("    pub fn foo() -> i32 { 42 }\n");
     p.push_str("    // === FILE: src/tests.rs\n");
-    p.push_str("    #[cfg(test)]\n");
-    p.push_str("    mod tests { /* ... */ }\n\n");
+    p.push_str("    use crate::*;\n");
+    p.push_str("    #[test]\n");
+    p.push_str("    fn it_works() { assert_eq!(foo(), 42); }\n\n");
     p.push_str("Rules: include only file content between markers, ");
     p.push_str("no explanation outside, no Cargo.toml (we'll generate one), ");
     p.push_str("no top-level `fn main`. Wrap the whole thing in one ");
