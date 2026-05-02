@@ -7,6 +7,7 @@ use crate::drivers::virtio::{Virtqueue, VRING_DESC_F_NEXT, VRING_DESC_F_WRITE};
 use super::GpuState;
 
 // ── VirtIO GPU Command Types ───────────────────────────────────────────
+// Control queue commands (sent on queue 0):
 
 pub(super) const VIRTIO_GPU_CMD_GET_DISPLAY_INFO: u32 = 0x0100;
 pub(super) const VIRTIO_GPU_CMD_RESOURCE_CREATE_2D: u32 = 0x0101;
@@ -14,8 +15,31 @@ pub(super) const VIRTIO_GPU_CMD_SET_SCANOUT: u32 = 0x0103;
 pub(super) const VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING: u32 = 0x0104;
 pub(super) const VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D: u32 = 0x0105;
 pub(super) const VIRTIO_GPU_CMD_RESOURCE_FLUSH: u32 = 0x0106;
+// RESOURCE_BLOB family — only valid if VIRTIO_GPU_F_RESOURCE_BLOB negotiated.
+// We define the wire format unconditionally so callers can stage commands;
+// `resources::create_blob` early-exits when the feature isn't enabled.
+#[allow(dead_code)]
+pub(super) const VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB: u32 = 0x010C;
+#[allow(dead_code)]
+pub(super) const VIRTIO_GPU_CMD_SET_SCANOUT_BLOB: u32 = 0x010D;
+
+// Cursor queue commands (sent on queue 1, dedicated so cursor stays
+// responsive when controlq is backed up with heavy renders):
+pub(super) const VIRTIO_GPU_CMD_UPDATE_CURSOR: u32 = 0x0300;
+pub(super) const VIRTIO_GPU_CMD_MOVE_CURSOR: u32 = 0x0301;
 
 pub(super) const VIRTIO_GPU_RESP_OK_DISPLAY_INFO: u32 = 0x1101;
+
+// ── RESOURCE_BLOB constants ────────────────────────────────────────────
+// Mirrors `virtio_gpu.h` from the spec. We expose the values the rapport
+// calls out (HOST3D + USE_MAPPABLE) plus the safer GUEST mode used as a
+// fallback when the host can't expose memory directly.
+#[allow(dead_code)]
+pub(super) const VIRTIO_GPU_BLOB_MEM_GUEST: u32 = 0x0001;
+#[allow(dead_code)]
+pub(super) const VIRTIO_GPU_BLOB_MEM_HOST3D: u32 = 0x0002;
+#[allow(dead_code)]
+pub(super) const VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE: u32 = 0x0001;
 
 // ── VirtIO GPU Pixel Formats ───────────────────────────────────────────
 
@@ -117,6 +141,60 @@ pub(super) struct GpuRespHdr {
     pub(super) fence_id: u64,
     pub(super) ctx_id: u32,
     pub(super) _padding: u32,
+}
+
+// ── Cursor queue wire format ───────────────────────────────────────────
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(super) struct GpuCursorPos {
+    pub(super) scanout_id: u32,
+    pub(super) x: u32,
+    pub(super) y: u32,
+    pub(super) padding: u32,
+}
+
+/// Used for both UPDATE_CURSOR (sets sprite + position) and MOVE_CURSOR
+/// (position only — `resource_id`, `hot_x`, `hot_y` are ignored). The shared
+/// struct is what the spec defines and matches what QEMU expects on cursorq.
+#[repr(C)]
+pub(super) struct GpuUpdateCursor {
+    pub(super) hdr: GpuCtrlHdr,
+    pub(super) pos: GpuCursorPos,
+    pub(super) resource_id: u32,
+    pub(super) hot_x: u32,
+    pub(super) hot_y: u32,
+    pub(super) padding: u32,
+}
+
+// ── RESOURCE_BLOB wire format ──────────────────────────────────────────
+
+#[repr(C)]
+#[allow(dead_code)]
+pub(super) struct GpuResourceCreateBlob {
+    pub(super) hdr: GpuCtrlHdr,
+    pub(super) resource_id: u32,
+    pub(super) blob_mem: u32,
+    pub(super) blob_flags: u32,
+    pub(super) nr_entries: u32,
+    pub(super) blob_id: u64,
+    pub(super) size: u64,
+    // Followed by nr_entries × GpuMemEntry (same layout as ATTACH_BACKING).
+}
+
+#[repr(C)]
+#[allow(dead_code)]
+pub(super) struct GpuSetScanoutBlob {
+    pub(super) hdr: GpuCtrlHdr,
+    pub(super) r: GpuRect,
+    pub(super) scanout_id: u32,
+    pub(super) resource_id: u32,
+    pub(super) width: u32,
+    pub(super) height: u32,
+    pub(super) format: u32,
+    pub(super) padding: u32,
+    pub(super) strides: [u32; 4],
+    pub(super) offsets: [u32; 4],
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
