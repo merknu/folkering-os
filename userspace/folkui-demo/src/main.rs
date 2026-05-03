@@ -83,11 +83,19 @@ static ALLOCATOR: BumpAllocator = BumpAllocator {
 //
 // Hard-coded for the smoke test. A future demo replaces this with
 // "ask Draug to author a UI" — that's the actual rapport endgame.
+// Markup demonstrates flexbox: the top HBox has a label on the
+// left and a `bind_text` clock on the right, separated by a
+// flex-grow="1" VBox spacer. This is the rapport's "label left,
+// clock right" status-bar pattern in action.
 const DEMO_MARKUP: &str = concat!(
     r##"<Window x="40" y="40" width="320" height="140" bg_color="#1E2030" corner_radius="8">"##,
     r##"  <VBox padding="16" spacing="8">"##,
-    r##"    <Text color="#C0CAF5" font_size="18">Hello from libfolkui</Text>"##,
-    r##"    <Text color="#A9B1D6" font_size="14" bind_text="counter">tick=0</Text>"##,
+    r##"    <HBox spacing="8">"##,
+    r##"      <Text color="#C0CAF5" font_size="14">libfolkui</Text>"##,
+    r##"      <VBox flex-grow="1"/>"##,
+    r##"      <Text color="#A9B1D6" font_size="14" bind_text="counter">tick=0</Text>"##,
+    r##"    </HBox>"##,
+    r##"    <Text color="#9ECE6A" font_size="14">flexbox: label left, counter right</Text>"##,
     r##"    <Button bg_color="#7AA2F7" corner_radius="6">Click me</Button>"##,
     r##"  </VBox>"##,
     r##"</Window>"##,
