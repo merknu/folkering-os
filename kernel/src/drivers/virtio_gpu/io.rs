@@ -13,8 +13,10 @@ pub(super) const STATUS_FAILED: u8 = 128;
 
 // ── VirtIO GPU Feature Bits ────────────────────────────────────────────
 
-pub(super) const VIRTIO_GPU_F_VIRGL: u32 = 1 << 0; // 3D/VirGL support
-pub(super) const VIRTIO_GPU_F_EDID: u32 = 1 << 1;  // EDID display info
+pub(super) const VIRTIO_GPU_F_VIRGL: u32 = 1 << 0;          // 3D/VirGL support
+pub(super) const VIRTIO_GPU_F_EDID: u32 = 1 << 1;           // EDID display info
+pub(super) const VIRTIO_GPU_F_RESOURCE_BLOB: u32 = 1 << 3;  // Host-visible blob resources (zero-copy framebuffer)
+pub(super) const VIRTIO_GPU_F_CONTEXT_INIT: u32 = 1 << 4;   // Async timelines + multi-context isolation
 
 // ── VirtIO GPU Command Flags ───────────────────────────────────────────
 

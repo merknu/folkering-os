@@ -48,12 +48,27 @@ use commands::*;
 pub(super) struct GpuState {
     pub(super) transport: MmioTransport,
     pub(super) controlq: Virtqueue,
+    /// Cursor queue (queue 1) — dedicated path for UPDATE_CURSOR/MOVE_CURSOR
+    /// so cursor stays responsive even when controlq is backed up. Optional
+    /// because not every transport exposes it (rare; the spec mandates it).
+    pub(super) cursorq: Option<Virtqueue>,
+    /// Notify offset for cursorq, kept separate because each queue has its
+    /// own slot in the notify capability region.
+    pub(super) cursorq_notify_off: u16,
+    /// Static page used to stage cursor commands (avoids alloc_page per send).
+    pub(super) cursor_cmd_page: Option<usize>,
     pub(super) width: u32,
     pub(super) height: u32,
     pub(super) fb_phys_pages: Vec<usize>, // Physical page addresses for backing
     pub(super) active: bool,
     pub(super) has_virgl: bool,
     pub(super) has_edid: bool,
+    /// Set if VIRTIO_GPU_F_RESOURCE_BLOB was advertised AND accepted. Today
+    /// this is informational — the framebuffer still uses ATTACH_BACKING. Once
+    /// we wire up `create_blob` it gates whether to take the zero-copy path.
+    pub(super) has_resource_blob: bool,
+    /// Set if VIRTIO_GPU_F_CONTEXT_INIT was negotiated.
+    pub(super) has_context_init: bool,
 }
 
 pub(super) static GPU_STATE: Mutex<Option<GpuState>> = Mutex::new(None);
@@ -101,6 +116,8 @@ pub fn init() -> Result<(), &'static str> {
     let features_lo = transport.read_common32(VIRTIO_PCI_COMMON_DF);
     let has_virgl = features_lo & VIRTIO_GPU_F_VIRGL != 0;
     let has_edid = features_lo & VIRTIO_GPU_F_EDID != 0;
+    let host_offers_blob = features_lo & VIRTIO_GPU_F_RESOURCE_BLOB != 0;
+    let host_offers_ctxinit = features_lo & VIRTIO_GPU_F_CONTEXT_INIT != 0;
 
     // Read feature bits page 1 (bits 32-63) — includes VIRTIO_F_VERSION_1
     transport.write_common32(VIRTIO_PCI_COMMON_DFSELECT, 1);
@@ -114,14 +131,24 @@ pub fn init() -> Result<(), &'static str> {
     crate::drivers::serial::write_dec(if has_virgl { 1 } else { 0 });
     crate::serial_str!(" EDID=");
     crate::drivers::serial::write_dec(if has_edid { 1 } else { 0 });
+    crate::serial_str!(" BLOB=");
+    crate::drivers::serial::write_dec(if host_offers_blob { 1 } else { 0 });
+    crate::serial_str!(" CTXINIT=");
+    crate::drivers::serial::write_dec(if host_offers_ctxinit { 1 } else { 0 });
     crate::serial_str!(" V1=");
     crate::drivers::serial::write_dec(if features_hi & 1 != 0 { 1 } else { 0 });
     crate::drivers::serial::write_newline();
 
     // Accept features for Modern transport
-    // Page 0: accept VIRTIO_F_EVENT_IDX (bit 29) + VIRTIO_F_INDIRECT_DESC (bit 28)
+    // Page 0: VIRTIO_F_EVENT_IDX (bit 29) + VIRTIO_F_INDIRECT_DESC (bit 28),
+    // plus RESOURCE_BLOB and CONTEXT_INIT when the host advertises them. The
+    // accept-only-what-host-offers pattern keeps boot working on QEMU builds
+    // that don't expose the newer feature bits.
+    let mut gf_lo: u32 = (1 << 29) | (1 << 28);
+    if host_offers_blob    { gf_lo |= VIRTIO_GPU_F_RESOURCE_BLOB; }
+    if host_offers_ctxinit { gf_lo |= VIRTIO_GPU_F_CONTEXT_INIT; }
     transport.write_common32(VIRTIO_PCI_COMMON_GFSELECT, 0);
-    transport.write_common32(VIRTIO_PCI_COMMON_GF, (1 << 29) | (1 << 28));
+    transport.write_common32(VIRTIO_PCI_COMMON_GF, gf_lo);
     // Page 1: VIRTIO_F_VERSION_1 (bit 0)
     transport.write_common32(VIRTIO_PCI_COMMON_GFSELECT, 1);
     transport.write_common32(VIRTIO_PCI_COMMON_GF, 1);
@@ -138,72 +165,22 @@ pub fn init() -> Result<(), &'static str> {
     }
     crate::serial_str!("[VIRTIO_GPU] FEATURES_OK accepted\n");
 
-    // Setup control queue (queue 0)
-    transport.write_common16(VIRTIO_PCI_COMMON_Q_SELECT, 0);
-    let queue_size = transport.read_common16(VIRTIO_PCI_COMMON_Q_SIZE);
-    if queue_size == 0 {
-        return Err("controlq size is 0");
-    }
+    // Setup control queue (queue 0) — primary command channel.
+    let (controlq, controlq_notify_off) = setup_queue(&mut transport, 0, "controlq")?;
+    transport.notify_off = controlq_notify_off;
 
-    crate::serial_str!("[VIRTIO_GPU] Controlq size: ");
-    crate::drivers::serial::write_dec(queue_size as u32);
-    crate::drivers::serial::write_newline();
-
-    let controlq = Virtqueue::new(queue_size).ok_or("failed to alloc controlq")?;
-
-    // Modern: write descriptor/available/used ring addresses directly
-    let dp = controlq.desc_phys();
-    let ap = controlq.avail_phys();
-    let up = controlq.used_phys();
-
-    crate::serial_str!("[VIRTIO_GPU] Ring addrs: desc=");
-    crate::drivers::serial::write_hex(dp);
-    crate::serial_str!(" avail=");
-    crate::drivers::serial::write_hex(ap);
-    crate::serial_str!(" used=");
-    crate::drivers::serial::write_hex(up);
-    crate::serial_str!(" (align: desc%16=");
-    crate::drivers::serial::write_dec((dp % 16) as u32);
-    crate::serial_str!(" avail%2=");
-    crate::drivers::serial::write_dec((ap % 2) as u32);
-    crate::serial_str!(" used%4=");
-    crate::drivers::serial::write_dec((up % 4) as u32);
-    crate::serial_str!(")\n");
-
-    // Write ring addresses (standard 32-bit lo/hi per OASIS spec)
-    transport.write_common32(VIRTIO_PCI_COMMON_Q_DESCLO, dp as u32);
-    transport.write_common32(VIRTIO_PCI_COMMON_Q_DESCHI, (dp >> 32) as u32);
-    transport.write_common32(VIRTIO_PCI_COMMON_Q_AVAILLO, ap as u32);
-    transport.write_common32(VIRTIO_PCI_COMMON_Q_AVAILHI, (ap >> 32) as u32);
-    transport.write_common32(VIRTIO_PCI_COMMON_Q_USEDLO, up as u32);
-    transport.write_common32(VIRTIO_PCI_COMMON_Q_USEDHI, (up >> 32) as u32);
-
-    // Read queue notify offset (needed for correct notify address)
-    let q_notify_off = transport.read_common16(VIRTIO_PCI_COMMON_Q_NOFF);
-    transport.notify_off = q_notify_off;
-    crate::serial_str!("[VIRTIO_GPU] Queue notify offset: ");
-    crate::drivers::serial::write_dec(q_notify_off as u32);
-    crate::serial_str!(", notify_mul=");
-    crate::drivers::serial::write_dec(transport.notify_mul);
-    crate::drivers::serial::write_newline();
-
-    // Verify USED readback
-    let rb_used = transport.read_common32(VIRTIO_PCI_COMMON_Q_USEDLO);
-    crate::serial_str!("[VIRTIO_GPU] USED readback=");
-    crate::drivers::serial::write_hex(rb_used as u64);
-    crate::drivers::serial::write_newline();
-    // Try writing as both u16 and u32 to handle potential alignment issues
-    unsafe {
-        core::ptr::write_volatile(
-            (transport.common_base + VIRTIO_PCI_COMMON_Q_ENABLE) as *mut u16, 1
-        );
-    }
-    // Force a small delay for device to process
-    for _ in 0..10000 { core::hint::spin_loop(); }
-    let q_enabled = transport.read_common16(VIRTIO_PCI_COMMON_Q_ENABLE);
-    crate::serial_str!("[VIRTIO_GPU] Q_ENABLE readback: ");
-    crate::drivers::serial::write_dec(q_enabled as u32);
-    crate::drivers::serial::write_newline();
+    // Setup cursor queue (queue 1) — separate fast-path for UPDATE_CURSOR /
+    // MOVE_CURSOR. Failure here is non-fatal: we still get scanout via
+    // controlq, just without the dedicated cursor channel.
+    let (cursorq, cursorq_notify_off) = match setup_queue(&mut transport, 1, "cursorq") {
+        Ok(pair) => (Some(pair.0), pair.1),
+        Err(e) => {
+            crate::serial_str!("[VIRTIO_GPU] cursorq setup failed (");
+            crate::serial_str!(e);
+            crate::serial_str!(") — falling back to controlq cursor\n");
+            (None, 0)
+        }
+    };
 
     // DRIVER_OK
     transport.write_common8(VIRTIO_PCI_COMMON_STATUS,
@@ -220,12 +197,17 @@ pub fn init() -> Result<(), &'static str> {
     let mut state = GpuState {
         transport,
         controlq,
+        cursorq,
+        cursorq_notify_off,
+        cursor_cmd_page: None,
         width: 0,
         height: 0,
         fb_phys_pages: Vec::new(),
         active: false,
         has_virgl,
         has_edid,
+        has_resource_blob: host_offers_blob,
+        has_context_init: host_offers_ctxinit,
     };
 
     // ── Get Display Info ────────────────────────────────────────────────
@@ -319,4 +301,155 @@ pub fn display_size() -> Option<(u32, u32)> {
 pub fn framebuffer_pages() -> Option<Vec<usize>> {
     let guard = GPU_STATE.lock();
     guard.as_ref().map(|s| s.fb_phys_pages.clone())
+}
+
+/// Whether VIRTIO_GPU_F_RESOURCE_BLOB was negotiated. Userspace can query
+/// this to decide whether a zero-copy framebuffer path is available.
+pub fn has_resource_blob() -> bool {
+    GPU_STATE.lock().as_ref().map(|s| s.has_resource_blob).unwrap_or(false)
+}
+
+/// Whether the device exposed a working cursorq. Mainly diagnostic — callers
+/// of `move_cursor` don't need to check this; the driver falls back silently.
+pub fn has_cursor_queue() -> bool {
+    GPU_STATE.lock().as_ref().map(|s| s.cursorq.is_some()).unwrap_or(false)
+}
+
+// ── Public API: Cursor (queue 1, fire-and-forget) ──────────────────────
+
+/// Move the hardware cursor without touching its sprite. Fire-and-forget on
+/// the cursor queue so this doesn't contend with the heavier control-queue
+/// flushes. No-op when cursorq isn't available.
+pub fn move_cursor(scanout_id: u32, x: u32, y: u32) {
+    let mut guard = GPU_STATE.lock();
+    let Some(state) = guard.as_mut() else { return };
+    if state.cursorq.is_none() { return; }
+    submit_cursor_cmd(state, VIRTIO_GPU_CMD_MOVE_CURSOR, scanout_id, x, y, 0, 0, 0);
+}
+
+/// Bind a sprite resource to the hardware cursor at `(x, y)` with the given
+/// hotspot. `resource_id == 0` hides the cursor (per spec).
+pub fn update_cursor(
+    scanout_id: u32,
+    x: u32, y: u32,
+    resource_id: u32, hot_x: u32, hot_y: u32,
+) {
+    let mut guard = GPU_STATE.lock();
+    let Some(state) = guard.as_mut() else { return };
+    if state.cursorq.is_none() { return; }
+    submit_cursor_cmd(state, VIRTIO_GPU_CMD_UPDATE_CURSOR,
+        scanout_id, x, y, resource_id, hot_x, hot_y);
+}
+
+// ── Internals ──────────────────────────────────────────────────────────
+
+/// Configure one virtqueue (descriptor/avail/used rings, notify offset,
+/// enable bit) and return the queue and its per-queue notify offset. Used
+/// for both controlq and cursorq.
+fn setup_queue(
+    transport: &mut MmioTransport,
+    queue_idx: u16,
+    label: &'static str,
+) -> Result<(Virtqueue, u16), &'static str> {
+    transport.write_common16(VIRTIO_PCI_COMMON_Q_SELECT, queue_idx);
+    let queue_size = transport.read_common16(VIRTIO_PCI_COMMON_Q_SIZE);
+    if queue_size == 0 {
+        return Err("queue size is 0");
+    }
+
+    crate::serial_str!("[VIRTIO_GPU] ");
+    crate::serial_str!(label);
+    crate::serial_str!(" size=");
+    crate::drivers::serial::write_dec(queue_size as u32);
+    crate::drivers::serial::write_newline();
+
+    let q = Virtqueue::new(queue_size).ok_or("failed to alloc queue")?;
+    let dp = q.desc_phys();
+    let ap = q.avail_phys();
+    let up = q.used_phys();
+
+    transport.write_common32(VIRTIO_PCI_COMMON_Q_DESCLO, dp as u32);
+    transport.write_common32(VIRTIO_PCI_COMMON_Q_DESCHI, (dp >> 32) as u32);
+    transport.write_common32(VIRTIO_PCI_COMMON_Q_AVAILLO, ap as u32);
+    transport.write_common32(VIRTIO_PCI_COMMON_Q_AVAILHI, (ap >> 32) as u32);
+    transport.write_common32(VIRTIO_PCI_COMMON_Q_USEDLO, up as u32);
+    transport.write_common32(VIRTIO_PCI_COMMON_Q_USEDHI, (up >> 32) as u32);
+
+    let notify_off = transport.read_common16(VIRTIO_PCI_COMMON_Q_NOFF);
+    crate::serial_str!("[VIRTIO_GPU] ");
+    crate::serial_str!(label);
+    crate::serial_str!(" notify_off=");
+    crate::drivers::serial::write_dec(notify_off as u32);
+    crate::drivers::serial::write_newline();
+
+    unsafe {
+        core::ptr::write_volatile(
+            (transport.common_base + VIRTIO_PCI_COMMON_Q_ENABLE) as *mut u16, 1,
+        );
+    }
+    for _ in 0..10_000 { core::hint::spin_loop(); }
+
+    let enabled = transport.read_common16(VIRTIO_PCI_COMMON_Q_ENABLE);
+    if enabled != 1 {
+        return Err("queue did not enable");
+    }
+
+    Ok((q, notify_off))
+}
+
+/// Stage and submit one cursor-queue command. Fire-and-forget: we recycle
+/// any used descriptors at the start of the next call rather than blocking.
+fn submit_cursor_cmd(
+    state: &mut GpuState,
+    cmd_type: u32,
+    scanout_id: u32, x: u32, y: u32,
+    resource_id: u32, hot_x: u32, hot_y: u32,
+) {
+    use commands::{GpuUpdateCursor, GpuCursorPos, make_hdr, recycle_used};
+
+    let cursorq = match state.cursorq.as_mut() {
+        Some(q) => q,
+        None => return,
+    };
+
+    // Reuse the staging page across calls — cursor traffic is tiny (~32B per
+    // command) and we never need to overlap two in flight: by spec the cursor
+    // queue serializes naturally, and we only ever post one command before
+    // returning.
+    let cmd_phys = match state.cursor_cmd_page {
+        Some(p) => p,
+        None => match physical::alloc_page() {
+            Some(p) => { state.cursor_cmd_page = Some(p); p }
+            None => return,
+        }
+    };
+
+    recycle_used(cursorq);
+
+    let hhdm_off = crate::memory::paging::hhdm_offset();
+    unsafe {
+        let cmd = (hhdm_off + cmd_phys) as *mut GpuUpdateCursor;
+        (*cmd).hdr = make_hdr(cmd_type);
+        (*cmd).pos = GpuCursorPos { scanout_id, x, y, padding: 0 };
+        (*cmd).resource_id = resource_id;
+        (*cmd).hot_x = hot_x;
+        (*cmd).hot_y = hot_y;
+        (*cmd).padding = 0;
+    }
+
+    // Single descriptor, device-read only — cursor commands have no response.
+    let Some(d0) = cursorq.alloc_desc() else { return };
+    cursorq.set_desc(
+        d0,
+        cmd_phys as u64,
+        core::mem::size_of::<GpuUpdateCursor>() as u32,
+        0,
+        0,
+    );
+    cursorq.submit(d0);
+
+    // Ring the cursorq doorbell using its own per-queue notify offset.
+    let off = state.cursorq_notify_off as usize * state.transport.notify_mul as usize;
+    let addr = state.transport.notify_base + off;
+    unsafe { core::ptr::write_volatile(addr as *mut u32, 1) };
 }
