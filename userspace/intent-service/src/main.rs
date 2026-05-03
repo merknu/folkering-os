@@ -13,8 +13,51 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+use core::alloc::{GlobalAlloc, Layout};
+use core::cell::UnsafeCell;
+
 use libfolk::{entry, println};
 use libfolk::sys::{yield_cpu, get_pid};
+
+// ── Bump allocator ──────────────────────────────────────────────────
+//
+// Same rationale as `shell/src/main.rs`: libfolk pulled in alloc via
+// `gfx::DisplayListBuilder` in #112, so every linked binary must
+// supply a `#[global_allocator]`. Intent-service barely allocates
+// (one or two transient `Vec`s during query forwarding), so 32 KiB
+// is plenty.
+const HEAP_SIZE: usize = 32 * 1024;
+
+struct BumpAllocator {
+    heap: UnsafeCell<[u8; HEAP_SIZE]>,
+    offset: UnsafeCell<usize>,
+}
+
+unsafe impl Sync for BumpAllocator {}
+
+unsafe impl GlobalAlloc for BumpAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let offset = &mut *self.offset.get();
+        let align = layout.align();
+        let aligned = (*offset + align - 1) & !(align - 1);
+        let new_offset = aligned + layout.size();
+        if new_offset > HEAP_SIZE {
+            core::ptr::null_mut()
+        } else {
+            *offset = new_offset;
+            (*self.heap.get()).as_mut_ptr().add(aligned)
+        }
+    }
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
+}
+
+#[global_allocator]
+static ALLOCATOR: BumpAllocator = BumpAllocator {
+    heap: UnsafeCell::new([0; HEAP_SIZE]),
+    offset: UnsafeCell::new(0),
+};
 use libfolk::sys::ipc::{recv_async, reply_with_token, CallerToken, AsyncIpcMessage};
 use libfolk::sys::intent::{
     INTENT_OP_REGISTER, INTENT_OP_SUBMIT, INTENT_OP_QUERY,
