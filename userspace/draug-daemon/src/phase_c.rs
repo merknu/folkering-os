@@ -45,13 +45,32 @@ use crate::project::Project;
 /// the per-file path, names get tight fast).
 pub const MULTI_FILE_PROJECTS: &[(&str, &str)] = &[
     (
-        "demo-calc",
-        "a tiny no_std calculator library. Two files: \
-         `src/lib.rs` defines `pub fn add(a: i32, b: i32) -> i32` \
-         and `pub fn sub(a: i32, b: i32) -> i32`; \
-         `src/tests.rs` is a `#[cfg(test)] mod` with three tests \
-         that verify add and sub via assert_eq! including a negative \
-         case. Both files compile as parts of a no_std `lib.rs` crate.",
+        "sysmon-lib",
+        "a no_std Rust library that returns Folkering OS UI markup \
+         for a system monitor panel. Two files. \
+         \
+         src/lib.rs starts with `#![no_std]` and ends with `#[cfg(test)] mod tests;`. \
+         It exports `pub fn markup() -> &'static str` returning a \
+         multi-line raw string `r##\"...\"##` containing this exact \
+         shape: \
+         \
+         <Window x=\"40\" y=\"40\" width=\"320\" height=\"160\" bg_color=\"#1E2030\" corner_radius=\"8\"> \
+         <VBox padding=\"16\" spacing=\"8\"> \
+         three <HBox spacing=\"8\"> rows, each holding (in order): \
+         a <Text color=\"#C0CAF5\" font_size=\"14\"> with a label \
+         (CPU, Memory, Uptime), a <VBox flex-grow=\"1\"/> spacer, \
+         and a <Text color=\"#9ECE6A\" font_size=\"14\" bind_text=\"K\">--</Text> \
+         where K is cpu_pct, mem_pct, uptime. \
+         Close all tags. Order: CPU row, Memory row, Uptime row. \
+         \
+         src/tests.rs has `#[cfg(test)] mod tests {{ ... }}` with \
+         three tests using assert!. test_has_window: markup contains \
+         \"<Window\". test_three_labels: markup contains all of \
+         CPU, Memory, Uptime. test_has_bind_keys: markup contains \
+         all of cpu_pct, mem_pct, uptime. \
+         \
+         No external dependencies. Use raw strings r##\"...\"## so \
+         the literal can contain double-quotes verbatim.",
     ),
 ];
 

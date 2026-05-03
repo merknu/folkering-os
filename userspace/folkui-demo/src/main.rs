@@ -83,23 +83,32 @@ static ALLOCATOR: BumpAllocator = BumpAllocator {
 //
 // Hard-coded for the smoke test. A future demo replaces this with
 // "ask Draug to author a UI" — that's the actual rapport endgame.
-// Markup demonstrates flexbox: the top HBox has a label on the
-// left and a `bind_text` clock on the right, separated by a
-// flex-grow="1" VBox spacer. This is the rapport's "label left,
-// clock right" status-bar pattern in action.
-const DEMO_MARKUP: &str = concat!(
-    r##"<Window x="40" y="40" width="320" height="140" bg_color="#1E2030" corner_radius="8">"##,
-    r##"  <VBox padding="16" spacing="8">"##,
-    r##"    <HBox spacing="8">"##,
-    r##"      <Text color="#C0CAF5" font_size="14">libfolkui</Text>"##,
-    r##"      <VBox flex-grow="1"/>"##,
-    r##"      <Text color="#A9B1D6" font_size="14" bind_text="counter">tick=0</Text>"##,
-    r##"    </HBox>"##,
-    r##"    <Text color="#9ECE6A" font_size="14">flexbox: label left, counter right</Text>"##,
-    r##"    <Button bg_color="#7AA2F7" corner_radius="6">Click me</Button>"##,
-    r##"  </VBox>"##,
-    r##"</Window>"##,
-);
+// This markup was AUTHORED BY DRAUG inside Folkering OS — generated
+// by qwen2.5-coder via the Phase C v3 pipeline (Synapse VFS →
+// MULTI_PATCH → cargo test → 3 passed). Pasted in verbatim from
+// /root/draug-sandbox/archive/multi-0005-sysmon-lib.rs. Folkering
+// is now showing a UI its own AI agent designed.
+const DEMO_MARKUP: &str = r##"
+<Window x="40" y="40" width="320" height="160" bg_color="#1E2030" corner_radius="8">
+    <VBox padding="16" spacing="8">
+        <HBox spacing="8">
+            <Text color="#C0CAF5" font_size="14">CPU</Text>
+            <VBox flex-grow="1"/>
+            <Text color="#9ECE6A" font_size="14" bind_text="cpu_pct">--</Text>
+        </HBox>
+        <HBox spacing="8">
+            <Text color="#C0CAF5" font_size="14">Memory</Text>
+            <VBox flex-grow="1"/>
+            <Text color="#9ECE6A" font_size="14" bind_text="mem_pct">--</Text>
+        </HBox>
+        <HBox spacing="8">
+            <Text color="#C0CAF5" font_size="14">Uptime</Text>
+            <VBox flex-grow="1"/>
+            <Text color="#9ECE6A" font_size="14" bind_text="uptime">--</Text>
+        </HBox>
+    </VBox>
+</Window>
+"##;
 
 /// Reserved virtual address for the producer's ring view. Picked to
 /// stay clear of the `RING_BASE_VADDR=0x6000_0000_0000` zone the
@@ -157,23 +166,39 @@ fn main() -> ! {
         max_w: 1024, max_h: 768, // matches the compositor's typical FB
     });
 
-    // 3. Push display lists with a live-updating counter binding.
-    //    Each tick we bump `counter`, set it on AppState, recompile,
-    //    and push. compile_diff_into emits the full tree on the first
-    //    frame and then only DrawRect+DrawText for the changed
-    //    binding — typically ~30 bytes/frame instead of ~144.
+    // 3. Per-tick: read live system stats, bind them to the three
+    //    keys Draug's markup expects (cpu_pct, mem_pct, uptime),
+    //    recompile the diff'd display list, push to the ring.
     let mut state = AppState::new();
-    let mut counter: u64 = 0;
-    let mut buf = [0u8; 24]; // "tick=NNNNNNNNNNNNNNNN\0"
+    let mut tick: u64 = 0;
+    let mut cpu_buf = [0u8; 16];
+    let mut mem_buf = [0u8; 16];
+    let mut up_buf  = [0u8; 32];
     let mut builder = DisplayListBuilder::new();
     let mut diff = DiffState::new();
     let mut printed_once = false;
 
     loop {
-        let written = format_counter(&mut buf, counter);
-        // SAFETY: `format_counter` writes ASCII bytes only.
-        let s = unsafe { core::str::from_utf8_unchecked(&buf[..written]) };
-        state.set("counter", s);
+        // CPU% — synapse-style "we don't have a CPU sampler yet so
+        // approximate with tick activity". A real one would read
+        // per-task scheduler counters; this is enough to prove the
+        // binding pipeline.
+        let cpu_pct = ((tick % 100) as u32) as u8;
+        let cpu_n = format_pct(&mut cpu_buf, cpu_pct);
+        let cpu_s = unsafe { core::str::from_utf8_unchecked(&cpu_buf[..cpu_n]) };
+        state.set("cpu_pct", cpu_s);
+
+        // Memory% from the kernel.
+        let (_used, _total, mem_pct) = libfolk::sys::memory_stats();
+        let mem_n = format_pct(&mut mem_buf, mem_pct.min(100) as u8);
+        let mem_s = unsafe { core::str::from_utf8_unchecked(&mem_buf[..mem_n]) };
+        state.set("mem_pct", mem_s);
+
+        // Uptime in seconds.
+        let secs = libfolk::sys::uptime() / 1000;
+        let up_n = format_uptime(&mut up_buf, secs);
+        let up_s = unsafe { core::str::from_utf8_unchecked(&up_buf[..up_n]) };
+        state.set("uptime", up_s);
 
         compile_diff_into(&tree, &state, &mut diff, &mut builder);
         let bytes = builder.as_slice();
@@ -187,36 +212,69 @@ fn main() -> ! {
         // and try next tick — apps shouldn't spin on the ring.
         let _ = ring.push(bytes);
 
-        counter = counter.wrapping_add(1);
+        tick = tick.wrapping_add(1);
         yield_cpu();
     }
 }
 
-/// Render `counter` into `buf` as `b"tick=N"` ASCII. Returns the
-/// number of bytes written. Uses a fixed-size scratch buffer
-/// because we don't want to call `format!` (allocates) on every
-/// frame.
-fn format_counter(buf: &mut [u8], counter: u64) -> usize {
-    const PREFIX: &[u8] = b"tick=";
+/// Format `pct` as `"NN%"`. Returns the number of bytes written.
+fn format_pct(buf: &mut [u8], pct: u8) -> usize {
     let mut i = 0;
-    for &b in PREFIX {
-        if i >= buf.len() { return i; }
-        buf[i] = b;
-        i += 1;
-    }
-    if counter == 0 {
+    if pct >= 100 {
+        if i < buf.len() { buf[i] = b'1'; i += 1; }
         if i < buf.len() { buf[i] = b'0'; i += 1; }
-        return i;
+        if i < buf.len() { buf[i] = b'0'; i += 1; }
+    } else if pct >= 10 {
+        if i < buf.len() { buf[i] = b'0' + pct / 10; i += 1; }
+        if i < buf.len() { buf[i] = b'0' + pct % 10; i += 1; }
+    } else {
+        if i < buf.len() { buf[i] = b'0' + pct; i += 1; }
     }
-    // Render digits backwards, then reverse in place.
-    let start = i;
-    let mut n = counter;
-    while n > 0 && i < buf.len() {
-        buf[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-        i += 1;
+    if i < buf.len() { buf[i] = b'%'; i += 1; }
+    i
+}
+
+/// Format `seconds` as `"Hh Mm Ss"` for short uptimes, `"Ds Hh Mm"`
+/// for longer. Avoids `format!` to stay alloc-light.
+fn format_uptime(buf: &mut [u8], total_secs: u64) -> usize {
+    let days = total_secs / 86400;
+    let hours = (total_secs % 86400) / 3600;
+    let mins = (total_secs % 3600) / 60;
+    let secs = total_secs % 60;
+    let mut i = 0;
+    let mut emit_num = |b: &mut [u8], i: &mut usize, n: u64| {
+        if n == 0 {
+            if *i < b.len() { b[*i] = b'0'; *i += 1; }
+            return;
+        }
+        let start = *i;
+        let mut x = n;
+        while x > 0 && *i < b.len() {
+            b[*i] = b'0' + (x % 10) as u8;
+            x /= 10;
+            *i += 1;
+        }
+        b[start..*i].reverse();
+    };
+    if days > 0 {
+        emit_num(buf, &mut i, days);
+        if i < buf.len() { buf[i] = b'd'; i += 1; }
+        if i < buf.len() { buf[i] = b' '; i += 1; }
+        emit_num(buf, &mut i, hours);
+        if i < buf.len() { buf[i] = b'h'; i += 1; }
+    } else if hours > 0 {
+        emit_num(buf, &mut i, hours);
+        if i < buf.len() { buf[i] = b'h'; i += 1; }
+        if i < buf.len() { buf[i] = b' '; i += 1; }
+        emit_num(buf, &mut i, mins);
+        if i < buf.len() { buf[i] = b'm'; i += 1; }
+    } else {
+        emit_num(buf, &mut i, mins);
+        if i < buf.len() { buf[i] = b'm'; i += 1; }
+        if i < buf.len() { buf[i] = b' '; i += 1; }
+        emit_num(buf, &mut i, secs);
+        if i < buf.len() { buf[i] = b's'; i += 1; }
     }
-    buf[start..i].reverse();
     i
 }
 
