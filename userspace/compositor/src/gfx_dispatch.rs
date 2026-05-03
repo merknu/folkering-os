@@ -124,28 +124,24 @@ pub fn dispatch_display_list(
 
             Command::DrawText { x, y, color_rgba, font_size: _, text } => {
                 stats.draw_texts += 1;
-                // Convert `&[u8]` payload to `&str`; non-UTF-8 bytes
-                // get replaced with U+FFFD via `from_utf8_lossy`-ish
-                // logic. We don't actually allocate a String — we
-                // just iterate `chars()` so each codepoint is fed to
-                // `fb.draw_char` directly.
+                // Walk the UTF-8 byte slice without allocating a String.
+                // Each codepoint goes through `draw_char_alpha` with
+                // `bg_alpha = 0` so only foreground pixels land on the
+                // shadow buffer; the background underneath the glyph
+                // (whatever the parent's DrawRect painted) shows
+                // through unchanged. The previous code passed
+                // `fg == bg` as a "transparent BG" sentinel, but
+                // `draw_char` writes bg pixels unconditionally so
+                // glyphs rendered as solid fg-coloured rectangles.
                 let mut cursor_x = x.max(0) as usize;
                 let cursor_y = y.max(0) as usize;
                 let fg = rgba_to_fb(color_rgba);
-                // For the BG we use a fully-transparent black; the
-                // existing draw_char draws bg pixels for empty mask
-                // bits, which would clobber whatever's behind the
-                // glyph. Until we route through draw_char_alpha we
-                // pick a sentinel that matches today's text rendering
-                // (foreground only, bg ignored when caller paints
-                // their own bg first via DrawRect).
-                let bg = fg; // identical fg/bg → effectively transparent BG
                 let s = match core::str::from_utf8(text) {
                     Ok(s) => s,
                     Err(_) => continue, // skip malformed run; producer bug
                 };
-                // Manual char-by-char so we can scissor to the
-                // current clip on each glyph rather than relying on
+                // Manual char-by-char so we can scissor to the current
+                // clip on each glyph rather than relying on
                 // draw_string's wrap-at-edge behaviour.
                 for ch in s.chars() {
                     if cursor_x + 8 > fb.width { break; }
@@ -157,7 +153,10 @@ pub fn dispatch_display_list(
                         }
                     }
                     if cursor_y + 16 > fb.height { break; }
-                    fb.draw_char(cursor_x, cursor_y, ch, fg, bg);
+                    // bg colour is a don't-care when bg_alpha == 0;
+                    // pass 0 (black) for stable diagnostics in case
+                    // someone later flips the alpha to non-zero.
+                    fb.draw_char_alpha(cursor_x, cursor_y, ch, fg, 0, 0);
                     cursor_x += 8;
                 }
             }
