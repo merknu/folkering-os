@@ -33,7 +33,11 @@ use libfolk::{entry, println};
 use libfolk::sys::yield_cpu;
 use libfolk::sys::compositor::{register_gfx_ring, COMPOSITOR_TASK_ID};
 use libfolk::gfx::RingHandle;
-use libfolkui::{compile_to_display_list, layout, parse, LayoutConstraint};
+use libfolk::gfx::DisplayListBuilder;
+use libfolkui::{
+    compile_into, layout, parse,
+    AppState, LayoutConstraint,
+};
 
 // ── Bump allocator ──────────────────────────────────────────────────
 //
@@ -80,9 +84,10 @@ static ALLOCATOR: BumpAllocator = BumpAllocator {
 // Hard-coded for the smoke test. A future demo replaces this with
 // "ask Draug to author a UI" — that's the actual rapport endgame.
 const DEMO_MARKUP: &str = concat!(
-    r##"<Window x="40" y="40" width="320" height="120" bg_color="#1E2030" corner_radius="8">"##,
-    r##"  <VBox padding="16" spacing="12">"##,
+    r##"<Window x="40" y="40" width="320" height="140" bg_color="#1E2030" corner_radius="8">"##,
+    r##"  <VBox padding="16" spacing="8">"##,
     r##"    <Text color="#C0CAF5" font_size="18">Hello from libfolkui</Text>"##,
+    r##"    <Text color="#A9B1D6" font_size="14" bind_text="counter">tick=0</Text>"##,
     r##"    <Button bg_color="#7AA2F7" corner_radius="6">Click me</Button>"##,
     r##"  </VBox>"##,
     r##"</Window>"##,
@@ -144,22 +149,69 @@ fn main() -> ! {
         max_w: 1024, max_h: 768, // matches the compositor's typical FB
     });
 
-    // 3. Push one frame's display list, then yield. The compositor
-    //    drains it inside render_frame; the producer doesn't need to
-    //    push at framerate — pushing only when content changes is a
-    //    follow-up. For the smoke test we push every wakeup so a
-    //    visible "Hello from libfolkui" stays painted.
-    let builder = compile_to_display_list(&tree);
-    let bytes = builder.as_slice();
-    println!("[FOLKUI-DEMO] display list = {} bytes", bytes.len());
+    // 3. Push display lists with a live-updating counter binding.
+    //    Each tick we bump `counter`, set it on AppState, recompile,
+    //    and push. The compiler resolves <Text bind_text="counter">
+    //    against state, so the on-screen panel shows an incrementing
+    //    value — proof that reactive bindings reach pixels.
+    let mut state = AppState::new();
+    let mut counter: u64 = 0;
+    let mut buf = [0u8; 24]; // "tick=NNNNNNNNNNNNNNNN\0"
+    // Single builder reused across frames — `compile_into` clears it
+    // before re-filling, so the heap buffer's capacity stays warm and
+    // we don't leak through the bump allocator (which never frees).
+    let mut builder = DisplayListBuilder::new();
+    let mut printed_once = false;
 
     loop {
+        let written = format_counter(&mut buf, counter);
+        // SAFETY: `format_counter` writes ASCII bytes only.
+        let s = unsafe { core::str::from_utf8_unchecked(&buf[..written]) };
+        state.set("counter", s);
+
+        compile_into(&tree, &state, &mut builder);
+        let bytes = builder.as_slice();
+        if !printed_once {
+            println!("[FOLKUI-DEMO] display list = {} bytes", bytes.len());
+            printed_once = true;
+        }
+
         let ring = handle.as_ring();
         // `Full` just means the consumer is behind. Drop the frame
         // and try next tick — apps shouldn't spin on the ring.
         let _ = ring.push(bytes);
+
+        counter = counter.wrapping_add(1);
         yield_cpu();
     }
+}
+
+/// Render `counter` into `buf` as `b"tick=N"` ASCII. Returns the
+/// number of bytes written. Uses a fixed-size scratch buffer
+/// because we don't want to call `format!` (allocates) on every
+/// frame.
+fn format_counter(buf: &mut [u8], counter: u64) -> usize {
+    const PREFIX: &[u8] = b"tick=";
+    let mut i = 0;
+    for &b in PREFIX {
+        if i >= buf.len() { return i; }
+        buf[i] = b;
+        i += 1;
+    }
+    if counter == 0 {
+        if i < buf.len() { buf[i] = b'0'; i += 1; }
+        return i;
+    }
+    // Render digits backwards, then reverse in place.
+    let start = i;
+    let mut n = counter;
+    while n > 0 && i < buf.len() {
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        i += 1;
+    }
+    buf[start..i].reverse();
+    i
 }
 
 fn idle_forever() -> ! {
