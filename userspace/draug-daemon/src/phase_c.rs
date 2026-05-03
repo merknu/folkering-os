@@ -45,6 +45,37 @@ use crate::project::Project;
 /// the per-file path, names get tight fast).
 pub const MULTI_FILE_PROJECTS: &[(&str, &str)] = &[
     (
+        "calc-lib",
+        "a no_std Rust library that returns Folkering OS UI markup \
+         for a 4-row calculator. One file. \
+         \
+         src/lib.rs starts with `#![no_std]` and ends with \
+         `#[cfg(test)] mod tests;`. It exports `pub fn markup() -> \
+         &'static str` returning a multi-line raw string \
+         `r##\"...\"##` containing this exact shape: \
+         \
+         <Window x=\"100\" y=\"60\" width=\"260\" height=\"320\" bg_color=\"#1E2030\" corner_radius=\"8\"> \
+         <VBox padding=\"12\" spacing=\"6\"> \
+         a display row first: <Text id=\"display\" color=\"#9ECE6A\" font_size=\"18\" bind_text=\"display\">0</Text>, \
+         then four <HBox spacing=\"6\"> rows of buttons. Buttons \
+         use <Button id=\"X\" bg_color=\"#3A3A3A\" corner_radius=\"4\">LABEL</Button>. \
+         Row 1: id=\"btn_7\" \"7\", id=\"btn_8\" \"8\", id=\"btn_9\" \"9\", id=\"btn_div\" \"/\". \
+         Row 2: id=\"btn_4\" \"4\", id=\"btn_5\" \"5\", id=\"btn_6\" \"6\", id=\"btn_mul\" \"*\". \
+         Row 3: id=\"btn_1\" \"1\", id=\"btn_2\" \"2\", id=\"btn_3\" \"3\", id=\"btn_sub\" \"-\". \
+         Row 4: id=\"btn_0\" \"0\", id=\"btn_clear\" \"C\", id=\"btn_eq\" \"=\", id=\"btn_add\" \"+\". \
+         Close all tags. \
+         \
+         src/tests.rs has `#[cfg(test)] mod tests {{ ... }}` with \
+         four tests using assert!. test_has_window: markup contains \
+         \"<Window\". test_has_display: markup contains \
+         \"id=\\\"display\\\"\". test_button_count: markup contains \
+         at least 16 occurrences of \"<Button\". test_has_eq: \
+         markup contains \"id=\\\"btn_eq\\\"\". \
+         \
+         No external dependencies. Use raw strings r##\"...\"## so \
+         the literal can contain double-quotes verbatim.",
+    ),
+    (
         "sysmon-lib",
         "a no_std Rust library that returns Folkering OS UI markup \
          for a system monitor panel. Two files. \

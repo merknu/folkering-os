@@ -84,27 +84,40 @@ static ALLOCATOR: BumpAllocator = BumpAllocator {
 //
 // Hard-coded for the smoke test. A future demo replaces this with
 // "ask Draug to author a UI" — that's the actual rapport endgame.
-// This markup was AUTHORED BY DRAUG inside Folkering OS — generated
-// by qwen2.5-coder via the Phase C v3 pipeline (Synapse VFS →
-// MULTI_PATCH → cargo test → 3 passed). Pasted in verbatim from
-// /root/draug-sandbox/archive/multi-0005-sysmon-lib.rs.
+// This markup was AUTHORED BY DRAUG inside Folkering OS — qwen2.5-
+// coder via Phase C v4 (Synapse VFS → MULTI_PATCH → cargo test).
+// Pasted verbatim from
+// /root/draug-sandbox/archive/multi-0006-calc-lib.rs.
+//
+// Every button has an `id` attribute so hit_test_id can route a
+// click to the right calculator key.
 const DEMO_MARKUP: &str = r##"
-<Window x="40" y="40" width="320" height="160" bg_color="#1E2030" corner_radius="8">
-    <VBox padding="16" spacing="8">
-        <HBox spacing="8">
-            <Text color="#C0CAF5" font_size="14">CPU</Text>
-            <VBox flex-grow="1"/>
-            <Text color="#9ECE6A" font_size="14" bind_text="cpu_pct">--</Text>
+<Window x="100" y="60" width="260" height="320" bg_color="#1E2030" corner_radius="8">
+    <VBox padding="12" spacing="6">
+        <Text id="display" color="#9ECE6A" font_size="18" bind_text="display">0</Text>
+        <HBox spacing="6">
+            <Button id="btn_7" bg_color="#3A3A3A" corner_radius="4">7</Button>
+            <Button id="btn_8" bg_color="#3A3A3A" corner_radius="4">8</Button>
+            <Button id="btn_9" bg_color="#3A3A3A" corner_radius="4">9</Button>
+            <Button id="btn_div" bg_color="#3A3A3A" corner_radius="4">/</Button>
         </HBox>
-        <HBox spacing="8">
-            <Text color="#C0CAF5" font_size="14">Memory</Text>
-            <VBox flex-grow="1"/>
-            <Text color="#9ECE6A" font_size="14" bind_text="mem_pct">--</Text>
+        <HBox spacing="6">
+            <Button id="btn_4" bg_color="#3A3A3A" corner_radius="4">4</Button>
+            <Button id="btn_5" bg_color="#3A3A3A" corner_radius="4">5</Button>
+            <Button id="btn_6" bg_color="#3A3A3A" corner_radius="4">6</Button>
+            <Button id="btn_mul" bg_color="#3A3A3A" corner_radius="4">*</Button>
         </HBox>
-        <HBox spacing="8">
-            <Text color="#C0CAF5" font_size="14">Uptime</Text>
-            <VBox flex-grow="1"/>
-            <Text color="#9ECE6A" font_size="14" bind_text="uptime">--</Text>
+        <HBox spacing="6">
+            <Button id="btn_1" bg_color="#3A3A3A" corner_radius="4">1</Button>
+            <Button id="btn_2" bg_color="#3A3A3A" corner_radius="4">2</Button>
+            <Button id="btn_3" bg_color="#3A3A3A" corner_radius="4">3</Button>
+            <Button id="btn_sub" bg_color="#3A3A3A" corner_radius="4">-</Button>
+        </HBox>
+        <HBox spacing="6">
+            <Button id="btn_0" bg_color="#3A3A3A" corner_radius="4">0</Button>
+            <Button id="btn_clear" bg_color="#3A3A3A" corner_radius="4">C</Button>
+            <Button id="btn_eq" bg_color="#3A3A3A" corner_radius="4">=</Button>
+            <Button id="btn_add" bg_color="#3A3A3A" corner_radius="4">+</Button>
         </HBox>
     </VBox>
 </Window>
@@ -188,129 +201,206 @@ fn main() -> ! {
         max_w: 1024, max_h: 768, // matches the compositor's typical FB
     });
 
-    // 3. Per-tick: read live system stats, bind them to the three
-    //    keys Draug's markup expects (cpu_pct, mem_pct, uptime),
-    //    recompile the diff'd display list, push to the ring.
+    // 3. Calculator state. The display string is what shows up on
+    //    screen via bind_text="display". Each click resolves to a
+    //    button id via hit_test_id, then the dispatch below mutates
+    //    state.
     let mut state = AppState::new();
-    let mut tick: u64 = 0;
+    let mut calc = Calc::new();
+    state.set("display", calc.text());
+
     let mut clicks: u32 = 0;
-    let mut cpu_buf = [0u8; 16];
-    let mut mem_buf = [0u8; 16];
-    let mut up_buf  = [0u8; 32];
     let mut builder = DisplayListBuilder::new();
     let mut diff = DiffState::new();
     let mut printed_once = false;
 
     loop {
-        // 0. Drain any pending input events. Compositor pushes one
-        //    record per click edge (press/release). For now we just
-        //    count left-button presses and log the coords.
+        let mut state_dirty = false;
+
+        // Drain pending click events. For each press, route it
+        // through hit_test_id to find which calculator button (if
+        // any) was clicked, then update the calculator state.
         while let Some(ev) = input.pop_event() {
             if ev.kind == EventKind::Mouse as u32 && ev.button == 1 && ev.down == 1 {
                 clicks = clicks.wrapping_add(1);
                 let hit = hit_test_id(&tree, ev.x, ev.y).unwrap_or("(none)");
-                println!("[FOLKUI-DEMO] click #{} at ({}, {}) hit={}",
+                println!("[FOLKUI-DEMO] click #{} at ({},{}) hit={}",
                     clicks, ev.x, ev.y, hit);
+                if calc.handle_button(hit) {
+                    state.set("display", calc.text());
+                    state_dirty = true;
+                }
             }
         }
+        // First-frame primer: state needs to be set so DiffState's
+        // first walk sees the initial value.
+        if !printed_once { state_dirty = true; }
 
-        // CPU% — synapse-style "we don't have a CPU sampler yet so
-        // approximate with tick activity". A real one would read
-        // per-task scheduler counters; this is enough to prove the
-        // binding pipeline.
-        let cpu_pct = ((tick % 100) as u32) as u8;
-        let cpu_n = format_pct(&mut cpu_buf, cpu_pct);
-        let cpu_s = unsafe { core::str::from_utf8_unchecked(&cpu_buf[..cpu_n]) };
-        state.set("cpu_pct", cpu_s);
-
-        // Memory% from the kernel.
-        let (_used, _total, mem_pct) = libfolk::sys::memory_stats();
-        let mem_n = format_pct(&mut mem_buf, mem_pct.min(100) as u8);
-        let mem_s = unsafe { core::str::from_utf8_unchecked(&mem_buf[..mem_n]) };
-        state.set("mem_pct", mem_s);
-
-        // Uptime in seconds.
-        let secs = libfolk::sys::uptime() / 1000;
-        let up_n = format_uptime(&mut up_buf, secs);
-        let up_s = unsafe { core::str::from_utf8_unchecked(&up_buf[..up_n]) };
-        state.set("uptime", up_s);
-
-        compile_diff_into(&tree, &state, &mut diff, &mut builder);
-        let bytes = builder.as_slice();
-        if !printed_once {
-            println!("[FOLKUI-DEMO] first display list = {} bytes", bytes.len());
-            printed_once = true;
+        if state_dirty || !printed_once {
+            compile_diff_into(&tree, &state, &mut diff, &mut builder);
+            let bytes = builder.as_slice();
+            if !printed_once {
+                println!("[FOLKUI-DEMO] first display list = {} bytes", bytes.len());
+                printed_once = true;
+            }
+            let ring = handle.as_ring();
+            let _ = ring.push(bytes);
         }
-
-        let ring = handle.as_ring();
-        // `Full` just means the consumer is behind. Drop the frame
-        // and try next tick — apps shouldn't spin on the ring.
-        let _ = ring.push(bytes);
-
-        tick = tick.wrapping_add(1);
         yield_cpu();
     }
 }
 
-/// Format `pct` as `"NN%"`. Returns the number of bytes written.
-fn format_pct(buf: &mut [u8], pct: u8) -> usize {
-    let mut i = 0;
-    if pct >= 100 {
-        if i < buf.len() { buf[i] = b'1'; i += 1; }
-        if i < buf.len() { buf[i] = b'0'; i += 1; }
-        if i < buf.len() { buf[i] = b'0'; i += 1; }
-    } else if pct >= 10 {
-        if i < buf.len() { buf[i] = b'0' + pct / 10; i += 1; }
-        if i < buf.len() { buf[i] = b'0' + pct % 10; i += 1; }
-    } else {
-        if i < buf.len() { buf[i] = b'0' + pct; i += 1; }
-    }
-    if i < buf.len() { buf[i] = b'%'; i += 1; }
-    i
+/// Tiny stack-only calculator state. Holds a printable display
+/// buffer plus the in-progress arithmetic — enough for the four
+/// classic operators with single-line precedence.
+struct Calc {
+    /// What `bind_text="display"` shows. Owns its bytes; we don't
+    /// allocate a `String` per frame.
+    display: [u8; 32],
+    display_len: usize,
+    /// Accumulator: the operand entered before the operator.
+    acc: i64,
+    /// Pending operator. `0` = none.
+    pending_op: u8,
+    /// `true` when the current digit-stream replaces, rather than
+    /// extends, the display (e.g. right after pressing an operator
+    /// or `=`).
+    fresh_entry: bool,
 }
 
-/// Format `seconds` as `"Hh Mm Ss"` for short uptimes, `"Ds Hh Mm"`
-/// for longer. Avoids `format!` to stay alloc-light.
-fn format_uptime(buf: &mut [u8], total_secs: u64) -> usize {
-    let days = total_secs / 86400;
-    let hours = (total_secs % 86400) / 3600;
-    let mins = (total_secs % 3600) / 60;
-    let secs = total_secs % 60;
-    let mut i = 0;
-    let mut emit_num = |b: &mut [u8], i: &mut usize, n: u64| {
+impl Calc {
+    fn new() -> Self {
+        let mut c = Self {
+            display: [0; 32],
+            display_len: 0,
+            acc: 0,
+            pending_op: 0,
+            fresh_entry: true,
+        };
+        c.set_display_i64(0);
+        c
+    }
+
+    fn text(&self) -> &str {
+        // SAFETY: only ASCII digits / minus / spaces are written.
+        unsafe { core::str::from_utf8_unchecked(&self.display[..self.display_len]) }
+    }
+
+    fn set_display_i64(&mut self, mut n: i64) {
+        self.display_len = 0;
         if n == 0 {
-            if *i < b.len() { b[*i] = b'0'; *i += 1; }
+            self.display[self.display_len] = b'0';
+            self.display_len += 1;
             return;
         }
-        let start = *i;
-        let mut x = n;
-        while x > 0 && *i < b.len() {
-            b[*i] = b'0' + (x % 10) as u8;
-            x /= 10;
-            *i += 1;
+        if n < 0 {
+            self.display[self.display_len] = b'-';
+            self.display_len += 1;
+            n = -n;
         }
-        b[start..*i].reverse();
-    };
-    if days > 0 {
-        emit_num(buf, &mut i, days);
-        if i < buf.len() { buf[i] = b'd'; i += 1; }
-        if i < buf.len() { buf[i] = b' '; i += 1; }
-        emit_num(buf, &mut i, hours);
-        if i < buf.len() { buf[i] = b'h'; i += 1; }
-    } else if hours > 0 {
-        emit_num(buf, &mut i, hours);
-        if i < buf.len() { buf[i] = b'h'; i += 1; }
-        if i < buf.len() { buf[i] = b' '; i += 1; }
-        emit_num(buf, &mut i, mins);
-        if i < buf.len() { buf[i] = b'm'; i += 1; }
-    } else {
-        emit_num(buf, &mut i, mins);
-        if i < buf.len() { buf[i] = b'm'; i += 1; }
-        if i < buf.len() { buf[i] = b' '; i += 1; }
-        emit_num(buf, &mut i, secs);
-        if i < buf.len() { buf[i] = b's'; i += 1; }
+        let start = self.display_len;
+        let mut tmp = n;
+        while tmp > 0 && self.display_len < self.display.len() {
+            self.display[self.display_len] = b'0' + (tmp % 10) as u8;
+            self.display_len += 1;
+            tmp /= 10;
+        }
+        self.display[start..self.display_len].reverse();
     }
-    i
+
+    /// Parse `display` as i64. Used when applying an operator —
+    /// `acc <op> current_display = result`.
+    fn read_display_i64(&self) -> i64 {
+        let s = self.text();
+        let mut n: i64 = 0;
+        let bytes = s.as_bytes();
+        let (sign, start) = if !bytes.is_empty() && bytes[0] == b'-' { (-1i64, 1) } else { (1, 0) };
+        for &b in &bytes[start..] {
+            if b.is_ascii_digit() {
+                n = n.saturating_mul(10).saturating_add((b - b'0') as i64);
+            }
+        }
+        sign * n
+    }
+
+    fn append_digit(&mut self, d: u8) {
+        if self.fresh_entry {
+            self.display_len = 0;
+            self.fresh_entry = false;
+        }
+        // Avoid leading zero like "03"; replace the lone "0" with the
+        // new digit.
+        if self.display_len == 1 && self.display[0] == b'0' {
+            self.display[0] = b'0' + d;
+            return;
+        }
+        if self.display_len < self.display.len() {
+            self.display[self.display_len] = b'0' + d;
+            self.display_len += 1;
+        }
+    }
+
+    fn apply_pending(&mut self) {
+        let cur = self.read_display_i64();
+        let result = match self.pending_op {
+            b'+' => self.acc.saturating_add(cur),
+            b'-' => self.acc.saturating_sub(cur),
+            b'*' => self.acc.saturating_mul(cur),
+            b'/' => if cur == 0 { 0 } else { self.acc / cur },
+            _    => cur,
+        };
+        self.set_display_i64(result);
+        self.acc = result;
+    }
+
+    /// Returns `true` when state changed (caller redraws).
+    fn handle_button(&mut self, id: &str) -> bool {
+        let digit = match id {
+            "btn_0" => Some(0u8),
+            "btn_1" => Some(1),
+            "btn_2" => Some(2),
+            "btn_3" => Some(3),
+            "btn_4" => Some(4),
+            "btn_5" => Some(5),
+            "btn_6" => Some(6),
+            "btn_7" => Some(7),
+            "btn_8" => Some(8),
+            "btn_9" => Some(9),
+            _ => None,
+        };
+        if let Some(d) = digit {
+            self.append_digit(d);
+            return true;
+        }
+        match id {
+            "btn_add" | "btn_sub" | "btn_mul" | "btn_div" => {
+                self.apply_pending();
+                self.pending_op = match id {
+                    "btn_add" => b'+',
+                    "btn_sub" => b'-',
+                    "btn_mul" => b'*',
+                    "btn_div" => b'/',
+                    _ => 0,
+                };
+                self.fresh_entry = true;
+                true
+            }
+            "btn_eq" => {
+                self.apply_pending();
+                self.pending_op = 0;
+                self.fresh_entry = true;
+                true
+            }
+            "btn_clear" => {
+                self.acc = 0;
+                self.pending_op = 0;
+                self.fresh_entry = true;
+                self.set_display_i64(0);
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 fn idle_forever() -> ! {
