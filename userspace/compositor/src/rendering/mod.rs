@@ -149,6 +149,19 @@ pub fn render_frame(ctx: &mut RenderContext) -> RenderResult {
         let stats = compositor::gfx_rings::drain_all(ctx.fb);
         if stats.rings_drained > 0 {
             did_work = true;
+            // One-shot debug print the first time a drain happens this
+            // boot, so we can confirm from serial that the producer→
+            // consumer pipeline is wired through. Repeated drains are
+            // silent to avoid flooding.
+            static LOGGED: core::sync::atomic::AtomicBool =
+                core::sync::atomic::AtomicBool::new(false);
+            if !LOGGED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                libfolk::println!(
+                    "[COMPOSITOR] gfx drain: rings={} bytes={} rects={} texts={}",
+                    stats.rings_drained, stats.bytes,
+                    stats.draw_rects, stats.draw_texts,
+                );
+            }
             // Damage rectangle: for now we mark a conservative fullscreen
             // damage when any ring drains. Once ring consumers report
             // their bounds (a follow-up), we replace this with a tighter

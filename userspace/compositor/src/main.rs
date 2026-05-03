@@ -1108,6 +1108,13 @@ fn main() -> ! {
         }
 
         // ===== Rendering + Present (moved to rendering.rs) =====
+        // Force a redraw when any gfx ring is registered so its
+        // producer's display-list bytes actually drain into the
+        // framebuffer. Without this, render_frame() only runs on
+        // input/clock events and ring data piles up unconsumed.
+        if compositor::gfx_rings::has_active_rings() {
+            need_redraw = true;
+        }
         if need_redraw {
             let rl = rendering::RenderLayout {
                 folk_dark, folk_accent, white, gray, dark_gray, omnibar_border,

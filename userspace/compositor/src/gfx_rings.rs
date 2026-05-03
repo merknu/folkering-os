@@ -128,6 +128,15 @@ pub fn count() -> usize {
     slots.iter().filter(|s: &&Option<Slot>| s.is_some()).count()
 }
 
+/// Whether at least one slot is registered. Used by the main loop
+/// to force a per-frame `render_frame()` call (and thus a `drain_all`)
+/// even when no other subsystem requested a redraw — otherwise an
+/// app pushing display-list bytes would never get its pixels painted
+/// because the imperative pipeline only wakes on input/clock events.
+pub fn has_active_rings() -> bool {
+    count() > 0
+}
+
 /// Drain every registered ring and dispatch its display list against
 /// `fb`. Returns aggregate stats so callers can log per-frame
 /// throughput. A parse error on one ring is logged via stats and the
@@ -137,6 +146,12 @@ pub fn drain_all(fb: &mut FramebufferView) -> DrainStats {
     // SAFETY: same as `register` — single-threaded.
     let slots: &mut [Option<Slot>; MAX_RINGS] = unsafe { &mut *core::ptr::addr_of_mut!(SLOTS) };
     let mut total = DrainStats::default();
+    // One-shot diagnostic so we can see in serial whether the drain
+    // actually finds bytes. Without this it's impossible to tell
+    // (from outside the kernel) whether the producer's writes are
+    // reaching the consumer's mapping.
+    static FIRST_PROBE: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(true);
     for slot in slots.iter_mut() {
         let s = match slot.as_mut() {
             Some(s) => s,
@@ -144,6 +159,15 @@ pub fn drain_all(fb: &mut FramebufferView) -> DrainStats {
         };
         let ring = s.ring.as_ring();
         let n = ring.pop_into(&mut s.scratch);
+        if FIRST_PROBE.swap(false, core::sync::atomic::Ordering::Relaxed) {
+            // SAFETY: read-only field access through atomics.
+            let head = ring.head.load(core::sync::atomic::Ordering::Acquire);
+            let tail = ring.tail.load(core::sync::atomic::Ordering::Acquire);
+            libfolk::println!(
+                "[GFX_RINGS] first probe: head={} tail={} pop_n={}",
+                head, tail, n
+            );
+        }
         if n == 0 { continue; }
         match dispatch_display_list(&s.scratch[..n], fb) {
             Ok((_consumed, ds)) => {
