@@ -17,6 +17,12 @@ pub const MSG_CLOSE: u64 = 0x03;
 pub const MSG_CREATE_UI_WINDOW: u64 = 0x06;
 pub const MSG_QUERY_NAME: u64 = 0x10;
 pub const MSG_QUERY_FOCUS: u64 = 0x11;
+/// Register a granted display-list ring. Request: opcode | (shmem_id << 8).
+/// Reply: slot index on success, u64::MAX on failure.
+pub const MSG_GFX_REGISTER_RING: u64 = 0x20;
+/// Unregister a previously registered ring. Request: opcode | (slot << 8).
+/// Reply: 0 on success, u64::MAX on failure.
+pub const MSG_GFX_UNREGISTER_RING: u64 = 0x21;
 
 /// Execute a tool call and write result back to TokenRing for AI feedback.
 /// Shows brief status in window; full result goes to ring for KV-cache injection.
@@ -351,6 +357,32 @@ pub fn handle_message(compositor: &mut Compositor, payload0: u64) -> u64 {
                     ((window_id as u64) << 32) | (node_id & 0xFFFF_FFFF)
                 }
                 None => u64::MAX
+            }
+        }
+
+        MSG_GFX_REGISTER_RING => {
+            // Payload: opcode (8) | shmem_id (32). Higher bits unused.
+            let shmem_id = ((payload0 >> 8) & 0xFFFF_FFFF) as u32;
+            match compositor::gfx_rings::register(shmem_id) {
+                Ok(slot) => {
+                    println!("[COMPOSITOR] Registered gfx ring shmem={} -> slot {}", shmem_id, slot);
+                    slot as u64
+                }
+                Err(e) => {
+                    println!("[COMPOSITOR] gfx ring register failed: {:?}", e);
+                    u64::MAX
+                }
+            }
+        }
+
+        MSG_GFX_UNREGISTER_RING => {
+            let slot = ((payload0 >> 8) & 0xFF) as u32;
+            match compositor::gfx_rings::unregister(slot) {
+                Ok(()) => {
+                    println!("[COMPOSITOR] Unregistered gfx ring slot {}", slot);
+                    0
+                }
+                Err(_) => u64::MAX,
             }
         }
 
