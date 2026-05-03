@@ -1,0 +1,12 @@
+[package]
+name = "folkui-demo"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "folkui-demo"
+path = "src/main.rs"
+
+[dependencies]
+libfolk = { path = "../libfolk" }
+libfolkui = { path = "../libfolkui" }
