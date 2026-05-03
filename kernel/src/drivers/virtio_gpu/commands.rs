@@ -16,11 +16,9 @@ pub(super) const VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING: u32 = 0x0104;
 pub(super) const VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D: u32 = 0x0105;
 pub(super) const VIRTIO_GPU_CMD_RESOURCE_FLUSH: u32 = 0x0106;
 // RESOURCE_BLOB family — only valid if VIRTIO_GPU_F_RESOURCE_BLOB negotiated.
-// We define the wire format unconditionally so callers can stage commands;
-// `resources::create_blob` early-exits when the feature isn't enabled.
-#[allow(dead_code)]
+// `resources::create_framebuffer_blob` is gated on `state.has_resource_blob`;
+// the legacy CREATE_2D path is the fallback.
 pub(super) const VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB: u32 = 0x010C;
-#[allow(dead_code)]
 pub(super) const VIRTIO_GPU_CMD_SET_SCANOUT_BLOB: u32 = 0x010D;
 
 // Cursor queue commands (sent on queue 1, dedicated so cursor stays
@@ -31,10 +29,10 @@ pub(super) const VIRTIO_GPU_CMD_MOVE_CURSOR: u32 = 0x0301;
 pub(super) const VIRTIO_GPU_RESP_OK_DISPLAY_INFO: u32 = 0x1101;
 
 // ── RESOURCE_BLOB constants ────────────────────────────────────────────
-// Mirrors `virtio_gpu.h` from the spec. We expose the values the rapport
-// calls out (HOST3D + USE_MAPPABLE) plus the safer GUEST mode used as a
-// fallback when the host can't expose memory directly.
-#[allow(dead_code)]
+// Mirrors `virtio_gpu.h` from the spec. We use BLOB_MEM_GUEST for the
+// scanout framebuffer (host reads guest pages directly). HOST3D and
+// USE_MAPPABLE are reserved for future virgl/3D paths and stay defined
+// for callers, even though we don't take them today.
 pub(super) const VIRTIO_GPU_BLOB_MEM_GUEST: u32 = 0x0001;
 #[allow(dead_code)]
 pub(super) const VIRTIO_GPU_BLOB_MEM_HOST3D: u32 = 0x0002;
@@ -170,7 +168,6 @@ pub(super) struct GpuUpdateCursor {
 // ── RESOURCE_BLOB wire format ──────────────────────────────────────────
 
 #[repr(C)]
-#[allow(dead_code)]
 pub(super) struct GpuResourceCreateBlob {
     pub(super) hdr: GpuCtrlHdr,
     pub(super) resource_id: u32,
@@ -183,7 +180,6 @@ pub(super) struct GpuResourceCreateBlob {
 }
 
 #[repr(C)]
-#[allow(dead_code)]
 pub(super) struct GpuSetScanoutBlob {
     pub(super) hdr: GpuCtrlHdr,
     pub(super) r: GpuRect,

@@ -63,10 +63,15 @@ pub(super) struct GpuState {
     pub(super) active: bool,
     pub(super) has_virgl: bool,
     pub(super) has_edid: bool,
-    /// Set if VIRTIO_GPU_F_RESOURCE_BLOB was advertised AND accepted. Today
-    /// this is informational — the framebuffer still uses ATTACH_BACKING. Once
-    /// we wire up `create_blob` it gates whether to take the zero-copy path.
+    /// Set if VIRTIO_GPU_F_RESOURCE_BLOB was advertised AND accepted.
     pub(super) has_resource_blob: bool,
+    /// Set when init() actually took the RESOURCE_CREATE_BLOB +
+    /// SET_SCANOUT_BLOB path successfully. Different from `has_resource_blob`:
+    /// the feature can be negotiated but the blob commands can still fail
+    /// (e.g. older QEMU advertising the feature but rejecting the wire format).
+    /// `flush.rs` reads this to decide whether `TRANSFER_TO_HOST_2D` is
+    /// needed — under blob the host already sees guest memory directly.
+    pub(super) using_blob: bool,
     /// Set if VIRTIO_GPU_F_CONTEXT_INIT was negotiated.
     pub(super) has_context_init: bool,
 }
@@ -207,6 +212,7 @@ pub fn init() -> Result<(), &'static str> {
         has_virgl,
         has_edid,
         has_resource_blob: host_offers_blob,
+        using_blob: false,
         has_context_init: host_offers_ctxinit,
     };
 
@@ -222,16 +228,56 @@ pub fn init() -> Result<(), &'static str> {
     crate::drivers::serial::write_dec(h);
     crate::drivers::serial::write_newline();
 
-    // ── Create Resource + Attach Backing + Set Scanout ──────────────────
+    // ── Create Resource + Set Scanout ───────────────────────────────────
+    //
+    // Two paths:
+    //   1. Zero-copy blob (RESOURCE_CREATE_BLOB + SET_SCANOUT_BLOB) when
+    //      VIRTIO_GPU_F_RESOURCE_BLOB is negotiated. Host reads our guest
+    //      pages directly — no per-frame TRANSFER_TO_HOST_2D copy.
+    //   2. Legacy (RESOURCE_CREATE_2D + ATTACH_BACKING + SET_SCANOUT) for
+    //      older QEMU that doesn't advertise the feature, or as a fallback
+    //      if the blob commands fail (e.g. host rejects USE_MAPPABLE).
+    let mut took_blob_path = false;
+    if state.has_resource_blob {
+        match resources::create_framebuffer_blob(&mut state) {
+            Ok(()) => {
+                crate::serial_strln!("[VIRTIO_GPU] Blob resource created (zero-copy)");
+                match resources::set_scanout_blob(&mut state) {
+                    Ok(()) => {
+                        crate::serial_strln!("[VIRTIO_GPU] Scanout active (blob)!");
+                        state.using_blob = true;
+                        took_blob_path = true;
+                    }
+                    Err(e) => {
+                        crate::serial_str!("[VIRTIO_GPU] SET_SCANOUT_BLOB failed (");
+                        crate::serial_str!(e);
+                        crate::serial_strln!(") — falling back to legacy");
+                        // Pages already allocated in fb_phys_pages; reuse for
+                        // legacy path so we don't double-allocate. Drop the
+                        // guest's blob resource_id so legacy create_2d can take
+                        // the same id 1.
+                        state.fb_phys_pages.clear();
+                    }
+                }
+            }
+            Err(e) => {
+                crate::serial_str!("[VIRTIO_GPU] RESOURCE_CREATE_BLOB failed (");
+                crate::serial_str!(e);
+                crate::serial_strln!(") — falling back to legacy");
+            }
+        }
+    }
 
-    resources::create_framebuffer_resource(&mut state)?;
-    crate::serial_strln!("[VIRTIO_GPU] Framebuffer resource created");
+    if !took_blob_path {
+        resources::create_framebuffer_resource(&mut state)?;
+        crate::serial_strln!("[VIRTIO_GPU] Framebuffer resource created");
 
-    resources::attach_framebuffer_backing(&mut state)?;
-    crate::serial_strln!("[VIRTIO_GPU] Backing attached (scatter-gather)");
+        resources::attach_framebuffer_backing(&mut state)?;
+        crate::serial_strln!("[VIRTIO_GPU] Backing attached (scatter-gather)");
 
-    resources::set_scanout(&mut state)?;
-    crate::serial_strln!("[VIRTIO_GPU] Scanout active!");
+        resources::set_scanout(&mut state)?;
+        crate::serial_strln!("[VIRTIO_GPU] Scanout active!");
+    }
 
     // TEST: Fill backing buffer with bright red pixels before declaring active
     let hhdm_off = crate::memory::paging::hhdm_offset();
@@ -243,22 +289,27 @@ pub fn init() -> Result<(), &'static str> {
     }
     crate::serial_str!("[VIRTIO_GPU] Test pattern: filled backing with RED\n");
 
-    // Do a sync transfer+flush to verify display works
+    // Do a sync transfer+flush to verify display works.
+    // Under blob path the host already sees our memory directly, so
+    // TRANSFER_TO_HOST_2D is unnecessary (and would be rejected — the spec
+    // says blob resources don't have a separate host-side staging copy).
     {
-        let cmd_phys = physical::alloc_page().unwrap();
-        let cmd_virt = (hhdm_off + cmd_phys) as *mut u8;
-        unsafe {
-            let transfer = cmd_virt as *mut GpuTransferToHost2D;
-            (*transfer).hdr = make_hdr(VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D);
-            (*transfer).r = GpuRect { x: 0, y: 0, width: state.width, height: state.height };
-            (*transfer).offset = 0;
-            (*transfer).resource_id = 1;
-            (*transfer).padding = 0;
+        if !state.using_blob {
+            let cmd_phys = physical::alloc_page().unwrap();
+            let cmd_virt = (hhdm_off + cmd_phys) as *mut u8;
+            unsafe {
+                let transfer = cmd_virt as *mut GpuTransferToHost2D;
+                (*transfer).hdr = make_hdr(VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D);
+                (*transfer).r = GpuRect { x: 0, y: 0, width: state.width, height: state.height };
+                (*transfer).offset = 0;
+                (*transfer).resource_id = 1;
+                (*transfer).padding = 0;
+            }
+            submit_and_wait(&mut state, cmd_phys,
+                core::mem::size_of::<GpuTransferToHost2D>(),
+                cmd_phys + core::mem::size_of::<GpuTransferToHost2D>(), 24)?;
+            crate::serial_str!("[VIRTIO_GPU] TRANSFER_TO_HOST_2D OK\n");
         }
-        submit_and_wait(&mut state, cmd_phys,
-            core::mem::size_of::<GpuTransferToHost2D>(),
-            cmd_phys + core::mem::size_of::<GpuTransferToHost2D>(), 24)?;
-        crate::serial_str!("[VIRTIO_GPU] TRANSFER_TO_HOST_2D OK\n");
 
         let cmd_phys2 = physical::alloc_page().unwrap();
         let cmd_virt2 = (hhdm_off + cmd_phys2) as *mut u8;
@@ -307,6 +358,13 @@ pub fn framebuffer_pages() -> Option<Vec<usize>> {
 /// this to decide whether a zero-copy framebuffer path is available.
 pub fn has_resource_blob() -> bool {
     GPU_STATE.lock().as_ref().map(|s| s.has_resource_blob).unwrap_or(false)
+}
+
+/// Whether the active scanout is backed by a blob resource (zero-copy
+/// scanout). Diagnostic — `flush_rect` consults `state.using_blob` directly
+/// for hot-path branching.
+pub fn using_blob_scanout() -> bool {
+    GPU_STATE.lock().as_ref().map(|s| s.using_blob).unwrap_or(false)
 }
 
 /// Whether the device exposed a working cursorq. Mainly diagnostic — callers
