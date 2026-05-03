@@ -38,13 +38,14 @@ fn emit_node(tree: &Tree, idx: u32, b: &mut DisplayListBuilder) {
             "Window" => {
                 // Background fill from `bg_color`, default black.
                 if let Some(color) = node.attrs.get_color("bg_color") {
+                    let radius = node.attrs.get_u32("corner_radius").unwrap_or(0) as u16;
                     b.draw_rect(DrawRectCmd {
                         x: node.bounds.x,
                         y: node.bounds.y,
                         width: node.bounds.w,
                         height: node.bounds.h,
                         color_rgba: color,
-                        corner_radius: 0,
+                        corner_radius: radius,
                     });
                 }
                 emit_children(tree, idx, b);

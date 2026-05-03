@@ -38,6 +38,7 @@ use libfolk::sys::memory::ShmemError;
 use crate::framebuffer::FramebufferView;
 use crate::gfx_dispatch::{dispatch_display_list, DispatchStats};
 use crate::gfx_consumer::ParseError;
+use crate::render_graph::Rect as DispatchRect;
 
 /// Maximum simultaneous graphics-ring producers. Eight is enough for
 /// "compositor + a handful of foreground apps"; multi-window agents
@@ -178,6 +179,12 @@ pub fn drain_all(fb: &mut FramebufferView) -> DrainStats {
                 total.set_clips += ds.set_clips;
                 total.draw_textures_skipped += ds.draw_textures_skipped;
                 total.unknown_skipped += ds.unknown_skipped;
+                if let Some(r) = ds.damage {
+                    total.damage = Some(match total.damage {
+                        Some(prev) => prev.union(&r),
+                        None => r,
+                    });
+                }
             }
             Err(e) => {
                 total.parse_errors += 1;
@@ -200,6 +207,11 @@ pub struct DrainStats {
     pub unknown_skipped: u32,
     pub parse_errors: u32,
     pub last_parse_error: Option<ParseError>,
+    /// Union of every painted rect across all drained rings, in
+    /// screen coords. Callers feed this to the DamageTracker so the
+    /// VirtIO-GPU flush only copies the touched region instead of
+    /// the whole framebuffer.
+    pub damage: Option<DispatchRect>,
 }
 
 #[cfg(test)]
