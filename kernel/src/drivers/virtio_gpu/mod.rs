@@ -237,33 +237,31 @@ pub fn init() -> Result<(), &'static str> {
     //   2. Legacy (RESOURCE_CREATE_2D + ATTACH_BACKING + SET_SCANOUT) for
     //      older QEMU that doesn't advertise the feature, or as a fallback
     //      if the blob commands fail (e.g. host rejects USE_MAPPABLE).
+    // Try blob first when the feature is negotiated. Only fall back to
+    // legacy if `CREATE_BLOB` itself fails — at that point no host-side
+    // resource was created so the legacy `CREATE_2D` can take id 1 cleanly.
+    // If `CREATE_BLOB` succeeds but `SET_SCANOUT_BLOB` fails, we don't
+    // try to recover: the host already owns a blob resource at id 1 and
+    // legacy `CREATE_2D` would collide on that id. Surface the error
+    // instead so it's visible in serial.
     let mut took_blob_path = false;
     if state.has_resource_blob {
         match resources::create_framebuffer_blob(&mut state) {
             Ok(()) => {
                 crate::serial_strln!("[VIRTIO_GPU] Blob resource created (zero-copy)");
-                match resources::set_scanout_blob(&mut state) {
-                    Ok(()) => {
-                        crate::serial_strln!("[VIRTIO_GPU] Scanout active (blob)!");
-                        state.using_blob = true;
-                        took_blob_path = true;
-                    }
-                    Err(e) => {
-                        crate::serial_str!("[VIRTIO_GPU] SET_SCANOUT_BLOB failed (");
-                        crate::serial_str!(e);
-                        crate::serial_strln!(") — falling back to legacy");
-                        // Pages already allocated in fb_phys_pages; reuse for
-                        // legacy path so we don't double-allocate. Drop the
-                        // guest's blob resource_id so legacy create_2d can take
-                        // the same id 1.
-                        state.fb_phys_pages.clear();
-                    }
-                }
+                resources::set_scanout_blob(&mut state)?;
+                crate::serial_strln!("[VIRTIO_GPU] Scanout active (blob)!");
+                state.using_blob = true;
+                took_blob_path = true;
             }
             Err(e) => {
                 crate::serial_str!("[VIRTIO_GPU] RESOURCE_CREATE_BLOB failed (");
                 crate::serial_str!(e);
                 crate::serial_strln!(") — falling back to legacy");
+                // No host-side resource was created — fb_phys_pages may
+                // hold guest pages we allocated; clear them so the legacy
+                // path's allocator starts fresh and we don't leak.
+                state.fb_phys_pages.clear();
             }
         }
     }

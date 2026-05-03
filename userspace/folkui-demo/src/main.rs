@@ -224,12 +224,13 @@ fn main() -> ! {
             if ev.kind == EventKind::Mouse as u32 && ev.button == 1 && ev.down == 1 {
                 clicks = clicks.wrapping_add(1);
                 let hit = hit_test_id(&tree, ev.x, ev.y).unwrap_or("(none)");
-                println!("[FOLKUI-DEMO] click #{} at ({},{}) hit={}",
-                    clicks, ev.x, ev.y, hit);
-                if calc.handle_button(hit) {
+                let handled = calc.handle_button(hit);
+                if handled {
                     state.set("display", calc.text());
                     state_dirty = true;
                 }
+                println!("[FOLKUI-DEMO] click #{} at ({},{}) hit={} -> display={}",
+                    clicks, ev.x, ev.y, hit, calc.text());
             }
         }
         // First-frame primer: state needs to be set so DiffState's
