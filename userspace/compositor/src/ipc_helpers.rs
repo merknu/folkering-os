@@ -23,6 +23,10 @@ pub const MSG_GFX_REGISTER_RING: u64 = 0x20;
 /// Unregister a previously registered ring. Request: opcode | (slot << 8).
 /// Reply: 0 on success, u64::MAX on failure.
 pub const MSG_GFX_UNREGISTER_RING: u64 = 0x21;
+/// Bind an input ring to an existing gfx slot.
+/// Request: opcode | (slot << 8) | (input_shmem_id << 16).
+/// Reply: 0 on success, u64::MAX on failure.
+pub const MSG_GFX_REGISTER_INPUT_RING: u64 = 0x22;
 
 /// Execute a tool call and write result back to TokenRing for AI feedback.
 /// Shows brief status in window; full result goes to ring for KV-cache injection.
@@ -383,6 +387,24 @@ pub fn handle_message(compositor: &mut Compositor, payload0: u64) -> u64 {
                     0
                 }
                 Err(_) => u64::MAX,
+            }
+        }
+
+        MSG_GFX_REGISTER_INPUT_RING => {
+            // payload0: op (8) | slot (8) | shmem_id (32). slot bits
+            // 8..16, shmem_id bits 16..48.
+            let slot = ((payload0 >> 8) & 0xFF) as u32;
+            let shmem_id = ((payload0 >> 16) & 0xFFFF_FFFF) as u32;
+            match compositor::gfx_rings::register_input(slot, shmem_id) {
+                Ok(()) => {
+                    println!("[COMPOSITOR] Bound input ring shmem={} -> gfx slot {}",
+                        shmem_id, slot);
+                    0
+                }
+                Err(e) => {
+                    println!("[COMPOSITOR] register_input failed: {:?}", e);
+                    u64::MAX
+                }
             }
         }
 

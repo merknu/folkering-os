@@ -83,6 +83,13 @@ pub const COMP_OP_GFX_REGISTER_RING: u64 = 0x20;
 /// Reply: 0 on success, u64::MAX on failure.
 pub const COMP_OP_GFX_UNREGISTER_RING: u64 = 0x21;
 
+/// Bind an input ring to an existing gfx slot. The compositor will
+/// push InputEvent records into this shmem when mouse/key events
+/// land inside the slot's damage bbox.
+/// Request: opcode | (slot << 8) | (input_shmem_id << 16)
+/// Reply: 0 on success, u64::MAX on failure.
+pub const COMP_OP_GFX_REGISTER_INPUT_RING: u64 = 0x22;
+
 // ============================================================================
 // Error Types
 // ============================================================================
@@ -278,6 +285,26 @@ pub fn register_gfx_ring(shmem_id: u32) -> Result<u32, CompError> {
 pub fn unregister_gfx_ring(slot: u32) -> Result<(), CompError> {
     let payload0 = (COMP_OP_GFX_UNREGISTER_RING & 0xFF)
         | ((slot as u64 & 0xFF) << 8);
+    let ret = unsafe {
+        syscall3(SYS_IPC_SEND, COMPOSITOR_TASK_ID as u64, payload0, 0)
+    };
+    if ret == u64::MAX {
+        Err(CompError::ServiceUnavailable)
+    } else {
+        Ok(())
+    }
+}
+
+/// Bind an input ring (created via `InputRingHandle::create_at`
+/// and granted to the compositor) to a previously registered gfx
+/// slot. Future mouse/key events landing in the slot's damage bbox
+/// flow into this shmem.
+pub fn register_input_ring(slot: u32, input_shmem_id: u32) -> Result<(), CompError> {
+    // payload0: op (8) | slot (8) | shmem_id (32). Shmem id occupies
+    // bits 16..48; slot bits 8..16; opcode bits 0..8.
+    let payload0 = (COMP_OP_GFX_REGISTER_INPUT_RING & 0xFF)
+        | ((slot as u64 & 0xFF) << 8)
+        | ((input_shmem_id as u64) << 16);
     let ret = unsafe {
         syscall3(SYS_IPC_SEND, COMPOSITOR_TASK_ID as u64, payload0, 0)
     };

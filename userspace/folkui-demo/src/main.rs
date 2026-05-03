@@ -31,9 +31,10 @@ use core::cell::UnsafeCell;
 
 use libfolk::{entry, println};
 use libfolk::sys::yield_cpu;
-use libfolk::sys::compositor::{register_gfx_ring, COMPOSITOR_TASK_ID};
+use libfolk::sys::compositor::{register_gfx_ring, register_input_ring, COMPOSITOR_TASK_ID};
 use libfolk::gfx::RingHandle;
 use libfolk::gfx::DisplayListBuilder;
+use libfolk::gfx::input::{InputRingHandle, EventKind};
 use libfolkui::{
     compile_diff_into, layout, parse,
     AppState, DiffState, LayoutConstraint,
@@ -86,8 +87,7 @@ static ALLOCATOR: BumpAllocator = BumpAllocator {
 // This markup was AUTHORED BY DRAUG inside Folkering OS — generated
 // by qwen2.5-coder via the Phase C v3 pipeline (Synapse VFS →
 // MULTI_PATCH → cargo test → 3 passed). Pasted in verbatim from
-// /root/draug-sandbox/archive/multi-0005-sysmon-lib.rs. Folkering
-// is now showing a UI its own AI agent designed.
+// /root/draug-sandbox/archive/multi-0005-sysmon-lib.rs.
 const DEMO_MARKUP: &str = r##"
 <Window x="40" y="40" width="320" height="160" bg_color="#1E2030" corner_radius="8">
     <VBox padding="16" spacing="8">
@@ -117,6 +117,9 @@ const DEMO_MARKUP: &str = r##"
 /// reservation, so a future per-task ring zone can mirror this layout
 /// across both sides without renumbering.
 const PRODUCER_RING_VADDR: usize = 0x4000_0000_0000;
+/// Input ring lives in a separate per-task vaddr so the gfx and
+/// input mappings don't collide. 1 MiB above the gfx ring's view.
+const INPUT_RING_VADDR: usize = 0x4000_0010_0000;
 
 entry!(main);
 
@@ -149,6 +152,25 @@ fn main() -> ! {
     };
     println!("[FOLKUI-DEMO] registered as compositor slot {}", slot);
 
+    // 1b. Same dance for the input ring so the compositor can push
+    //     mouse/key events back to us.
+    let input = match InputRingHandle::create_at(INPUT_RING_VADDR) {
+        Ok(h) => h,
+        Err(e) => {
+            println!("[FOLKUI-DEMO] input ring create failed: {:?}", e);
+            idle_forever();
+        }
+    };
+    if let Err(e) = input.grant_to(COMPOSITOR_TASK_ID) {
+        println!("[FOLKUI-DEMO] input grant_to failed: {:?}", e);
+        idle_forever();
+    }
+    if let Err(e) = register_input_ring(slot, input.id) {
+        println!("[FOLKUI-DEMO] register_input_ring failed: {:?}", e);
+        idle_forever();
+    }
+    println!("[FOLKUI-DEMO] input ring shmem={} bound to slot {}", input.id, slot);
+
     // 2. Parse + layout once. The DSML is static so we don't have to
     //    redo this every frame — only the display-list compile step
     //    runs in the loop. Conceptually the compiler also doesn't
@@ -171,6 +193,7 @@ fn main() -> ! {
     //    recompile the diff'd display list, push to the ring.
     let mut state = AppState::new();
     let mut tick: u64 = 0;
+    let mut clicks: u32 = 0;
     let mut cpu_buf = [0u8; 16];
     let mut mem_buf = [0u8; 16];
     let mut up_buf  = [0u8; 32];
@@ -179,6 +202,16 @@ fn main() -> ! {
     let mut printed_once = false;
 
     loop {
+        // 0. Drain any pending input events. Compositor pushes one
+        //    record per click edge (press/release). For now we just
+        //    count left-button presses and log the coords.
+        while let Some(ev) = input.pop_event() {
+            if ev.kind == EventKind::Mouse as u32 && ev.button == 1 && ev.down == 1 {
+                clicks = clicks.wrapping_add(1);
+                println!("[FOLKUI-DEMO] click #{} at ({}, {})", clicks, ev.x, ev.y);
+            }
+        }
+
         // CPU% — synapse-style "we don't have a CPU sampler yet so
         // approximate with tick activity". A real one would read
         // per-task scheduler counters; this is enough to prove the
