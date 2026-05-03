@@ -29,19 +29,17 @@
 //! - Compiler: emits `DrawRect` + `DrawText` per node. `<Button>`
 //!   composes (rect + text). Color attributes parse `#RRGGBB`.
 //!
-//! Not in this PR (separate follow-ups, deliberate):
+//! Reactive bindings: `<Text bind_text="key">` resolves against an
+//! `AppState` map at compile time. Apps call `state.set(key, value)`
+//! once per frame; markup stays static. See `state.rs`.
+//!
+//! Not in this PR (deliberate follow-ups):
 //! - Tree-diffing / virtual DOM reconciliation. Today every frame
-//!   re-parses + re-emits. The framework already keeps `Vec` capacity
-//!   warm so this is alloc-light.
+//!   re-parses + re-emits. `Vec` capacity stays warm so this is
+//!   alloc-light after the first frame.
 //! - Real flexbox. The `layout::layout` API takes a width/height
 //!   constraint and is shaped to grow into bidirectional passes when
 //!   we add it.
-//! - Reactive bindings (`bind_text="status_message"`). Today text
-//!   content is whatever the markup contains literally.
-//! - Wiring into a WASM app and the kernel-side ring. The producer half
-//!   of the SPSC ring (`libfolk::gfx`) is in a sibling PR; once the
-//!   shmem syscall lands, an end-to-end demo replaces an existing
-//!   FKUI-backed widget.
 
 #![no_std]
 
@@ -51,8 +49,10 @@ pub mod parser;
 pub mod dom;
 pub mod layout;
 pub mod compiler;
+pub mod state;
 
 pub use parser::{parse, ParseError};
 pub use dom::{Node, NodeKind, Tree, AttrMap};
 pub use layout::{layout, LayoutConstraint};
-pub use compiler::compile_to_display_list;
+pub use compiler::{compile_to_display_list, compile_to_display_list_with_state, compile_into};
+pub use state::AppState;

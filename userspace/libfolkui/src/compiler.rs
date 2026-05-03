@@ -17,20 +17,48 @@ extern crate alloc;
 use libfolk::gfx::{DisplayListBuilder, DrawRectCmd};
 
 use crate::dom::{NodeKind, Tree};
+use crate::state::AppState;
 
-/// Compile `tree` into a builder. The builder is returned with an
-/// already-appended `Sync` end-of-frame marker, so the caller can
-/// directly `push()` `builder.as_slice()` onto the SPSC ring.
+/// Compile `tree` into a builder using an empty state map. Equivalent
+/// to `compile_to_display_list_with_state(tree, &AppState::empty())`,
+/// kept as a convenience for apps that don't have any bindings.
 pub fn compile_to_display_list(tree: &Tree) -> DisplayListBuilder {
+    compile_to_display_list_with_state(tree, &AppState::empty())
+}
+
+/// Compile `tree` into a builder, resolving `bind_text="key"` on
+/// `<Text>` elements against `state`. The builder is returned with an
+/// already-appended `Sync` end-of-frame marker.
+///
+/// Resolution rules for `<Text>`:
+/// - If `bind_text` is set AND `state.get(key)` returns `Some(v)` →
+///   emit a `DrawText` carrying `v` directly. The element's child
+///   text (if any) is ignored.
+/// - If `bind_text` is set but the key is absent from `state` → fall
+///   back to whatever child text the markup has. Useful for the
+///   "first frame before state is populated" case.
+/// - If `bind_text` isn't set → emit children as before.
+pub fn compile_to_display_list_with_state(tree: &Tree, state: &AppState) -> DisplayListBuilder {
     let mut b = DisplayListBuilder::new();
-    if let Some(root) = tree.root() {
-        emit_node(tree, root, &mut b);
-    }
-    b.end_frame();
+    compile_into(tree, state, &mut b);
     b
 }
 
-fn emit_node(tree: &Tree, idx: u32, b: &mut DisplayListBuilder) {
+/// Reuse-friendly variant: clears `b` and re-fills it with the
+/// current frame's display list. Apps that emit a fresh frame each
+/// tick should hold onto a single `DisplayListBuilder` and call this
+/// instead of `compile_to_display_list_with_state` to avoid
+/// allocating a new heap buffer per frame — important for callers on
+/// bump allocators that don't deallocate.
+pub fn compile_into(tree: &Tree, state: &AppState, b: &mut DisplayListBuilder) {
+    b.clear();
+    if let Some(root) = tree.root() {
+        emit_node(tree, root, state, b);
+    }
+    b.end_frame();
+}
+
+fn emit_node(tree: &Tree, idx: u32, state: &AppState, b: &mut DisplayListBuilder) {
     let node = &tree.nodes[idx as usize];
 
     match node.kind {
@@ -48,7 +76,7 @@ fn emit_node(tree: &Tree, idx: u32, b: &mut DisplayListBuilder) {
                         corner_radius: radius,
                     });
                 }
-                emit_children(tree, idx, b);
+                emit_children(tree, idx, state, b);
             }
             "Button" => {
                 let color = node.attrs.get_color("bg_color").unwrap_or(0x3A_3A_3A_FF);
@@ -63,7 +91,7 @@ fn emit_node(tree: &Tree, idx: u32, b: &mut DisplayListBuilder) {
                 });
                 // Children (typically a `<Text>`) draw on top of the
                 // button background.
-                emit_children(tree, idx, b);
+                emit_children(tree, idx, state, b);
             }
             "ProgressBar" => {
                 // Track
@@ -95,23 +123,32 @@ fn emit_node(tree: &Tree, idx: u32, b: &mut DisplayListBuilder) {
                 }
             }
             "Text" => {
-                // Top-level <Text> directly under another container. The
-                // text content lives in the child Text node, so emit that
-                // recursively. (When a <Text> is empty/self-closing with
-                // a `bind_text=` attr, the runtime is supposed to fill
-                // it before layout/compile — that's a Del-4-follow-up.)
-                emit_children(tree, idx, b);
+                // Reactive binding: `<Text bind_text="key">` resolves
+                // against AppState. If the key is present we emit the
+                // bound value at this node's own bounds; otherwise we
+                // fall through to whatever child text the markup has,
+                // so a "first frame before state populated" doesn't
+                // produce a blank panel.
+                if let Some(key) = node.attrs.get("bind_text") {
+                    if let Some(value) = state.get(key) {
+                        let color = node.attrs.get_color("color").unwrap_or(0xFF_FF_FF_FF);
+                        let font_size = node.attrs.get_u32("font_size").unwrap_or(14) as u16;
+                        b.draw_text(node.bounds.x, node.bounds.y, color, font_size, value);
+                        return;
+                    }
+                }
+                emit_children(tree, idx, state, b);
             }
             "VBox" | "HBox" => {
                 // Layout containers don't paint themselves — they only
                 // position children. Pure structural.
-                emit_children(tree, idx, b);
+                emit_children(tree, idx, state, b);
             }
             _ => {
                 // Unknown element: no warning, no draw. Children still
                 // render, so a future tag we forgot to handle (`<Card>`,
                 // `<Spacer>`) at least stacks layout-wise.
-                emit_children(tree, idx, b);
+                emit_children(tree, idx, state, b);
             }
         },
         NodeKind::Text => {
@@ -130,10 +167,10 @@ fn emit_node(tree: &Tree, idx: u32, b: &mut DisplayListBuilder) {
     }
 }
 
-fn emit_children(tree: &Tree, idx: u32, b: &mut DisplayListBuilder) {
+fn emit_children(tree: &Tree, idx: u32, state: &AppState, b: &mut DisplayListBuilder) {
     let children = &tree.nodes[idx as usize].children;
     for &c in children {
-        emit_node(tree, c, b);
+        emit_node(tree, c, state, b);
     }
 }
 
