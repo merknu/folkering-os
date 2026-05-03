@@ -36,7 +36,7 @@ use libfolk::gfx::RingHandle;
 use libfolk::gfx::DisplayListBuilder;
 use libfolk::gfx::input::{InputRingHandle, EventKind};
 use libfolkui::{
-    compile_diff_into, layout, parse,
+    compile_diff_into, hit_test_id, layout, parse,
     AppState, DiffState, LayoutConstraint,
 };
 
@@ -208,7 +208,9 @@ fn main() -> ! {
         while let Some(ev) = input.pop_event() {
             if ev.kind == EventKind::Mouse as u32 && ev.button == 1 && ev.down == 1 {
                 clicks = clicks.wrapping_add(1);
-                println!("[FOLKUI-DEMO] click #{} at ({}, {})", clicks, ev.x, ev.y);
+                let hit = hit_test_id(&tree, ev.x, ev.y).unwrap_or("(none)");
+                println!("[FOLKUI-DEMO] click #{} at ({}, {}) hit={}",
+                    clicks, ev.x, ev.y, hit);
             }
         }
 
