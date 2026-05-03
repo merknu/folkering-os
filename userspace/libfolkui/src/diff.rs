@@ -138,18 +138,16 @@ fn emit_full(
     diff: &mut DiffState,
     b: &mut DisplayListBuilder,
 ) {
+    // First-frame emit — same shape as `compile_into` would produce,
+    // but with a side-table populated for binding diff on later frames.
+    // We can't reuse `compile_into` directly because it appends a
+    // `Sync` marker we'd have to peel off; rolling our own walk that
+    // ends *before* the Sync keeps the wire format symmetric (the
+    // outer `compile_diff_into` adds Sync for both the full and diff
+    // paths via `b.end_frame()`). The builder is assumed already
+    // cleared by the caller (`compile_diff_into` does `b.clear()` up
+    // front).
     if let Some(root) = tree.root() {
-        // Reuse the production compiler for the full path; we just
-        // tail-walk afterwards to populate the binding cache.
-        crate::compiler::compile_into(tree, state, b);
-        // Note: `compile_into` already emitted Sync. We strip it
-        // here so the wrapper can re-add Sync at the end (keeps the
-        // diff and full paths symmetric for the caller). But the
-        // builder's `as_slice()` already includes Sync — undoing it
-        // means peeking into the buffer, which is brittle. Cleaner:
-        // skip `end_frame` in `compile_into` by rolling our own
-        // walk here. That's what we do.
-        b.clear();
         walk_full(tree, root, state, /*ancestor_bg=*/0, diff, b);
     }
 }

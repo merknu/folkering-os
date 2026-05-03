@@ -128,17 +128,19 @@ pub fn process_mouse(
         let prev_left = latest_buttons & 1 != 0;
         let now_left  = event.buttons & 1 != 0;
         if now_left != prev_left {
-            // Diagnostic: log first edge + first routing attempt so
-            // we can tell from serial whether bbox matching succeeds.
-            static EDGE_LOGGED: core::sync::atomic::AtomicBool =
-                core::sync::atomic::AtomicBool::new(false);
+            // Diagnostic: log button edges + routing outcome. Capped
+            // at 20 edges to keep serial from filling under a flood,
+            // but enough to see a few clicks of input-pipeline work.
+            static EDGE_COUNT: core::sync::atomic::AtomicU32 =
+                core::sync::atomic::AtomicU32::new(0);
             let routed = compositor::gfx_rings::route_mouse_event(
                 event_cursor_x, event_cursor_y, 1, now_left,
             );
-            if !EDGE_LOGGED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+            let n = EDGE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if n < 20 {
                 libfolk::println!(
-                    "[INPUT_MOUSE] first edge prev={} now={} at ({},{}) routed={:?}",
-                    prev_left as u8, now_left as u8,
+                    "[INPUT_MOUSE] edge#{} prev={} now={} at ({},{}) routed={:?}",
+                    n, prev_left as u8, now_left as u8,
                     event_cursor_x, event_cursor_y, routed,
                 );
             }
