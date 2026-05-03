@@ -91,6 +91,14 @@ pub fn process_mouse(
     // pick up the rest next tick. Use a bounded `for` loop so the
     // 1025th event stays in the kernel ring instead of being consumed
     // and dropped (PR #63 Copilot review).
+    // Track per-event delta cursor so input ring routing has the
+    // exact (x, y) at the moment of the press/release edge — the
+    // accumulated delta below would conflate motion + click into
+    // a single endpoint.
+    let mut event_cursor_x = cursor.x;
+    let mut event_cursor_y = cursor.y;
+    let fb_w = fb.width as i32;
+    let fb_h = fb.height as i32;
     for _ in 0..1024 {
         let event = match read_mouse() {
             Some(e) => e,
@@ -104,6 +112,37 @@ pub fn process_mouse(
         had_mouse_events = true;
         accumulated_dx += event.dx as i32;
         accumulated_dy -= event.dy as i32; // Invert Y (mouse up = negative dy in PS/2)
+
+        // Per-event cursor for ring routing.
+        event_cursor_x = event_cursor_x
+            .saturating_add(event.dx as i32)
+            .clamp(0, fb_w - 1);
+        event_cursor_y = event_cursor_y
+            .saturating_sub(event.dy as i32)
+            .clamp(0, fb_h - 1);
+
+        // Per-event button-edge detection. Without this a press +
+        // release within the same `process_mouse` batch (very common
+        // when the source is a programmatic VNC viewer) would both
+        // disappear into the accumulator.
+        let prev_left = latest_buttons & 1 != 0;
+        let now_left  = event.buttons & 1 != 0;
+        if now_left != prev_left {
+            // Diagnostic: log first edge + first routing attempt so
+            // we can tell from serial whether bbox matching succeeds.
+            static EDGE_LOGGED: core::sync::atomic::AtomicBool =
+                core::sync::atomic::AtomicBool::new(false);
+            let routed = compositor::gfx_rings::route_mouse_event(
+                event_cursor_x, event_cursor_y, 1, now_left,
+            );
+            if !EDGE_LOGGED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                libfolk::println!(
+                    "[INPUT_MOUSE] first edge prev={} now={} at ({},{}) routed={:?}",
+                    prev_left as u8, now_left as u8,
+                    event_cursor_x, event_cursor_y, routed,
+                );
+            }
+        }
         latest_buttons = event.buttons;
     }
 
@@ -140,6 +179,11 @@ pub fn process_mouse(
                 did_work = true;
             }
         }
+
+        // Click routing to gfx-ring apps now happens inside the
+        // PS/2 drain loop above (per-event edge detection). The
+        // batched `latest_buttons` here would lose press+release
+        // pairs that arrive in the same scheduling window.
 
         // Route mouse events to active WASM app (Phase 2)
         if let Some(app) = &mut wasm.active_app {

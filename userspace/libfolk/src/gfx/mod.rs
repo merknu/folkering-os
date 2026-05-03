@@ -16,6 +16,7 @@
 pub mod ring;
 pub mod display_list;
 pub mod shmem;
+pub mod input;
 
 pub use ring::{IpcGraphicsRing, RING_CAPACITY_BYTES, PushError};
 pub use display_list::{
@@ -24,3 +25,7 @@ pub use display_list::{
     DisplayListBuilder,
 };
 pub use shmem::{RingHandle, MountedRing, mount_ring};
+pub use input::{
+    InputEvent, EventKind, InputRingHandle, MountedInputRing,
+    mount_input_ring, INPUT_RING_BYTES,
+};
