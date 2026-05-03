@@ -157,18 +157,29 @@ pub fn render_frame(ctx: &mut RenderContext) -> RenderResult {
                 core::sync::atomic::AtomicBool::new(false);
             if !LOGGED.swap(true, core::sync::atomic::Ordering::Relaxed) {
                 libfolk::println!(
-                    "[COMPOSITOR] gfx drain: rings={} bytes={} rects={} texts={}",
+                    "[COMPOSITOR] gfx drain: rings={} bytes={} rects={} texts={} damage={:?}",
                     stats.rings_drained, stats.bytes,
-                    stats.draw_rects, stats.draw_texts,
+                    stats.draw_rects, stats.draw_texts, stats.damage,
                 );
             }
-            // Damage rectangle: for now we mark a conservative fullscreen
-            // damage when any ring drains. Once ring consumers report
-            // their bounds (a follow-up), we replace this with a tighter
-            // union of per-ring bboxes.
-            ctx.damage.add_damage(compositor::damage::Rect::new(
-                0, 0, ctx.fb.width as u32, ctx.fb.height as u32,
-            ));
+            // Damage rectangle: tight per-ring bbox aggregated by the
+            // dispatcher. Falls back to fullscreen damage when an
+            // unknown opcode skipped (we don't know what region the
+            // skipped op would have touched, so be conservative).
+            let fallback = stats.unknown_skipped > 0;
+            if let (Some(r), false) = (stats.damage, fallback) {
+                let x = r.x.max(0) as u32;
+                let y = r.y.max(0) as u32;
+                let w = r.w.min(ctx.fb.width as u32 - x);
+                let h = r.h.min(ctx.fb.height as u32 - y);
+                if w > 0 && h > 0 {
+                    ctx.damage.add_damage(compositor::damage::Rect::new(x, y, w, h));
+                }
+            } else {
+                ctx.damage.add_damage(compositor::damage::Rect::new(
+                    0, 0, ctx.fb.width as u32, ctx.fb.height as u32,
+                ));
+            }
         }
     }
 

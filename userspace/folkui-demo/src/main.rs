@@ -80,10 +80,10 @@ static ALLOCATOR: BumpAllocator = BumpAllocator {
 // Hard-coded for the smoke test. A future demo replaces this with
 // "ask Draug to author a UI" — that's the actual rapport endgame.
 const DEMO_MARKUP: &str = concat!(
-    r##"<Window x="40" y="40" width="320" height="120" bg_color="#1E2030">"##,
+    r##"<Window x="40" y="40" width="320" height="120" bg_color="#1E2030" corner_radius="8">"##,
     r##"  <VBox padding="16" spacing="12">"##,
     r##"    <Text color="#C0CAF5" font_size="18">Hello from libfolkui</Text>"##,
-    r##"    <Button bg_color="#7AA2F7">Click me</Button>"##,
+    r##"    <Button bg_color="#7AA2F7" corner_radius="6">Click me</Button>"##,
     r##"  </VBox>"##,
     r##"</Window>"##,
 );

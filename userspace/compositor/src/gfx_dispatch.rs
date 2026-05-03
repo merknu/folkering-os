@@ -49,7 +49,11 @@ fn rgba_to_fb(rgba: u32) -> u32 {
 }
 
 /// Counters reported back to callers so render_frame() can log how
-/// much display-list traffic flowed this frame.
+/// much display-list traffic flowed this frame. The `damage` field
+/// carries the screen-clipped bounding box of every pixel the
+/// dispatcher actually wrote — drain_all hands it to the
+/// DamageTracker so the next VirtIO-GPU flush copies only the
+/// touched rect, not the whole screen.
 #[derive(Default, Clone, Copy, Debug)]
 pub struct DispatchStats {
     pub draw_rects: u32,
@@ -57,6 +61,78 @@ pub struct DispatchStats {
     pub set_clips: u32,
     pub draw_textures_skipped: u32,
     pub unknown_skipped: u32,
+    /// Union of every painted rect, in screen coords. `None` if
+    /// nothing was drawn (Sync-only or all-clipped frames).
+    pub damage: Option<ClipRect>,
+}
+
+#[inline]
+fn extend_damage(damage: &mut Option<ClipRect>, rect: ClipRect) {
+    *damage = Some(match *damage {
+        Some(prev) => prev.union(&rect),
+        None => rect,
+    });
+}
+
+/// Fill a rectangle with rounded corners using a quarter-circle
+/// distance test. Pre-clipped to fb bounds by the caller. The body
+/// is split into three horizontal bands so the all-rectangle middle
+/// avoids the per-pixel distance check entirely — that's where the
+/// vast majority of pixels live for typical UI shapes.
+fn fill_rect_rounded(
+    fb: &mut FramebufferView,
+    x: usize, y: usize, w: u32, h: u32,
+    color: u32, radius: u32,
+) {
+    // Cap radius to half the smaller side so a small rect with a
+    // big radius still produces something sensible (a circle when
+    // radius == w/2 == h/2).
+    let r = radius.min(w / 2).min(h / 2);
+    if r == 0 {
+        fb.fill_rect(x, y, w as usize, h as usize, color);
+        return;
+    }
+    let r2 = (r * r) as i64;
+
+    // Top band: rows [y .. y+r), per-row clipped by the top corners.
+    for row in 0..r {
+        let dy = (r - row) as i64; // distance from the corner centre
+        let dx2 = r2 - dy * dy;
+        // Inset = r - sqrt(r^2 - dy^2). Approximate sqrt with a
+        // tight integer search since r is small (typically <= 16).
+        let mut sx = 0u32;
+        while ((r - sx) as i64) * ((r - sx) as i64) > dx2 {
+            sx += 1;
+        }
+        let inset = sx;
+        let row_x = x + inset as usize;
+        let row_w = (w - 2 * inset) as usize;
+        if row_w > 0 {
+            fb.fill_rect(row_x, y + row as usize, row_w, 1, color);
+        }
+    }
+
+    // Middle band: rows [y+r .. y+h-r), full width.
+    let mid_h = h.saturating_sub(2 * r);
+    if mid_h > 0 {
+        fb.fill_rect(x, y + r as usize, w as usize, mid_h as usize, color);
+    }
+
+    // Bottom band: rows [y+h-r .. y+h), mirror of the top.
+    for row in 0..r {
+        let dy = (row + 1) as i64;
+        let dx2 = r2 - dy * dy;
+        let mut sx = 0u32;
+        while ((r - sx) as i64) * ((r - sx) as i64) > dx2 {
+            sx += 1;
+        }
+        let inset = sx;
+        let row_x = x + inset as usize;
+        let row_w = (w - 2 * inset) as usize;
+        if row_w > 0 {
+            fb.fill_rect(row_x, y + (h - r + row) as usize, row_w, 1, color);
+        }
+    }
 }
 
 /// Dispatch every command in `bytes` against `fb`. Stops at the first
@@ -111,15 +187,20 @@ pub fn dispatch_display_list(
                 let fr = (clipped.x as i64 + clipped.w as i64).min(fb_w);
                 let fbottom = (clipped.y as i64 + clipped.h as i64).min(fb_h);
                 if fr <= fx || fbottom <= fy { continue; }
-                fb.fill_rect(
-                    fx as usize,
-                    fy as usize,
-                    (fr - fx) as usize,
-                    (fbottom - fy) as usize,
-                    rgba_to_fb(rcolor),
-                );
-                // corner_radius != 0 currently silently rounds to 0 —
-                // see module-level comment for why.
+                let rect_w = (fr - fx) as u32;
+                let rect_h = (fbottom - fy) as u32;
+                let radius = r.corner_radius as u32;
+                if radius == 0 {
+                    fb.fill_rect(fx as usize, fy as usize,
+                        rect_w as usize, rect_h as usize,
+                        rgba_to_fb(rcolor));
+                } else {
+                    fill_rect_rounded(fb, fx as usize, fy as usize,
+                        rect_w, rect_h, rgba_to_fb(rcolor), radius);
+                }
+                extend_damage(&mut stats.damage, ClipRect::new(
+                    fx as i32, fy as i32, rect_w, rect_h,
+                ));
             }
 
             Command::DrawText { x, y, color_rgba, font_size: _, text } => {
@@ -143,6 +224,7 @@ pub fn dispatch_display_list(
                 // Manual char-by-char so we can scissor to the current
                 // clip on each glyph rather than relying on
                 // draw_string's wrap-at-edge behaviour.
+                let text_x_start = cursor_x;
                 for ch in s.chars() {
                     if cursor_x + 8 > fb.width { break; }
                     if let Some(top) = clips.last() {
@@ -158,6 +240,12 @@ pub fn dispatch_display_list(
                     // someone later flips the alpha to non-zero.
                     fb.draw_char_alpha(cursor_x, cursor_y, ch, fg, 0, 0);
                     cursor_x += 8;
+                }
+                if cursor_x > text_x_start {
+                    extend_damage(&mut stats.damage, ClipRect::new(
+                        text_x_start as i32, cursor_y as i32,
+                        (cursor_x - text_x_start) as u32, 16,
+                    ));
                 }
             }
 
