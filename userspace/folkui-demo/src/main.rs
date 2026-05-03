@@ -35,8 +35,8 @@ use libfolk::sys::compositor::{register_gfx_ring, COMPOSITOR_TASK_ID};
 use libfolk::gfx::RingHandle;
 use libfolk::gfx::DisplayListBuilder;
 use libfolkui::{
-    compile_into, layout, parse,
-    AppState, LayoutConstraint,
+    compile_diff_into, layout, parse,
+    AppState, DiffState, LayoutConstraint,
 };
 
 // ── Bump allocator ──────────────────────────────────────────────────
@@ -151,16 +151,14 @@ fn main() -> ! {
 
     // 3. Push display lists with a live-updating counter binding.
     //    Each tick we bump `counter`, set it on AppState, recompile,
-    //    and push. The compiler resolves <Text bind_text="counter">
-    //    against state, so the on-screen panel shows an incrementing
-    //    value — proof that reactive bindings reach pixels.
+    //    and push. compile_diff_into emits the full tree on the first
+    //    frame and then only DrawRect+DrawText for the changed
+    //    binding — typically ~30 bytes/frame instead of ~144.
     let mut state = AppState::new();
     let mut counter: u64 = 0;
     let mut buf = [0u8; 24]; // "tick=NNNNNNNNNNNNNNNN\0"
-    // Single builder reused across frames — `compile_into` clears it
-    // before re-filling, so the heap buffer's capacity stays warm and
-    // we don't leak through the bump allocator (which never frees).
     let mut builder = DisplayListBuilder::new();
+    let mut diff = DiffState::new();
     let mut printed_once = false;
 
     loop {
@@ -169,10 +167,10 @@ fn main() -> ! {
         let s = unsafe { core::str::from_utf8_unchecked(&buf[..written]) };
         state.set("counter", s);
 
-        compile_into(&tree, &state, &mut builder);
+        compile_diff_into(&tree, &state, &mut diff, &mut builder);
         let bytes = builder.as_slice();
         if !printed_once {
-            println!("[FOLKUI-DEMO] display list = {} bytes", bytes.len());
+            println!("[FOLKUI-DEMO] first display list = {} bytes", bytes.len());
             printed_once = true;
         }
 
