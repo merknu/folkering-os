@@ -870,6 +870,22 @@ fn main() -> ! {
             if ai.need_redraw { need_redraw = true; }
         }
 
+        // ===== App IPC polling (MSG_CREATE_UI_WINDOW, MSG_GFX_REGISTER_RING,
+        // MSG_QUERY_NAME, MSG_QUERY_FOCUS, …) =====
+        // The graphics-mode main loop wasn't polling IPC from other tasks
+        // before — only `run_ipc_loop` (the no-graphics fallback) did.
+        // That's why apps blocked forever on `register_gfx_ring` (#119)
+        // and similar requests. Calling this every iteration drains one
+        // queued message per pass, which is enough since we don't expect
+        // a single app to flood the compositor.
+        {
+            let ipc = mcp_handler::tick_ipc_and_streaming(
+                &mut wm, &mut stream, &mut fb, &mut damage, &mut compositor,
+            );
+            if ipc.did_work { did_work = true; }
+            if ipc.need_redraw { need_redraw = true; }
+        }
+
         // GOD MODE: Poll COM3 for injected commands (moved to god_mode.rs)
         if god_mode::poll_com3(&mut com3_buf, &mut com3_len, &mut com3_queue) {
             did_work = true;
