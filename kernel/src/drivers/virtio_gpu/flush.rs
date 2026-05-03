@@ -14,7 +14,13 @@ use super::{
 };
 
 /// Flush a dirty rectangle to the display (hot path).
-/// Non-blocking: submits TRANSFER_TO_HOST_2D + RESOURCE_FLUSH, returns immediately.
+///
+/// Non-blocking. Two paths:
+/// - Legacy: submits TRANSFER_TO_HOST_2D + RESOURCE_FLUSH (4 descriptors).
+/// - Blob: submits RESOURCE_FLUSH only (2 descriptors). The host already
+///   sees our guest pages directly thanks to RESOURCE_CREATE_BLOB at init,
+///   so the per-frame copy goes away — that's the entire point of blob.
+///
 /// Called from SYS_GPU_FLUSH syscall.
 pub fn flush_rect(x: u32, y: u32, w: u32, h: u32) {
     let submit_tsc = crate::drivers::iqe::rdtsc();
@@ -49,17 +55,23 @@ pub fn flush_rect(x: u32, y: u32, w: u32, h: u32) {
     let hhdm = crate::memory::paging::hhdm_offset();
     let cmd_virt = (hhdm + cmd_phys) as *mut u8;
 
+    let using_blob = state.using_blob;
+
     // Layout: [TransferToHost2D @ 0] [ResourceFlush @ 64] [RespHdr @ 128] [RespHdr @ 160]
     unsafe {
-        // TRANSFER_TO_HOST_2D
-        let transfer = cmd_virt as *mut GpuTransferToHost2D;
-        (*transfer).hdr = make_hdr(VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D);
-        (*transfer).r = GpuRect { x, y, width: w, height: h };
-        (*transfer).offset = 0;
-        (*transfer).resource_id = 1;
-        (*transfer).padding = 0;
+        if !using_blob {
+            // TRANSFER_TO_HOST_2D — only needed when the host doesn't see
+            // our memory directly (legacy ATTACH_BACKING path).
+            let transfer = cmd_virt as *mut GpuTransferToHost2D;
+            (*transfer).hdr = make_hdr(VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D);
+            (*transfer).r = GpuRect { x, y, width: w, height: h };
+            (*transfer).offset = 0;
+            (*transfer).resource_id = 1;
+            (*transfer).padding = 0;
+        }
 
-        // RESOURCE_FLUSH with VSync fence
+        // RESOURCE_FLUSH with VSync fence — required in both paths to tell
+        // the host "draw the new pixels now."
         let fence_id = FENCE_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let flush = cmd_virt.add(64) as *mut GpuResourceFlush;
         (*flush).hdr = GpuCtrlHdr {
@@ -77,38 +89,52 @@ pub fn flush_rect(x: u32, y: u32, w: u32, h: u32) {
         core::ptr::write_bytes(cmd_virt.add(128), 0, 64);
     }
 
-    // Submit: 4 chained descriptors (transfer cmd, resp1, flush cmd, resp2)
     let q = &mut state.controlq;
-    if let Some(d0) = q.alloc_desc() {
-        if let Some(d1) = q.alloc_desc() {
-            if let Some(d2) = q.alloc_desc() {
-                if let Some(d3) = q.alloc_desc() {
-                    // Transfer command
-                    q.set_desc(d0, cmd_phys as u64,
-                        core::mem::size_of::<GpuTransferToHost2D>() as u32,
-                        VRING_DESC_F_NEXT, d1);
-                    // Transfer response
-                    q.set_desc(d1, (cmd_phys + 128) as u64,
-                        core::mem::size_of::<GpuRespHdr>() as u32,
-                        VRING_DESC_F_WRITE, 0);
-                    // Flush command
-                    q.set_desc(d2, (cmd_phys + 64) as u64,
-                        core::mem::size_of::<GpuResourceFlush>() as u32,
-                        VRING_DESC_F_NEXT, d3);
-                    // Flush response
-                    q.set_desc(d3, (cmd_phys + 160) as u64,
-                        core::mem::size_of::<GpuRespHdr>() as u32,
-                        VRING_DESC_F_WRITE, 0);
+    if using_blob {
+        // 2-descriptor submit: just the flush + its response.
+        if let (Some(d0), Some(d1)) = (q.alloc_desc(), q.alloc_desc()) {
+            q.set_desc(d0, (cmd_phys + 64) as u64,
+                core::mem::size_of::<GpuResourceFlush>() as u32,
+                VRING_DESC_F_NEXT, d1);
+            q.set_desc(d1, (cmd_phys + 160) as u64,
+                core::mem::size_of::<GpuRespHdr>() as u32,
+                VRING_DESC_F_WRITE, 0);
+            q.submit(d0);
+            state.transport.notify_queue(0);
+        }
+    } else {
+        // 4-descriptor submit: transfer + resp + flush + resp.
+        if let Some(d0) = q.alloc_desc() {
+            if let Some(d1) = q.alloc_desc() {
+                if let Some(d2) = q.alloc_desc() {
+                    if let Some(d3) = q.alloc_desc() {
+                        // Transfer command
+                        q.set_desc(d0, cmd_phys as u64,
+                            core::mem::size_of::<GpuTransferToHost2D>() as u32,
+                            VRING_DESC_F_NEXT, d1);
+                        // Transfer response
+                        q.set_desc(d1, (cmd_phys + 128) as u64,
+                            core::mem::size_of::<GpuRespHdr>() as u32,
+                            VRING_DESC_F_WRITE, 0);
+                        // Flush command
+                        q.set_desc(d2, (cmd_phys + 64) as u64,
+                            core::mem::size_of::<GpuResourceFlush>() as u32,
+                            VRING_DESC_F_NEXT, d3);
+                        // Flush response
+                        q.set_desc(d3, (cmd_phys + 160) as u64,
+                            core::mem::size_of::<GpuRespHdr>() as u32,
+                            VRING_DESC_F_WRITE, 0);
 
-                    // Submit both as separate available ring entries
-                    q.submit(d0);
-                    q.submit(d2);
+                        // Submit both as separate available ring entries
+                        q.submit(d0);
+                        q.submit(d2);
 
-                    // Ring doorbell (async — don't wait)
-                    state.transport.notify_queue(0);
-                } else { q.free_desc(d2); q.free_desc(d1); q.free_desc(d0); }
-            } else { q.free_desc(d1); q.free_desc(d0); }
-        } else { q.free_desc(d0); }
+                        // Ring doorbell (async — don't wait)
+                        state.transport.notify_queue(0);
+                    } else { q.free_desc(d2); q.free_desc(d1); q.free_desc(d0); }
+                } else { q.free_desc(d1); q.free_desc(d0); }
+            } else { q.free_desc(d0); }
+        }
     }
 
     // IQE: always record flush submit (even if descriptors exhausted)
@@ -142,6 +168,7 @@ pub fn flush_rects_batched(rects: &[(u32, u32, u32, u32)]) {
     let cmd = (hhdm + cmd_phys) as *mut u8;
 
     let n = rects.len().min(4); // max 4 rects per batch
+    let using_blob = state.using_blob;
 
     // Compute union bounding box for the final RESOURCE_FLUSH
     let mut ux = rects[0].0;
@@ -156,22 +183,24 @@ pub fn flush_rects_batched(rects: &[(u32, u32, u32, u32)]) {
     }
 
     // Layout: for each rect i:
-    //   [i*80 + 0..56]  = TRANSFER_TO_HOST_2D
+    //   [i*80 + 0..56]  = TRANSFER_TO_HOST_2D  (legacy only, skipped under blob)
     //   [i*80 + 56..80] = Response (24 bytes)
     // After all rects:
     //   [n*80 + 0..48]  = RESOURCE_FLUSH
     //   [n*80 + 48..72] = Response
     unsafe {
-        for i in 0..n {
-            let off = i * 80;
-            let xfer = cmd.add(off) as *mut GpuTransferToHost2D;
-            (*xfer).hdr = make_hdr(VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D);
-            (*xfer).r = GpuRect { x: rects[i].0, y: rects[i].1, width: rects[i].2, height: rects[i].3 };
-            (*xfer).offset = 0;
-            (*xfer).resource_id = 1;
-            (*xfer).padding = 0;
-            // Zero response
-            core::ptr::write_bytes(cmd.add(off + 56), 0, 24);
+        if !using_blob {
+            for i in 0..n {
+                let off = i * 80;
+                let xfer = cmd.add(off) as *mut GpuTransferToHost2D;
+                (*xfer).hdr = make_hdr(VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D);
+                (*xfer).r = GpuRect { x: rects[i].0, y: rects[i].1, width: rects[i].2, height: rects[i].3 };
+                (*xfer).offset = 0;
+                (*xfer).resource_id = 1;
+                (*xfer).padding = 0;
+                // Zero response
+                core::ptr::write_bytes(cmd.add(off + 56), 0, 24);
+            }
         }
 
         let flush_off = n * 80;
@@ -192,17 +221,20 @@ pub fn flush_rects_batched(rects: &[(u32, u32, u32, u32)]) {
 
     // Chain all descriptors: [xfer0→resp0] [xfer1→resp1] ... [flush→resp]
     // Submit each transfer pair separately, then flush pair last.
-    // All use ONE doorbell notification at the end.
+    // All use ONE doorbell notification at the end. Under blob we skip
+    // the per-rect transfer pairs entirely — host already sees the bytes.
     let q = &mut state.controlq;
     let mut submitted = false;
 
-    for i in 0..n {
-        let off = i * 80;
-        if let (Some(d_cmd), Some(d_resp)) = (q.alloc_desc(), q.alloc_desc()) {
-            q.set_desc(d_cmd, (cmd_phys + off) as u64, 56, VRING_DESC_F_NEXT, d_resp);
-            q.set_desc(d_resp, (cmd_phys + off + 56) as u64, 24, VRING_DESC_F_WRITE, 0);
-            q.submit(d_cmd);
-            submitted = true;
+    if !using_blob {
+        for i in 0..n {
+            let off = i * 80;
+            if let (Some(d_cmd), Some(d_resp)) = (q.alloc_desc(), q.alloc_desc()) {
+                q.set_desc(d_cmd, (cmd_phys + off) as u64, 56, VRING_DESC_F_NEXT, d_resp);
+                q.set_desc(d_resp, (cmd_phys + off + 56) as u64, 24, VRING_DESC_F_WRITE, 0);
+                q.submit(d_cmd);
+                submitted = true;
+            }
         }
     }
 
