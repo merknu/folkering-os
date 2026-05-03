@@ -50,9 +50,11 @@ pub mod dom;
 pub mod layout;
 pub mod compiler;
 pub mod state;
+pub mod diff;
 
 pub use parser::{parse, ParseError};
 pub use dom::{Node, NodeKind, Tree, AttrMap};
 pub use layout::{layout, LayoutConstraint};
 pub use compiler::{compile_to_display_list, compile_to_display_list_with_state, compile_into};
 pub use state::AppState;
+pub use diff::{DiffState, compile_diff_into};
