@@ -137,6 +137,28 @@ pub fn render_frame(ctx: &mut RenderContext) -> RenderResult {
         statusbar::render_ram_graph(ctx);
     }
 
+    // Stage 5b — Drain all registered gfx rings.
+    //
+    // Apps that registered an IpcGraphicsRing via MSG_GFX_REGISTER_RING
+    // produce display-list bytes; we pop them, walk through gfx_consumer,
+    // and dispatch to fill_rect/draw_char primitives. Drains happen after
+    // the imperative stages so app surfaces land on top of the desktop
+    // chrome — matches the rapport's z-order intent (apps own foreground,
+    // statusbar is the only thing above them, handled at Stage 5).
+    {
+        let stats = compositor::gfx_rings::drain_all(ctx.fb);
+        if stats.rings_drained > 0 {
+            did_work = true;
+            // Damage rectangle: for now we mark a conservative fullscreen
+            // damage when any ring drains. Once ring consumers report
+            // their bounds (a follow-up), we replace this with a tighter
+            // union of per-ring bboxes.
+            ctx.damage.add_damage(compositor::damage::Rect::new(
+                0, 0, ctx.fb.width as u32, ctx.fb.height as u32,
+            ));
+        }
+    }
+
     // Stage 6 — Targeted damage tracking + cursor save
     statusbar::add_targeted_damage(ctx, wasm_fullscreen);
     if ctx.cursor_drawn {
