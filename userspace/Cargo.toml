@@ -5,6 +5,7 @@
 members = [
     "libfolk",
     "libfolkui",
+    "folkui-demo",
     "libsqlite",
     "libtensor",
     "shell",
