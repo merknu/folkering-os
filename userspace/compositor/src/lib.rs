@@ -55,6 +55,7 @@ pub mod blend;
 pub mod damage;
 pub mod gfx_consumer;
 pub mod gfx_dispatch;
+pub mod gfx_rings;
 pub mod render_graph;
 pub mod framebuffer;
 pub mod font;

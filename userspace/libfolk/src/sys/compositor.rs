@@ -73,6 +73,16 @@ pub const COMP_OP_QUERY_NAME: u64 = 0x10;
 /// Reply: (window_id << 32) | node_id, or u64::MAX if no focus
 pub const COMP_OP_QUERY_FOCUS: u64 = 0x11;
 
+/// Register a granted graphics-ring shmem id with the compositor.
+/// Request: opcode | (shmem_id << 8)
+/// Reply: slot index on success, u64::MAX on failure.
+pub const COMP_OP_GFX_REGISTER_RING: u64 = 0x20;
+
+/// Unregister a previously registered ring slot.
+/// Request: opcode | (slot << 8)
+/// Reply: 0 on success, u64::MAX on failure.
+pub const COMP_OP_GFX_UNREGISTER_RING: u64 = 0x21;
+
 // ============================================================================
 // Error Types
 // ============================================================================
@@ -233,6 +243,48 @@ pub fn query_focus() -> Result<Option<(u64, u64)>, CompError> {
         let window_id = ret >> 32;
         let node_id = ret & 0xFFFF_FFFF;
         Ok(Some((node_id, window_id)))
+    }
+}
+
+// ============================================================================
+// Graphics-ring registration
+// ============================================================================
+
+/// Register a previously created+granted display-list ring with the
+/// compositor. Returns the slot index assigned.
+///
+/// Caller responsibilities (in order):
+/// 1. `RingHandle::create_at(virt)` — allocates the shmem region.
+/// 2. `handle.grant_to(COMPOSITOR_TASK_ID)` — gives compositor permission
+///    to map the same id.
+/// 3. Pass the resulting `handle.id` here.
+///
+/// The slot index is stable for the lifetime of the registration and
+/// can be passed to `unregister_gfx_ring` when the producer shuts down.
+pub fn register_gfx_ring(shmem_id: u32) -> Result<u32, CompError> {
+    let payload0 = (COMP_OP_GFX_REGISTER_RING & 0xFF)
+        | ((shmem_id as u64) << 8);
+    let ret = unsafe {
+        syscall3(SYS_IPC_SEND, COMPOSITOR_TASK_ID as u64, payload0, 0)
+    };
+    if ret == u64::MAX {
+        Err(CompError::ServiceUnavailable)
+    } else {
+        Ok(ret as u32)
+    }
+}
+
+/// Unregister a slot returned by `register_gfx_ring`.
+pub fn unregister_gfx_ring(slot: u32) -> Result<(), CompError> {
+    let payload0 = (COMP_OP_GFX_UNREGISTER_RING & 0xFF)
+        | ((slot as u64 & 0xFF) << 8);
+    let ret = unsafe {
+        syscall3(SYS_IPC_SEND, COMPOSITOR_TASK_ID as u64, payload0, 0)
+    };
+    if ret == u64::MAX {
+        Err(CompError::ServiceUnavailable)
+    } else {
+        Ok(())
     }
 }
 
