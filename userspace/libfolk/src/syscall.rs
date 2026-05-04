@@ -42,6 +42,10 @@ pub const SYS_MAP_PHYSICAL: u64 = 0x24;  // 36 - Map physical memory with capabi
 
 // Phase 7: Input
 pub const SYS_READ_MOUSE: u64 = 0x25;    // 37 - Read mouse event (packed buttons/dx/dy)
+/// VirtIO Input absolute-pointer read. Args: fb_w, fb_h (clamped 16-bit).
+/// Returns 0 when no frame queued OR the driver didn't attach. Otherwise:
+///   bit 63 = 1, bits 32-47 = y, bits 16-31 = x, bits 8-15 = buttons (0=L, 1=R, 2=M).
+pub const SYS_READ_MOUSE_ABS: u64 = 0x69; // 105 - Absolute pointer (scaled to fb)
 
 // Phase 8: Detailed task list
 pub const SYS_TASK_LIST_DETAILED: u64 = 0x26; // 38 - Fill shmem with task details

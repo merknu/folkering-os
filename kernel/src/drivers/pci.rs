@@ -375,3 +375,18 @@ pub fn find_virtio_gpu() -> Option<PciDevice> {
     }
     None
 }
+
+/// VirtIO Input device ID (modern, virtio device id 18 → 0x1040 + 18).
+/// QEMU exposes this for `-device virtio-tablet-pci`, `virtio-mouse-pci`,
+/// `virtio-keyboard-pci`, and `virtio-input-host-pci`. They all share the
+/// same PCI device id; the per-instance role is encoded in the device's
+/// config space (`CFG_ID_DEVIDS` / `CFG_PROP_BITS`).
+pub const VIRTIO_INPUT_DEVICE_MODERN: u16 = 0x1040 + 18;
+
+/// Find the *first* VirtIO Input device on the bus. Returns None if the
+/// guest config doesn't include one. Multiple input devices (e.g. tablet
+/// + keyboard) co-exist on the same bus; we only pick the first up here
+/// — adding a second instance is a follow-up if/when it's needed.
+pub fn find_virtio_input() -> Option<PciDevice> {
+    find_device(VIRTIO_VENDOR_ID, VIRTIO_INPUT_DEVICE_MODERN)
+}

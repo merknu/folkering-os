@@ -238,6 +238,18 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
             }
         }
 
+        // VirtIO Input (absolute pointer / tablet mode for VNC pixel-precise
+        // input). Optional — if no virtio-tablet-pci device is exposed by
+        // the host, we silently fall back to the PS/2 path which is what
+        // every existing host config uses today.
+        match drivers::virtio_input::init() {
+            Ok(()) => { serial_strln!("[INIT] VirtIO Input active (absolute pointer)"); }
+            Err(e) => {
+                serial_str!("[INIT] VirtIO Input: ");
+                serial_strln!(e);
+            }
+        }
+
         // AC97 audio (optional — only present if QEMU started with -device AC97)
         drivers::ac97::init();
 

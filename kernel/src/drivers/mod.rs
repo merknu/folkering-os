@@ -8,6 +8,7 @@ pub mod virtio;
 pub mod virtio_blk;
 pub mod virtio_net;
 pub mod virtio_gpu;
+pub mod virtio_input;
 pub mod cmos;
 pub mod rng;
 pub mod iqe;

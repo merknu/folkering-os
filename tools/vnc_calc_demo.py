@@ -67,6 +67,22 @@ def rfb_handshake(sock):
     name_len = struct.unpack(">I", init[20:24])[0]
     if name_len:
         sock.recv(name_len)
+
+    # Advertise POINTER_TYPE_CHANGE (-257). Without this, QEMU's VNC
+    # server sticks the connection in relative-deltas mode and pointer
+    # positions go to PS/2 instead of any registered virtio-tablet —
+    # we get button events but no `EV_ABS`. With the pseudo-encoding
+    # advertised, QEMU flips this connection to absolute mode and our
+    # PointerEvent (x, y) lands as ABS_X/ABS_Y on virtio-tablet's
+    # eventq. Encoding list also includes Raw (0) so the server has
+    # at least one real framebuffer encoding to fall back on; we
+    # never request a framebuffer update so it doesn't actually
+    # matter, but RFB 3.8 expects at least one.
+    encs = [0, -257]  # Raw, PointerTypeChange
+    msg = struct.pack(">BBH", 2, 0, len(encs))
+    for e in encs:
+        msg += struct.pack(">i", e)
+    sock.sendall(msg)
     return width, height
 
 
@@ -103,6 +119,14 @@ def main():
     ap.add_argument("--sequence", default="5,add,3,eq",
                     help="Comma-separated calculator buttons (digits or "
                          "add/sub/mul/div/eq/clear)")
+    # Folkering OS framebuffer is the virtio-gpu display (1280x800 on
+    # Proxmox VM 800 by default). VNC, however, may advertise a
+    # different resolution to the client (Proxmox/QEMU still reports
+    # the legacy 1024x768 even after virtio-gpu has resized). Click
+    # targets in BUTTONS are in OS-framebuffer pixels, so we must scale
+    # them to whatever the VNC server reports as the desktop size.
+    ap.add_argument("--fb-w", type=int, default=1280, help="OS framebuffer width")
+    ap.add_argument("--fb-h", type=int, default=800,  help="OS framebuffer height")
     args = ap.parse_args()
 
     seq = args.sequence.split(",")
@@ -120,8 +144,15 @@ def main():
     sock = socket.create_connection((args.host, args.port), timeout=10.0)
     try:
         w, h = rfb_handshake(sock)
-        print(f"RFB connected: {w}x{h}")
+        print(f"RFB connected: {w}x{h}  (OS fb {args.fb_w}x{args.fb_h})")
         sock.settimeout(0.05)
+
+        # Scale OS-framebuffer-space targets into VNC-pixel-space.
+        def to_vnc(p):
+            tx, ty = p
+            vx = tx * w // args.fb_w
+            vy = ty * h // args.fb_h
+            return (vx, vy)
 
         # PS/2 mouse only sees relative deltas. Force the guest's
         # cursor to the top-left by sweeping the VNC pointer all the
@@ -139,8 +170,9 @@ def main():
         time.sleep(0.5)
 
         for label in targets:
-            tgt = BUTTONS[label]
-            print(f"  -> {label} @ ({tgt[0]},{tgt[1]})")
+            fb_tgt = BUTTONS[label]
+            tgt = to_vnc(fb_tgt)
+            print(f"  -> {label} @ fb {fb_tgt} -> vnc {tgt}")
             drag_to(sock, cur, tgt)
             cur = tgt
             click_at(sock, *cur)
