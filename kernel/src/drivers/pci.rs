@@ -346,6 +346,51 @@ pub fn find_virtio_block() -> Option<PciDevice> {
     find_device(VIRTIO_VENDOR_ID, VIRTIO_BLK_DEVICE_TRANSITIONAL)
 }
 
+/// Find the Nth VirtIO block device on the bus (0-indexed). Used by
+/// the model-disk loader (D.3.7.virtio) to attach to a *secondary*
+/// virtio_blk PCI device alongside the primary one that hosts the
+/// FOLKDISK persistence partition.
+///
+/// Walks both the modern (0x1042) and transitional (0x1001) device
+/// IDs, treating them as one logical pool so the index is stable
+/// regardless of which transport variant the host exposes.
+pub fn find_virtio_block_nth(n: usize) -> Option<PciDevice> {
+    let list = PCI_DEVICES.lock();
+    let mut found = 0usize;
+    for i in 0..list.count {
+        if let Some(ref dev) = list.devices[i] {
+            if dev.vendor_id == VIRTIO_VENDOR_ID
+                && (dev.device_id == VIRTIO_BLK_DEVICE_MODERN
+                    || dev.device_id == VIRTIO_BLK_DEVICE_TRANSITIONAL)
+            {
+                if found == n {
+                    return Some(dev.clone());
+                }
+                found += 1;
+            }
+        }
+    }
+    None
+}
+
+/// Count how many VirtIO block devices the PCI scan picked up. The
+/// boot path uses this to decide whether a model disk is attached.
+pub fn count_virtio_block() -> usize {
+    let list = PCI_DEVICES.lock();
+    let mut found = 0usize;
+    for i in 0..list.count {
+        if let Some(ref dev) = list.devices[i] {
+            if dev.vendor_id == VIRTIO_VENDOR_ID
+                && (dev.device_id == VIRTIO_BLK_DEVICE_MODERN
+                    || dev.device_id == VIRTIO_BLK_DEVICE_TRANSITIONAL)
+            {
+                found += 1;
+            }
+        }
+    }
+    found
+}
+
 /// Find VirtIO network device (checks both transitional and modern IDs)
 pub fn find_virtio_net() -> Option<PciDevice> {
     if let Some(dev) = find_device(VIRTIO_VENDOR_ID, VIRTIO_NET_DEVICE_MODERN) {
