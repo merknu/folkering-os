@@ -589,36 +589,51 @@ pub fn attention_block(
     q_bias: Option<&[f32]>,
     k_bias: Option<&[f32]>,
     v_bias: Option<&[f32]>,
+    // q_norm / k_norm: per-head RMSNorm applied to Q / K after
+    // projection, before RoPE (Qwen3-only). Pass `None` for
+    // Qwen2.5 / Llama-3 which don't ship the tensor. Length =
+    // `head_dim`. `rms_eps` is consulted only when norms are
+    // present. Qwen3 uses 1e-6, Qwen2.5 uses 1e-5.
+    q_norm: Option<&[f32]>,
+    k_norm: Option<&[f32]>,
+    rms_eps: f32,
     rope_cos: &[f32], rope_sin: &[f32],
     new_seq: usize, hidden_dim: usize,
+    // head_dim: per-head dimension. NOT necessarily
+    // `hidden_dim / n_heads` — Qwen3 has hidden=1024, n_heads=16,
+    // head_dim=128 so n_heads*head_dim = 2048 != hidden. Wq output
+    // dim is `q_dim = n_heads * head_dim`; Wo input dim is the same.
+    head_dim: usize,
     n_heads: usize, n_kv_heads: usize,
     cache_layer: &mut LayerKv,
     max_pos: usize,
     pos_offset: usize,
 ) -> Option<Vec<f32>> {
-    if hidden_dim % n_heads != 0 { return None; }
+    if n_heads == 0 || head_dim == 0 { return None; }
     if n_kv_heads == 0 || n_heads % n_kv_heads != 0 { return None; }
-    let head_dim = hidden_dim / n_heads;
+    let q_dim = n_heads * head_dim;
     let hkv = n_kv_heads * head_dim;
     if x.len() != new_seq * hidden_dim { return None; }
     if pos_offset + new_seq > max_pos { return None; }
     if cache_layer.k.len() != max_pos * hkv { return None; }
     if cache_layer.v.len() != max_pos * hkv { return None; }
-    if let Some(b) = q_bias { if b.len() != hidden_dim { return None; } }
+    if let Some(b) = q_bias { if b.len() != q_dim { return None; } }
     if let Some(b) = k_bias { if b.len() != hkv { return None; } }
     if let Some(b) = v_bias { if b.len() != hkv { return None; } }
+    if let Some(n) = q_norm { if n.len() != head_dim { return None; } }
+    if let Some(n) = k_norm { if n.len() != head_dim { return None; } }
 
     // ── 1. Project x → Q (full), K_new, V_new (per-row matvec) ─────
-    let mut q = Vec::with_capacity(new_seq * hidden_dim);
+    let mut q = Vec::with_capacity(new_seq * q_dim);
     let mut k_new = Vec::with_capacity(new_seq * hkv);
     let mut v_new = Vec::with_capacity(new_seq * hkv);
     for s in 0..new_seq {
         let row = &x[s * hidden_dim..(s + 1) * hidden_dim];
-        let mut q_row = wq.matvec(hidden_dim, hidden_dim, row)?;
+        let mut q_row = wq.matvec(hidden_dim, q_dim, row)?;
         let mut k_row = wk.matvec(hidden_dim, hkv, row)?;
         let mut v_row = wv.matvec(hidden_dim, hkv, row)?;
         if let Some(b) = q_bias {
-            for i in 0..hidden_dim { q_row[i] += b[i]; }
+            for i in 0..q_dim { q_row[i] += b[i]; }
         }
         if let Some(b) = k_bias {
             for i in 0..hkv { k_row[i] += b[i]; }
@@ -631,17 +646,42 @@ pub fn attention_block(
         v_new.extend(v_row);
     }
 
-    // ── 2. RoPE on Q and the new K. V isn't rotated. ───────────────
+    // ── 2. Per-head RMSNorm on Q and K (Qwen3-only). The same
+    //      `head_dim`-sized weight applies to every head. RoPE comes
+    //      next, so this is "QK pre-normalization" — stabilises the
+    //      attention scale at deep model widths. ─────────────────
+    if let Some(qn) = q_norm {
+        for s in 0..new_seq {
+            for h in 0..n_heads {
+                let off = s * q_dim + h * head_dim;
+                let head_slice = &q[off..off + head_dim];
+                let normed = rmsnorm(head_slice, qn, rms_eps)?;
+                q[off..off + head_dim].copy_from_slice(&normed);
+            }
+        }
+    }
+    if let Some(kn) = k_norm {
+        for s in 0..new_seq {
+            for h in 0..n_kv_heads {
+                let off = s * hkv + h * head_dim;
+                let head_slice = &k_new[off..off + head_dim];
+                let normed = rmsnorm(head_slice, kn, rms_eps)?;
+                k_new[off..off + head_dim].copy_from_slice(&normed);
+            }
+        }
+    }
+
+    // ── 3. RoPE on Q and the new K. V isn't rotated. ───────────────
     apply_rope(&mut q, rope_cos, rope_sin, new_seq, n_heads, head_dim)?;
     apply_rope(&mut k_new, rope_cos, rope_sin, new_seq, n_kv_heads, head_dim)?;
 
-    // ── 3. Splice new K/V into the cache at pos_offset ─────────────
+    // ── 4. Splice new K/V into the cache at pos_offset ─────────────
     let dst_start = pos_offset * hkv;
     let dst_end = (pos_offset + new_seq) * hkv;
     cache_layer.k[dst_start..dst_end].copy_from_slice(&k_new);
     cache_layer.v[dst_start..dst_end].copy_from_slice(&v_new);
 
-    // ── 4. SDPA (GQA-aware) over the populated prefix ──────────────
+    // ── 5. SDPA (GQA-aware) over the populated prefix ──────────────
     let kv_seq = pos_offset + new_seq;
     let k_view = &cache_layer.k[..kv_seq * hkv];
     let v_view = &cache_layer.v[..kv_seq * hkv];
@@ -652,11 +692,45 @@ pub fn attention_block(
         pos_offset,
     )?;
 
-    // ── 5. Output projection (per-row matvec) ──────────────────────
+    // ── 6. Output projection (per-row matvec). Wo is [hidden_dim,
+    //      q_dim] — i.e., it shrinks back to hidden_dim. ──────────
     let mut out = Vec::with_capacity(new_seq * hidden_dim);
     for s in 0..new_seq {
-        let row = &attn[s * hidden_dim..(s + 1) * hidden_dim];
-        out.extend(wo.matvec(hidden_dim, hidden_dim, row)?);
+        let row = &attn[s * q_dim..(s + 1) * q_dim];
+        out.extend(wo.matvec(q_dim, hidden_dim, row)?);
+    }
+    Some(out)
+}
+
+/// Q8_0 embedding lookup. Same semantics as `embedding_lookup` but
+/// reads one row of a Q8_0 quantized embed table. The row is
+/// dequantized into a fresh `Vec<f32>` for the caller. Cost is
+/// `hidden_dim / 32` block decodes — negligible at one row per
+/// token, dominated by the layer math that follows.
+pub fn embedding_lookup_q8(
+    table_q8: &[u8],
+    n_vocab: usize,
+    hidden_dim: usize,
+    vocab_id: u32,
+) -> Option<Vec<f32>> {
+    let id = vocab_id as usize;
+    if id >= n_vocab { return None; }
+    if hidden_dim % Q8_BLOCK_SIZE != 0 { return None; }
+    let blocks_per_row = hidden_dim / Q8_BLOCK_SIZE;
+    let row_bytes = blocks_per_row * Q8_BLOCK_BYTES;
+    if table_q8.len() != n_vocab * row_bytes { return None; }
+    let row_off = id * row_bytes;
+    let mut out = Vec::with_capacity(hidden_dim);
+    for b in 0..blocks_per_row {
+        let block_off = row_off + b * Q8_BLOCK_BYTES;
+        let scale = f16_to_f32(u16::from_le_bytes([
+            table_q8[block_off],
+            table_q8[block_off + 1],
+        ]));
+        for k in 0..Q8_BLOCK_SIZE {
+            let q = table_q8[block_off + 2 + k] as i8;
+            out.push((q as f32) * scale);
+        }
     }
     Some(out)
 }

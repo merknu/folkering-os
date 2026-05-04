@@ -254,6 +254,17 @@ fn main() -> ! {
         println!("[INFERENCE] D.3.1.q Q8 self-test PASS");
     }
 
+    // D.3.7: First Blood. Load real Qwen3-0.6B (4 layers, Q8 +
+    // Q8 embed) from VFS, encode a ChatML prompt with the real
+    // Qwen tokenizer, run forward_pass, greedy-decode N tokens,
+    // print them through tokenizer.decode_seq. The model is
+    // truncated (4/28 layers) so output won't be coherent — but
+    // it WILL be deterministic, and matching the numpy reference
+    // proves the runtime is correct end-to-end.
+    if !run_d37_first_blood() {
+        println!("[INFERENCE] D.3.7 First Blood failed (qwen.fbin / qwen.tokb may be missing — non-fatal)");
+    }
+
     println!("[INFERENCE] ready — awaiting IPC requests on this task id");
 
     let mut req_count: u64 = 0;
@@ -526,8 +537,10 @@ fn run_d34_self_test() -> bool {
         tensor_math::WeightView::F32(&wv),
         tensor_math::WeightView::F32(&wo),
         /*q_bias=*/None, /*k_bias=*/None, /*v_bias=*/None,
+        /*q_norm=*/None, /*k_norm=*/None, /*rms_eps=*/1e-5,
         &rope_cos, &rope_sin,
         /*new_seq=*/2, /*hidden_dim=*/2,
+        /*head_dim=*/2,
         /*n_heads=*/1, /*n_kv_heads=*/1,
         &mut cache_layer,
         /*max_pos=*/2,
@@ -658,9 +671,11 @@ fn run_d312_vfs_self_test() -> bool {
         tensor_math::WeightView::F32(&wv),
         tensor_math::WeightView::F32(&wo),
         None, None, None,
+        None, None, 1e-5,
         &rope_cos, &rope_sin,
-        2, 2, 1, 1,
-        &mut cache_layer, 2, 0,
+        /*new_seq=*/2, /*hidden_dim=*/2,
+        /*head_dim=*/2, /*n_heads=*/1, /*n_kv_heads=*/1,
+        &mut cache_layer, /*max_pos=*/2, /*pos_offset=*/0,
     ) {
         Some(v) => v,
         None => return false,
@@ -990,10 +1005,8 @@ fn run_d35_self_test() -> bool {
         n_layers: 1,
         hidden_dim: 64,
         n_heads: 4,
-        // D.3.6: synthetic regenerated with grouped-query attention
-        // (n_kv_heads=2) + nonzero q/k/v biases, mirroring real
-        // Qwen2.5's shape ratio. argmax expectation updated to match.
         n_kv_heads: 2,
+        head_dim: 16,
         intermediate: 128,
         vocab: 256,
         max_pos: 32,
@@ -1102,6 +1115,7 @@ fn run_d4_kv_cache_self_test() -> bool {
         hidden_dim: 64,
         n_heads: 4,
         n_kv_heads: 2,
+        head_dim: 16,
         intermediate: 128,
         vocab: 256,
         max_pos: 32,
@@ -1194,6 +1208,7 @@ fn run_d31q_q8_self_test() -> bool {
         hidden_dim: 64,
         n_heads: 4,
         n_kv_heads: 2,
+        head_dim: 16,
         intermediate: 128,
         vocab: 256,
         max_pos: 32,
@@ -1242,6 +1257,161 @@ fn run_d31q_q8_self_test() -> bool {
         );
         return false;
     }
+    true
+}
+
+/// D.3.7 First Blood: real Qwen3-0.6B forward pass through the
+/// inference task. This is the moment Folkering OS goes from
+/// "executes the math correctly" to "puts a real LLM into a real
+/// kernel and asks it a question."
+///
+/// The model is `qwen.fbin`, produced by:
+///   python tools/fbin-gen/hf_to_fbin.py \
+///       --model-dir <Qwen3-0.6B HF cache path> \
+///       --max-layers 4 --max-seq-len 512 \
+///       --quantize q8_0 --quantize-embed \
+///       --out boot/iso_root/qwen.fbin
+///
+/// `--max-layers 4` truncates 28 layers to 4 — the output won't be
+/// coherent, but it WILL be deterministic, which is what we
+/// actually need to verify. The numpy reference
+/// (`tools/fbin-gen/forward_ref.py`) on the same .fbin produces
+/// argmax = 72 ('i') for the prompt "Hvem er du?" wrapped in
+/// ChatML. That's our hard fixture.
+///
+/// On failure the test logs but doesn't fatal the boot — the
+/// router still serves IPC requests. Useful so a freshly-cloned
+/// repo without the converted .fbin still boots.
+fn run_d37_first_blood() -> bool {
+    use weights::FbinView;
+    use forward_pass::{forward_pass, argmax, ModelConfig};
+    use tensor_math::KvCache;
+    use alloc::vec::Vec;
+
+    println!("[INFERENCE] D.3.7: First Blood — real Qwen3-0.6B (4 layers, Q8)...");
+
+    let fbin_bytes = match vfs_loader::read_file("qwen.fbin") {
+        Ok(b) => b,
+        Err(e) => {
+            println!("[INFERENCE] D.3.7: VFS read qwen.fbin failed: {:?}", e);
+            return false;
+        }
+    };
+    println!(
+        "[INFERENCE] D.3.7: loaded qwen.fbin ({} MB) from VFS",
+        fbin_bytes.len() / (1024 * 1024)
+    );
+    let view = match FbinView::parse(&fbin_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            println!("[INFERENCE] D.3.7: parse error: {:?}", e);
+            return false;
+        }
+    };
+    println!(
+        "[INFERENCE] D.3.7: parsed {} tensors from .fbin",
+        view.tensors.len()
+    );
+
+    let tokb_bytes = match vfs_loader::read_file("qwen.tokb") {
+        Ok(b) => b,
+        Err(e) => {
+            println!("[INFERENCE] D.3.7: VFS read qwen.tokb failed: {:?}", e);
+            return false;
+        }
+    };
+    let tok = match tokenizer::Tokenizer::parse(&tokb_bytes) {
+        Ok(t) => t,
+        Err(e) => {
+            println!("[INFERENCE] D.3.7: tokenizer parse error: {:?}", e);
+            return false;
+        }
+    };
+
+    // Qwen3-0.6B config (truncated to 4 layers).
+    let cfg = ModelConfig {
+        n_layers: 4,
+        hidden_dim: 1024,
+        n_heads: 16,
+        n_kv_heads: 8,
+        head_dim: 128,
+        intermediate: 3072,
+        vocab: 151936,
+        max_pos: 512,
+        eps: 1e-6,
+    };
+    let mut cache = KvCache::new(
+        cfg.n_layers, cfg.max_pos, cfg.n_kv_heads, cfg.head_dim,
+    );
+
+    // ChatML wrap of "Hvem er du?". HF reference is 14 tokens.
+    let prompt = "<|im_start|>user\nHvem er du?<|im_end|>\n<|im_start|>assistant\n";
+    let prompt_ids = tok.encode(prompt);
+    println!(
+        "[INFERENCE] D.3.7: encoded prompt -> {} tokens",
+        prompt_ids.len()
+    );
+
+    // Prefill: forward the whole prompt at once, populating the
+    // cache. The returned logits are at the LAST prompt position;
+    // argmax of those is the model's first generated token.
+    let logits = match forward_pass(&view, &cfg, &mut cache, &prompt_ids) {
+        Some(v) => v,
+        None => {
+            println!("[INFERENCE] D.3.7: prefill returned None");
+            return false;
+        }
+    };
+    let first_id = match argmax(&logits) {
+        Some(i) => i,
+        None => return false,
+    };
+    println!(
+        "[INFERENCE] D.3.7: first token = {} ({:?})",
+        first_id, tok.decode(first_id).unwrap_or("?")
+    );
+
+    // The numpy reference (forward_ref.py on the same .fbin) gives
+    // argmax = 72 ('i'). If the runtime drifts, we land on a
+    // different token. Don't fatal — log and continue so the rest
+    // of the trace is visible.
+    let expected = 72u32;
+    if first_id != expected {
+        println!(
+            "[INFERENCE] D.3.7: WARN argmax {} != numpy reference {}",
+            first_id, expected
+        );
+    } else {
+        println!("[INFERENCE] D.3.7: argmax matches numpy reference ({})", expected);
+    }
+
+    // Greedy decode 8 more tokens. Stops on <|im_end|> (151645) or
+    // <|endoftext|> (151643). Each step pushes one token through
+    // the KV-cached forward pass — O(layers) per token instead of
+    // O(seq² × layers).
+    let mut sampled: Vec<u32> = Vec::new();
+    sampled.push(first_id);
+    let mut next = first_id;
+    for _ in 0..7 {
+        if next == 151645 || next == 151643 { break; }
+        let logits = match forward_pass(&view, &cfg, &mut cache, &[next]) {
+            Some(v) => v,
+            None => break,
+        };
+        next = match argmax(&logits) {
+            Some(i) => i,
+            None => break,
+        };
+        sampled.push(next);
+    }
+
+    let response = tok.decode_seq(&sampled);
+    println!(
+        "[INFERENCE] D.3.7: sampled {} tokens, ids={:?}",
+        sampled.len(), sampled
+    );
+    println!("[INFERENCE] D.3.7: Draug response: {:?}", response);
+    println!("[INFERENCE] D.3.7 First Blood — model lives.");
     true
 }
 

@@ -73,14 +73,21 @@ pub struct ModelConfig {
     pub n_heads: usize,
     /// Grouped-query attention: number of distinct K/V heads. For
     /// non-GQA models pass `n_kv_heads = n_heads`. Real Qwen2.5-0.5B
-    /// has `n_heads=14, n_kv_heads=2`.
+    /// has `n_heads=14, n_kv_heads=2`; Qwen3-0.6B has 16/8.
     pub n_kv_heads: usize,
+    /// Per-head dimension. Qwen3 sets this *independently* of
+    /// `hidden_dim / n_heads` — Qwen3-0.6B has `hidden=1024,
+    /// n_heads=16, head_dim=128`, so `n_heads*head_dim=2048` and the
+    /// Wq/Wo projections operate on a 2048-dim attention space that
+    /// shrinks back to 1024 across Wo. Qwen2.5 / Llama set head_dim
+    /// = hidden_dim / n_heads, so this just becomes the same number.
+    pub head_dim: usize,
     pub intermediate: usize,
     pub vocab: usize,
     /// Maximum positions the embedded RoPE tables cover. Forward
     /// pass asserts `cache.seq_len + new_token_ids.len() <= max_pos`.
     pub max_pos: usize,
-    /// RMSNorm epsilon. Qwen2.5 uses 1e-5.
+    /// RMSNorm epsilon. Qwen2.5 uses 1e-5; Qwen3 uses 1e-6.
     pub eps: f32,
 }
 
@@ -111,8 +118,8 @@ pub fn forward_pass(
 ) -> Option<Vec<f32>> {
     let new_seq = new_token_ids.len();
     if new_seq == 0 { return None; }
-    if cfg.hidden_dim % cfg.n_heads != 0 { return None; }
-    let head_dim = cfg.hidden_dim / cfg.n_heads;
+    let head_dim = cfg.head_dim;
+    if head_dim == 0 || head_dim % 2 != 0 { return None; }
     let pairs = head_dim / 2;
 
     // Validate cache geometry matches model config.
@@ -124,7 +131,15 @@ pub fn forward_pass(
     let pos_offset = cache.seq_len;
     if pos_offset + new_seq > cache.max_pos { return None; }
 
-    let embed = view.find("embed").and_then(|t| view.read_f32(t))?;
+    // Embed table: prefer fp32, fall back to Q8 if that's how the
+    // .fbin stored it. Both paths return a Vec<f32> per token row.
+    let embed_meta = view.find("embed")?;
+    let embed_loaded = match embed_meta.dtype {
+        DType::F32 => LoadedWeight::F32(view.read_f32(embed_meta)?),
+        DType::Q8 => LoadedWeight::Q8(view.data_for(embed_meta)),
+        DType::Q4 => return None,
+    };
+
     let final_norm = view.find("final_norm").and_then(|t| view.read_f32(t))?;
     let rope_cos_full = view.find("rope_cos").and_then(|t| view.read_f32(t))?;
     let rope_sin_full = view.find("rope_sin").and_then(|t| view.read_f32(t))?;
@@ -140,12 +155,19 @@ pub fn forward_pass(
     let rope_cos = &rope_cos_full[rope_start..rope_end];
     let rope_sin = &rope_sin_full[rope_start..rope_end];
 
-    // Step 1: embedding lookup for the new tokens only.
+    // Step 1: embedding lookup for the new tokens only. Dispatches
+    // on the table's stored dtype so a Q8 embed (saves ~75% on the
+    // table) drops in transparently.
     let mut x: Vec<f32> = Vec::with_capacity(new_seq * cfg.hidden_dim);
     for &id in new_token_ids {
-        let row = tensor_math::embedding_lookup(
-            &embed, cfg.vocab, cfg.hidden_dim, id,
-        )?;
+        let row = match &embed_loaded {
+            LoadedWeight::F32(t) => tensor_math::embedding_lookup(
+                t, cfg.vocab, cfg.hidden_dim, id,
+            )?,
+            LoadedWeight::Q8(t) => tensor_math::embedding_lookup_q8(
+                t, cfg.vocab, cfg.hidden_dim, id,
+            )?,
+        };
         x.extend(row);
     }
 
@@ -169,6 +191,12 @@ pub fn forward_pass(
         let q_bias = view.find(&join(&prefix, "q_bias")).and_then(|t| view.read_f32(t));
         let k_bias = view.find(&join(&prefix, "k_bias")).and_then(|t| view.read_f32(t));
         let v_bias = view.find(&join(&prefix, "v_bias")).and_then(|t| view.read_f32(t));
+        // Qwen3-only: per-head RMSNorm on Q and K after projection,
+        // before RoPE. Llama-3 / Qwen2.5 don't ship these tensors;
+        // their absence flows through as `None` and the runtime
+        // skips the normalization step.
+        let q_norm = view.find(&join(&prefix, "q_norm")).and_then(|t| view.read_f32(t));
+        let k_norm = view.find(&join(&prefix, "k_norm")).and_then(|t| view.read_f32(t));
         let ffn_norm = view.find(&join(&prefix, "ffn_norm"))
             .and_then(|t| view.read_f32(t))?;
         let gate = load_weight(view, &join(&prefix, "gate"))?;
@@ -189,9 +217,10 @@ pub fn forward_pass(
             &x_normed,
             wq.view(), wk.view(), wv.view(), wo.view(),
             q_bias.as_deref(), k_bias.as_deref(), v_bias.as_deref(),
+            q_norm.as_deref(), k_norm.as_deref(), cfg.eps,
             rope_cos, rope_sin,
             new_seq, cfg.hidden_dim,
-            cfg.n_heads, cfg.n_kv_heads,
+            head_dim, cfg.n_heads, cfg.n_kv_heads,
             &mut cache.layers[li],
             cache.max_pos,
             pos_offset,
@@ -231,9 +260,12 @@ pub fn forward_pass(
     let last_normed = tensor_math::rmsnorm(last, &final_norm, cfg.eps)?;
 
     // Step 4: lm_head (tied to embed) — logits = embed @ last_normed.
-    // `embed` has shape [vocab, hidden], so it's already in the
-    // [out_dim, in_dim] orientation `linear` wants.
-    let logits = tensor_math::linear(&embed, cfg.hidden_dim, cfg.vocab, &last_normed)?;
+    // `embed` has shape [vocab, hidden], already in the [out_dim,
+    // in_dim] orientation `linear` wants. Dispatch on the embed's
+    // dtype so a Q8 table runs through linear_q8 (zero-copy on the
+    // weight bytes; just dequantizes block-by-block during the
+    // matvec).
+    let logits = embed_loaded.view().matvec(cfg.hidden_dim, cfg.vocab, &last_normed)?;
 
     // Step 5: every layer succeeded — commit the new positions to
     // the cache so the next call lines up at the right offset.
