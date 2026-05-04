@@ -1,0 +1,27 @@
+[package]
+name = "inference"
+version = "0.1.0"
+edition = "2021"
+description = "Folkering OS Phase D — hybrid inference service (router + local + proxy)"
+
+[[bin]]
+name = "inference"
+path = "src/main.rs"
+
+[dependencies]
+libfolk = { path = "../libfolk" }
+
+# Burn tensor abstraction layer.
+#
+# `default-features = false` is load-bearing: the default `std` feature
+# pulls in `colored`, `num-traits/std`, and `burn-std` which all require
+# a real `std`. With it disabled, `burn-tensor` compiles in a `no_std +
+# alloc` environment — the API surface is preserved, you just have to
+# plug in a backend yourself.
+#
+# We keep this dep present at D.1 (router) so the workspace tree
+# resolves the no_std feature flags now and `cargo check` for D.2
+# (Burn local backend) doesn't have to re-run dependency resolution
+# from scratch. The local-backend module references `burn_tensor` only
+# behind an unimplemented stub today.
+burn-tensor = { version = "0.21.0-pre.4", default-features = false }

@@ -1,7 +1,15 @@
-# Phase D — AI-native Inference Inside Folkering OS
+# Phase D — Hybrid AI-native Inference Inside Folkering OS
 
-**Status:** design notes, no implementation yet. This is the Phase D bible:
-when we cut the network cord on Draug, this is the path we'll walk.
+**Status:** D.1 (hybrid router + IPC abstraction) landed 2026-05-04 in
+PR (TBD — this commit). D.2 onward unimplemented. This doc is the
+Phase D bible.
+
+**Strategy update (2026-05-04):** the goal is *hybrid* inference, not
+a hard cut from the network. Local Burn engine becomes the primary
+when it's ready; the proxy stays as a transparent fallback for
+heavy-lift requests. The router in `userspace/inference/` is the seam
+that lets us land local capability one model at a time without
+breaking any caller.
 
 **Goal:** Run an LLM (Qwen2.5, Gemma, Phi, etc.) *inside* Folkering OS — no
 Ollama on the host, no folkering-proxy bridge, no LAN dependency. The OS
@@ -108,48 +116,69 @@ shipping and the bottleneck is empirically the matmul, not anything else.
 
 ---
 
-## 3. Recommended phasing
+## 3. Phasing (revised 2026-05-04)
 
 ```
-Phase D.1 — CPU-only inference, prove the loop closes
-   • Resurrect userspace/inference-server with Burn 0.18+
-   • Target: Qwen2.5-0.5B or Phi-3-mini Q4_0. Both fit ≤500 MB.
-   • Bind to Draug via existing inference syscall (0x70 ASK_GEMINI shape).
-   • Success metric: Phase 17 L1 PASS without folkering-proxy LLM hop.
-       Latency target: ≤30s per L1 (acceptable for autonomous loop).
+Phase D.1 — Inference router + IPC abstraction  ← LANDED 2026-05-04
+   • New `userspace/inference/` crate. IPC service that owns:
+       - `router::dispatch`         — picks local vs proxy
+       - `local_backend::run`       — D.1 stub: NotImplemented
+       - `proxy_backend::run`       — calls libfolk::sys::llm_generate
+       - `tensor_math::self_test`   — runs at boot (2x2 matmul)
+   • Wire format: shmem region with `InferenceWire` header carrying
+     model name + prompt + result buffer. Same shape as
+     `llm_generate` so the proxy backend is a 5-line delegator.
+   • Burn 0.21 verified to compile in our `no_std + alloc` custom
+     target (`burn-tensor` with `default-features = false`).
+   • Out-of-tree: callers (draug-daemon) still call `llm_generate`
+     direct; D.1's only deliverable is the router skeleton + proof
+     Burn fits. Migrating callers is D.1.5.
 
-Phase D.2 — Move the proxy boundary
-   • folkering-proxy keeps `cargo test`, FETCH_SOURCE, GRAPH_CALLERS.
-     Drops the LLM forwarding path.
-   • Draug compositor cuts COM2 LLM requests, calls local inference
-     instead. Same `mcp.async_tool_gen` plumbing.
-   • Validates: VM 800 boots disconnected from any LLM-host network,
-     still produces L1 PASSes.
+Phase D.2 — Burn local backend, dummy matmul over IPC
+   • Implement Burn's `Backend` trait for a custom CPU backend
+     (`FolkeringCpu`) that owns `Vec<f32>` storage and uses
+     `tensor_math::matmul` under the hood.
+   • Local backend's `run` recognizes a sentinel model name like
+     `"local:matmul-test"` and runs a 32×32 matmul over IPC,
+     returning the L2 norm of the result as a sanity-check string.
+   • Caller (a tiny test app) verifies routing is functional:
+     same IPC request reaches the local backend instead of the
+     proxy.
 
-Phase D.3 — Quantization-aware Burn backend
-   • Burn's INT8/INT4 path (currently nightly) lands in a known-good
-     state. Switch the default model load path to quantized.
-   • Memory floor drops from ~500 MB to ~200 MB for the same model.
+Phase D.3 — Real model: Qwen2.5-0.5B Q4 forward pass
+   • Quantized weights in Synapse VFS (loaded via libfolk::sys::synapse).
+   • Tokenizer: re-use the BPE merger from the legacy
+     inference-server crate (still in tree). Project memory:
+     `folkering-bpe-tokenizer.md`.
+   • Forward pass via Burn tensors backed by `FolkeringCpu`. Per-row
+     yield_cpu so the GUI stays responsive.
+   • Success metric: end-to-end "Hello → " → token via local backend.
+     Latency target: ≤2s per token (Q4 0.5B on CPU is realistic).
 
-Phase D.4 — VirGL compute bring-up
+Phase D.4 — KV-cache + memory plumbing
+   • Pre-allocated KV-cache buffer in the inference task's heap;
+     bump-allocator-friendly (alloc once, reuse forever per session).
+   • Streaming response: extend the wire to support a "session"
+     handle; subsequent prompts append to the same KV without re-
+     processing the prefix.
+   • At this point draug-daemon's TCP/Ollama path can be retired —
+     the local backend handles its routine workload, proxy stays
+     for `cargo test` + heavy models only.
+
+Phase D.5 — VirGL compute bring-up
    • Negotiate VIRTIO_GPU_F_VIRGL during init (already detected).
-   • Submit a "hello world" SPIR-V compute (vector add). Verify result
+   • Submit a SPIR-V compute kernel (vector add). Verify result
      via VIRTIO_GPU_RESOURCE_READBACK.
-   • Translate one Burn matmul kernel to GLSL compute. Plumb a backend.
-   • Success metric: 8B model at >20 tokens/sec on a host with a 2080Ti
-     equivalent. We've earned the Phase D label at this point.
-
-Phase D.5 — Tooling parity
-   • LiteRT-LM as build-time HuggingFace → Burn-tensor converter.
-     Run on host during userspace build; ship serialized weights into
-     the OS image (or fetch via Synapse VFS at first boot).
-   • Optional: quantization passes (GPTQ, AWQ) baked into the same
-     build step.
+   • Translate one Burn matmul kernel to GLSL compute. Plumb the
+     `FolkeringGpu` backend, swap router's local backend over.
+   • Success metric: 8B model at >20 tokens/sec on a host with
+     a 2080Ti-class GPU.
 ```
 
-The milestones are stackable. Phase D.1 alone unlocks the "OS thinks
-while disconnected" headline; D.2 makes it real; D.3 makes it
-practical; D.4 makes it competitive.
+The milestones are stackable. **D.1 unlocks the seam without changing
+behavior**; D.2 plants the local engine alongside the proxy fallback;
+D.3 makes the local engine actually answer; D.4 makes it practical;
+D.5 makes it competitive.
 
 ---
 
