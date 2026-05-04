@@ -126,6 +126,27 @@ pub(crate) fn init_with_mac(mac: [u8; 6]) {
 
     crate::serial_strln!("[NET] Stack initialized, DHCP discovery starting...");
 
+    // IF is still cleared at this point in boot — `lib.rs` doesn't
+    // do its first `sti` until after every driver has come up. The
+    // DHCP wait loop below depends on `uptime_ms()` advancing for
+    // the 10-second escape clause, and that counter only ticks
+    // when the LAPIC timer ISR fires. Without IF=1 we observed the
+    // loop spinning forever on Proxmox KVM (Issue #49 family —
+    // RFL=0x0203, 50+ DHCP DISCOVER retries with no timeout).
+    //
+    // Save the prior IF state, enable IRQs for the duration of the
+    // DHCP wait, restore on exit so no caller sees an unexpected
+    // change in interrupt state.
+    let saved_flags: u64;
+    unsafe {
+        core::arch::asm!(
+            "pushfq; pop {0}",
+            out(reg) saved_flags,
+            options(nomem, preserves_flags),
+        );
+        core::arch::asm!("sti", options(nomem, nostack, preserves_flags));
+    }
+
     // Drive the network stack until DHCP assigns an IP.
     let dhcp_start = crate::timer::uptime_ms();
     loop {
@@ -141,6 +162,12 @@ pub(crate) fn init_with_mac(mac: [u8; 6]) {
             break;
         }
         for _ in 0..10_000 { core::hint::spin_loop(); }
+    }
+
+    // Restore prior IF state. If IRQs were off on entry, mask them
+    // back so the rest of init runs in its original quiescent mode.
+    if (saved_flags & (1u64 << 9)) == 0 {
+        unsafe { core::arch::asm!("cli", options(nomem, nostack, preserves_flags)); }
     }
 }
 

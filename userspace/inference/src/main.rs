@@ -69,14 +69,15 @@ mod forward_pass;
 
 // ── Bump allocator ──────────────────────────────────────────────────
 //
-// 256 KiB. The router itself doesn't allocate much (one map per
-// request); the proxy backend uses the kernel's syscall_llm_generate
-// path which allocates kernel-side. Local backend (Burn) will need
-// significantly more heap once D.2 lands — at that point we either
-// bump this constant up or move to a per-request slab to bound
-// per-call usage.
-
-const HEAP_SIZE: usize = 256 * 1024;
+// 8 MiB. D.3.5 / D.3.6 forward-pass loads the entire .fbin into
+// f32 Vecs (embed alone is vocab*hidden*4 ≈ 64 KiB on the
+// synthetic) and then accumulates per-layer intermediates without
+// freeing — bump never deallocates. 256 KiB hit OOM during the
+// boot self-test; 8 MiB is comfortable for the synthetic and
+// leaves headroom for a `--max-layers 4` real Qwen2.5 fbin. When
+// real weights land we either move to a slab allocator or page in
+// tensors on demand from the .fbin (zero-copy).
+const HEAP_SIZE: usize = 8 * 1024 * 1024;
 
 struct BumpAllocator {
     heap: UnsafeCell<[u8; HEAP_SIZE]>,
