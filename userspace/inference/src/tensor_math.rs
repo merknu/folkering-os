@@ -24,6 +24,115 @@ use alloc::vec::Vec;
 /// `m * k` loop body never reaches 32 cells). Tunable per-phase.
 const MATMUL_YIELD_EVERY: usize = 32;
 
+/// Q8_0 block size — same as llama.cpp / GGUF. Picked for
+/// cache-friendly inner loops: a 32-element block is one f16 scale
+/// + 32 i8 vals = 34 bytes, fits comfortably in any sane L1.
+pub const Q8_BLOCK_SIZE: usize = 32;
+/// Q8_0 bytes per block: 2 (f16 scale) + 32 (i8 vals).
+pub const Q8_BLOCK_BYTES: usize = 34;
+
+/// View into a weight matrix that may be either fp32 or Q8_0. The
+/// matvec entry point (`matvec`) dispatches to `linear` for the
+/// fp32 case and `linear_q8` for the quantized case; both produce
+/// the same `Vec<f32>` so the rest of the forward pass doesn't have
+/// to care which backing format the .fbin used.
+pub enum WeightView<'a> {
+    F32(&'a [f32]),
+    /// Q8_0: blocks of `[f16 scale, 32 i8 vals]` packed contiguously
+    /// in row-major order. The matrix is logically `[out_dim,
+    /// in_dim]` row-major with `in_dim` divisible by Q8_BLOCK_SIZE.
+    Q8(&'a [u8]),
+}
+
+impl<'a> WeightView<'a> {
+    /// out[i] = sum_k(weights[i, k] * x[k]). Returns `None` on shape
+    /// mismatch — proxy through `?` keeps call sites readable.
+    pub fn matvec(&self, in_dim: usize, out_dim: usize, x: &[f32]) -> Option<Vec<f32>> {
+        match self {
+            Self::F32(w) => linear(w, in_dim, out_dim, x),
+            Self::Q8(blocks) => linear_q8(blocks, in_dim, out_dim, x),
+        }
+    }
+}
+
+/// Decode a 16-bit half-precision float to f32. No `core::simd`,
+/// no libm — pure bit twiddling. Hot path for Q8_0 dequantize.
+#[inline]
+pub fn f16_to_f32(half: u16) -> f32 {
+    let sign = (half >> 15) & 1;
+    let exp = (half >> 10) & 0x1f;
+    let mant = (half & 0x3ff) as u32;
+    let bits: u32 = if exp == 0 {
+        if mant == 0 {
+            (sign as u32) << 31
+        } else {
+            // Subnormal: renormalize.
+            let mut m = mant;
+            let mut e: i32 = -14;
+            while (m & 0x400) == 0 {
+                m <<= 1;
+                e -= 1;
+            }
+            m &= 0x3ff;
+            let f32_exp = (e + 127) as u32;
+            ((sign as u32) << 31) | (f32_exp << 23) | (m << 13)
+        }
+    } else if exp == 0x1f {
+        // Inf or NaN: propagate.
+        ((sign as u32) << 31) | (0xff << 23) | (mant << 13)
+    } else {
+        // Normal: shift exponent bias from 15 to 127 and pad
+        // mantissa from 10 bits to 23 bits.
+        let f32_exp = (exp as u32) + (127 - 15);
+        ((sign as u32) << 31) | (f32_exp << 23) | (mant << 13)
+    };
+    f32::from_bits(bits)
+}
+
+/// Q8_0 matvec: same as `linear` but reads weights from packed
+/// blocks of `[f16 scale, 32 i8 vals]`. Dequantizes one element at a
+/// time inside the inner loop — the int8 → f32 multiply is two
+/// int-to-float conversions and a multiply, ~3 cycles, dwarfed by
+/// the savings from streaming 1 byte instead of 4 from memory. For
+/// Qwen-sized projections (~1 GB fp32 → ~265 MB Q8_0) this puts
+/// the whole layer's working set in L2 instead of pushing into RAM.
+pub fn linear_q8(weights_q8: &[u8], in_dim: usize, out_dim: usize, x: &[f32]) -> Option<Vec<f32>> {
+    if in_dim % Q8_BLOCK_SIZE != 0 { return None; }
+    if x.len() != in_dim { return None; }
+    let blocks_per_row = in_dim / Q8_BLOCK_SIZE;
+    let row_bytes = blocks_per_row * Q8_BLOCK_BYTES;
+    if weights_q8.len() != out_dim * row_bytes { return None; }
+
+    let mut out = Vec::with_capacity(out_dim);
+    let mut since_yield: usize = 0;
+    for i in 0..out_dim {
+        let mut acc = 0.0f32;
+        let row_off = i * row_bytes;
+        for b in 0..blocks_per_row {
+            let block_off = row_off + b * Q8_BLOCK_BYTES;
+            let scale = f16_to_f32(u16::from_le_bytes([
+                weights_q8[block_off],
+                weights_q8[block_off + 1],
+            ]));
+            let x_off = b * Q8_BLOCK_SIZE;
+            // Inner block: 32 multiply-accumulates with one shared
+            // scale. The compiler unrolls this in release; the i8 is
+            // sign-extended to i32 by the cast, then to f32.
+            for k in 0..Q8_BLOCK_SIZE {
+                let q = weights_q8[block_off + 2 + k] as i8;
+                acc += (q as f32) * scale * x[x_off + k];
+            }
+            since_yield += Q8_BLOCK_SIZE;
+            if since_yield >= MATMUL_YIELD_EVERY {
+                since_yield = 0;
+                libfolk::sys::yield_cpu();
+            }
+        }
+        out.push(acc);
+    }
+    Some(out)
+}
+
 /// Row-major 2-D tensor of f32. Owns its storage on the bump heap.
 pub struct Tensor2 {
     rows: usize,
@@ -214,17 +323,17 @@ pub fn silu(x: &[f32]) -> Vec<f32> {
 /// starts mattering.
 pub fn swiglu_ffn(
     x: &[f32],
-    gate_proj: &[f32],
-    up_proj: &[f32],
-    down_proj: &[f32],
+    gate_proj: WeightView,
+    up_proj: WeightView,
+    down_proj: WeightView,
     hidden: usize,
     intermediate: usize,
 ) -> Option<Vec<f32>> {
-    let g = linear(gate_proj, hidden, intermediate, x)?;
-    let u = linear(up_proj, hidden, intermediate, x)?;
+    let g = gate_proj.matvec(hidden, intermediate, x)?;
+    let u = up_proj.matvec(hidden, intermediate, x)?;
     let g_silu = silu(&g);
     let mixed = elemwise_mul(&g_silu, &u)?;
-    linear(down_proj, intermediate, hidden, &mixed)
+    down_proj.matvec(intermediate, hidden, &mixed)
 }
 
 /// In-place softmax over a 1-D slice. Numerically stable: subtract
@@ -476,7 +585,7 @@ impl KvCache {
 #[allow(clippy::too_many_arguments)]
 pub fn attention_block(
     x: &[f32],
-    wq: &[f32], wk: &[f32], wv: &[f32], wo: &[f32],
+    wq: WeightView, wk: WeightView, wv: WeightView, wo: WeightView,
     q_bias: Option<&[f32]>,
     k_bias: Option<&[f32]>,
     v_bias: Option<&[f32]>,
@@ -505,9 +614,9 @@ pub fn attention_block(
     let mut v_new = Vec::with_capacity(new_seq * hkv);
     for s in 0..new_seq {
         let row = &x[s * hidden_dim..(s + 1) * hidden_dim];
-        let mut q_row = linear(wq, hidden_dim, hidden_dim, row)?;
-        let mut k_row = linear(wk, hidden_dim, hkv, row)?;
-        let mut v_row = linear(wv, hidden_dim, hkv, row)?;
+        let mut q_row = wq.matvec(hidden_dim, hidden_dim, row)?;
+        let mut k_row = wk.matvec(hidden_dim, hkv, row)?;
+        let mut v_row = wv.matvec(hidden_dim, hkv, row)?;
         if let Some(b) = q_bias {
             for i in 0..hidden_dim { q_row[i] += b[i]; }
         }
@@ -547,7 +656,7 @@ pub fn attention_block(
     let mut out = Vec::with_capacity(new_seq * hidden_dim);
     for s in 0..new_seq {
         let row = &attn[s * hidden_dim..(s + 1) * hidden_dim];
-        out.extend(linear(wo, hidden_dim, hidden_dim, row)?);
+        out.extend(wo.matvec(hidden_dim, hidden_dim, row)?);
     }
     Some(out)
 }
@@ -714,7 +823,13 @@ pub fn self_test() -> bool {
     let gate = [1.0_f32, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, -1.0];
     let up   = [1.0_f32, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0];
     let down = [1.0_f32, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0];
-    let ffn = match swiglu_ffn(&[1.0_f32, 2.0], &gate, &up, &down, 2, 4) {
+    let ffn = match swiglu_ffn(
+        &[1.0_f32, 2.0],
+        WeightView::F32(&gate),
+        WeightView::F32(&up),
+        WeightView::F32(&down),
+        2, 4,
+    ) {
         Some(v) => v,
         None => return false,
     };

@@ -70,7 +70,7 @@ from typing import Dict
 
 # Local helpers
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from fbin import write_fbin, DTYPE_F32  # type: ignore
+from fbin import write_fbin, q8_0_bytes, DTYPE_F32, DTYPE_Q8, Q8_BLOCK_SIZE  # type: ignore
 
 import numpy as np
 from safetensors import safe_open
@@ -157,17 +157,48 @@ def precompute_rope(
 def to_f32_le_bytes(arr: np.ndarray) -> bytes:
     """Force f32 little-endian byte layout regardless of input dtype.
 
-    HF safetensors emit bf16 / f16 / f32 depending on the model. For
-    D.3.1.3 we promote everything to f32 — the inference task's matmul
-    path is f32-only. Quantization (and lower-precision compute) come
-    in D.3.3 quant-aware, after we've proven the f32 reference path.
+    HF safetensors emit bf16 / f16 / f32 depending on the model. We
+    promote everything to f32 first; the .fbin then either keeps it
+    or routes through a quantizer based on `emit_tensor`'s `quant`
+    argument.
     """
     if arr.dtype != np.float32:
         arr = arr.astype(np.float32)
     return arr.astype("<f4").tobytes()
 
 
-def emit_tensor(out: list, name: str, arr: np.ndarray):
+# Suffix sets that decide whether `emit_tensor` quantizes the tensor
+# (when --quantize q8_0 is on). Projections compress well; norms,
+# biases, and the embed table are kept fp32 because they're small
+# and / or precision-sensitive.
+QUANTIZABLE_SUFFIXES = {".q", ".k", ".v", ".o", ".gate", ".up", ".down"}
+# Top-level names that always stay fp32 even with --quantize on.
+ALWAYS_F32_NAMES = {"embed", "final_norm", "lm_head"}
+
+
+def emit_tensor(
+    out: list,
+    name: str,
+    arr: np.ndarray,
+    quant: str = "f32",
+):
+    """Append a tensor to the output list, quantizing if both the
+    `quant` mode says so AND the tensor's name matches a quantizable
+    suffix. Falls back to f32 otherwise."""
+    is_quant_candidate = (
+        quant == "q8_0"
+        and name not in ALWAYS_F32_NAMES
+        and not name.endswith("_norm")  # attn_norm, ffn_norm, layernorm
+        and not name.endswith("_bias")
+    )
+    if is_quant_candidate and any(name.endswith(s) for s in QUANTIZABLE_SUFFIXES):
+        n_elem = int(np.prod(arr.shape))
+        if n_elem % Q8_BLOCK_SIZE == 0:
+            out.append((name, DTYPE_Q8, list(arr.shape), q8_0_bytes(arr.flatten())))
+            return
+        # Tensor doesn't divide evenly; fall back to f32. Common in
+        # tiny synthetic models where some dim < 32; real Qwen always
+        # divides cleanly so this just affects the fixture.
     out.append((name, DTYPE_F32, list(arr.shape), to_f32_le_bytes(arr)))
 
 
@@ -176,6 +207,7 @@ def convert(
     out_path: str,
     max_layers: int | None = None,
     max_seq_len: int | None = None,
+    quant: str = "f32",
 ):
     cfg_path = os.path.join(model_dir, "config.json")
     with open(cfg_path) as f:
@@ -207,7 +239,7 @@ def convert(
 
     # ── Embedding ──
     if "model.embed_tokens.weight" in weights:
-        emit_tensor(tensors, "embed", weights["model.embed_tokens.weight"])
+        emit_tensor(tensors, "embed", weights["model.embed_tokens.weight"], quant=quant)
     else:
         raise KeyError("missing model.embed_tokens.weight")
 
@@ -221,20 +253,20 @@ def convert(
                 # runtime will skip the corresponding op.
                 continue
             our_name = f"layer.{layer_i}.{our_suffix}"
-            emit_tensor(tensors, our_name, weights[hf_name])
+            emit_tensor(tensors, our_name, weights[hf_name], quant=quant)
 
     # ── Final norm ──
     if "model.norm.weight" in weights:
-        emit_tensor(tensors, "final_norm", weights["model.norm.weight"])
+        emit_tensor(tensors, "final_norm", weights["model.norm.weight"], quant=quant)
 
     # ── lm_head (skip if tied to embed) ──
     if not tie_emb and "lm_head.weight" in weights:
-        emit_tensor(tensors, "lm_head", weights["lm_head.weight"])
+        emit_tensor(tensors, "lm_head", weights["lm_head.weight"], quant=quant)
 
     # ── RoPE precomputed tables ──
     cos_t, sin_t = precompute_rope(head_dim, max_pos, rope_theta)
-    emit_tensor(tensors, "rope_cos", cos_t)
-    emit_tensor(tensors, "rope_sin", sin_t)
+    emit_tensor(tensors, "rope_cos", cos_t, quant=quant)
+    emit_tensor(tensors, "rope_sin", sin_t, quant=quant)
 
     blob = write_fbin(tensors)
     with open(out_path, "wb") as f:
@@ -257,6 +289,11 @@ def main():
                     help="Truncate to first N layers (default: all)")
     ap.add_argument("--max-seq-len", type=int, default=None,
                     help="Override max_position_embeddings for RoPE table size")
+    ap.add_argument("--quantize", choices=["f32", "q8_0"], default="f32",
+                    help="Quantize the projection matrices (q/k/v/o/gate/up/down). "
+                         "Q8_0 stores 32-element blocks of [f16 scale, 32 i8 vals], "
+                         "shrinking the projections ~4x. Embed, lm_head, norms, and "
+                         "biases stay fp32 for precision.")
     args = ap.parse_args()
 
     convert(
@@ -264,6 +301,7 @@ def main():
         out_path=args.out,
         max_layers=args.max_layers,
         max_seq_len=args.max_seq_len,
+        quant=args.quantize,
     )
 
 

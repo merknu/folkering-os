@@ -29,8 +29,41 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::tensor_math;
-use crate::tensor_math::KvCache;
-use crate::weights::FbinView;
+use crate::tensor_math::{KvCache, WeightView};
+use crate::weights::{DType, FbinView, TensorMeta};
+
+/// Owned-or-borrowed weight tensor. The fp32 path materialises a
+/// fresh `Vec<f32>` (the `.fbin` data section is a borrowed slice
+/// into the underlying VFS read; we copy it once here so the math
+/// path can hold a `&[f32]`). The Q8_0 path borrows the raw bytes
+/// directly — no dequantization at load time, the inner matvec
+/// loop pays per-block.
+enum LoadedWeight<'a> {
+    F32(Vec<f32>),
+    Q8(&'a [u8]),
+}
+
+impl<'a> LoadedWeight<'a> {
+    fn view<'b>(&'b self) -> WeightView<'b> {
+        match self {
+            Self::F32(v) => WeightView::F32(v.as_slice()),
+            Self::Q8(b) => WeightView::Q8(b),
+        }
+    }
+}
+
+/// Load a weight tensor by name, dispatching on its on-disk dtype.
+/// Q8_0 stays as borrowed bytes (zero copy); fp32 is read into a
+/// fresh `Vec<f32>`. Returns `None` if the tensor is missing or
+/// has an unsupported dtype.
+fn load_weight<'a>(view: &'a FbinView, name: &str) -> Option<LoadedWeight<'a>> {
+    let meta: &TensorMeta = view.find(name)?;
+    match meta.dtype {
+        DType::F32 => view.read_f32(meta).map(LoadedWeight::F32),
+        DType::Q8 => Some(LoadedWeight::Q8(view.data_for(meta))),
+        DType::Q4 => None, // reserved; not implemented
+    }
+}
 
 /// Topology + numerics knobs the runtime needs to drive the forward
 /// pass. Mirrors the subset of `config.json` we actually consume.
@@ -119,12 +152,17 @@ pub fn forward_pass(
     // Step 2: per-layer attention + FFN with residuals.
     for li in 0..cfg.n_layers {
         let prefix = layer_prefix(li);
+        // Norms and biases stay fp32 even with --quantize q8_0 on
+        // (precision-sensitive + small). Projection matrices may be
+        // either fp32 or Q8 depending on what `hf_to_fbin.py` emitted;
+        // `LoadedWeight` hides the difference behind a uniform
+        // `WeightView` for the matvec calls below.
         let attn_norm = view.find(&join(&prefix, "attn_norm"))
             .and_then(|t| view.read_f32(t))?;
-        let wq = view.find(&join(&prefix, "q")).and_then(|t| view.read_f32(t))?;
-        let wk = view.find(&join(&prefix, "k")).and_then(|t| view.read_f32(t))?;
-        let wv = view.find(&join(&prefix, "v")).and_then(|t| view.read_f32(t))?;
-        let wo = view.find(&join(&prefix, "o")).and_then(|t| view.read_f32(t))?;
+        let wq = load_weight(view, &join(&prefix, "q"))?;
+        let wk = load_weight(view, &join(&prefix, "k"))?;
+        let wv = load_weight(view, &join(&prefix, "v"))?;
+        let wo = load_weight(view, &join(&prefix, "o"))?;
         // Biases are Qwen2.5-only; Llama-3 and the original synthetic
         // omit them. Treat absence as "no bias to add" rather than an
         // error so a single forward_pass covers both architectures.
@@ -133,9 +171,9 @@ pub fn forward_pass(
         let v_bias = view.find(&join(&prefix, "v_bias")).and_then(|t| view.read_f32(t));
         let ffn_norm = view.find(&join(&prefix, "ffn_norm"))
             .and_then(|t| view.read_f32(t))?;
-        let gate = view.find(&join(&prefix, "gate")).and_then(|t| view.read_f32(t))?;
-        let up = view.find(&join(&prefix, "up")).and_then(|t| view.read_f32(t))?;
-        let down = view.find(&join(&prefix, "down")).and_then(|t| view.read_f32(t))?;
+        let gate = load_weight(view, &join(&prefix, "gate"))?;
+        let up = load_weight(view, &join(&prefix, "up"))?;
+        let down = load_weight(view, &join(&prefix, "down"))?;
 
         // 2a. Pre-attention RMSNorm (per-row).
         let mut x_normed = Vec::with_capacity(new_seq * cfg.hidden_dim);
@@ -148,7 +186,8 @@ pub fn forward_pass(
         // → SDPA over [0, pos_offset + new_seq) → Wo). The cache for
         // this layer carries history of all prior decode steps.
         let attn = tensor_math::attention_block(
-            &x_normed, &wq, &wk, &wv, &wo,
+            &x_normed,
+            wq.view(), wk.view(), wv.view(), wo.view(),
             q_bias.as_deref(), k_bias.as_deref(), v_bias.as_deref(),
             rope_cos, rope_sin,
             new_seq, cfg.hidden_dim,
@@ -173,7 +212,9 @@ pub fn forward_pass(
         for s in 0..new_seq {
             let row = &x_normed2[s * cfg.hidden_dim..(s + 1) * cfg.hidden_dim];
             ffn_out.extend(tensor_math::swiglu_ffn(
-                row, &gate, &up, &down, cfg.hidden_dim, cfg.intermediate,
+                row,
+                gate.view(), up.view(), down.view(),
+                cfg.hidden_dim, cfg.intermediate,
             )?);
         }
 

@@ -244,6 +244,16 @@ fn main() -> ! {
         println!("[INFERENCE] D.4 KV-cache self-test PASS");
     }
 
+    // D.3.1.q: Q8_0 forward pass on the same synthetic, but with
+    // the projection matrices quantized to Q8 blocks. Argmax must
+    // stay at 3 (top-1 is robust to quantization noise) and
+    // logits[3] must drift < 0.02 from the fp32 reference 1.1470.
+    if !run_d31q_q8_self_test() {
+        println!("[INFERENCE] D.3.1.q Q8 self-test failed (file may be missing — non-fatal)");
+    } else {
+        println!("[INFERENCE] D.3.1.q Q8 self-test PASS");
+    }
+
     println!("[INFERENCE] ready — awaiting IPC requests on this task id");
 
     let mut req_count: u64 = 0;
@@ -450,7 +460,13 @@ fn run_d33_self_test() -> bool {
     let u = match read("up_proj")    { Some(v) => v, None => return false };
     let d = match read("down_proj")  { Some(v) => v, None => return false };
 
-    let y = match tensor_math::swiglu_ffn(&x, &g, &u, &d, /*hidden=*/2, /*inter=*/4) {
+    let y = match tensor_math::swiglu_ffn(
+        &x,
+        tensor_math::WeightView::F32(&g),
+        tensor_math::WeightView::F32(&u),
+        tensor_math::WeightView::F32(&d),
+        /*hidden=*/2, /*inter=*/4,
+    ) {
         Some(v) => v,
         None => {
             println!("[INFERENCE] D.3.3: swiglu_ffn shape mismatch");
@@ -504,7 +520,11 @@ fn run_d34_self_test() -> bool {
         v: alloc::vec![0.0f32; 2 * 2],
     };
     let y = match tensor_math::attention_block(
-        &x, &wq, &wk, &wv, &wo,
+        &x,
+        tensor_math::WeightView::F32(&wq),
+        tensor_math::WeightView::F32(&wk),
+        tensor_math::WeightView::F32(&wv),
+        tensor_math::WeightView::F32(&wo),
         /*q_bias=*/None, /*k_bias=*/None, /*v_bias=*/None,
         &rope_cos, &rope_sin,
         /*new_seq=*/2, /*hidden_dim=*/2,
@@ -599,7 +619,13 @@ fn run_d312_vfs_self_test() -> bool {
     ) else {
         return false;
     };
-    let y = match tensor_math::swiglu_ffn(&x, &g, &u, &d, 2, 4) {
+    let y = match tensor_math::swiglu_ffn(
+        &x,
+        tensor_math::WeightView::F32(&g),
+        tensor_math::WeightView::F32(&u),
+        tensor_math::WeightView::F32(&d),
+        2, 4,
+    ) {
         Some(v) => v,
         None => return false,
     };
@@ -626,7 +652,11 @@ fn run_d312_vfs_self_test() -> bool {
         v: alloc::vec![0.0f32; 2 * 2],
     };
     let attn = match tensor_math::attention_block(
-        &ax, &wq, &wk, &wv, &wo,
+        &ax,
+        tensor_math::WeightView::F32(&wq),
+        tensor_math::WeightView::F32(&wk),
+        tensor_math::WeightView::F32(&wv),
+        tensor_math::WeightView::F32(&wo),
         None, None, None,
         &rope_cos, &rope_sin,
         2, 2, 1, 1,
@@ -1122,6 +1152,93 @@ fn run_d4_kv_cache_self_test() -> bool {
         println!(
             "[INFERENCE] D.4: logits[3]={} drifts from D.3.5 reference 1.1470",
             last_logits[3]
+        );
+        return false;
+    }
+    true
+}
+
+/// D.3.1.q Q8_0 forward-pass self-test: identical math as D.3.5, but
+/// the projection matrices are loaded from `qwen_test_q8.fbin`
+/// (where q/k/v/o/gate/up/down are stored as Q8_0 blocks of [f16
+/// scale, 32 i8 vals]). Argmax should stay at 3 and logits[3]
+/// should remain within 0.02 of the fp32 reference 1.1470 — Q8
+/// quantization on small projections drifts ~0.001 per element on
+/// average, which compounds bounded through one layer.
+///
+/// Reference (numpy `forward_ref.py` over the same .fbin):
+///   argmax    = 3
+///   logits[3] = 1.146946 (fp32 reference: 1.147015, drift ≈ 0.0001)
+fn run_d31q_q8_self_test() -> bool {
+    use weights::FbinView;
+    use forward_pass::{forward_pass, argmax, ModelConfig};
+    use tensor_math::KvCache;
+
+    let bytes = match vfs_loader::read_file("qwen_test_q8.fbin") {
+        Ok(b) => b,
+        Err(e) => {
+            println!("[INFERENCE] D.3.1.q: VFS read failed: {:?}", e);
+            return false;
+        }
+    };
+    let view = match FbinView::parse(&bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            println!("[INFERENCE] D.3.1.q: parse error: {:?}", e);
+            return false;
+        }
+    };
+
+    let cfg = ModelConfig {
+        n_layers: 1,
+        hidden_dim: 64,
+        n_heads: 4,
+        n_kv_heads: 2,
+        intermediate: 128,
+        vocab: 256,
+        max_pos: 32,
+        eps: 1e-5,
+    };
+    let head_dim = cfg.hidden_dim / cfg.n_heads;
+    let mut cache = KvCache::new(
+        cfg.n_layers, cfg.max_pos, cfg.n_kv_heads, head_dim,
+    );
+    let token_ids: [u32; 3] = [1, 2, 3];
+
+    let logits = match forward_pass(&view, &cfg, &mut cache, &token_ids) {
+        Some(v) => v,
+        None => {
+            println!("[INFERENCE] D.3.1.q: forward_pass returned None");
+            return false;
+        }
+    };
+
+    for (i, &v) in logits.iter().enumerate() {
+        if !v.is_finite() {
+            println!("[INFERENCE] D.3.1.q: logits[{}] = {} (not finite)", i, v);
+            return false;
+        }
+    }
+
+    let am = match argmax(&logits) {
+        Some(i) => i,
+        None => return false,
+    };
+    println!(
+        "[INFERENCE] D.3.1.q: Q8 forward -> argmax={} logits[{}]={}",
+        am, am, logits[am as usize]
+    );
+    if am != 3 {
+        println!(
+            "[INFERENCE] D.3.1.q: argmax {} != 3 (Q8 quantization should preserve top-1)",
+            am
+        );
+        return false;
+    }
+    if (logits[3] - 1.1470).abs() > 0.02 {
+        println!(
+            "[INFERENCE] D.3.1.q: logits[3]={} drifts > 0.02 from fp32 reference 1.1470",
+            logits[3]
         );
         return false;
     }

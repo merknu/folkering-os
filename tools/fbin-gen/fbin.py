@@ -77,6 +77,64 @@ def f32_bytes(values) -> bytes:
     return struct.pack(f"<{len(values)}f", *values)
 
 
+# ── Q8_0 quantization ──────────────────────────────────────────────────
+#
+# Same on-disk layout as llama.cpp's Q8_0:
+#
+#   for each block of 32 elements:
+#       scale: f16 (2 bytes)
+#       vals : i8 × 32 (32 bytes)   → 34 bytes per block
+#
+# Quantize: scale = max(|x|) / 127, q[i] = round(x[i] / scale)
+# Dequantize: x[i] = q[i] * scale
+#
+# We require N % 32 == 0 today (every Qwen / Llama projection matches —
+# hidden_size and intermediate_size are always multiples of 32). For
+# tensors that would round into a partial trailing block, the converter
+# refuses rather than silently padding.
+
+Q8_BLOCK_SIZE = 32
+Q8_BLOCK_BYTES = 2 + 32  # f16 scale + 32 i8 vals
+
+
+def q8_0_bytes(values) -> bytes:
+    """Pack a flat list of floats as Q8_0 blocks. Returns the raw
+    bytes; caller emits with `dtype = DTYPE_Q8`.
+
+    Importing numpy lazily so callers that only need the f32 path
+    don't pay the import cost (and so this module stays usable in
+    `gen_test_blobs.py` which runs without numpy when emitting only
+    fp32 fixtures).
+    """
+    import numpy as np
+    arr = np.asarray(values, dtype=np.float32)
+    n = arr.size
+    if n % Q8_BLOCK_SIZE != 0:
+        raise ValueError(
+            f"Q8_0: tensor size {n} not divisible by block size "
+            f"{Q8_BLOCK_SIZE}"
+        )
+    n_blocks = n // Q8_BLOCK_SIZE
+    out = bytearray()
+    for b in range(n_blocks):
+        block = arr[b * Q8_BLOCK_SIZE : (b + 1) * Q8_BLOCK_SIZE]
+        absmax = float(np.max(np.abs(block)))
+        if absmax == 0.0:
+            scale = np.float32(0.0)
+            qs = np.zeros(Q8_BLOCK_SIZE, dtype=np.int8)
+        else:
+            scale = np.float32(absmax / 127.0)
+            qs = np.round(block / scale).astype(np.int32)
+            # Saturate to int8 range. Round-half-to-even can drift to
+            # ±128 on edge cases; clamp keeps us in the legal range.
+            qs = np.clip(qs, -127, 127).astype(np.int8)
+        # f16 scale, little-endian.
+        scale_f16 = np.float16(scale).tobytes()
+        out += scale_f16
+        out += qs.tobytes()
+    return bytes(out)
+
+
 def emit_rust_const(name: str, blob: bytes) -> str:
     """Render a `pub const NAME: &[u8] = &[ ... ];` literal of the
     blob bytes, 16 per row, with a one-line comment header so the
