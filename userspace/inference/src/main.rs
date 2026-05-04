@@ -478,8 +478,11 @@ fn run_d34_self_test() -> bool {
     };
 
     let y = match tensor_math::attention_block(
-        &x, &wq, &wk, &wv, &wo, &rope_cos, &rope_sin,
-        /*seq_len=*/2, /*hidden_dim=*/2, /*n_heads=*/1,
+        &x, &wq, &wk, &wv, &wo,
+        /*q_bias=*/None, /*k_bias=*/None, /*v_bias=*/None,
+        &rope_cos, &rope_sin,
+        /*seq_len=*/2, /*hidden_dim=*/2,
+        /*n_heads=*/1, /*n_kv_heads=*/1,
     ) {
         Some(v) => v,
         None => {
@@ -590,7 +593,10 @@ fn run_d312_vfs_self_test() -> bool {
         return false;
     };
     let attn = match tensor_math::attention_block(
-        &ax, &wq, &wk, &wv, &wo, &rope_cos, &rope_sin, 2, 2, 1
+        &ax, &wq, &wk, &wv, &wo,
+        None, None, None,
+        &rope_cos, &rope_sin,
+        2, 2, 1, 1,
     ) {
         Some(v) => v,
         None => return false,
@@ -643,15 +649,15 @@ fn run_d313_self_test() -> bool {
         }
     };
 
-    // Synthetic config — D.3.5 regenerated with n_kv_heads = n_heads
-    // so the simple non-GQA attention block applies. Real Qwen2.5
-    // brings GQA back in D.3.6.
+    // Synthetic config — D.3.6 regenerated with grouped-query
+    // attention (n_kv_heads=2) and nonzero QKV biases so it mirrors
+    // Qwen2.5's actual shape ratio. The structural test exercises
+    // both the GQA shape (HKV != HIDDEN) and the bias presence.
     const HIDDEN: u32 = 64;
     const N_HEADS: u32 = 4;
+    const N_KV_HEADS: u32 = 2;
     const HEAD_DIM: u32 = HIDDEN / N_HEADS;            // 16
-    // n_kv_heads == n_heads, so HKV == HIDDEN. Kept as a constant
-    // so the field references read consistently with the doc.
-    const HKV: u32 = HIDDEN;
+    const HKV: u32 = HEAD_DIM * N_KV_HEADS;            // 32
     const INTER: u32 = 128;
     const VOCAB: u32 = 256;
     const N_LAYERS: usize = 1;
@@ -797,16 +803,17 @@ fn run_d31_tokenizer_self_test() -> bool {
     true
 }
 
-/// D.3.5 forward-pass self-test: run the full transformer over a
-/// fixed token sequence on the synthetic 1-layer model and verify
-/// the greedy-sampled token matches the numpy reference.
+/// D.3.5/D.3.6 forward-pass self-test: run the full transformer
+/// over a fixed token sequence on the synthetic 1-layer model
+/// (now with GQA + QKV biases) and verify the greedy-sampled token
+/// matches the numpy reference.
 ///
 /// Reference (computed by `tools/fbin-gen/forward_ref.py` against the
-/// same .fbin):
+/// same .fbin, n_kv_heads=2 + nonzero biases):
 ///   token_ids   = [1, 2, 3]
 ///   argmax      = 3
-///   logits[3]   ≈ 1.0935
-///   top-5 ids   = [3, 20, 25, 28, 139]
+///   logits[3]   ≈ 1.1470
+///   top-5 ids   = [3, 25, 108, 138, 146]
 ///
 /// If this fails after a clean rebuild + repack, the divergence is in
 /// one of:
@@ -814,7 +821,8 @@ fn run_d31_tokenizer_self_test() -> bool {
 ///     wrong norm placement, etc.)
 ///   - `tensor_math::fast_exp` / `fast_rsqrt` drifting from the numpy
 ///     reference (both implementations have to match bit-for-bit-ish)
-///   - `attention_block` (GQA assumption, RoPE convention, mask)
+///   - `attention_block` (GQA broadcast wrong, bias add missing, RoPE
+///     convention, causal mask)
 fn run_d35_self_test() -> bool {
     use weights::FbinView;
     use forward_pass::{forward_pass, argmax, ModelConfig};
@@ -838,6 +846,10 @@ fn run_d35_self_test() -> bool {
         n_layers: 1,
         hidden_dim: 64,
         n_heads: 4,
+        // D.3.6: synthetic regenerated with grouped-query attention
+        // (n_kv_heads=2) + nonzero q/k/v biases, mirroring real
+        // Qwen2.5's shape ratio. argmax expectation updated to match.
+        n_kv_heads: 2,
         intermediate: 128,
         vocab: 256,
         max_pos: 32,
@@ -884,13 +896,13 @@ fn run_d35_self_test() -> bool {
         );
         return false;
     }
-    // Tighter sanity: logits[3] should be close to the reference 1.0935.
+    // Tighter sanity: logits[3] should be close to the reference 1.1470.
     // We use a generous tolerance because the float roundoff order
     // between numpy's BLAS-backed @ and our naive triple-loop matmul
     // can shift the magnitude by a percent or two.
-    if (logits[3] - 1.0935).abs() > 0.05 {
+    if (logits[3] - 1.1470).abs() > 0.05 {
         println!(
-            "[INFERENCE] D.3.5: logits[3]={} drifts from reference 1.0935",
+            "[INFERENCE] D.3.5: logits[3]={} drifts from reference 1.1470",
             logits[3]
         );
         return false;

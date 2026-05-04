@@ -37,6 +37,10 @@ pub struct ModelConfig {
     pub n_layers: usize,
     pub hidden_dim: usize,
     pub n_heads: usize,
+    /// Grouped-query attention: number of distinct K/V heads. For
+    /// non-GQA models pass `n_kv_heads = n_heads`. Real Qwen2.5-0.5B
+    /// has `n_heads=14, n_kv_heads=2`.
+    pub n_kv_heads: usize,
     pub intermediate: usize,
     pub vocab: usize,
     /// Maximum positions the embedded RoPE tables cover. Forward pass
@@ -93,6 +97,12 @@ pub fn forward_pass(
         let wk = view.find(&join(&prefix, "k")).and_then(|t| view.read_f32(t))?;
         let wv = view.find(&join(&prefix, "v")).and_then(|t| view.read_f32(t))?;
         let wo = view.find(&join(&prefix, "o")).and_then(|t| view.read_f32(t))?;
+        // Biases are Qwen2.5-only; Llama-3 and the original synthetic
+        // omit them. Treat absence as "no bias to add" rather than an
+        // error so a single forward_pass covers both architectures.
+        let q_bias = view.find(&join(&prefix, "q_bias")).and_then(|t| view.read_f32(t));
+        let k_bias = view.find(&join(&prefix, "k_bias")).and_then(|t| view.read_f32(t));
+        let v_bias = view.find(&join(&prefix, "v_bias")).and_then(|t| view.read_f32(t));
         let ffn_norm = view.find(&join(&prefix, "ffn_norm"))
             .and_then(|t| view.read_f32(t))?;
         let gate = view.find(&join(&prefix, "gate")).and_then(|t| view.read_f32(t))?;
@@ -106,10 +116,13 @@ pub fn forward_pass(
             x_normed.extend(tensor_math::rmsnorm(row, &attn_norm, cfg.eps)?);
         }
 
-        // 2b. Attention block (QKV → RoPE → SDPA → Wo).
+        // 2b. Attention block (QKV (+biases) → RoPE → SDPA (GQA) → Wo).
         let attn = tensor_math::attention_block(
-            &x_normed, &wq, &wk, &wv, &wo, rope_cos, rope_sin,
-            seq_len, cfg.hidden_dim, cfg.n_heads,
+            &x_normed, &wq, &wk, &wv, &wo,
+            q_bias.as_deref(), k_bias.as_deref(), v_bias.as_deref(),
+            rope_cos, rope_sin,
+            seq_len, cfg.hidden_dim,
+            cfg.n_heads, cfg.n_kv_heads,
         )?;
 
         // 2c. Residual.

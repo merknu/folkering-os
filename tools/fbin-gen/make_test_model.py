@@ -39,11 +39,10 @@ def make_config(
     n_layers: int = 1,
     hidden: int = 64,
     n_heads: int = 4,
-    # D.3.5 needs n_kv_heads == n_heads (no GQA in attention_block yet);
-    # D.3.6 reintroduces grouped-query attention and we drop this back to 2
-    # to mirror Qwen2.5-0.5B's actual ratio. Keep the CLI flag in case a
-    # future test wants to exercise non-square KV again.
-    n_kv_heads: int = 4,
+    # D.3.6: GQA back on (mirrors real Qwen2.5-0.5B's 14:2 ratio at
+    # tiny scale). Pass --kv-heads 4 to fall back to the non-GQA
+    # synthetic if needed for debugging.
+    n_kv_heads: int = 2,
     intermediate: int = 128,
     vocab: int = 256,
     max_pos: int = 32,
@@ -100,10 +99,13 @@ def make_weights(cfg: dict, seed: int = 42) -> dict:
         out[f"{prefix}.self_attn.k_proj.weight"] = rand(Hkv, H)
         out[f"{prefix}.self_attn.v_proj.weight"] = rand(Hkv, H)
         out[f"{prefix}.self_attn.o_proj.weight"] = rand(H,   H)
-        # Qwen2.5 has biases on q/k/v but NOT on o.
-        out[f"{prefix}.self_attn.q_proj.bias"] = np.zeros(H,   dtype=np.float32)
-        out[f"{prefix}.self_attn.k_proj.bias"] = np.zeros(Hkv, dtype=np.float32)
-        out[f"{prefix}.self_attn.v_proj.bias"] = np.zeros(Hkv, dtype=np.float32)
+        # Qwen2.5 has biases on q/k/v but NOT on o. D.3.6 needs nonzero
+        # values so the test fixture actually exercises the bias add
+        # path; small magnitudes keep logits finite through one
+        # forward pass.
+        out[f"{prefix}.self_attn.q_proj.bias"] = rand(H)
+        out[f"{prefix}.self_attn.k_proj.bias"] = rand(Hkv)
+        out[f"{prefix}.self_attn.v_proj.bias"] = rand(Hkv)
         out[f"{prefix}.mlp.gate_proj.weight"] = rand(I, H)
         out[f"{prefix}.mlp.up_proj.weight"]   = rand(I, H)
         out[f"{prefix}.mlp.down_proj.weight"] = rand(H, I)
@@ -117,7 +119,7 @@ def main():
     ap.add_argument("--layers", type=int, default=1)
     ap.add_argument("--hidden", type=int, default=64)
     ap.add_argument("--heads", type=int, default=4)
-    ap.add_argument("--kv-heads", type=int, default=4)
+    ap.add_argument("--kv-heads", type=int, default=2)
     ap.add_argument("--inter", type=int, default=128)
     ap.add_argument("--vocab", type=int, default=256)
     ap.add_argument("--max-pos", type=int, default=32)
