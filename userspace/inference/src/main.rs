@@ -115,6 +115,15 @@ fn main() -> ! {
         println!("[INFERENCE] tensor self-test PASS");
     }
 
+    // D.2: exercise the full local-backend path (incl. Burn's
+    // TensorData round-trip) on a fake in-process wire. Real IPC
+    // end-to-end is D.3.
+    if !local_backend::boot_test() {
+        println!("[INFERENCE] FATAL: local_backend boot_test failed");
+    } else {
+        println!("[INFERENCE] local_backend D.2 boot_test PASS");
+    }
+
     println!("[INFERENCE] ready — awaiting IPC requests on this task id");
 
     let mut req_count: u64 = 0;
