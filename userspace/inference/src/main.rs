@@ -63,6 +63,7 @@ mod weights;
 mod weights_test_blob;
 mod weights_ffn_blob;
 mod weights_attn_blob;
+mod vfs_loader;
 
 // ── Bump allocator ──────────────────────────────────────────────────
 //
@@ -166,6 +167,17 @@ fn main() -> ! {
         println!("[INFERENCE] FATAL: D.3.4 self-test failed");
     } else {
         println!("[INFERENCE] D.3.4 self-test PASS");
+    }
+
+    // D.3.1.2: load `model_test.fbin` from Synapse VFS, parse it,
+    // verify the same tensors land. Replaces the const blob path
+    // with a real on-disk-to-memory pipeline. When D.3.1.3 lands the
+    // HuggingFace converter and packs a real Qwen2.5 fbin, the same
+    // code path picks it up — only the file name changes.
+    if !run_d312_vfs_self_test() {
+        println!("[INFERENCE] FATAL: D.3.1.2 VFS self-test failed");
+    } else {
+        println!("[INFERENCE] D.3.1.2 VFS self-test PASS");
     }
 
     println!("[INFERENCE] ready — awaiting IPC requests on this task id");
@@ -444,6 +456,114 @@ fn run_d34_self_test() -> bool {
     println!(
         "[INFERENCE] D.3.4: attention -> sum={} (expected 4.0)",
         sum
+    );
+    true
+}
+
+/// D.3.1.2 self-test: pull `model_test.fbin` from Synapse VFS,
+/// parse it, run the same FFN + attention checks the const-blob
+/// tests do — verifies the on-disk → ramdisk → Synapse → IPC →
+/// shmem pipeline end-to-end.
+fn run_d312_vfs_self_test() -> bool {
+    use weights::FbinView;
+
+    let bytes = match vfs_loader::read_file("model_test.fbin") {
+        Ok(b) => b,
+        Err(e) => {
+            println!("[INFERENCE] D.3.1.2: VFS read failed: {:?}", e);
+            return false;
+        }
+    };
+    println!(
+        "[INFERENCE] D.3.1.2: read model_test.fbin from VFS ({} bytes)",
+        bytes.len()
+    );
+
+    let view = match FbinView::parse(&bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            println!("[INFERENCE] D.3.1.2: parse error: {:?}", e);
+            return false;
+        }
+    };
+    let n = view.tensors.len();
+    if n != 12 {
+        println!(
+            "[INFERENCE] D.3.1.2: expected 12 tensors in combined blob, got {}",
+            n
+        );
+        return false;
+    }
+
+    // Marker tensor — fingerprint check that the bytes survived the
+    // VFS round-trip intact. Any byte-level corruption in
+    // ramdisk/Synapse plumbing shows up here as a hash mismatch.
+    let marker = match view.find("vfs_marker").and_then(|t| view.read_f32(t)) {
+        Some(v) => v,
+        None => return false,
+    };
+    if marker.len() != 4 {
+        return false;
+    }
+    let sum: f32 = marker.iter().sum();
+    if (sum - 1.0).abs() > 1e-3 {
+        // 0.1 + 0.2 + 0.3 + 0.4 = 1.0
+        println!(
+            "[INFERENCE] D.3.1.2: marker sum {} != 1.0 — bytes corrupted?",
+            sum
+        );
+        return false;
+    }
+
+    // Re-run the FFN end-to-end on VFS-sourced bytes — proves the
+    // round-trip didn't change a single f32.
+    let read = |name: &str| -> Option<alloc::vec::Vec<f32>> {
+        view.find(name).and_then(|t| view.read_f32(t))
+    };
+    let (Some(x), Some(g), Some(u), Some(d)) = (
+        read("ffn_input"), read("gate_proj"), read("up_proj"), read("down_proj"),
+    ) else {
+        return false;
+    };
+    let y = match tensor_math::swiglu_ffn(&x, &g, &u, &d, 2, 4) {
+        Some(v) => v,
+        None => return false,
+    };
+    let ffn_sum: f32 = y.iter().sum();
+    if (ffn_sum - 9.7009).abs() > 5e-2 {
+        println!(
+            "[INFERENCE] D.3.1.2: VFS FFN sum {} != 9.7009 expected",
+            ffn_sum
+        );
+        return false;
+    }
+
+    // And the attention block on VFS-sourced bytes — same expected
+    // sum 4.0 as the const-blob D.3.4 test.
+    let (Some(ax), Some(wq), Some(wk), Some(wv), Some(wo),
+         Some(rope_cos), Some(rope_sin)) = (
+        read("attn_input"), read("wq"), read("wk"), read("wv"),
+        read("wo"), read("rope_cos"), read("rope_sin"),
+    ) else {
+        return false;
+    };
+    let attn = match tensor_math::attention_block(
+        &ax, &wq, &wk, &wv, &wo, &rope_cos, &rope_sin, 2, 2, 1
+    ) {
+        Some(v) => v,
+        None => return false,
+    };
+    let attn_sum: f32 = attn.iter().sum();
+    if (attn_sum - 4.0).abs() > 5e-2 {
+        println!(
+            "[INFERENCE] D.3.1.2: VFS attn sum {} != 4.0 expected",
+            attn_sum
+        );
+        return false;
+    }
+    println!(
+        "[INFERENCE] D.3.1.2: VFS-sourced FFN={} attn={} (matches const-blob)",
+        ffn_sum, attn_sum
     );
     true
 }

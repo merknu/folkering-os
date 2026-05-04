@@ -152,11 +152,11 @@ def gen_attn_blob() -> bytes:
 
 
 def main():
-    targets = [
+    rust_targets = [
         ("weights_ffn_blob.rs",  "TEST_FFN_FBIN",  gen_ffn_blob()),
         ("weights_attn_blob.rs", "TEST_ATTN_FBIN", gen_attn_blob()),
     ]
-    for filename, const_name, blob in targets:
+    for filename, const_name, blob in rust_targets:
         out_path = os.path.join(
             REPO_ROOT, "userspace", "inference", "src", filename
         )
@@ -166,6 +166,67 @@ def main():
         with open(out_path, "w", encoding="utf-8", newline="\n") as f:
             f.write(rust)
         print(f"wrote {out_path}  ({len(blob)} bytes)")
+
+    # Also drop the union of the test tensors as a real on-disk
+    # `.fbin` so the OS-side VFS-read path (D.3.1.2) has something
+    # to chew on at boot. We write to boot/iso_root/ which folk-pack
+    # picks up via `--add model_test.fbin:data:...` in nightly.sh
+    # and the dev pack invocation. Keeping the file alongside
+    # kernel.elf and initrd.fpk makes it visible in `qm config`-style
+    # ops and easy to swap out for real model weights later.
+    binary_targets = [
+        ("model_test.fbin",      gen_combined_blob()),
+    ]
+    for filename, blob in binary_targets:
+        out_path = os.path.join(REPO_ROOT, "boot", "iso_root", filename)
+        with open(out_path, "wb") as f:
+            f.write(blob)
+        print(f"wrote {out_path}  ({len(blob)} bytes)")
+
+
+def gen_combined_blob() -> bytes:
+    """A single `.fbin` carrying both the FFN and attention test
+    tensors, plus a marker tensor so the VFS-read self-test has
+    something tiny to verify before walking the full set.
+
+    The boot self-tests in `inference/src/main.rs` read this via
+    `synapse::read_file_shmem("model_test.fbin")` — same parser, same
+    correctness checks, just sourced from the real on-disk pipeline.
+    Eventually this binary gets replaced by a real Qwen2.5-0.5B
+    converted from HuggingFace safetensors (D.3.1.3).
+    """
+    import math as _math
+
+    # Marker: a 4-element identity vector so VFS readers can sanity-
+    # check before the heavy tensors. The hash will print at boot
+    # the same way our other tensors do, providing a fingerprint
+    # that drifts if the file gets corrupted in transit.
+    marker = [0.1, 0.2, 0.3, 0.4]
+
+    tensors = [
+        ("vfs_marker", DTYPE_F32, [4],    f32_bytes(marker)),
+        # FFN tensors (same as gen_ffn_blob, kept verbatim for
+        # boot-self-test parity).
+        ("ffn_input", DTYPE_F32, [2],    f32_bytes([1.0, 2.0])),
+        ("gate_proj", DTYPE_F32, [4, 2], f32_bytes([
+            1.0, 0.0,  0.0, 1.0,  1.0, 1.0,  1.0, -1.0,
+        ])),
+        ("up_proj",   DTYPE_F32, [4, 2], f32_bytes([
+            1.0, 0.0,  0.0, 1.0,  0.0, 1.0,  1.0, 0.0,
+        ])),
+        ("down_proj", DTYPE_F32, [2, 4], f32_bytes([
+            1.0, 0.0, 1.0, 0.0,  0.0, 1.0, 0.0, 1.0,
+        ])),
+        # Attention tensors (same as gen_attn_blob).
+        ("attn_input", DTYPE_F32, [2, 2], f32_bytes([1.0, 0.0, 0.0, 1.0])),
+        ("wq",         DTYPE_F32, [2, 2], f32_bytes([1.0, 0.0, 0.0, 1.0])),
+        ("wk",         DTYPE_F32, [2, 2], f32_bytes([1.0, 0.0, 0.0, 1.0])),
+        ("wv",         DTYPE_F32, [2, 2], f32_bytes([2.0, 0.0, 0.0, 2.0])),
+        ("wo",         DTYPE_F32, [2, 2], f32_bytes([1.0, 0.0, 0.0, 1.0])),
+        ("rope_cos",   DTYPE_F32, [2, 1], f32_bytes([1.0, _math.cos(1.0)])),
+        ("rope_sin",   DTYPE_F32, [2, 1], f32_bytes([0.0, _math.sin(1.0)])),
+    ]
+    return write_fbin(tensors)
 
 
 if __name__ == "__main__":
