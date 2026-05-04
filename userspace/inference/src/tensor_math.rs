@@ -227,6 +227,198 @@ pub fn swiglu_ffn(
     linear(down_proj, intermediate, hidden, &mixed)
 }
 
+/// In-place softmax over a 1-D slice. Numerically stable: subtract
+/// the max before `fast_exp` so exponents stay in the well-behaved
+/// region (`fast_exp` clamps |x| < 88 anyway, but the stability
+/// trick keeps the precision at the high end of the input).
+///
+/// Handles `f32::NEG_INFINITY` cleanly — those entries get
+/// `fast_exp(-inf) == 0` (per the implementation's clamp at -88),
+/// which is exactly the masked-position behaviour we want for
+/// causal attention.
+pub fn softmax_inplace(x: &mut [f32]) {
+    if x.is_empty() { return; }
+    let mut max = f32::NEG_INFINITY;
+    for &v in x.iter() {
+        if v > max { max = v; }
+    }
+    if max == f32::NEG_INFINITY {
+        // All entries masked → distribute uniform mass. Shouldn't
+        // happen for causal attention, but defend against it.
+        let n = x.len() as f32;
+        for v in x.iter_mut() { *v = 1.0 / n; }
+        return;
+    }
+    let mut sum = 0.0f32;
+    for v in x.iter_mut() {
+        *v = fast_exp(*v - max);
+        sum += *v;
+    }
+    if sum > 0.0 {
+        let inv = 1.0 / sum;
+        for v in x.iter_mut() { *v *= inv; }
+    }
+}
+
+/// Apply Rotary Position Embedding (RoPE) in-place to a Q or K tensor
+/// of shape `[seq_len, n_heads, head_dim]` row-major (= flat
+/// `[seq_len * n_heads * head_dim]`).
+///
+/// `cos_table` and `sin_table` both have shape `[seq_len, head_dim/2]`,
+/// pre-computed by the build-time tooling (`gen_test_blobs.py` and the
+/// future HuggingFace converter). For each (s, h, i) where `i` indexes
+/// the pair (`pair_i = i / 2`), rotates `(qk[s,h,2*pair], qk[s,h,2*pair+1])`
+/// by the angle `arctan2(sin, cos)` baked into the tables.
+///
+/// Why pre-compute the tables instead of running sin/cos in the kernel:
+/// fast `sin/cos` approximations cost ~30 cycles per call, and we'd
+/// burn one per RoPE pair per token per layer. Pre-computing once at
+/// build time and reading f32s from the .fbin keeps the hot path
+/// pure linear algebra — the compositor has no idea inference is
+/// happening, frame budget stays clean.
+pub fn apply_rope(
+    qk: &mut [f32],
+    cos_table: &[f32],
+    sin_table: &[f32],
+    seq_len: usize,
+    n_heads: usize,
+    head_dim: usize,
+) -> Option<()> {
+    if head_dim % 2 != 0 { return None; }
+    let pairs = head_dim / 2;
+    if cos_table.len() != seq_len * pairs || sin_table.len() != seq_len * pairs {
+        return None;
+    }
+    if qk.len() != seq_len * n_heads * head_dim { return None; }
+
+    for s in 0..seq_len {
+        for h in 0..n_heads {
+            for p in 0..pairs {
+                let i = s * n_heads * head_dim + h * head_dim + 2 * p;
+                let j = i + 1;
+                let cos = cos_table[s * pairs + p];
+                let sin = sin_table[s * pairs + p];
+                let x = qk[i];
+                let y = qk[j];
+                qk[i] = x * cos - y * sin;
+                qk[j] = x * sin + y * cos;
+            }
+        }
+    }
+    Some(())
+}
+
+/// Scaled dot-product attention with causal mask.
+///
+/// All inputs are `[seq_len, n_heads, head_dim]` row-major. The
+/// returned tensor has the same shape, flattened.
+///
+/// Per query position `i`:
+///   1. Compute scores[j] = (Q[i] · K[j]) / sqrt(head_dim) for j ≤ i,
+///      mask scores[j] = -inf for j > i (causal).
+///   2. Softmax across j.
+///   3. out[i] = sum_j(scores[j] * V[j]).
+///
+/// Allocates a `Vec<f32>` per query row for the score buffer plus
+/// the output. D.3.5 will pre-allocate when we start caring about
+/// per-token throughput; D.3.4's job is correctness.
+pub fn scaled_dot_product_attention(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq_len: usize,
+    n_heads: usize,
+    head_dim: usize,
+) -> Option<Vec<f32>> {
+    let total = seq_len * n_heads * head_dim;
+    if q.len() != total || k.len() != total || v.len() != total {
+        return None;
+    }
+
+    let scale = fast_rsqrt(head_dim as f32);
+    let mut out = vec![0.0f32; total];
+    let mut scores = vec![0.0f32; seq_len];
+
+    for h in 0..n_heads {
+        for i in 0..seq_len {
+            // ── Compute Q·K scores with causal mask ────────────────
+            for j in 0..seq_len {
+                if j > i {
+                    scores[j] = f32::NEG_INFINITY;
+                    continue;
+                }
+                let mut dot = 0.0f32;
+                for d in 0..head_dim {
+                    let q_idx = i * n_heads * head_dim + h * head_dim + d;
+                    let k_idx = j * n_heads * head_dim + h * head_dim + d;
+                    dot += q[q_idx] * k[k_idx];
+                }
+                scores[j] = dot * scale;
+            }
+
+            softmax_inplace(&mut scores);
+
+            // ── attn @ V ───────────────────────────────────────────
+            for d in 0..head_dim {
+                let mut acc = 0.0f32;
+                for j in 0..seq_len {
+                    let v_idx = j * n_heads * head_dim + h * head_dim + d;
+                    acc += scores[j] * v[v_idx];
+                }
+                let out_idx = i * n_heads * head_dim + h * head_dim + d;
+                out[out_idx] = acc;
+            }
+            libfolk::sys::yield_cpu();
+        }
+    }
+    Some(out)
+}
+
+/// Full attention block: QKV projection → RoPE on Q/K → causal SDPA
+/// → output projection. The shape Qwen2.5 / Llama use, modulo
+/// grouped-query attention (GQA) where `n_kv_heads < n_heads` —
+/// today we assume `n_kv_heads == n_heads`; D.3.5 adds GQA.
+///
+/// `x` is `[seq_len, hidden_dim]`. Wq / Wk / Wv / Wo are all
+/// `[hidden_dim, hidden_dim]` row-major (HuggingFace native).
+/// `rope_cos` / `rope_sin` are `[seq_len, head_dim/2]`.
+pub fn attention_block(
+    x: &[f32],
+    wq: &[f32], wk: &[f32], wv: &[f32], wo: &[f32],
+    rope_cos: &[f32], rope_sin: &[f32],
+    seq_len: usize, hidden_dim: usize, n_heads: usize,
+) -> Option<Vec<f32>> {
+    if hidden_dim % n_heads != 0 { return None; }
+    let head_dim = hidden_dim / n_heads;
+    if x.len() != seq_len * hidden_dim { return None; }
+
+    // ── 1. Project x → Q, K, V (per-row matvec) ─────────────────────
+    let mut q = Vec::with_capacity(seq_len * hidden_dim);
+    let mut k = Vec::with_capacity(seq_len * hidden_dim);
+    let mut v = Vec::with_capacity(seq_len * hidden_dim);
+    for s in 0..seq_len {
+        let row = &x[s * hidden_dim..(s + 1) * hidden_dim];
+        q.extend(linear(wq, hidden_dim, hidden_dim, row)?);
+        k.extend(linear(wk, hidden_dim, hidden_dim, row)?);
+        v.extend(linear(wv, hidden_dim, hidden_dim, row)?);
+    }
+
+    // ── 2. RoPE on Q and K (V is not rotated) ───────────────────────
+    apply_rope(&mut q, rope_cos, rope_sin, seq_len, n_heads, head_dim)?;
+    apply_rope(&mut k, rope_cos, rope_sin, seq_len, n_heads, head_dim)?;
+
+    // ── 3. Scaled dot-product attention ─────────────────────────────
+    let attn = scaled_dot_product_attention(&q, &k, &v, seq_len, n_heads, head_dim)?;
+
+    // ── 4. Output projection (per-row matvec) ───────────────────────
+    let mut out = Vec::with_capacity(seq_len * hidden_dim);
+    for s in 0..seq_len {
+        let row = &attn[s * hidden_dim..(s + 1) * hidden_dim];
+        out.extend(linear(wo, hidden_dim, hidden_dim, row)?);
+    }
+    Some(out)
+}
+
 /// Embedding lookup: `table[vocab_id, :]` from a row-major
 /// `[n_vocab, hidden_dim]` table. Allocates a fresh `Vec<f32>` of
 /// length `hidden_dim` so the caller can mutate it for the rest of
@@ -395,6 +587,34 @@ pub fn self_test() -> bool {
     };
     let ffn_sum: f32 = ffn.iter().sum();
     if (ffn_sum - 9.7009).abs() > 5e-2 { return false; }
+
+    // ── 9. softmax_inplace ──
+    // softmax([1, 2, 3]) ≈ [0.0900, 0.2447, 0.6652]
+    let mut sm = [1.0_f32, 2.0, 3.0];
+    softmax_inplace(&mut sm);
+    if (sm[0] - 0.0900).abs() > 1e-2 { return false; }
+    if (sm[1] - 0.2447).abs() > 1e-2 { return false; }
+    if (sm[2] - 0.6652).abs() > 1e-2 { return false; }
+    // Sum to 1
+    let sm_sum: f32 = sm.iter().sum();
+    if (sm_sum - 1.0).abs() > 1e-3 { return false; }
+
+    // softmax with -inf entry (causal mask)
+    let mut sm_masked = [0.7071_f32, f32::NEG_INFINITY];
+    softmax_inplace(&mut sm_masked);
+    if (sm_masked[0] - 1.0).abs() > 1e-3 { return false; }
+    if sm_masked[1].abs() > 1e-3 { return false; }
+
+    // ── 10. apply_rope ──
+    // qk = [1, 0] (1 token, 1 head, head_dim=2)
+    // cos = [cos(1)] ≈ 0.5403, sin = [sin(1)] ≈ 0.8415
+    // After: [1*0.5403 - 0*0.8415, 1*0.8415 + 0*0.5403] = [0.5403, 0.8415]
+    let mut qk = [1.0_f32, 0.0];
+    let cos = [0.5403_f32];
+    let sin = [0.8415_f32];
+    apply_rope(&mut qk, &cos, &sin, 1, 1, 2);
+    if (qk[0] - 0.5403).abs() > 1e-3 { return false; }
+    if (qk[1] - 0.8415).abs() > 1e-3 { return false; }
 
     true
 }
