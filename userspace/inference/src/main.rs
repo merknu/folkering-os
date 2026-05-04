@@ -62,6 +62,7 @@ mod tensor_math;
 mod weights;
 mod weights_test_blob;
 mod weights_ffn_blob;
+mod weights_attn_blob;
 
 // ── Bump allocator ──────────────────────────────────────────────────
 //
@@ -155,6 +156,16 @@ fn main() -> ! {
         println!("[INFERENCE] FATAL: D.3.3 self-test failed");
     } else {
         println!("[INFERENCE] D.3.3 self-test PASS");
+    }
+
+    // D.3.4: full attention block (QKV + RoPE + causal SDPA + Wo).
+    // Two-token sequence with hand-computed reference sum ≈4.0.
+    // The Final Boss for inference math; D.3.5 stitches FFN + attn
+    // into a real transformer layer.
+    if !run_d34_self_test() {
+        println!("[INFERENCE] FATAL: D.3.4 self-test failed");
+    } else {
+        println!("[INFERENCE] D.3.4 self-test PASS");
     }
 
     println!("[INFERENCE] ready — awaiting IPC requests on this task id");
@@ -377,6 +388,61 @@ fn run_d33_self_test() -> bool {
     }
     println!(
         "[INFERENCE] D.3.3: SwiGLU FFN -> sum={} (expected 9.7009)",
+        sum
+    );
+    true
+}
+
+/// D.3.4 end-to-end self-test:
+/// 1. Parse the attention test blob (7 tensors: input, Wq, Wk, Wv,
+///    Wo, rope_cos, rope_sin).
+/// 2. Run `attention_block(x, Wq, Wk, Wv, Wo, cos, sin, seq=2,
+///    hidden=2, n_heads=1)`.
+/// 3. Sum the result and compare against the Python-computed
+///    reference (≈4.0 — full derivation in
+///    `tools/fbin-gen/gen_test_blobs.py::gen_attn_blob` docstring).
+fn run_d34_self_test() -> bool {
+    use weights::FbinView;
+
+    let view = match FbinView::parse(weights_attn_blob::TEST_ATTN_FBIN) {
+        Ok(v) => v,
+        Err(e) => {
+            println!("[INFERENCE] D.3.4: attn-blob parse error: {:?}", e);
+            return false;
+        }
+    };
+    let read = |name: &str| -> Option<alloc::vec::Vec<f32>> {
+        view.find(name).and_then(|t| view.read_f32(t))
+    };
+    let (Some(x), Some(wq), Some(wk), Some(wv), Some(wo),
+         Some(rope_cos), Some(rope_sin)) = (
+        read("attn_input"), read("wq"), read("wk"), read("wv"),
+        read("wo"), read("rope_cos"), read("rope_sin"),
+    ) else {
+        println!("[INFERENCE] D.3.4: missing tensor in attn-blob");
+        return false;
+    };
+
+    let y = match tensor_math::attention_block(
+        &x, &wq, &wk, &wv, &wo, &rope_cos, &rope_sin,
+        /*seq_len=*/2, /*hidden_dim=*/2, /*n_heads=*/1,
+    ) {
+        Some(v) => v,
+        None => {
+            println!("[INFERENCE] D.3.4: attention_block shape mismatch");
+            return false;
+        }
+    };
+    let sum: f32 = y.iter().sum();
+    if (sum - 4.0).abs() > 5e-2 {
+        println!(
+            "[INFERENCE] D.3.4: attention sum {} off from expected 4.0",
+            sum
+        );
+        return false;
+    }
+    println!(
+        "[INFERENCE] D.3.4: attention -> sum={} (expected 4.0)",
         sum
     );
     true
