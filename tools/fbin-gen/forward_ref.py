@@ -33,8 +33,35 @@ from typing import Dict, Tuple
 import numpy as np
 
 
+DTYPE_F32 = 0
+DTYPE_Q8 = 1
+
+
+def dequantize_q8(blob: bytes, n_elem: int) -> np.ndarray:
+    """Decode Q8_0 blocks (34 bytes each: f16 scale + 32 i8 vals)
+    into an f32 array. Mirrors the Rust runtime's dequantize path
+    for parity verification."""
+    assert n_elem % 32 == 0, f"Q8 n_elem={n_elem} not divisible by 32"
+    n_blocks = n_elem // 32
+    expected_bytes = n_blocks * 34
+    assert len(blob) == expected_bytes, (
+        f"Q8 blob {len(blob)} bytes != expected {expected_bytes} "
+        f"({n_blocks} blocks × 34)"
+    )
+    out = np.empty(n_elem, dtype=np.float32)
+    for b in range(n_blocks):
+        off = b * 34
+        scale = float(np.frombuffer(blob[off:off + 2], dtype=np.float16)[0])
+        vals = np.frombuffer(blob[off + 2:off + 34], dtype=np.int8)
+        out[b * 32:(b + 1) * 32] = vals.astype(np.float32) * scale
+    return out
+
+
 def parse_fbin(path: str) -> Tuple[Dict[str, np.ndarray], dict]:
-    """Parse a `.fbin` and return (name -> ndarray, header_info)."""
+    """Parse a `.fbin` and return (name -> ndarray, header_info).
+    Both fp32 and Q8 tensors land in the dict as f32 arrays — Q8
+    payloads are dequantized at parse time so the rest of the
+    reference forward pass stays a single code path."""
     with open(path, "rb") as f:
         data = f.read()
     assert data[:4] == b"FBN1", f"bad magic {data[:4]!r}"
@@ -56,15 +83,26 @@ def parse_fbin(path: str) -> Tuple[Dict[str, np.ndarray], dict]:
         cur += 4 * rank
         data_offset, data_len = struct.unpack("<QQ", data[cur:cur + 16])
         cur += 16
-        assert dtype_byte == 0, "ref impl only handles f32"
-        metas.append((name, shape, data_offset, data_len))
+        metas.append((name, dtype_byte, shape, data_offset, data_len))
 
     out: Dict[str, np.ndarray] = {}
-    for name, shape, off, n in metas:
-        arr = np.frombuffer(data[off:off + n], dtype=np.float32).copy()
-        arr = arr.reshape(shape)
-        out[name] = arr
-    return out, {"n_tensors": n_tensors, "metadata_end": metadata_end}
+    n_quant = 0
+    for name, dt, shape, off, n in metas:
+        n_elem = int(np.prod(shape))
+        blob = data[off:off + n]
+        if dt == DTYPE_F32:
+            arr = np.frombuffer(blob, dtype=np.float32).copy()
+        elif dt == DTYPE_Q8:
+            arr = dequantize_q8(blob, n_elem)
+            n_quant += 1
+        else:
+            raise ValueError(f"unsupported dtype {dt} for tensor {name!r}")
+        out[name] = arr.reshape(shape)
+    return out, {
+        "n_tensors": n_tensors,
+        "metadata_end": metadata_end,
+        "n_quant": n_quant,
+    }
 
 
 def fast_rsqrt(x: np.ndarray) -> np.ndarray:
