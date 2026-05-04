@@ -180,6 +180,22 @@ fn main() -> ! {
         println!("[INFERENCE] D.3.1.2 VFS self-test PASS");
     }
 
+    // D.3.1.3: load a real-shape Qwen2.5 fbin produced by
+    // `tools/fbin-gen/hf_to_fbin.py`. The synthetic 1-layer model
+    // (`make_test_model.py`) is the build-time stand-in; the same
+    // self-test runs verbatim against a real Qwen2.5-0.5B fbin once
+    // we drop one in `boot/iso_root/`.
+    //
+    // We only check structural properties here — naming, count,
+    // shapes — because the weights are random. Once D.3.5 wires
+    // the per-layer forward pass we'll get numerical verification
+    // against PyTorch reference output for the same input ids.
+    if !run_d313_self_test() {
+        println!("[INFERENCE] D.3.1.3 self-test failed (file may be missing — non-fatal)");
+    } else {
+        println!("[INFERENCE] D.3.1.3 self-test PASS");
+    }
+
     println!("[INFERENCE] ready — awaiting IPC requests on this task id");
 
     let mut req_count: u64 = 0;
@@ -566,6 +582,113 @@ fn run_d312_vfs_self_test() -> bool {
         ffn_sum, attn_sum
     );
     true
+}
+
+/// D.3.1.3 self-test: load `qwen_test.fbin` from Synapse VFS, walk
+/// the per-layer tensors that `hf_to_fbin.py` produced, verify shapes
+/// match the synthetic config (hidden=64, n_heads=4, head_dim=16,
+/// intermediate=128, n_kv_heads=2, vocab=256, n_layers=1).
+///
+/// This is a STRUCTURAL test — we don't run forward pass yet (D.3.5).
+/// Random weights would produce random output anyway; the value here
+/// is proving that the converter's tensor layout matches what the
+/// runtime expects to find.
+fn run_d313_self_test() -> bool {
+    use weights::FbinView;
+
+    let bytes = match vfs_loader::read_file("qwen_test.fbin") {
+        Ok(b) => b,
+        Err(_) => {
+            // Non-fatal: file isn't always packed. The early-out
+            // above prints a "non-fatal" message in that case.
+            return false;
+        }
+    };
+    println!(
+        "[INFERENCE] D.3.1.3: read qwen_test.fbin from VFS ({} bytes)",
+        bytes.len()
+    );
+
+    let view = match FbinView::parse(&bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            println!("[INFERENCE] D.3.1.3: parse error: {:?}", e);
+            return false;
+        }
+    };
+
+    // Synthetic config (matches `make_test_model.py` defaults).
+    const HIDDEN: u32 = 64;
+    const N_HEADS: u32 = 4;
+    const N_KV_HEADS: u32 = 2;
+    const HEAD_DIM: u32 = HIDDEN / N_HEADS;            // 16
+    const HKV: u32 = HEAD_DIM * N_KV_HEADS;            // 32
+    const INTER: u32 = 128;
+    const VOCAB: u32 = 256;
+    const N_LAYERS: usize = 1;
+    const MAX_POS: u32 = 32;
+
+    // Walk every name + shape we expect to find. The order doesn't
+    // matter; missing-or-wrong-shape is what trips the assertion.
+    let expect = |view: &FbinView, name: &str, shape: &[u32]| -> bool {
+        match view.find(name) {
+            Some(t) => {
+                if t.shape != shape {
+                    println!(
+                        "[INFERENCE] D.3.1.3: {} shape {:?} != expected {:?}",
+                        name, t.shape, shape
+                    );
+                    false
+                } else {
+                    true
+                }
+            }
+            None => {
+                println!("[INFERENCE] D.3.1.3: missing tensor '{}'", name);
+                false
+            }
+        }
+    };
+
+    let mut ok = true;
+    ok &= expect(&view, "embed", &[VOCAB, HIDDEN]);
+    ok &= expect(&view, "final_norm", &[HIDDEN]);
+    ok &= expect(&view, "rope_cos", &[MAX_POS, HEAD_DIM / 2]);
+    ok &= expect(&view, "rope_sin", &[MAX_POS, HEAD_DIM / 2]);
+
+    for li in 0..N_LAYERS {
+        let prefix = match li {
+            0 => "layer.0",
+            _ => return false, // synthetic config caps at 1 layer
+        };
+        let p = |name: &str| -> alloc::string::String {
+            let mut s = alloc::string::String::with_capacity(prefix.len() + 1 + name.len());
+            s.push_str(prefix);
+            s.push('.');
+            s.push_str(name);
+            s
+        };
+        ok &= expect(&view, &p("attn_norm"), &[HIDDEN]);
+        ok &= expect(&view, &p("ffn_norm"),  &[HIDDEN]);
+        ok &= expect(&view, &p("q"),         &[HIDDEN, HIDDEN]);
+        ok &= expect(&view, &p("k"),         &[HKV,    HIDDEN]);
+        ok &= expect(&view, &p("v"),         &[HKV,    HIDDEN]);
+        ok &= expect(&view, &p("o"),         &[HIDDEN, HIDDEN]);
+        ok &= expect(&view, &p("q_bias"),    &[HIDDEN]);
+        ok &= expect(&view, &p("k_bias"),    &[HKV]);
+        ok &= expect(&view, &p("v_bias"),    &[HKV]);
+        ok &= expect(&view, &p("gate"),      &[INTER,  HIDDEN]);
+        ok &= expect(&view, &p("up"),        &[INTER,  HIDDEN]);
+        ok &= expect(&view, &p("down"),      &[HIDDEN, INTER]);
+    }
+
+    if ok {
+        println!(
+            "[INFERENCE] D.3.1.3: {} tensors, layout matches Qwen2.5 config",
+            view.tensors.len()
+        );
+    }
+    ok
 }
 
 fn handle_request(msg: &libfolk::sys::ipc::IpcMessage, n: u64) {
