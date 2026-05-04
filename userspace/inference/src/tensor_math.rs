@@ -308,10 +308,15 @@ pub fn apply_rope(
     Some(())
 }
 
-/// Scaled dot-product attention with causal mask.
+/// Scaled dot-product attention with causal mask, GQA-aware.
 ///
-/// All inputs are `[seq_len, n_heads, head_dim]` row-major. The
-/// returned tensor has the same shape, flattened.
+/// `q` is `[seq_len, n_heads, head_dim]` row-major.
+/// `k` and `v` are `[seq_len, n_kv_heads, head_dim]` row-major.
+/// Returned tensor matches the Q shape, flattened.
+///
+/// When `n_kv_heads < n_heads` (grouped-query attention), every
+/// `groups = n_heads / n_kv_heads` consecutive query heads share
+/// one K/V head — query head `h` maps to kv head `h / groups`.
 ///
 /// Per query position `i`:
 ///   1. Compute scores[j] = (Q[i] · K[j]) / sqrt(head_dim) for j ≤ i,
@@ -320,26 +325,32 @@ pub fn apply_rope(
 ///   3. out[i] = sum_j(scores[j] * V[j]).
 ///
 /// Allocates a `Vec<f32>` per query row for the score buffer plus
-/// the output. D.3.5 will pre-allocate when we start caring about
-/// per-token throughput; D.3.4's job is correctness.
+/// the output. Pre-allocation is D.4 territory; D.3.6's job is
+/// correctness.
 pub fn scaled_dot_product_attention(
     q: &[f32],
     k: &[f32],
     v: &[f32],
     seq_len: usize,
     n_heads: usize,
+    n_kv_heads: usize,
     head_dim: usize,
 ) -> Option<Vec<f32>> {
-    let total = seq_len * n_heads * head_dim;
-    if q.len() != total || k.len() != total || v.len() != total {
+    if n_kv_heads == 0 || n_heads == 0 { return None; }
+    if n_heads % n_kv_heads != 0 { return None; }
+    let q_total = seq_len * n_heads * head_dim;
+    let kv_total = seq_len * n_kv_heads * head_dim;
+    if q.len() != q_total || k.len() != kv_total || v.len() != kv_total {
         return None;
     }
 
+    let groups = n_heads / n_kv_heads;
     let scale = fast_rsqrt(head_dim as f32);
-    let mut out = vec![0.0f32; total];
+    let mut out = vec![0.0f32; q_total];
     let mut scores = vec![0.0f32; seq_len];
 
     for h in 0..n_heads {
+        let kvh = h / groups;
         for i in 0..seq_len {
             // ── Compute Q·K scores with causal mask ────────────────
             for j in 0..seq_len {
@@ -350,7 +361,7 @@ pub fn scaled_dot_product_attention(
                 let mut dot = 0.0f32;
                 for d in 0..head_dim {
                     let q_idx = i * n_heads * head_dim + h * head_dim + d;
-                    let k_idx = j * n_heads * head_dim + h * head_dim + d;
+                    let k_idx = j * n_kv_heads * head_dim + kvh * head_dim + d;
                     dot += q[q_idx] * k[k_idx];
                 }
                 scores[j] = dot * scale;
@@ -362,7 +373,7 @@ pub fn scaled_dot_product_attention(
             for d in 0..head_dim {
                 let mut acc = 0.0f32;
                 for j in 0..seq_len {
-                    let v_idx = j * n_heads * head_dim + h * head_dim + d;
+                    let v_idx = j * n_kv_heads * head_dim + kvh * head_dim + d;
                     acc += scores[j] * v[v_idx];
                 }
                 let out_idx = i * n_heads * head_dim + h * head_dim + d;
@@ -374,41 +385,71 @@ pub fn scaled_dot_product_attention(
     Some(out)
 }
 
-/// Full attention block: QKV projection → RoPE on Q/K → causal SDPA
-/// → output projection. The shape Qwen2.5 / Llama use, modulo
-/// grouped-query attention (GQA) where `n_kv_heads < n_heads` —
-/// today we assume `n_kv_heads == n_heads`; D.3.5 adds GQA.
+/// Full attention block: QKV projection (+ optional biases) → RoPE
+/// on Q/K → causal SDPA (GQA-aware) → output projection. The shape
+/// Qwen2.5 / Llama-3 use.
 ///
-/// `x` is `[seq_len, hidden_dim]`. Wq / Wk / Wv / Wo are all
-/// `[hidden_dim, hidden_dim]` row-major (HuggingFace native).
-/// `rope_cos` / `rope_sin` are `[seq_len, head_dim/2]`.
+/// `x` is `[seq_len, hidden_dim]`. Q-side: `wq` is `[hidden_dim,
+/// hidden_dim]`, optional `q_bias` length `hidden_dim`. KV-side: `wk`
+/// and `wv` are `[hkv, hidden_dim]` where `hkv = n_kv_heads *
+/// head_dim`; optional `k_bias` / `v_bias` length `hkv`. `wo` is
+/// `[hidden_dim, hidden_dim]`. RoPE tables are `[seq_len,
+/// head_dim/2]`.
+///
+/// Pass `n_kv_heads = n_heads` and `None` for all biases to get the
+/// pre-D.3.6 behaviour (no GQA, no biases) — that's what the D.3.4
+/// synthetic test exercises.
+#[allow(clippy::too_many_arguments)]
 pub fn attention_block(
     x: &[f32],
     wq: &[f32], wk: &[f32], wv: &[f32], wo: &[f32],
+    q_bias: Option<&[f32]>,
+    k_bias: Option<&[f32]>,
+    v_bias: Option<&[f32]>,
     rope_cos: &[f32], rope_sin: &[f32],
-    seq_len: usize, hidden_dim: usize, n_heads: usize,
+    seq_len: usize, hidden_dim: usize,
+    n_heads: usize, n_kv_heads: usize,
 ) -> Option<Vec<f32>> {
     if hidden_dim % n_heads != 0 { return None; }
+    if n_kv_heads == 0 || n_heads % n_kv_heads != 0 { return None; }
     let head_dim = hidden_dim / n_heads;
+    let hkv = n_kv_heads * head_dim;
     if x.len() != seq_len * hidden_dim { return None; }
+    if let Some(b) = q_bias { if b.len() != hidden_dim { return None; } }
+    if let Some(b) = k_bias { if b.len() != hkv { return None; } }
+    if let Some(b) = v_bias { if b.len() != hkv { return None; } }
 
-    // ── 1. Project x → Q, K, V (per-row matvec) ─────────────────────
+    // ── 1. Project x → Q, K, V (per-row matvec, then add bias) ─────
     let mut q = Vec::with_capacity(seq_len * hidden_dim);
-    let mut k = Vec::with_capacity(seq_len * hidden_dim);
-    let mut v = Vec::with_capacity(seq_len * hidden_dim);
+    let mut k = Vec::with_capacity(seq_len * hkv);
+    let mut v = Vec::with_capacity(seq_len * hkv);
     for s in 0..seq_len {
         let row = &x[s * hidden_dim..(s + 1) * hidden_dim];
-        q.extend(linear(wq, hidden_dim, hidden_dim, row)?);
-        k.extend(linear(wk, hidden_dim, hidden_dim, row)?);
-        v.extend(linear(wv, hidden_dim, hidden_dim, row)?);
+        let mut q_row = linear(wq, hidden_dim, hidden_dim, row)?;
+        let mut k_row = linear(wk, hidden_dim, hkv, row)?;
+        let mut v_row = linear(wv, hidden_dim, hkv, row)?;
+        if let Some(b) = q_bias {
+            for i in 0..hidden_dim { q_row[i] += b[i]; }
+        }
+        if let Some(b) = k_bias {
+            for i in 0..hkv { k_row[i] += b[i]; }
+        }
+        if let Some(b) = v_bias {
+            for i in 0..hkv { v_row[i] += b[i]; }
+        }
+        q.extend(q_row);
+        k.extend(k_row);
+        v.extend(v_row);
     }
 
-    // ── 2. RoPE on Q and K (V is not rotated) ───────────────────────
+    // ── 2. RoPE on Q (n_heads) and K (n_kv_heads). V isn't rotated. ─
     apply_rope(&mut q, rope_cos, rope_sin, seq_len, n_heads, head_dim)?;
-    apply_rope(&mut k, rope_cos, rope_sin, seq_len, n_heads, head_dim)?;
+    apply_rope(&mut k, rope_cos, rope_sin, seq_len, n_kv_heads, head_dim)?;
 
-    // ── 3. Scaled dot-product attention ─────────────────────────────
-    let attn = scaled_dot_product_attention(&q, &k, &v, seq_len, n_heads, head_dim)?;
+    // ── 3. Scaled dot-product attention (GQA-aware) ─────────────────
+    let attn = scaled_dot_product_attention(
+        &q, &k, &v, seq_len, n_heads, n_kv_heads, head_dim,
+    )?;
 
     // ── 4. Output projection (per-row matvec) ───────────────────────
     let mut out = Vec::with_capacity(seq_len * hidden_dim);

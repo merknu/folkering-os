@@ -150,31 +150,39 @@ def apply_rope(qk: np.ndarray, cos_t: np.ndarray, sin_t: np.ndarray,
     return out.reshape(seq_len * n_heads * head_dim)
 
 
-def attention(x: np.ndarray, wq, wk, wv, wo, rope_cos, rope_sin,
-              seq_len, hidden_dim, n_heads) -> np.ndarray:
+def attention(x: np.ndarray, wq, wk, wv, wo,
+              q_bias, k_bias, v_bias,
+              rope_cos, rope_sin,
+              seq_len, hidden_dim, n_heads, n_kv_heads) -> np.ndarray:
     head_dim = hidden_dim // n_heads
+    hkv = head_dim * n_kv_heads
     # x: [seq, hidden]
     q = (x @ wq.T).astype(np.float32)
     k = (x @ wk.T).astype(np.float32)
     v = (x @ wv.T).astype(np.float32)
+    if q_bias is not None: q = q + q_bias
+    if k_bias is not None: k = k + k_bias
+    if v_bias is not None: v = v + v_bias
     q = apply_rope(q.flatten(), rope_cos, rope_sin, seq_len, n_heads, head_dim)
-    k = apply_rope(k.flatten(), rope_cos, rope_sin, seq_len, n_heads, head_dim)
+    k = apply_rope(k.flatten(), rope_cos, rope_sin, seq_len, n_kv_heads, head_dim)
     q = q.reshape(seq_len, n_heads, head_dim)
-    k = k.reshape(seq_len, n_heads, head_dim)
-    v = v.reshape(seq_len, n_heads, head_dim)
+    k = k.reshape(seq_len, n_kv_heads, head_dim)
+    v = v.reshape(seq_len, n_kv_heads, head_dim)
+    groups = n_heads // n_kv_heads
     scale = fast_rsqrt(np.float32(head_dim))
     out = np.zeros((seq_len, n_heads, head_dim), dtype=np.float32)
     for h in range(n_heads):
+        kvh = h // groups
         for i in range(seq_len):
             scores = np.full(seq_len, -np.inf, dtype=np.float32)
             for j in range(seq_len):
                 if j > i:
                     continue
-                dot = float((q[i, h] * k[j, h]).sum()) * float(scale)
+                dot = float((q[i, h] * k[j, kvh]).sum()) * float(scale)
                 scores[j] = np.float32(dot)
             attn = softmax_inplace(scores)
             for d in range(head_dim):
-                out[i, h, d] = sum(attn[j] * v[j, h, d] for j in range(seq_len))
+                out[i, h, d] = sum(attn[j] * v[j, kvh, d] for j in range(seq_len))
     out2 = out.reshape(seq_len, hidden_dim)
     return (out2 @ wo.T).astype(np.float32)
 
@@ -191,6 +199,7 @@ def forward(tensors: Dict[str, np.ndarray], cfg: dict, ids):
     n_layers = cfg["n_layers"]
     hidden = cfg["hidden_dim"]
     n_heads = cfg["n_heads"]
+    n_kv_heads = cfg["n_kv_heads"]
     eps = cfg.get("eps", 1e-5)
 
     embed = tensors["embed"]
@@ -210,14 +219,20 @@ def forward(tensors: Dict[str, np.ndarray], cfg: dict, ids):
         wk = tensors[f"{prefix}.k"]
         wv = tensors[f"{prefix}.v"]
         wo = tensors[f"{prefix}.o"]
+        # Biases optional (Llama-3 skips them, Qwen2.5 has them on q/k/v).
+        q_bias = tensors.get(f"{prefix}.q_bias")
+        k_bias = tensors.get(f"{prefix}.k_bias")
+        v_bias = tensors.get(f"{prefix}.v_bias")
         ffn_norm = tensors[f"{prefix}.ffn_norm"]
         gate = tensors[f"{prefix}.gate"]
         up = tensors[f"{prefix}.up"]
         down = tensors[f"{prefix}.down"]
 
         x_n = np.stack([rmsnorm(x[s], attn_norm, eps) for s in range(seq_len)])
-        attn = attention(x_n, wq, wk, wv, wo, rope_cos, rope_sin,
-                         seq_len, hidden, n_heads)
+        attn = attention(x_n, wq, wk, wv, wo,
+                         q_bias, k_bias, v_bias,
+                         rope_cos, rope_sin,
+                         seq_len, hidden, n_heads, n_kv_heads)
         x = (x + attn).astype(np.float32)
 
         x_n2 = np.stack([rmsnorm(x[s], ffn_norm, eps) for s in range(seq_len)])
@@ -245,6 +260,7 @@ def main():
         "n_layers": 1,
         "hidden_dim": 64,
         "n_heads": 4,
+        "n_kv_heads": 2,
         "eps": 1e-5,
     }
     ids = [1, 2, 3]
