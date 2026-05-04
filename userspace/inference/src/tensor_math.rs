@@ -106,6 +106,127 @@ pub fn matmul(a: &Tensor2, b: &Tensor2) -> Tensor2 {
     out
 }
 
+/// Linear layer (matmul-vector, no bias): `out = W @ x`, where `W`
+/// has shape `[out_dim, in_dim]` row-major. Qwen and Llama don't use
+/// bias on these projections, so we skip it. Allocates a fresh
+/// `Vec<f32>` of length `out_dim`.
+///
+/// Returns `None` on shape mismatch — easier to propagate than panic
+/// in the request-driven hot path.
+pub fn linear(weights: &[f32], in_dim: usize, out_dim: usize, x: &[f32]) -> Option<Vec<f32>> {
+    if x.len() != in_dim || weights.len() != in_dim * out_dim { return None; }
+    let mut out = Vec::with_capacity(out_dim);
+    let mut since_yield: usize = 0;
+    for i in 0..out_dim {
+        let mut acc = 0.0f32;
+        let row_off = i * in_dim;
+        for k in 0..in_dim {
+            acc += weights[row_off + k] * x[k];
+            since_yield += 1;
+            if since_yield >= MATMUL_YIELD_EVERY {
+                since_yield = 0;
+                libfolk::sys::yield_cpu();
+            }
+        }
+        out.push(acc);
+    }
+    Some(out)
+}
+
+/// Element-wise multiply (Hadamard product). Used by SwiGLU between
+/// the SiLU-gated branch and the up-projection branch.
+pub fn elemwise_mul(a: &[f32], b: &[f32]) -> Option<Vec<f32>> {
+    if a.len() != b.len() { return None; }
+    let mut out = Vec::with_capacity(a.len());
+    for i in 0..a.len() {
+        out.push(a[i] * b[i]);
+    }
+    Some(out)
+}
+
+/// Fast exp(x) using a 6th-order minimax polynomial after range
+/// reduction. Max error ~3e-5 for |x| < 88. Lifted from
+/// `libtensor::ops::fast_exp`. We avoid libm because under QEMU TCG
+/// the FPU-emulated `expf` is ~100× slower than this.
+#[inline]
+fn fast_exp(x: f32) -> f32 {
+    if x > 88.0 { return f32::MAX; }
+    if x < -88.0 { return 0.0; }
+
+    let ln2 = 0.6931471805599453_f32;
+    let inv_ln2 = 1.4426950408889634_f32;
+    // Floor without libm: cast to int, adjust for negatives.
+    let n_raw = x * inv_ln2 + 0.5;
+    let n_int = n_raw as i32;
+    let n = if n_raw < 0.0 && (n_int as f32) != n_raw {
+        (n_int - 1) as f32
+    } else {
+        n_int as f32
+    };
+    let r = x - n * ln2;
+
+    // Horner-evaluated 1 + r + r²/2 + r³/6 + r⁴/24 + r⁵/120.
+    let p = 1.0_f32
+        + r * (1.0
+        + r * (0.5
+        + r * (1.0/6.0
+        + r * (1.0/24.0
+        + r * (1.0/120.0)))));
+
+    // Multiply by 2^n via direct manipulation of the IEEE 754 exponent.
+    let bits = ((n as i32 + 127) as u32).wrapping_shl(23);
+    let pow2 = f32::from_bits(bits);
+    p * pow2
+}
+
+/// Sigmoid Linear Unit (a.k.a. swish).
+///
+///   silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
+///
+/// Used by Qwen and Llama as the activation function inside SwiGLU.
+/// We compute `sigmoid` via `fast_exp` for the no-libm reasons above;
+/// max error ~3e-5 vs the reference is well below the precision
+/// budget RMSNorm-stacking already swallows.
+pub fn silu(x: &[f32]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(x.len());
+    for &v in x {
+        let e_neg = fast_exp(-v);
+        let sigmoid = 1.0 / (1.0 + e_neg);
+        out.push(v * sigmoid);
+    }
+    out
+}
+
+/// SwiGLU FFN block (Qwen2.5 / Llama style).
+///
+///   y = down_proj( silu(gate_proj(x)) ⊙ up_proj(x) )
+///
+/// Shapes:
+///   x          : [hidden]
+///   gate_proj  : [intermediate, hidden] row-major
+///   up_proj    : [intermediate, hidden] row-major
+///   down_proj  : [hidden, intermediate] row-major
+///   y          : [hidden]
+///
+/// Returns None on any shape mismatch. We allocate three intermediate
+/// `Vec<f32>` (gate output, up output, hadamard output); D.3.4 will
+/// switch to a pre-allocated scratch slab when per-token throughput
+/// starts mattering.
+pub fn swiglu_ffn(
+    x: &[f32],
+    gate_proj: &[f32],
+    up_proj: &[f32],
+    down_proj: &[f32],
+    hidden: usize,
+    intermediate: usize,
+) -> Option<Vec<f32>> {
+    let g = linear(gate_proj, hidden, intermediate, x)?;
+    let u = linear(up_proj, hidden, intermediate, x)?;
+    let g_silu = silu(&g);
+    let mixed = elemwise_mul(&g_silu, &u)?;
+    linear(down_proj, intermediate, hidden, &mixed)
+}
+
 /// Embedding lookup: `table[vocab_id, :]` from a row-major
 /// `[n_vocab, hidden_dim]` table. Allocates a fresh `Vec<f32>` of
 /// length `hidden_dim` so the caller can mutate it for the rest of
@@ -225,6 +346,55 @@ pub fn self_test() -> bool {
     if row1 != [5.0_f32, 6.0, 7.0, 8.0] { return false; }
     // out-of-range returns None
     if embedding_lookup(&table, 4, 4, 9).is_some() { return false; }
+
+    // ── 5. fast_exp sanity ──
+    // exp(0) = 1, exp(1) ≈ 2.71828, exp(-1) ≈ 0.36788
+    if (fast_exp(0.0) - 1.0).abs() > 1e-3 { return false; }
+    if (fast_exp(1.0) - 2.71828).abs() > 1e-2 { return false; }
+    if (fast_exp(-1.0) - 0.36788).abs() > 1e-3 { return false; }
+
+    // ── 6. silu against PyTorch reference ──
+    // silu(0) = 0
+    // silu(1) ≈ 0.7311
+    // silu(-1) ≈ -0.2689
+    let silu_out = silu(&[0.0_f32, 1.0, -1.0, 2.0]);
+    if silu_out[0].abs() > 1e-3 { return false; }
+    if (silu_out[1] - 0.7311).abs() > 1e-2 { return false; }
+    if (silu_out[2] - (-0.2689)).abs() > 1e-2 { return false; }
+    if (silu_out[3] - 1.7616).abs() > 1e-2 { return false; }
+
+    // ── 7. linear (matvec) ──
+    // W = [[1, 2], [3, 4]] row-major, x = [5, 6]
+    // out = [1*5 + 2*6, 3*5 + 4*6] = [17, 39]
+    let w = [1.0_f32, 2.0, 3.0, 4.0];
+    let lo = match linear(&w, 2, 2, &[5.0_f32, 6.0]) {
+        Some(v) => v,
+        None => return false,
+    };
+    if (lo[0] - 17.0).abs() > 1e-6 { return false; }
+    if (lo[1] - 39.0).abs() > 1e-6 { return false; }
+
+    // ── 8. SwiGLU FFN end-to-end with hand-computed reference ──
+    // x = [1, 2]
+    // gate_proj 4×2 = [[1, 0], [0, 1], [1, 1], [1, -1]]   row-major
+    // up_proj   4×2 = [[1, 0], [0, 1], [0, 1], [1, 0]]
+    // down_proj 2×4 = [[1, 0, 1, 0], [0, 1, 0, 1]]
+    //
+    // gate(x) = [1, 2, 3, -1]
+    // up(x)   = [1, 2, 2, 1]
+    // silu(gate) ≈ [0.7311, 1.7616, 2.8577, -0.2689]
+    // hadamard ≈ [0.7311, 3.5232, 5.7155, -0.2689]
+    // down([h]) = [h0+h2, h1+h3] = [6.4466, 3.2543]
+    // sum ≈ 9.7009
+    let gate = [1.0_f32, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, -1.0];
+    let up   = [1.0_f32, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0];
+    let down = [1.0_f32, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0];
+    let ffn = match swiglu_ffn(&[1.0_f32, 2.0], &gate, &up, &down, 2, 4) {
+        Some(v) => v,
+        None => return false,
+    };
+    let ffn_sum: f32 = ffn.iter().sum();
+    if (ffn_sum - 9.7009).abs() > 5e-2 { return false; }
 
     true
 }
