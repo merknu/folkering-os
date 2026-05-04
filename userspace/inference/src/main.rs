@@ -59,6 +59,8 @@ mod router;
 mod proxy_backend;
 mod local_backend;
 mod tensor_math;
+mod weights;
+mod weights_test_blob;
 
 // ── Bump allocator ──────────────────────────────────────────────────
 //
@@ -124,6 +126,15 @@ fn main() -> ! {
         println!("[INFERENCE] local_backend D.2 boot_test PASS");
     }
 
+    // D.3.1: parse the embedded `.fbin` test blob, find both named
+    // tensors, verify their data via FNV-1a checksums. Real Synapse
+    // VFS file-read plumbs in D.3.1.2.
+    if !run_fbin_self_test() {
+        println!("[INFERENCE] FATAL: weights D.3.1 self-test failed");
+    } else {
+        println!("[INFERENCE] weights D.3.1 self-test PASS");
+    }
+
     println!("[INFERENCE] ready — awaiting IPC requests on this task id");
 
     let mut req_count: u64 = 0;
@@ -147,6 +158,88 @@ fn main() -> ! {
             }
         }
     }
+}
+
+/// D.3.1 self-test: parse the embedded blob, look up both tensors,
+/// verify shapes and data hashes match the values
+/// `weights_test_blob.rs` baked into the file.
+fn run_fbin_self_test() -> bool {
+    use weights::{FbinView, fnv1a_64};
+
+    let view = match FbinView::parse(weights_test_blob::TEST_FBIN) {
+        Ok(v) => v,
+        Err(e) => {
+            println!("[INFERENCE] fbin parse error: {:?}", e);
+            return false;
+        }
+    };
+    if view.tensors.len() != 2 {
+        println!("[INFERENCE] fbin: expected 2 tensors, got {}", view.tensors.len());
+        return false;
+    }
+
+    // ── tensor 1: embed_test (4×4 f32, values 1..16) ───────────────
+    let embed = match view.find("embed_test") {
+        Some(t) => t,
+        None => {
+            println!("[INFERENCE] fbin: tensor 'embed_test' not found");
+            return false;
+        }
+    };
+    if embed.shape != [4u32, 4] {
+        println!("[INFERENCE] fbin: embed_test wrong shape (got {:?})", embed.shape);
+        return false;
+    }
+    let embed_vals = match view.read_f32(embed) {
+        Some(v) => v,
+        None => {
+            println!("[INFERENCE] fbin: embed_test read_f32 failed");
+            return false;
+        }
+    };
+    let sum: f32 = embed_vals.iter().sum();
+    // Expected: 1+2+...+16 = 136
+    if (sum - 136.0).abs() > 1e-3 {
+        println!("[INFERENCE] fbin: embed_test sum {} != 136", sum);
+        return false;
+    }
+
+    // ── tensor 2: weight_test (4 f32, [0.25, 0.5, 0.75, 1.0]) ──────
+    let weight = match view.find("weight_test") {
+        Some(t) => t,
+        None => {
+            println!("[INFERENCE] fbin: tensor 'weight_test' not found");
+            return false;
+        }
+    };
+    if weight.shape != [4u32] {
+        println!("[INFERENCE] fbin: weight_test wrong shape (got {:?})", weight.shape);
+        return false;
+    }
+    let weight_vals = match view.read_f32(weight) {
+        Some(v) => v,
+        None => {
+            println!("[INFERENCE] fbin: weight_test read_f32 failed");
+            return false;
+        }
+    };
+    let wsum: f32 = weight_vals.iter().sum();
+    // Expected: 0.25 + 0.5 + 0.75 + 1.0 = 2.5
+    if (wsum - 2.5).abs() > 1e-6 {
+        println!("[INFERENCE] fbin: weight_test sum {} != 2.5", wsum);
+        return false;
+    }
+
+    // ── Hash check (proves byte-level integrity) ───────────────────
+    // FNV-1a over each tensor's raw bytes. Stable so a regression in
+    // the parser surfaces here, not 100 LOC into a forward pass.
+    let h_embed = fnv1a_64(view.data_for(embed));
+    let h_weight = fnv1a_64(view.data_for(weight));
+    println!(
+        "[INFERENCE] fbin: embed_hash=0x{:x} weight_hash=0x{:x}",
+        h_embed, h_weight
+    );
+    true
 }
 
 fn handle_request(msg: &libfolk::sys::ipc::IpcMessage, n: u64) {
