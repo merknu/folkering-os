@@ -190,17 +190,35 @@ def apply_rope(qk: np.ndarray, cos_t: np.ndarray, sin_t: np.ndarray,
 
 def attention(x: np.ndarray, wq, wk, wv, wo,
               q_bias, k_bias, v_bias,
+              q_norm, k_norm, rms_eps,
               rope_cos, rope_sin,
-              seq_len, hidden_dim, n_heads, n_kv_heads) -> np.ndarray:
-    head_dim = hidden_dim // n_heads
+              seq_len, hidden_dim, head_dim, n_heads, n_kv_heads) -> np.ndarray:
+    """Qwen3-aware attention: head_dim is independent of
+    hidden_dim/n_heads, and Q/K can have per-head RMSNorm before
+    RoPE. Falls back to Qwen2.5 / Llama-3 semantics when q_norm /
+    k_norm are None."""
+    q_dim = head_dim * n_heads
     hkv = head_dim * n_kv_heads
     # x: [seq, hidden]
-    q = (x @ wq.T).astype(np.float32)
-    k = (x @ wk.T).astype(np.float32)
-    v = (x @ wv.T).astype(np.float32)
+    q = (x @ wq.T).astype(np.float32)  # [seq, q_dim]
+    k = (x @ wk.T).astype(np.float32)  # [seq, hkv]
+    v = (x @ wv.T).astype(np.float32)  # [seq, hkv]
     if q_bias is not None: q = q + q_bias
     if k_bias is not None: k = k + k_bias
     if v_bias is not None: v = v + v_bias
+    # Per-head RMSNorm (Qwen3) — applied to each head_dim chunk.
+    if q_norm is not None:
+        qr = q.reshape(seq_len, n_heads, head_dim)
+        qr = np.stack([np.stack([rmsnorm(qr[s, h], q_norm, rms_eps)
+                                 for h in range(n_heads)])
+                       for s in range(seq_len)])
+        q = qr.reshape(seq_len, q_dim)
+    if k_norm is not None:
+        kr = k.reshape(seq_len, n_kv_heads, head_dim)
+        kr = np.stack([np.stack([rmsnorm(kr[s, h], k_norm, rms_eps)
+                                 for h in range(n_kv_heads)])
+                       for s in range(seq_len)])
+        k = kr.reshape(seq_len, hkv)
     q = apply_rope(q.flatten(), rope_cos, rope_sin, seq_len, n_heads, head_dim)
     k = apply_rope(k.flatten(), rope_cos, rope_sin, seq_len, n_kv_heads, head_dim)
     q = q.reshape(seq_len, n_heads, head_dim)
@@ -221,7 +239,9 @@ def attention(x: np.ndarray, wq, wk, wv, wo,
             attn = softmax_inplace(scores)
             for d in range(head_dim):
                 out[i, h, d] = sum(attn[j] * v[j, kvh, d] for j in range(seq_len))
-    out2 = out.reshape(seq_len, hidden_dim)
+    # out: [seq, n_heads, head_dim] = [seq, q_dim] flat. Wo shape is
+    # [hidden_dim, q_dim]; out @ Wo.T → [seq, hidden_dim].
+    out2 = out.reshape(seq_len, q_dim)
     return (out2 @ wo.T).astype(np.float32)
 
 
@@ -238,6 +258,7 @@ def forward(tensors: Dict[str, np.ndarray], cfg: dict, ids):
     hidden = cfg["hidden_dim"]
     n_heads = cfg["n_heads"]
     n_kv_heads = cfg["n_kv_heads"]
+    head_dim = cfg.get("head_dim", hidden // n_heads)
     eps = cfg.get("eps", 1e-5)
 
     embed = tensors["embed"]
@@ -257,10 +278,13 @@ def forward(tensors: Dict[str, np.ndarray], cfg: dict, ids):
         wk = tensors[f"{prefix}.k"]
         wv = tensors[f"{prefix}.v"]
         wo = tensors[f"{prefix}.o"]
-        # Biases optional (Llama-3 skips them, Qwen2.5 has them on q/k/v).
+        # Biases optional (Llama-3 / Qwen3 skip them, Qwen2.5 has them on q/k/v).
         q_bias = tensors.get(f"{prefix}.q_bias")
         k_bias = tensors.get(f"{prefix}.k_bias")
         v_bias = tensors.get(f"{prefix}.v_bias")
+        # Per-head Q/K RMSNorm — Qwen3-only.
+        q_norm = tensors.get(f"{prefix}.q_norm")
+        k_norm = tensors.get(f"{prefix}.k_norm")
         ffn_norm = tensors[f"{prefix}.ffn_norm"]
         gate = tensors[f"{prefix}.gate"]
         up = tensors[f"{prefix}.up"]
@@ -269,8 +293,9 @@ def forward(tensors: Dict[str, np.ndarray], cfg: dict, ids):
         x_n = np.stack([rmsnorm(x[s], attn_norm, eps) for s in range(seq_len)])
         attn = attention(x_n, wq, wk, wv, wo,
                          q_bias, k_bias, v_bias,
+                         q_norm, k_norm, eps,
                          rope_cos, rope_sin,
-                         seq_len, hidden, n_heads, n_kv_heads)
+                         seq_len, hidden, head_dim, n_heads, n_kv_heads)
         x = (x + attn).astype(np.float32)
 
         x_n2 = np.stack([rmsnorm(x[s], ffn_norm, eps) for s in range(seq_len)])

@@ -90,6 +90,10 @@ HF_LAYER_TENSORS = {
     "self_attn.q_proj.bias":          "q_bias",   # Qwen2.5-only
     "self_attn.k_proj.bias":          "k_bias",
     "self_attn.v_proj.bias":          "v_bias",
+    # Qwen3-only: per-head RMSNorm on Q / K after projection, before
+    # RoPE. Shape is `[head_dim]`, applied to every head.
+    "self_attn.q_norm.weight":        "q_norm",
+    "self_attn.k_norm.weight":        "k_norm",
     "post_attention_layernorm.weight":"ffn_norm",
     "mlp.gate_proj.weight":           "gate",
     "mlp.up_proj.weight":             "up",
@@ -108,6 +112,9 @@ def load_safetensors(model_dir: str) -> Dict[str, np.ndarray]:
     returning a single name → numpy.ndarray dict.
 
     Walks shard files (`model-00001-of-NNNNN.safetensors`) automatically.
+    Models stored as bf16 (Qwen3 default) require the torch backend
+    because numpy doesn't support bfloat16; we promote to fp32 at
+    load time so downstream code sees a uniform dtype.
     """
     out: Dict[str, np.ndarray] = {}
     files = sorted(
@@ -118,12 +125,33 @@ def load_safetensors(model_dir: str) -> Dict[str, np.ndarray]:
         raise FileNotFoundError(
             f"no .safetensors in {model_dir} — is this a real HF dir?"
         )
-    for f in files:
-        path = os.path.join(model_dir, f)
-        with safe_open(path, framework="numpy") as st:
-            for k in st.keys():
-                out[k] = st.get_tensor(k)
-    return out
+    # Try numpy first (faster). Fall back to torch if any tensor is bf16.
+    try:
+        for f in files:
+            path = os.path.join(model_dir, f)
+            with safe_open(path, framework="numpy") as st:
+                for k in st.keys():
+                    out[k] = st.get_tensor(k)
+        return out
+    except TypeError as e:
+        if "bfloat16" not in str(e):
+            raise
+        # Reset and reload via torch.
+        out.clear()
+        try:
+            import torch  # noqa: F401
+        except ImportError as ie:
+            raise SystemExit(
+                "model uses bfloat16, which numpy can't decode. "
+                "Install torch: `pip install torch`."
+            ) from ie
+        for f in files:
+            path = os.path.join(model_dir, f)
+            with safe_open(path, framework="pt") as st:
+                for k in st.keys():
+                    t = st.get_tensor(k)
+                    out[k] = t.to(dtype=__import__("torch").float32).numpy()
+        return out
 
 
 def precompute_rope(
@@ -169,11 +197,12 @@ def to_f32_le_bytes(arr: np.ndarray) -> bytes:
 
 # Suffix sets that decide whether `emit_tensor` quantizes the tensor
 # (when --quantize q8_0 is on). Projections compress well; norms,
-# biases, and the embed table are kept fp32 because they're small
-# and / or precision-sensitive.
+# biases, and (by default) the embed table are kept fp32 because
+# they're small and / or precision-sensitive.
 QUANTIZABLE_SUFFIXES = {".q", ".k", ".v", ".o", ".gate", ".up", ".down"}
-# Top-level names that always stay fp32 even with --quantize on.
-ALWAYS_F32_NAMES = {"embed", "final_norm", "lm_head"}
+# Names that may opt into Q8 separately via `--quantize-embed`. Norms
+# stay fp32 unconditionally — they're tiny and accumulate error.
+EMBED_NAMES = {"embed", "lm_head"}
 
 
 def emit_tensor(
@@ -181,24 +210,35 @@ def emit_tensor(
     name: str,
     arr: np.ndarray,
     quant: str = "f32",
+    quant_embed: bool = False,
 ):
-    """Append a tensor to the output list, quantizing if both the
-    `quant` mode says so AND the tensor's name matches a quantizable
-    suffix. Falls back to f32 otherwise."""
-    is_quant_candidate = (
-        quant == "q8_0"
-        and name not in ALWAYS_F32_NAMES
-        and not name.endswith("_norm")  # attn_norm, ffn_norm, layernorm
-        and not name.endswith("_bias")
-    )
-    if is_quant_candidate and any(name.endswith(s) for s in QUANTIZABLE_SUFFIXES):
+    """Append a tensor to the output list, quantizing per the
+    `quant` + `quant_embed` flags. Norms and biases always stay
+    fp32; projections quantize when `quant=q8_0`; embed/lm_head
+    only quantize when `quant_embed=True` (separate flag because
+    embed precision matters more than projection precision)."""
+    # Norms (input_layernorm, post_attention_layernorm,
+    # final_norm, q_norm, k_norm) and biases — always fp32.
+    if name.endswith("_norm") or name.endswith("_bias") or name == "final_norm":
+        out.append((name, DTYPE_F32, list(arr.shape), to_f32_le_bytes(arr)))
+        return
+
+    # Embed / lm_head: gated by --quantize-embed.
+    if name in EMBED_NAMES:
+        if quant == "q8_0" and quant_embed:
+            n_elem = int(np.prod(arr.shape))
+            if n_elem % Q8_BLOCK_SIZE == 0:
+                out.append((name, DTYPE_Q8, list(arr.shape), q8_0_bytes(arr.flatten())))
+                return
+        out.append((name, DTYPE_F32, list(arr.shape), to_f32_le_bytes(arr)))
+        return
+
+    # Projection matrices: gated by --quantize.
+    if quant == "q8_0" and any(name.endswith(s) for s in QUANTIZABLE_SUFFIXES):
         n_elem = int(np.prod(arr.shape))
         if n_elem % Q8_BLOCK_SIZE == 0:
             out.append((name, DTYPE_Q8, list(arr.shape), q8_0_bytes(arr.flatten())))
             return
-        # Tensor doesn't divide evenly; fall back to f32. Common in
-        # tiny synthetic models where some dim < 32; real Qwen always
-        # divides cleanly so this just affects the fixture.
     out.append((name, DTYPE_F32, list(arr.shape), to_f32_le_bytes(arr)))
 
 
@@ -208,6 +248,7 @@ def convert(
     max_layers: int | None = None,
     max_seq_len: int | None = None,
     quant: str = "f32",
+    quant_embed: bool = False,
 ):
     cfg_path = os.path.join(model_dir, "config.json")
     with open(cfg_path) as f:
@@ -239,7 +280,7 @@ def convert(
 
     # ── Embedding ──
     if "model.embed_tokens.weight" in weights:
-        emit_tensor(tensors, "embed", weights["model.embed_tokens.weight"], quant=quant)
+        emit_tensor(tensors, "embed", weights["model.embed_tokens.weight"], quant=quant, quant_embed=quant_embed)
     else:
         raise KeyError("missing model.embed_tokens.weight")
 
@@ -253,20 +294,20 @@ def convert(
                 # runtime will skip the corresponding op.
                 continue
             our_name = f"layer.{layer_i}.{our_suffix}"
-            emit_tensor(tensors, our_name, weights[hf_name], quant=quant)
+            emit_tensor(tensors, our_name, weights[hf_name], quant=quant, quant_embed=quant_embed)
 
     # ── Final norm ──
     if "model.norm.weight" in weights:
-        emit_tensor(tensors, "final_norm", weights["model.norm.weight"], quant=quant)
+        emit_tensor(tensors, "final_norm", weights["model.norm.weight"], quant=quant, quant_embed=quant_embed)
 
     # ── lm_head (skip if tied to embed) ──
     if not tie_emb and "lm_head.weight" in weights:
-        emit_tensor(tensors, "lm_head", weights["lm_head.weight"], quant=quant)
+        emit_tensor(tensors, "lm_head", weights["lm_head.weight"], quant=quant, quant_embed=quant_embed)
 
     # ── RoPE precomputed tables ──
     cos_t, sin_t = precompute_rope(head_dim, max_pos, rope_theta)
-    emit_tensor(tensors, "rope_cos", cos_t, quant=quant)
-    emit_tensor(tensors, "rope_sin", sin_t, quant=quant)
+    emit_tensor(tensors, "rope_cos", cos_t, quant=quant, quant_embed=quant_embed)
+    emit_tensor(tensors, "rope_sin", sin_t, quant=quant, quant_embed=quant_embed)
 
     blob = write_fbin(tensors)
     with open(out_path, "wb") as f:
@@ -294,6 +335,13 @@ def main():
                          "Q8_0 stores 32-element blocks of [f16 scale, 32 i8 vals], "
                          "shrinking the projections ~4x. Embed, lm_head, norms, and "
                          "biases stay fp32 for precision.")
+    ap.add_argument("--quantize-embed", action="store_true",
+                    help="ALSO quantize embed / lm_head to Q8_0 (only effective "
+                         "when --quantize=q8_0). Saves another ~75% on the embed "
+                         "table — Qwen3-0.6B drops from 622 MB fp32 to 165 MB. "
+                         "Slight precision tradeoff; argmax stability typically "
+                         "preserved on short prompts. Use when fitting on edge "
+                         "hardware (Pi 5, low-RAM VMs).")
     args = ap.parse_args()
 
     convert(
@@ -302,6 +350,7 @@ def main():
         max_layers=args.max_layers,
         max_seq_len=args.max_seq_len,
         quant=args.quantize,
+        quant_embed=args.quantize_embed,
     )
 
 
