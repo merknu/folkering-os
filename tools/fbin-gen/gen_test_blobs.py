@@ -21,6 +21,7 @@ import sys
 # Make the local helper importable when run from repo root.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fbin import write_fbin, f32_bytes, emit_rust_const, DTYPE_F32
+from tokb import make_synthetic_tokenizer
 
 REPO_ROOT = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
@@ -175,7 +176,10 @@ def main():
     # kernel.elf and initrd.fpk makes it visible in `qm config`-style
     # ops and easy to swap out for real model weights later.
     binary_targets = [
-        ("model_test.fbin",      gen_combined_blob()),
+        ("model_test.fbin", gen_combined_blob()),
+        # D.3.1 synthetic tokenizer: 256 byte tokens + 3 test merges.
+        # Real Qwen tokenizer.json conversion lands in D.3.1.b.
+        ("tokenizer_test.tokb", make_synthetic_tokenizer()),
     ]
     for filename, blob in binary_targets:
         out_path = os.path.join(REPO_ROOT, "boot", "iso_root", filename)
