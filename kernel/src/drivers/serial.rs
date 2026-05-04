@@ -173,12 +173,21 @@ pub fn com2_async_send(data: &[u8]) {
 
 /// Poll COM2 RX (non-blocking). Call this every frame from the compositor.
 /// Drains any available COM2 bytes into the ring buffer.
+///
+/// Iteration cap: 256 per call. Each `com2_read_byte` does a port-I/O LSR
+/// check, which traps to the hypervisor under KVM/WHPX (~5-15µs per
+/// VMEXIT). If COM2 is unconnected the LSR can return 0xFF, so bit 0
+/// (data-ready) reads as set and the loop *would* spin out the full
+/// budget every call. The old 4096 cap turned this into a 26-54ms tax
+/// per frame in the compositor (Issue #135). At 115200 baud the wire
+/// can deliver at most ~180 B/frame, so 256 leaves comfortable
+/// headroom; if real traffic ever overflows it the next poll picks up
+/// the rest.
 pub fn com2_async_poll() {
     if !COM2_ASYNC_ACTIVE.load(Ordering::Acquire) {
         return;
     }
-    // Drain all available COM2 bytes into ring (up to 4096 per poll to avoid starving the main loop)
-    for _ in 0..4096 {
+    for _ in 0..256 {
         if let Some(byte) = com2_read_byte() {
             let head = COM2_RX_HEAD.load(Ordering::Relaxed);
             if head < COM2_RING_SIZE {
