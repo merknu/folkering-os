@@ -29,6 +29,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::tensor_math;
+use crate::tensor_math::KvCache;
 use crate::weights::FbinView;
 
 /// Topology + numerics knobs the runtime needs to drive the forward
@@ -43,45 +44,72 @@ pub struct ModelConfig {
     pub n_kv_heads: usize,
     pub intermediate: usize,
     pub vocab: usize,
-    /// Maximum positions the embedded RoPE tables cover. Forward pass
-    /// asserts `seq_len <= max_pos`.
+    /// Maximum positions the embedded RoPE tables cover. Forward
+    /// pass asserts `cache.seq_len + new_token_ids.len() <= max_pos`.
     pub max_pos: usize,
     /// RMSNorm epsilon. Qwen2.5 uses 1e-5.
     pub eps: f32,
 }
 
-/// Run the forward pass over `token_ids` and return the unnormalized
-/// logits at the LAST position. Caller picks the next token via
-/// `argmax` / sampler.
+/// Run the forward pass over `new_token_ids`, advance `cache` to
+/// reflect the new positions, and return unnormalized logits at the
+/// LAST position. Caller picks the next token via `argmax` /
+/// sampler, then can call again with that token (and the same
+/// cache) to keep generating without re-prefilling history.
 ///
-/// Returns `None` on any tensor lookup failure or shape mismatch —
-/// proxying through `?` keeps the call sites readable; debug logging
-/// happens at the boot-test layer above.
+/// Two modes fall out of the same code path:
+/// - **Prefill** — `cache.seq_len = 0`, `new_token_ids` carries the
+///   whole prompt. Same arithmetic as the pre-D.4 single-shot
+///   forward pass; caller observes argmax for the prompt's last
+///   token.
+/// - **Decode** — `cache.seq_len > 0`, `new_token_ids` is one (or
+///   a small batch of) freshly sampled tokens. Per-call cost drops
+///   from O(seq² * layers) to O(seq * layers) because K/V for past
+///   positions come from the cache instead of being recomputed.
+///
+/// Returns `None` on any tensor lookup failure, shape mismatch, or
+/// position overflow (`cache.seq_len + new_token_ids.len() >
+/// cache.max_pos`).
 pub fn forward_pass(
     view: &FbinView,
     cfg: &ModelConfig,
-    token_ids: &[u32],
+    cache: &mut KvCache,
+    new_token_ids: &[u32],
 ) -> Option<Vec<f32>> {
-    let seq_len = token_ids.len();
-    if seq_len == 0 || seq_len > cfg.max_pos { return None; }
+    let new_seq = new_token_ids.len();
+    if new_seq == 0 { return None; }
     if cfg.hidden_dim % cfg.n_heads != 0 { return None; }
     let head_dim = cfg.hidden_dim / cfg.n_heads;
     let pairs = head_dim / 2;
+
+    // Validate cache geometry matches model config.
+    if cache.layers.len() != cfg.n_layers { return None; }
+    if cache.n_kv_heads != cfg.n_kv_heads { return None; }
+    if cache.head_dim != head_dim { return None; }
+    if cache.max_pos > cfg.max_pos { return None; }
+
+    let pos_offset = cache.seq_len;
+    if pos_offset + new_seq > cache.max_pos { return None; }
 
     let embed = view.find("embed").and_then(|t| view.read_f32(t))?;
     let final_norm = view.find("final_norm").and_then(|t| view.read_f32(t))?;
     let rope_cos_full = view.find("rope_cos").and_then(|t| view.read_f32(t))?;
     let rope_sin_full = view.find("rope_sin").and_then(|t| view.read_f32(t))?;
 
-    // RoPE tables are stored at full max_pos; slice to seq_len.
-    let need = seq_len * pairs;
-    if rope_cos_full.len() < need || rope_sin_full.len() < need { return None; }
-    let rope_cos = &rope_cos_full[..need];
-    let rope_sin = &rope_sin_full[..need];
+    // Slice RoPE tables to the absolute positions covered by the
+    // NEW tokens — `[pos_offset, pos_offset + new_seq)` — not the
+    // [0, new_seq) prefix (which is what pre-cache code used).
+    let rope_start = pos_offset * pairs;
+    let rope_end = (pos_offset + new_seq) * pairs;
+    if rope_cos_full.len() < rope_end || rope_sin_full.len() < rope_end {
+        return None;
+    }
+    let rope_cos = &rope_cos_full[rope_start..rope_end];
+    let rope_sin = &rope_sin_full[rope_start..rope_end];
 
-    // Step 1: embedding lookup → x : [seq_len, hidden]
-    let mut x: Vec<f32> = Vec::with_capacity(seq_len * cfg.hidden_dim);
-    for &id in token_ids {
+    // Step 1: embedding lookup for the new tokens only.
+    let mut x: Vec<f32> = Vec::with_capacity(new_seq * cfg.hidden_dim);
+    for &id in new_token_ids {
         let row = tensor_math::embedding_lookup(
             &embed, cfg.vocab, cfg.hidden_dim, id,
         )?;
@@ -110,34 +138,39 @@ pub fn forward_pass(
         let down = view.find(&join(&prefix, "down")).and_then(|t| view.read_f32(t))?;
 
         // 2a. Pre-attention RMSNorm (per-row).
-        let mut x_normed = Vec::with_capacity(seq_len * cfg.hidden_dim);
-        for s in 0..seq_len {
+        let mut x_normed = Vec::with_capacity(new_seq * cfg.hidden_dim);
+        for s in 0..new_seq {
             let row = &x[s * cfg.hidden_dim..(s + 1) * cfg.hidden_dim];
             x_normed.extend(tensor_math::rmsnorm(row, &attn_norm, cfg.eps)?);
         }
 
-        // 2b. Attention block (QKV (+biases) → RoPE → SDPA (GQA) → Wo).
+        // 2b. Attention block (QKV (+biases) → RoPE → write KV cache
+        // → SDPA over [0, pos_offset + new_seq) → Wo). The cache for
+        // this layer carries history of all prior decode steps.
         let attn = tensor_math::attention_block(
             &x_normed, &wq, &wk, &wv, &wo,
             q_bias.as_deref(), k_bias.as_deref(), v_bias.as_deref(),
             rope_cos, rope_sin,
-            seq_len, cfg.hidden_dim,
+            new_seq, cfg.hidden_dim,
             cfg.n_heads, cfg.n_kv_heads,
+            &mut cache.layers[li],
+            cache.max_pos,
+            pos_offset,
         )?;
 
         // 2c. Residual.
         for i in 0..x.len() { x[i] += attn[i]; }
 
         // 2d. Pre-FFN RMSNorm (per-row).
-        let mut x_normed2 = Vec::with_capacity(seq_len * cfg.hidden_dim);
-        for s in 0..seq_len {
+        let mut x_normed2 = Vec::with_capacity(new_seq * cfg.hidden_dim);
+        for s in 0..new_seq {
             let row = &x[s * cfg.hidden_dim..(s + 1) * cfg.hidden_dim];
             x_normed2.extend(tensor_math::rmsnorm(row, &ffn_norm, cfg.eps)?);
         }
 
         // 2e. SwiGLU FFN (per-row).
-        let mut ffn_out = Vec::with_capacity(seq_len * cfg.hidden_dim);
-        for s in 0..seq_len {
+        let mut ffn_out = Vec::with_capacity(new_seq * cfg.hidden_dim);
+        for s in 0..new_seq {
             let row = &x_normed2[s * cfg.hidden_dim..(s + 1) * cfg.hidden_dim];
             ffn_out.extend(tensor_math::swiglu_ffn(
                 row, &gate, &up, &down, cfg.hidden_dim, cfg.intermediate,
@@ -151,15 +184,21 @@ pub fn forward_pass(
     // Step 3: final norm on the last position only — that's the only
     // row we need to project to logits for greedy sampling. Skipping
     // normalization on the other rows costs nothing today but saves
-    // (seq_len-1) RMSNorms + linears at scale.
-    let last_off = (seq_len - 1) * cfg.hidden_dim;
+    // (new_seq-1) RMSNorms + linears at scale.
+    let last_off = (new_seq - 1) * cfg.hidden_dim;
     let last = &x[last_off..last_off + cfg.hidden_dim];
     let last_normed = tensor_math::rmsnorm(last, &final_norm, cfg.eps)?;
 
     // Step 4: lm_head (tied to embed) — logits = embed @ last_normed.
     // `embed` has shape [vocab, hidden], so it's already in the
     // [out_dim, in_dim] orientation `linear` wants.
-    tensor_math::linear(&embed, cfg.hidden_dim, cfg.vocab, &last_normed)
+    let logits = tensor_math::linear(&embed, cfg.hidden_dim, cfg.vocab, &last_normed)?;
+
+    // Step 5: every layer succeeded — commit the new positions to
+    // the cache so the next call lines up at the right offset.
+    cache.seq_len += new_seq;
+
+    Some(logits)
 }
 
 /// Find the next token by greedy argmax. Ignores ties; first-wins.
