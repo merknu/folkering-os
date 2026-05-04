@@ -2,7 +2,7 @@
 //!
 //! Functions for basic input/output operations.
 
-use crate::syscall::{syscall0, syscall1, SYS_READ_KEY, SYS_WRITE_CHAR, SYS_POWEROFF, SYS_CHECK_INTERRUPT, SYS_CLEAR_INTERRUPT, SYS_READ_MOUSE};
+use crate::syscall::{syscall0, syscall1, syscall2, SYS_READ_KEY, SYS_WRITE_CHAR, SYS_POWEROFF, SYS_CHECK_INTERRUPT, SYS_CLEAR_INTERRUPT, SYS_READ_MOUSE, SYS_READ_MOUSE_ABS};
 
 /// Mouse event with button state and delta movement
 #[derive(Debug, Clone, Copy)]
@@ -62,6 +62,35 @@ pub fn read_mouse() -> Option<MouseEvent> {
         let dx = ((ret >> 8) & 0xFFFF) as u16 as i16;
         let dy = ((ret >> 24) & 0xFFFF) as u16 as i16;
         Some(MouseEvent { buttons, dx, dy })
+    }
+}
+
+/// Absolute pointer event (virtio-input tablet). The kernel scales the
+/// device's raw 0..0x7FFF range into pixel coords against the
+/// `(fb_w, fb_h)` argument so the caller doesn't have to.
+#[derive(Debug, Clone, Copy)]
+pub struct MouseAbsEvent {
+    /// X in pixels, 0..fb_w-1
+    pub x: u16,
+    /// Y in pixels, 0..fb_h-1
+    pub y: u16,
+    /// Button bitmask: bit 0 = left, bit 1 = right, bit 2 = middle
+    pub buttons: u8,
+}
+
+/// Try to read the latest absolute pointer frame, scaled to the given
+/// framebuffer dimensions. Returns `None` if no frame is queued OR if
+/// the kernel didn't attach to a virtio-input device — callers should
+/// fall back to relative `read_mouse()` in that case.
+pub fn read_mouse_abs(fb_w: u32, fb_h: u32) -> Option<MouseAbsEvent> {
+    let ret = unsafe { syscall2(SYS_READ_MOUSE_ABS, fb_w as u64, fb_h as u64) };
+    if ret & (1u64 << 63) == 0 {
+        None
+    } else {
+        let buttons = ((ret >> 8) & 0xFF) as u8;
+        let x = ((ret >> 16) & 0xFFFF) as u16;
+        let y = ((ret >> 32) & 0xFFFF) as u16;
+        Some(MouseAbsEvent { x, y, buttons })
     }
 }
 

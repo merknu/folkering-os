@@ -48,6 +48,36 @@ pub fn syscall_read_mouse() -> u64 {
     }
 }
 
+/// Absolute pointer read. Pumps the virtio-input eventq and returns
+/// the latest scaled `(x, y, buttons)` frame, or 0 when nothing is
+/// queued / the driver didn't attach.
+///
+/// Args: `fb_w`, `fb_h` — pixel dimensions to scale device coords into.
+/// We clamp `fb_w`, `fb_h` at 16 bits since they ride in 16-bit slots
+/// in the return packing; 65535 is well above any framebuffer the OS
+/// targets today.
+///
+/// Return packing (when frame present):
+///   bit 63    = 1 (presence flag, mirrors `syscall_read_mouse`)
+///   bits 32-47 = y
+///   bits 16-31 = x
+///   bits 8-15  = buttons (bit 0 = left, 1 = right, 2 = middle)
+///   bits 0-7   = reserved (always 0)
+pub fn syscall_read_mouse_abs(fb_w: u64, fb_h: u64) -> u64 {
+    let w = (fb_w & 0xFFFF) as u32;
+    let h = (fb_h & 0xFFFF) as u32;
+    if w == 0 || h == 0 { return 0; }
+    match crate::drivers::virtio_input::read_frame_scaled(w, h) {
+        Some((x, y, buttons)) => {
+            let xb = (x & 0xFFFF) as u64;
+            let yb = (y & 0xFFFF) as u64;
+            let btn = (buttons as u64) & 0xFF;
+            (1u64 << 63) | (yb << 32) | (xb << 16) | (btn << 8)
+        }
+        None => 0,
+    }
+}
+
 /// Set interrupt flag on current task (private helper for read_key/read_mouse)
 fn set_current_task_interrupt() {
     let task_id = crate::task::task::get_current_task();

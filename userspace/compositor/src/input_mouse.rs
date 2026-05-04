@@ -9,7 +9,7 @@ use compositor::damage::DamageTracker;
 use compositor::framebuffer::FramebufferView;
 use compositor::state::{CursorState, InputState, RenderState, StreamState, WasmState, Category};
 use compositor::window_manager::{WindowManager, HitZone, BORDER_W, TITLE_BAR_H};
-use libfolk::sys::io::write_str;
+use libfolk::sys::io::{write_str, read_mouse_abs};
 use libfolk::sys::read_mouse;
 
 /// Layout/color constants needed for mouse processing.
@@ -78,12 +78,75 @@ pub fn process_mouse(
     let mut did_work = false;
     let mut need_redraw = false;
 
+    // ===== Absolute pointer fast path (virtio-input tablet) =====
+    //
+    // When the kernel attached to a virtio-tablet device, raw VNC
+    // PointerEvents arrive as absolute (x, y, buttons). No relative
+    // accumulator, no drift, no need to feather a "drag" sequence
+    // before clicking — `read_mouse_abs` returns the latest scaled
+    // pixel coordinate ready to use.
+    //
+    // We deliberately drain `read_mouse` (PS/2) AFTER this path so
+    // that on hosts without virtio-input the existing relative flow
+    // takes over verbatim. With both, the absolute frame wins —
+    // QEMU still sends synthetic PS/2 deltas to the guest's PS/2
+    // controller for back-compat; we'd just throw them away.
+    let abs_taken = if let Some(abs) = read_mouse_abs(fb.width as u32, fb.height as u32) {
+        let new_x = abs.x as i32;
+        let new_y = abs.y as i32;
+        let prev_left = *last_buttons & 1 != 0;
+        let now_left  = abs.buttons & 1 != 0;
+        if now_left != prev_left {
+            // Same routing path as the PS/2 edge detector below — point
+            // to the click coordinate exactly, since absolute already
+            // is the click coordinate.
+            static EDGE_COUNT: core::sync::atomic::AtomicU32 =
+                core::sync::atomic::AtomicU32::new(0);
+            let routed = compositor::gfx_rings::route_mouse_event(
+                new_x, new_y, 1, now_left,
+            );
+            let n = EDGE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if n < 20 {
+                libfolk::println!(
+                    "[INPUT_ABS] edge#{} prev={} now={} at ({},{}) routed={:?}",
+                    n, prev_left as u8, now_left as u8, new_x, new_y, routed,
+                );
+            }
+        }
+        // Move cursor to the absolute target. Old position needs the
+        // same `bg_dirty` repaint flag the PS/2 path sets when motion
+        // happens, so the trail of cursor pixels gets erased.
+        if cursor.x != new_x || cursor.y != new_y {
+            cursor.bg_dirty = true;
+        }
+        cursor.x = new_x;
+        cursor.y = new_y;
+        *last_buttons = abs.buttons;
+        did_work = true;
+        true
+    } else {
+        false
+    };
+
     // ===== Process mouse input =====
     // Accumulate all pending mouse events, then draw cursor ONCE
     let mut accumulated_dx: i32 = 0;
     let mut accumulated_dy: i32 = 0;
     let mut latest_buttons: u8 = *last_buttons;
     let mut had_mouse_events = false;
+    // Skip the PS/2 drain entirely when absolute already produced a
+    // frame — we don't want phantom deltas re-displacing the cursor
+    // we just authoritatively placed.
+    if abs_taken {
+        // Consume any queued PS/2 packets without applying them, so
+        // the kernel ring doesn't fill up. One read() returning None
+        // is enough on quiet hosts; we still cap at 32 to bound the
+        // worst case under a buffered flood.
+        for _ in 0..32 {
+            if read_mouse().is_none() { break; }
+        }
+        return MouseResult { did_work, need_redraw, had_events: true };
+    }
 
     // Drain capped at 1024 events per call (Issue #56). PS/2 mouse
     // generates 3 bytes per event, kernel ring is small, so flood needs

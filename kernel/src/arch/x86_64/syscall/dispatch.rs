@@ -139,6 +139,12 @@ pub(super) extern "C" fn syscall_handler(
         // see syscall_proxy_ping_udp doc for caveats). Returns 1 if
         // PONG received, 0 otherwise.
         0x68 => syscall_proxy_ping_udp(),
+        // VirtIO Input absolute pointer read. Pumps the eventq, returns
+        // the latest scaled (x, y, buttons) frame packed as
+        // (1<<63 | y<<32 | x<<16 | buttons<<8 | 0). Returns 0 when no
+        // frame is queued or the device isn't present. arg1, arg2 carry
+        // fb_w, fb_h so userspace controls the scaling target.
+        0x69 => syscall_read_mouse_abs(arg1, arg2),
         // Folkering CodeGraph: query callers of a fn name via the
         // proxy's GRAPH_CALLERS command. Same packed-lengths shape
         // as fbp_patch / llm_generate.
