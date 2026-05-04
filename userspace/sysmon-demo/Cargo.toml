@@ -1,0 +1,12 @@
+[package]
+name = "sysmon-demo"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "sysmon-demo"
+path = "src/main.rs"
+
+[dependencies]
+libfolk = { path = "../libfolk" }
+libfolkui = { path = "../libfolkui" }

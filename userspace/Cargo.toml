@@ -6,6 +6,7 @@ members = [
     "libfolk",
     "libfolkui",
     "folkui-demo",
+    "sysmon-demo",
     "libsqlite",
     "libtensor",
     "shell",
