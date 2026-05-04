@@ -65,6 +65,7 @@ mod weights_ffn_blob;
 mod weights_attn_blob;
 mod vfs_loader;
 mod tokenizer;
+mod forward_pass;
 
 // ── Bump allocator ──────────────────────────────────────────────────
 //
@@ -207,6 +208,18 @@ fn main() -> ! {
         println!("[INFERENCE] FATAL: D.3.1 tokenizer self-test failed");
     } else {
         println!("[INFERENCE] D.3.1 tokenizer self-test PASS");
+    }
+
+    // D.3.5: full multi-layer forward pass on the synthetic
+    // qwen_test.fbin, greedy-sample the next token. Numerically
+    // matches the numpy reference in `tools/fbin-gen/forward_ref.py`
+    // (same fast_rsqrt / fast_exp polynomials), so the argmax is a
+    // hard-baked expected value. The first time we run end-to-end
+    // inference: random weights in, deterministic token out.
+    if !run_d35_self_test() {
+        println!("[INFERENCE] D.3.5 forward-pass self-test failed (file may be missing — non-fatal)");
+    } else {
+        println!("[INFERENCE] D.3.5 forward-pass self-test PASS");
     }
 
     println!("[INFERENCE] ready — awaiting IPC requests on this task id");
@@ -630,12 +643,15 @@ fn run_d313_self_test() -> bool {
         }
     };
 
-    // Synthetic config (matches `make_test_model.py` defaults).
+    // Synthetic config — D.3.5 regenerated with n_kv_heads = n_heads
+    // so the simple non-GQA attention block applies. Real Qwen2.5
+    // brings GQA back in D.3.6.
     const HIDDEN: u32 = 64;
     const N_HEADS: u32 = 4;
-    const N_KV_HEADS: u32 = 2;
     const HEAD_DIM: u32 = HIDDEN / N_HEADS;            // 16
-    const HKV: u32 = HEAD_DIM * N_KV_HEADS;            // 32
+    // n_kv_heads == n_heads, so HKV == HIDDEN. Kept as a constant
+    // so the field references read consistently with the doc.
+    const HKV: u32 = HIDDEN;
     const INTER: u32 = 128;
     const VOCAB: u32 = 256;
     const N_LAYERS: usize = 1;
@@ -778,6 +794,107 @@ fn run_d31_tokenizer_self_test() -> bool {
     println!(
         "[INFERENCE] D.3.1: encode(\"Hi\")=[258], encode(\"Hell\")=[256,257]"
     );
+    true
+}
+
+/// D.3.5 forward-pass self-test: run the full transformer over a
+/// fixed token sequence on the synthetic 1-layer model and verify
+/// the greedy-sampled token matches the numpy reference.
+///
+/// Reference (computed by `tools/fbin-gen/forward_ref.py` against the
+/// same .fbin):
+///   token_ids   = [1, 2, 3]
+///   argmax      = 3
+///   logits[3]   ≈ 1.0935
+///   top-5 ids   = [3, 20, 25, 28, 139]
+///
+/// If this fails after a clean rebuild + repack, the divergence is in
+/// one of:
+///   - `forward_pass::forward_pass` chaining order (missing residual,
+///     wrong norm placement, etc.)
+///   - `tensor_math::fast_exp` / `fast_rsqrt` drifting from the numpy
+///     reference (both implementations have to match bit-for-bit-ish)
+///   - `attention_block` (GQA assumption, RoPE convention, mask)
+fn run_d35_self_test() -> bool {
+    use weights::FbinView;
+    use forward_pass::{forward_pass, argmax, ModelConfig};
+
+    let bytes = match vfs_loader::read_file("qwen_test.fbin") {
+        Ok(b) => b,
+        Err(e) => {
+            println!("[INFERENCE] D.3.5: VFS read failed: {:?}", e);
+            return false;
+        }
+    };
+    let view = match FbinView::parse(&bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            println!("[INFERENCE] D.3.5: parse error: {:?}", e);
+            return false;
+        }
+    };
+
+    let cfg = ModelConfig {
+        n_layers: 1,
+        hidden_dim: 64,
+        n_heads: 4,
+        intermediate: 128,
+        vocab: 256,
+        max_pos: 32,
+        eps: 1e-5,
+    };
+    let token_ids: [u32; 3] = [1, 2, 3];
+
+    let logits = match forward_pass(&view, &cfg, &token_ids) {
+        Some(v) => v,
+        None => {
+            println!("[INFERENCE] D.3.5: forward_pass returned None");
+            return false;
+        }
+    };
+    if logits.len() != cfg.vocab {
+        println!(
+            "[INFERENCE] D.3.5: logits.len() {} != vocab {}",
+            logits.len(), cfg.vocab
+        );
+        return false;
+    }
+
+    // NaN / inf guard — fast_exp clamps but a bug in matmul could
+    // still produce non-finite output. Catch it loudly.
+    for (i, &v) in logits.iter().enumerate() {
+        if !v.is_finite() {
+            println!("[INFERENCE] D.3.5: logits[{}] = {} (not finite)", i, v);
+            return false;
+        }
+    }
+
+    let am = match argmax(&logits) {
+        Some(i) => i,
+        None => return false,
+    };
+    println!(
+        "[INFERENCE] D.3.5: token_ids=[1,2,3] -> argmax={} logits[{}]={}",
+        am, am, logits[am as usize]
+    );
+    if am != 3 {
+        println!(
+            "[INFERENCE] D.3.5: argmax {} != reference 3 — divergence from numpy ref",
+            am
+        );
+        return false;
+    }
+    // Tighter sanity: logits[3] should be close to the reference 1.0935.
+    // We use a generous tolerance because the float roundoff order
+    // between numpy's BLAS-backed @ and our naive triple-loop matmul
+    // can shift the magnitude by a percent or two.
+    if (logits[3] - 1.0935).abs() > 0.05 {
+        println!(
+            "[INFERENCE] D.3.5: logits[3]={} drifts from reference 1.0935",
+            logits[3]
+        );
+        return false;
+    }
     true
 }
 
