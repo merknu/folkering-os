@@ -47,6 +47,16 @@ impl Tensor2 {
         Self { rows: r, cols: c, data }
     }
 
+    /// Construct from a row-major flat `Vec<f32>`. Used by the local
+    /// backend to bridge `burn_tensor::TensorData` (whose underlying
+    /// storage is just bytes + a separate shape) into a typed
+    /// `Tensor2` for the matmul path.
+    pub fn from_flat(rows: usize, cols: usize, data: Vec<f32>) -> Self {
+        assert!(data.len() == rows * cols,
+            "Tensor2::from_flat length mismatch: rows*cols != data.len()");
+        Self { rows, cols, data }
+    }
+
     #[inline]
     pub fn get(&self, r: usize, c: usize) -> f32 {
         self.data[r * self.cols + c]
