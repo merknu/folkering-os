@@ -196,6 +196,27 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
         // it (self-test, disk layout) even when NVMe wins the backend
         // race below, because the VirtIO disk carries the model and
         // Synapse DB that aren't MVFS-managed.
+        //
+        // D.3.7.virtio prep: log the total count of virtio_blk devices
+        // on the bus so the boot trace tells us at a glance whether a
+        // dedicated model disk is attached. The primary disk is always
+        // index 0 (FOLKDISK + Synapse persistence); index 1+ is where
+        // a model disk lands once the host configures it.
+        let n_virtio_blk = drivers::pci::count_virtio_block();
+        serial_str!("[INIT] VirtIO block devices found: ");
+        drivers::serial::write_dec(n_virtio_blk as u32);
+        serial_strln!("");
+        if n_virtio_blk >= 2 {
+            if let Some(model_dev) = drivers::pci::find_virtio_block_nth(1) {
+                serial_str!("[INIT] Secondary virtio_blk at PCI ");
+                drivers::serial::write_dec(model_dev.bus as u32);
+                serial_str!(":");
+                drivers::serial::write_dec(model_dev.device as u32);
+                serial_str!(".");
+                drivers::serial::write_dec(model_dev.function as u32);
+                serial_strln!(" — candidate model disk for D.3.7.virtio");
+            }
+        }
         serial_strln!("[INIT] Looking for VirtIO block device...");
         let virtio_blk_ready = match drivers::virtio_blk::init() {
             Ok(()) => {
