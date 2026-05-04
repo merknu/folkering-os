@@ -135,6 +135,17 @@ fn main() -> ! {
         println!("[INFERENCE] weights D.3.1 self-test PASS");
     }
 
+    // D.3.2: end-to-end exercise of the new ops over the loaded
+    // weights. Pulls the same `.fbin` tensors into actual math:
+    // embedding_lookup followed by RMSNorm, with hand-computed
+    // expected output. Proves the data path goes from on-disk
+    // bytes → parsed tensor → live forward-pass code.
+    if !run_d32_self_test() {
+        println!("[INFERENCE] FATAL: D.3.2 self-test failed");
+    } else {
+        println!("[INFERENCE] D.3.2 self-test PASS");
+    }
+
     println!("[INFERENCE] ready — awaiting IPC requests on this task id");
 
     let mut req_count: u64 = 0;
@@ -238,6 +249,68 @@ fn run_fbin_self_test() -> bool {
     println!(
         "[INFERENCE] fbin: embed_hash=0x{:x} weight_hash=0x{:x}",
         h_embed, h_weight
+    );
+    true
+}
+
+/// D.3.2 end-to-end self-test:
+/// 1. Parse the embedded `.fbin` blob.
+/// 2. Treat `embed_test` (4×4 f32) as a 4-vocab × 4-hidden_dim
+///    embedding table, look up `vocab_id = 1` → row [5, 6, 7, 8].
+/// 3. Treat `weight_test` (4 f32) as the RMSNorm scale and apply.
+/// 4. Sum the result and compare against the hand-computed value
+///    from `tensor_math::self_test`.
+///
+/// This is the first time we run "real" forward-pass code over
+/// data that came in via the .fbin loader. When D.3.1.2 lands and
+/// the source switches to Synapse VFS, this same function is the
+/// regression test.
+fn run_d32_self_test() -> bool {
+    use weights::FbinView;
+
+    let view = match FbinView::parse(weights_test_blob::TEST_FBIN) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let embed = view.find("embed_test");
+    let weight = view.find("weight_test");
+    let (Some(embed), Some(weight)) = (embed, weight) else {
+        println!("[INFERENCE] D.3.2: missing tensors in .fbin");
+        return false;
+    };
+
+    let embed_data = match view.read_f32(embed) {
+        Some(v) => v,
+        None => return false,
+    };
+    let weight_data = match view.read_f32(weight) {
+        Some(v) => v,
+        None => return false,
+    };
+
+    // Embedding lookup: vocab_id 1 → row [5, 6, 7, 8]
+    let vec = match tensor_math::embedding_lookup(&embed_data, 4, 4, 1) {
+        Some(v) => v,
+        None => return false,
+    };
+    if vec != [5.0_f32, 6.0, 7.0, 8.0] {
+        println!("[INFERENCE] D.3.2: embed lookup row 1 wrong");
+        return false;
+    }
+
+    // RMSNorm with weight_test → expected sum ≈ 2.65336
+    let normed = match tensor_math::rmsnorm(&vec, &weight_data, 1e-6) {
+        Some(v) => v,
+        None => return false,
+    };
+    let sum: f32 = normed.iter().sum();
+    if (sum - 2.65336).abs() > 5e-3 {
+        println!("[INFERENCE] D.3.2: RMSNorm sum {} off from expected 2.65336", sum);
+        return false;
+    }
+    println!(
+        "[INFERENCE] D.3.2: embed[1] -> RMSNorm -> sum={} (expected 2.65336)",
+        sum
     );
     true
 }
