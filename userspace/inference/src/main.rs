@@ -64,6 +64,7 @@ mod weights_test_blob;
 mod weights_ffn_blob;
 mod weights_attn_blob;
 mod vfs_loader;
+mod tokenizer;
 
 // ── Bump allocator ──────────────────────────────────────────────────
 //
@@ -194,6 +195,18 @@ fn main() -> ! {
         println!("[INFERENCE] D.3.1.3 self-test failed (file may be missing — non-fatal)");
     } else {
         println!("[INFERENCE] D.3.1.3 self-test PASS");
+    }
+
+    // D.3.1: BPE tokenizer end-to-end. Load the synthetic 259-token
+    // .tokb from VFS, encode "Hi" / "Hello" / "Hell" against
+    // hand-computed reference IDs, round-trip decode. When D.3.1.b
+    // adds GPT-2 byte mapping + pre-tokenizer + a real Qwen
+    // tokenizer.json converter, the same self-test runs but with a
+    // 151k-token vocab.
+    if !run_d31_tokenizer_self_test() {
+        println!("[INFERENCE] FATAL: D.3.1 tokenizer self-test failed");
+    } else {
+        println!("[INFERENCE] D.3.1 tokenizer self-test PASS");
     }
 
     println!("[INFERENCE] ready — awaiting IPC requests on this task id");
@@ -689,6 +702,83 @@ fn run_d313_self_test() -> bool {
         );
     }
     ok
+}
+
+/// D.3.1 BPE tokenizer self-test. Loads `tokenizer_test.tokb` via
+/// VFS, walks the synthetic merge table on a few hand-checked inputs,
+/// verifies round-trip decode == input.
+///
+/// Synthetic vocab (256 byte tokens + 3 merge tokens):
+///   ID 256 = "He"   (merge 'H' + 'e')
+///   ID 257 = "ll"   (merge 'l' + 'l')
+///   ID 258 = "Hi"   (merge 'H' + 'i')
+///
+/// Test cases:
+///   encode("Hi")    → [258]
+///   encode("Hell")  → [256, 257]   (apply H+e first, then l+l)
+///   encode("X")     → [88]         (no merge applies)
+///
+/// Round-trip: decode_seq(encode(s)) == s for all of the above.
+fn run_d31_tokenizer_self_test() -> bool {
+    let bytes = match vfs_loader::read_file("tokenizer_test.tokb") {
+        Ok(b) => b,
+        Err(e) => {
+            println!("[INFERENCE] D.3.1: VFS read failed: {:?}", e);
+            return false;
+        }
+    };
+    let tok = match tokenizer::Tokenizer::parse(&bytes) {
+        Ok(t) => t,
+        Err(e) => {
+            println!("[INFERENCE] D.3.1: tokenizer parse error: {:?}", e);
+            return false;
+        }
+    };
+    println!(
+        "[INFERENCE] D.3.1: tokenizer loaded — vocab={} merges={}",
+        tok.vocab_size(), tok.merges_count()
+    );
+
+    // Test 1: encode("Hi") → [258]
+    let ids = tok.encode("Hi");
+    if ids != [258u32] {
+        println!("[INFERENCE] D.3.1: encode(\"Hi\") = {:?} != [258]", ids);
+        return false;
+    }
+    let back = tok.decode_seq(&ids);
+    if back != "Hi" {
+        println!("[INFERENCE] D.3.1: round-trip(\"Hi\") = {:?}", back);
+        return false;
+    }
+
+    // Test 2: encode("Hell") → [256, 257]
+    let ids = tok.encode("Hell");
+    if ids != [256u32, 257] {
+        println!("[INFERENCE] D.3.1: encode(\"Hell\") = {:?} != [256, 257]", ids);
+        return false;
+    }
+    let back = tok.decode_seq(&ids);
+    if back != "Hell" {
+        println!("[INFERENCE] D.3.1: round-trip(\"Hell\") = {:?}", back);
+        return false;
+    }
+
+    // Test 3: single byte that doesn't trigger any merge
+    let ids = tok.encode("X");
+    if ids != [b'X' as u32] {
+        println!("[INFERENCE] D.3.1: encode(\"X\") = {:?} != [88]", ids);
+        return false;
+    }
+    let back = tok.decode_seq(&ids);
+    if back != "X" {
+        println!("[INFERENCE] D.3.1: round-trip(\"X\") = {:?}", back);
+        return false;
+    }
+
+    println!(
+        "[INFERENCE] D.3.1: encode(\"Hi\")=[258], encode(\"Hell\")=[256,257]"
+    );
+    true
 }
 
 fn handle_request(msg: &libfolk::sys::ipc::IpcMessage, n: u64) {
