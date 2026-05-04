@@ -69,15 +69,15 @@ mod forward_pass;
 
 // ── Bump allocator ──────────────────────────────────────────────────
 //
-// 8 MiB. D.3.5 / D.3.6 forward-pass loads the entire .fbin into
-// f32 Vecs (embed alone is vocab*hidden*4 ≈ 64 KiB on the
-// synthetic) and then accumulates per-layer intermediates without
-// freeing — bump never deallocates. 256 KiB hit OOM during the
-// boot self-test; 8 MiB is comfortable for the synthetic and
-// leaves headroom for a `--max-layers 4` real Qwen2.5 fbin. When
-// real weights land we either move to a slab allocator or page in
-// tensors on demand from the .fbin (zero-copy).
-const HEAP_SIZE: usize = 8 * 1024 * 1024;
+// 64 MiB. D.3.1.b's real Qwen tokenizer (~150k vocab, ~150k merges)
+// settles at ~14 MiB live before we even load weights; D.3.7's
+// real-Qwen forward pass adds the model itself plus a per-layer
+// KV-cache. Bump never frees, so this is the cumulative high-
+// water mark, not a steady-state. When Q8 quantization (D.3.1.q)
+// shrinks the projections from fp32 to int8, this can come back
+// down — for now 64 MiB covers the worst case (Qwen3-0.6B fp32 +
+// full tokenizer + KV-cache for 1k context).
+const HEAP_SIZE: usize = 64 * 1024 * 1024;
 
 struct BumpAllocator {
     heap: UnsafeCell<[u8; HEAP_SIZE]>,
@@ -209,6 +209,16 @@ fn main() -> ! {
         println!("[INFERENCE] FATAL: D.3.1 tokenizer self-test failed");
     } else {
         println!("[INFERENCE] D.3.1 tokenizer self-test PASS");
+    }
+
+    // D.3.1.b: real Qwen3 tokenizer (vocab=151669, merges=151387,
+    // 14 specials including <|im_start|> / <|im_end|>). Verifies
+    // GPT-2 byte-mapping, special-token splitting, and whole-chunk
+    // BPE produce IDs byte-identical to HuggingFace's reference.
+    if !run_d31b_qwen_tokenizer_self_test() {
+        println!("[INFERENCE] D.3.1.b Qwen tokenizer self-test failed (file may be missing — non-fatal)");
+    } else {
+        println!("[INFERENCE] D.3.1.b Qwen tokenizer self-test PASS");
     }
 
     // D.3.5: full multi-layer forward pass on the synthetic
@@ -847,6 +857,85 @@ fn run_d31_tokenizer_self_test() -> bool {
 ///     reference (both implementations have to match bit-for-bit-ish)
 ///   - `attention_block` (GQA broadcast wrong, bias add missing, RoPE
 ///     convention, causal mask)
+
+/// D.3.1.b: real Qwen3 tokenizer self-test. Loads `qwen.tokb` from
+/// VFS, encodes the reference inputs that `tools/fbin-gen/tok_to_tokb.py
+/// --verify` produced via HuggingFace's transformers, and asserts
+/// every ID matches.
+///
+/// Reference (from HF transformers AutoTokenizer on Qwen3-0.6B):
+///   "Hello world"                       → [9707, 1879]
+///   "Hvem er du?"                       → [39, 85, 336, 2714, 3845, 30]
+///   ChatML wrap of "Hvem er du?"        → [151644, 872, 198, 39, 85,
+///                                          336, 2714, 3845, 30, 151645,
+///                                          198, 151644, 77091, 198]
+///
+/// If any of these drift, the divergence is in one of:
+///   - GPT-2 byte-to-unicode mapping (off-by-one in the overflow range)
+///   - Special-token splitting (longest-match ordering, or boundary
+///     scan misses an embedded `<|...|>`)
+///   - BPE priority lookup (binary-search index out of order with the
+///     priority Vec)
+///   - Vocab string decode (UTF-8 round-trip on `Ġ` chars)
+fn run_d31b_qwen_tokenizer_self_test() -> bool {
+    let bytes = match vfs_loader::read_file("qwen.tokb") {
+        Ok(b) => b,
+        Err(e) => {
+            println!("[INFERENCE] D.3.1.b: VFS read failed: {:?}", e);
+            return false;
+        }
+    };
+    let tok = match tokenizer::Tokenizer::parse(&bytes) {
+        Ok(t) => t,
+        Err(e) => {
+            println!("[INFERENCE] D.3.1.b: parse error: {:?}", e);
+            return false;
+        }
+    };
+    println!(
+        "[INFERENCE] D.3.1.b: Qwen tokenizer loaded — vocab={} merges={} special={}",
+        tok.vocab_size(), tok.merges_count(), tok.special_count()
+    );
+
+    let cases: [(&str, &[u32]); 3] = [
+        ("Hello world", &[9707, 1879]),
+        ("Hvem er du?", &[39, 85, 336, 2714, 3845, 30]),
+        (
+            "<|im_start|>user\nHvem er du?<|im_end|>\n<|im_start|>assistant\n",
+            &[151644, 872, 198, 39, 85, 336, 2714, 3845, 30, 151645,
+              198, 151644, 77091, 198],
+        ),
+    ];
+    for (text, expected) in cases.iter() {
+        let ids = tok.encode(text);
+        if ids.as_slice() != *expected {
+            println!(
+                "[INFERENCE] D.3.1.b: encode({:?}) = {:?} != HF {:?}",
+                text, ids, expected
+            );
+            return false;
+        }
+        // Round-trip decode for the non-ChatML cases (ChatML's special
+        // tokens decode to their literal `<|im_start|>` strings, which
+        // round-trips the *visible* form back; useful but not the
+        // primary check).
+        let back = tok.decode_seq(&ids);
+        if !text.starts_with("<|") {
+            if back != *text {
+                println!(
+                    "[INFERENCE] D.3.1.b: decode round-trip {:?} != {:?}",
+                    back, text
+                );
+                return false;
+            }
+        }
+    }
+    println!(
+        "[INFERENCE] D.3.1.b: encode(\"Hvem er du?\") matches HF [39,85,336,2714,3845,30]"
+    );
+    true
+}
+
 fn run_d35_self_test() -> bool {
     use weights::FbinView;
     use forward_pass::{forward_pass, argmax, ModelConfig};
