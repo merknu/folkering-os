@@ -308,38 +308,43 @@ pub fn apply_rope(
     Some(())
 }
 
-/// Scaled dot-product attention with causal mask, GQA-aware.
+/// Scaled dot-product attention with causal mask, GQA-aware,
+/// supporting an asymmetric query / key-value sequence length.
 ///
-/// `q` is `[seq_len, n_heads, head_dim]` row-major.
-/// `k` and `v` are `[seq_len, n_kv_heads, head_dim]` row-major.
+/// `q` is `[q_seq, n_heads, head_dim]` row-major.
+/// `k` and `v` are `[kv_seq, n_kv_heads, head_dim]` row-major.
 /// Returned tensor matches the Q shape, flattened.
+///
+/// `q_pos_offset` is the absolute position of the first query
+/// token. With the KV-cache, the K/V tensors carry every position
+/// from 0 up to `kv_seq - 1`, but the queries only cover the
+/// freshly-appended tail (`q_seq` tokens starting at absolute
+/// position `q_pos_offset`). Causal mask is therefore:
+///   query at row `i` (absolute pos `q_pos_offset + i`) may attend
+///   to key positions `j ∈ [0, q_pos_offset + i]`; everything past
+///   that is masked.
 ///
 /// When `n_kv_heads < n_heads` (grouped-query attention), every
 /// `groups = n_heads / n_kv_heads` consecutive query heads share
 /// one K/V head — query head `h` maps to kv head `h / groups`.
 ///
-/// Per query position `i`:
-///   1. Compute scores[j] = (Q[i] · K[j]) / sqrt(head_dim) for j ≤ i,
-///      mask scores[j] = -inf for j > i (causal).
-///   2. Softmax across j.
-///   3. out[i] = sum_j(scores[j] * V[j]).
-///
-/// Allocates a `Vec<f32>` per query row for the score buffer plus
-/// the output. Pre-allocation is D.4 territory; D.3.6's job is
-/// correctness.
+#[allow(clippy::too_many_arguments)]
 pub fn scaled_dot_product_attention(
     q: &[f32],
     k: &[f32],
     v: &[f32],
-    seq_len: usize,
+    q_seq: usize,
+    kv_seq: usize,
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
+    q_pos_offset: usize,
 ) -> Option<Vec<f32>> {
     if n_kv_heads == 0 || n_heads == 0 { return None; }
     if n_heads % n_kv_heads != 0 { return None; }
-    let q_total = seq_len * n_heads * head_dim;
-    let kv_total = seq_len * n_kv_heads * head_dim;
+    if q_pos_offset + q_seq > kv_seq { return None; }
+    let q_total = q_seq * n_heads * head_dim;
+    let kv_total = kv_seq * n_kv_heads * head_dim;
     if q.len() != q_total || k.len() != kv_total || v.len() != kv_total {
         return None;
     }
@@ -347,14 +352,15 @@ pub fn scaled_dot_product_attention(
     let groups = n_heads / n_kv_heads;
     let scale = fast_rsqrt(head_dim as f32);
     let mut out = vec![0.0f32; q_total];
-    let mut scores = vec![0.0f32; seq_len];
+    let mut scores = vec![0.0f32; kv_seq];
 
     for h in 0..n_heads {
         let kvh = h / groups;
-        for i in 0..seq_len {
+        for i in 0..q_seq {
+            let abs_pos = q_pos_offset + i;
             // ── Compute Q·K scores with causal mask ────────────────
-            for j in 0..seq_len {
-                if j > i {
+            for j in 0..kv_seq {
+                if j > abs_pos {
                     scores[j] = f32::NEG_INFINITY;
                     continue;
                 }
@@ -372,7 +378,7 @@ pub fn scaled_dot_product_attention(
             // ── attn @ V ───────────────────────────────────────────
             for d in 0..head_dim {
                 let mut acc = 0.0f32;
-                for j in 0..seq_len {
+                for j in 0..kv_seq {
                     let v_idx = j * n_kv_heads * head_dim + kvh * head_dim + d;
                     acc += scores[j] * v[v_idx];
                 }
@@ -385,20 +391,88 @@ pub fn scaled_dot_product_attention(
     Some(out)
 }
 
+/// Per-layer slot in the KV-cache. `k` and `v` are pre-allocated to
+/// `max_pos * n_kv_heads * head_dim` f32s and grow logically as the
+/// sequence advances (tracked by `KvCache::seq_len`). The buffers
+/// themselves never resize; this keeps the bump allocator's
+/// high-water mark predictable.
+pub struct LayerKv {
+    pub k: Vec<f32>,
+    pub v: Vec<f32>,
+}
+
+/// Whole-model KV-cache. One `LayerKv` per transformer layer. The
+/// caller mutates `seq_len` after each successful forward pass to
+/// reflect how many positions are now populated.
+///
+/// On a fresh cache, `seq_len = 0`; the first forward pass with
+/// `pos_offset = 0` writes positions `[0, new_seq)` and the caller
+/// then sets `seq_len = new_seq`. The next pass uses
+/// `pos_offset = seq_len`, etc.
+pub struct KvCache {
+    pub layers: Vec<LayerKv>,
+    pub max_pos: usize,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+    pub seq_len: usize,
+}
+
+impl KvCache {
+    /// Allocate a cache for `n_layers` × `max_pos` positions.
+    /// Allocates `n_layers * 2 * max_pos * n_kv_heads * head_dim *
+    /// 4` bytes up front.
+    pub fn new(
+        n_layers: usize,
+        max_pos: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> Self {
+        let elems = max_pos * n_kv_heads * head_dim;
+        let layers = (0..n_layers)
+            .map(|_| LayerKv {
+                k: vec![0.0; elems],
+                v: vec![0.0; elems],
+            })
+            .collect();
+        Self {
+            layers,
+            max_pos,
+            n_kv_heads,
+            head_dim,
+            seq_len: 0,
+        }
+    }
+
+    /// Reuse the buffers for a fresh sequence. Cheap — just resets
+    /// the logical length; the f32 storage stays allocated.
+    #[allow(dead_code)] // exercised once a real multi-prompt loop lands
+    pub fn reset(&mut self) {
+        self.seq_len = 0;
+    }
+}
+
 /// Full attention block: QKV projection (+ optional biases) → RoPE
-/// on Q/K → causal SDPA (GQA-aware) → output projection. The shape
-/// Qwen2.5 / Llama-3 use.
+/// on Q/K → write new K/V into the per-layer cache → causal SDPA
+/// (GQA-aware) over the cached prefix → output projection. The
+/// shape Qwen2.5 / Llama-3 use.
 ///
-/// `x` is `[seq_len, hidden_dim]`. Q-side: `wq` is `[hidden_dim,
-/// hidden_dim]`, optional `q_bias` length `hidden_dim`. KV-side: `wk`
-/// and `wv` are `[hkv, hidden_dim]` where `hkv = n_kv_heads *
-/// head_dim`; optional `k_bias` / `v_bias` length `hkv`. `wo` is
-/// `[hidden_dim, hidden_dim]`. RoPE tables are `[seq_len,
-/// head_dim/2]`.
+/// Inputs cover only the NEW tokens being added to the sequence:
+///   - `x` is `[new_seq, hidden_dim]` for the freshly-arrived tokens
+///   - `rope_cos` / `rope_sin` are `[new_seq, head_dim/2]`,
+///     pre-sliced for the absolute positions
+///     `[pos_offset, pos_offset + new_seq)`
 ///
-/// Pass `n_kv_heads = n_heads` and `None` for all biases to get the
-/// pre-D.3.6 behaviour (no GQA, no biases) — that's what the D.3.4
-/// synthetic test exercises.
+/// After the call, `cache_layer.k` and `cache_layer.v` contain the
+/// post-RoPE keys (K) and raw values (V) for absolute positions
+/// `[0, pos_offset + new_seq)`. The caller is responsible for
+/// updating the parent `KvCache::seq_len` field once every layer
+/// has been processed.
+///
+/// Q-side: `wq` is `[hidden_dim, hidden_dim]`, optional `q_bias`
+/// length `hidden_dim`. KV-side: `wk` and `wv` are `[hkv,
+/// hidden_dim]` where `hkv = n_kv_heads * head_dim`; optional
+/// `k_bias` / `v_bias` length `hkv`. `wo` is `[hidden_dim,
+/// hidden_dim]`.
 #[allow(clippy::too_many_arguments)]
 pub fn attention_block(
     x: &[f32],
@@ -407,23 +481,29 @@ pub fn attention_block(
     k_bias: Option<&[f32]>,
     v_bias: Option<&[f32]>,
     rope_cos: &[f32], rope_sin: &[f32],
-    seq_len: usize, hidden_dim: usize,
+    new_seq: usize, hidden_dim: usize,
     n_heads: usize, n_kv_heads: usize,
+    cache_layer: &mut LayerKv,
+    max_pos: usize,
+    pos_offset: usize,
 ) -> Option<Vec<f32>> {
     if hidden_dim % n_heads != 0 { return None; }
     if n_kv_heads == 0 || n_heads % n_kv_heads != 0 { return None; }
     let head_dim = hidden_dim / n_heads;
     let hkv = n_kv_heads * head_dim;
-    if x.len() != seq_len * hidden_dim { return None; }
+    if x.len() != new_seq * hidden_dim { return None; }
+    if pos_offset + new_seq > max_pos { return None; }
+    if cache_layer.k.len() != max_pos * hkv { return None; }
+    if cache_layer.v.len() != max_pos * hkv { return None; }
     if let Some(b) = q_bias { if b.len() != hidden_dim { return None; } }
     if let Some(b) = k_bias { if b.len() != hkv { return None; } }
     if let Some(b) = v_bias { if b.len() != hkv { return None; } }
 
-    // ── 1. Project x → Q, K, V (per-row matvec, then add bias) ─────
-    let mut q = Vec::with_capacity(seq_len * hidden_dim);
-    let mut k = Vec::with_capacity(seq_len * hkv);
-    let mut v = Vec::with_capacity(seq_len * hkv);
-    for s in 0..seq_len {
+    // ── 1. Project x → Q (full), K_new, V_new (per-row matvec) ─────
+    let mut q = Vec::with_capacity(new_seq * hidden_dim);
+    let mut k_new = Vec::with_capacity(new_seq * hkv);
+    let mut v_new = Vec::with_capacity(new_seq * hkv);
+    for s in 0..new_seq {
         let row = &x[s * hidden_dim..(s + 1) * hidden_dim];
         let mut q_row = linear(wq, hidden_dim, hidden_dim, row)?;
         let mut k_row = linear(wk, hidden_dim, hkv, row)?;
@@ -438,22 +518,34 @@ pub fn attention_block(
             for i in 0..hkv { v_row[i] += b[i]; }
         }
         q.extend(q_row);
-        k.extend(k_row);
-        v.extend(v_row);
+        k_new.extend(k_row);
+        v_new.extend(v_row);
     }
 
-    // ── 2. RoPE on Q (n_heads) and K (n_kv_heads). V isn't rotated. ─
-    apply_rope(&mut q, rope_cos, rope_sin, seq_len, n_heads, head_dim)?;
-    apply_rope(&mut k, rope_cos, rope_sin, seq_len, n_kv_heads, head_dim)?;
+    // ── 2. RoPE on Q and the new K. V isn't rotated. ───────────────
+    apply_rope(&mut q, rope_cos, rope_sin, new_seq, n_heads, head_dim)?;
+    apply_rope(&mut k_new, rope_cos, rope_sin, new_seq, n_kv_heads, head_dim)?;
 
-    // ── 3. Scaled dot-product attention (GQA-aware) ─────────────────
+    // ── 3. Splice new K/V into the cache at pos_offset ─────────────
+    let dst_start = pos_offset * hkv;
+    let dst_end = (pos_offset + new_seq) * hkv;
+    cache_layer.k[dst_start..dst_end].copy_from_slice(&k_new);
+    cache_layer.v[dst_start..dst_end].copy_from_slice(&v_new);
+
+    // ── 4. SDPA (GQA-aware) over the populated prefix ──────────────
+    let kv_seq = pos_offset + new_seq;
+    let k_view = &cache_layer.k[..kv_seq * hkv];
+    let v_view = &cache_layer.v[..kv_seq * hkv];
     let attn = scaled_dot_product_attention(
-        &q, &k, &v, seq_len, n_heads, n_kv_heads, head_dim,
+        &q, k_view, v_view,
+        new_seq, kv_seq,
+        n_heads, n_kv_heads, head_dim,
+        pos_offset,
     )?;
 
-    // ── 4. Output projection (per-row matvec) ───────────────────────
-    let mut out = Vec::with_capacity(seq_len * hidden_dim);
-    for s in 0..seq_len {
+    // ── 5. Output projection (per-row matvec) ──────────────────────
+    let mut out = Vec::with_capacity(new_seq * hidden_dim);
+    for s in 0..new_seq {
         let row = &attn[s * hidden_dim..(s + 1) * hidden_dim];
         out.extend(linear(wo, hidden_dim, hidden_dim, row)?);
     }

@@ -223,6 +223,17 @@ fn main() -> ! {
         println!("[INFERENCE] D.3.5 forward-pass self-test PASS");
     }
 
+    // D.4: KV-cache incremental decode. Runs the same prompt
+    // ([1, 2, 3]) one token at a time against a single shared cache
+    // and verifies the final logits[3] matches D.3.5's prefill
+    // result. Proves the cache write/read paths line up with the
+    // single-shot reference math.
+    if !run_d4_kv_cache_self_test() {
+        println!("[INFERENCE] D.4 KV-cache self-test failed (file may be missing — non-fatal)");
+    } else {
+        println!("[INFERENCE] D.4 KV-cache self-test PASS");
+    }
+
     println!("[INFERENCE] ready — awaiting IPC requests on this task id");
 
     let mut req_count: u64 = 0;
@@ -478,12 +489,19 @@ fn run_d34_self_test() -> bool {
         return false;
     };
 
+    let mut cache_layer = tensor_math::LayerKv {
+        k: alloc::vec![0.0f32; 2 * 2],
+        v: alloc::vec![0.0f32; 2 * 2],
+    };
     let y = match tensor_math::attention_block(
         &x, &wq, &wk, &wv, &wo,
         /*q_bias=*/None, /*k_bias=*/None, /*v_bias=*/None,
         &rope_cos, &rope_sin,
-        /*seq_len=*/2, /*hidden_dim=*/2,
+        /*new_seq=*/2, /*hidden_dim=*/2,
         /*n_heads=*/1, /*n_kv_heads=*/1,
+        &mut cache_layer,
+        /*max_pos=*/2,
+        /*pos_offset=*/0,
     ) {
         Some(v) => v,
         None => {
@@ -593,11 +611,16 @@ fn run_d312_vfs_self_test() -> bool {
     ) else {
         return false;
     };
+    let mut cache_layer = tensor_math::LayerKv {
+        k: alloc::vec![0.0f32; 2 * 2],
+        v: alloc::vec![0.0f32; 2 * 2],
+    };
     let attn = match tensor_math::attention_block(
         &ax, &wq, &wk, &wv, &wo,
         None, None, None,
         &rope_cos, &rope_sin,
         2, 2, 1, 1,
+        &mut cache_layer, 2, 0,
     ) {
         Some(v) => v,
         None => return false,
@@ -827,6 +850,7 @@ fn run_d31_tokenizer_self_test() -> bool {
 fn run_d35_self_test() -> bool {
     use weights::FbinView;
     use forward_pass::{forward_pass, argmax, ModelConfig};
+    use tensor_math::KvCache;
 
     let bytes = match vfs_loader::read_file("qwen_test.fbin") {
         Ok(b) => b,
@@ -858,7 +882,14 @@ fn run_d35_self_test() -> bool {
     };
     let token_ids: [u32; 3] = [1, 2, 3];
 
-    let logits = match forward_pass(&view, &cfg, &token_ids) {
+    // Prefill the whole prompt at once with a fresh cache. Same
+    // arithmetic as the pre-D.4 path; argmax expectation is the
+    // GQA + biases reference 1.1470 from `forward_ref.py`.
+    let head_dim = cfg.hidden_dim / cfg.n_heads;
+    let mut cache = KvCache::new(
+        cfg.n_layers, cfg.max_pos, cfg.n_kv_heads, head_dim,
+    );
+    let logits = match forward_pass(&view, &cfg, &mut cache, &token_ids) {
         Some(v) => v,
         None => {
             println!("[INFERENCE] D.3.5: forward_pass returned None");
@@ -905,6 +936,103 @@ fn run_d35_self_test() -> bool {
         println!(
             "[INFERENCE] D.3.5: logits[3]={} drifts from reference 1.1470",
             logits[3]
+        );
+        return false;
+    }
+    true
+}
+
+/// D.4 KV-cache incremental decode self-test.
+///
+/// Uses the same model and prompt as D.3.5, but feeds the tokens
+/// in one at a time, reusing a single `KvCache` across calls. The
+/// last call's logits must match the D.3.5 single-shot prefill
+/// result (argmax=3, logits[3]≈1.1470). If they don't, the cache
+/// is either:
+///   - writing to the wrong slot (pos_offset arithmetic off-by-one)
+///   - dropping the prior K/V on a subsequent call
+///   - applying RoPE at the wrong absolute position for new tokens
+///   - mis-broadcasting groups under GQA (kvh = h / groups when
+///     reading the cached slice)
+///
+/// All four bugs are flat-out incompatible with this assertion, so
+/// it's a tight signal. We also verify `cache.seq_len` advanced by
+/// the right amount on each call.
+fn run_d4_kv_cache_self_test() -> bool {
+    use weights::FbinView;
+    use forward_pass::{forward_pass, argmax, ModelConfig};
+    use tensor_math::KvCache;
+
+    let bytes = match vfs_loader::read_file("qwen_test.fbin") {
+        Ok(b) => b,
+        Err(e) => {
+            println!("[INFERENCE] D.4: VFS read failed: {:?}", e);
+            return false;
+        }
+    };
+    let view = match FbinView::parse(&bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            println!("[INFERENCE] D.4: parse error: {:?}", e);
+            return false;
+        }
+    };
+
+    let cfg = ModelConfig {
+        n_layers: 1,
+        hidden_dim: 64,
+        n_heads: 4,
+        n_kv_heads: 2,
+        intermediate: 128,
+        vocab: 256,
+        max_pos: 32,
+        eps: 1e-5,
+    };
+    let head_dim = cfg.hidden_dim / cfg.n_heads;
+    let mut cache = KvCache::new(
+        cfg.n_layers, cfg.max_pos, cfg.n_kv_heads, head_dim,
+    );
+
+    // Feed [1], then [2], then [3] — each call advances the cache
+    // by one position. The final logits should be the same as the
+    // single-shot prefill because the algorithm is mathematically
+    // equivalent: K and V for past tokens come from the cache
+    // instead of being recomputed.
+    let mut last_logits: alloc::vec::Vec<f32> = alloc::vec::Vec::new();
+    for (step, tok) in [1u32, 2, 3].iter().enumerate() {
+        let logits = match forward_pass(&view, &cfg, &mut cache, &[*tok]) {
+            Some(v) => v,
+            None => {
+                println!("[INFERENCE] D.4: step {} forward_pass returned None", step);
+                return false;
+            }
+        };
+        if cache.seq_len != step + 1 {
+            println!(
+                "[INFERENCE] D.4: cache.seq_len={} after step {}, expected {}",
+                cache.seq_len, step, step + 1
+            );
+            return false;
+        }
+        last_logits = logits;
+    }
+
+    let am = match argmax(&last_logits) {
+        Some(i) => i,
+        None => return false,
+    };
+    println!(
+        "[INFERENCE] D.4: incremental decode -> argmax={} logits[3]={}",
+        am, last_logits[3]
+    );
+    if am != 3 {
+        println!("[INFERENCE] D.4: argmax {} != reference 3", am);
+        return false;
+    }
+    if (last_logits[3] - 1.1470).abs() > 0.05 {
+        println!(
+            "[INFERENCE] D.4: logits[3]={} drifts from D.3.5 reference 1.1470",
+            last_logits[3]
         );
         return false;
     }
