@@ -61,6 +61,7 @@ mod local_backend;
 mod tensor_math;
 mod weights;
 mod weights_test_blob;
+mod weights_ffn_blob;
 
 // ── Bump allocator ──────────────────────────────────────────────────
 //
@@ -144,6 +145,16 @@ fn main() -> ! {
         println!("[INFERENCE] FATAL: D.3.2 self-test failed");
     } else {
         println!("[INFERENCE] D.3.2 self-test PASS");
+    }
+
+    // D.3.3: SwiGLU FFN block end-to-end. Loads the FFN test blob
+    // (gate_proj, up_proj, down_proj + a sample input), runs the
+    // full SwiGLU sequence, verifies the sum against the
+    // hand-computed reference (≈9.7009).
+    if !run_d33_self_test() {
+        println!("[INFERENCE] FATAL: D.3.3 self-test failed");
+    } else {
+        println!("[INFERENCE] D.3.3 self-test PASS");
     }
 
     println!("[INFERENCE] ready — awaiting IPC requests on this task id");
@@ -310,6 +321,62 @@ fn run_d32_self_test() -> bool {
     }
     println!(
         "[INFERENCE] D.3.2: embed[1] -> RMSNorm -> sum={} (expected 2.65336)",
+        sum
+    );
+    true
+}
+
+/// D.3.3 end-to-end self-test:
+/// 1. Parse the FFN test blob (4 tensors: ffn_input, gate_proj,
+///    up_proj, down_proj).
+/// 2. Read all four into f32 vectors.
+/// 3. Run `swiglu_ffn(x, gate, up, down, hidden=2, intermediate=4)`.
+/// 4. Sum the result and compare against the Python-computed
+///    reference (≈9.7009 — see `tools/fbin-gen/gen_test_blobs.py`
+///    docstring for the full derivation).
+///
+/// When D.3.4 needs more tensors, add a third blob via the same
+/// `tools/fbin-gen/gen_test_blobs.py` pattern; the boot tests
+/// generalize.
+fn run_d33_self_test() -> bool {
+    use weights::FbinView;
+
+    let view = match FbinView::parse(weights_ffn_blob::TEST_FFN_FBIN) {
+        Ok(v) => v,
+        Err(e) => {
+            println!("[INFERENCE] D.3.3: ffn-blob parse error: {:?}", e);
+            return false;
+        }
+    };
+    let want = ["ffn_input", "gate_proj", "up_proj", "down_proj"];
+    for n in &want {
+        if view.find(n).is_none() {
+            println!("[INFERENCE] D.3.3: missing tensor '{}'", n);
+            return false;
+        }
+    }
+    let read = |name: &str| -> Option<alloc::vec::Vec<f32>> {
+        view.find(name).and_then(|t| view.read_f32(t))
+    };
+    let x = match read("ffn_input")  { Some(v) => v, None => return false };
+    let g = match read("gate_proj")  { Some(v) => v, None => return false };
+    let u = match read("up_proj")    { Some(v) => v, None => return false };
+    let d = match read("down_proj")  { Some(v) => v, None => return false };
+
+    let y = match tensor_math::swiglu_ffn(&x, &g, &u, &d, /*hidden=*/2, /*inter=*/4) {
+        Some(v) => v,
+        None => {
+            println!("[INFERENCE] D.3.3: swiglu_ffn shape mismatch");
+            return false;
+        }
+    };
+    let sum: f32 = y.iter().sum();
+    if (sum - 9.7009).abs() > 5e-2 {
+        println!("[INFERENCE] D.3.3: ffn sum {} off from expected 9.7009", sum);
+        return false;
+    }
+    println!(
+        "[INFERENCE] D.3.3: SwiGLU FFN -> sum={} (expected 9.7009)",
         sum
     );
     true
