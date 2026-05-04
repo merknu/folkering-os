@@ -401,7 +401,15 @@ fn handle_read_file_shmem<T: TokenSource>(
                 Ok(h) => h,
                 Err(_) => { let _ = reply(src, SYN_STATUS_ERROR, 0); return; }
             };
+            // Grant to the actual sender plus the historical 2..=8
+            // fan-out (kept so existing callers in that range — shell,
+            // compositor, draug-daemon, etc. — keep working without a
+            // re-test pass). New tasks (inference task 10+, future
+            // userspace) get the grant via msg.sender.
             for tid in 2..=8 { let _ = shmem_grant(shmem_handle, tid); }
+            if msg.sender > 8 {
+                let _ = shmem_grant(shmem_handle, msg.sender);
+            }
 
             let bytes_read = {
                 let mut arena = match ShmemArena::map(shmem_handle, vaddr::SHMEM_BUFFER) {
@@ -454,7 +462,14 @@ fn handle_read_file_shmem<T: TokenSource>(
                 Ok(h) => h,
                 Err(_) => { let _ = reply(src, SYN_STATUS_ERROR, 0); return; }
             };
+            // Same grant fan-out as the SQLite branch above — keep
+            // tasks 2..=8 working, plus grant to the actual sender
+            // when it lives outside that range (e.g. inference at
+            // task 10+).
             for tid in 2..=8 { let _ = shmem_grant(shmem_handle, tid); }
+            if msg.sender > 8 {
+                let _ = shmem_grant(shmem_handle, msg.sender);
+            }
 
             let bytes_read = {
                 let mut arena = match ShmemArena::map(shmem_handle, vaddr::SHMEM_BUFFER) {
