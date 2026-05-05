@@ -259,11 +259,12 @@ pub fn forward_pass(
 
     // Step 4: lm_head (tied to embed) — logits = embed @ last_normed.
     // `embed` has shape [vocab, hidden], already in the [out_dim,
-    // in_dim] orientation `linear` wants. Dispatch on the embed's
-    // dtype so a Q8 table runs through linear_q8 (zero-copy on the
-    // weight bytes; just dequantizes block-by-block during the
-    // matvec).
-    let logits = embed_loaded.view().matvec(cfg.hidden_dim, cfg.vocab, &last_normed)?;
+    // in_dim] orientation `matmul` wants. Calling `matmul` with
+    // seq = 1 routes through the AVX2 + FMA fast path on hosts that
+    // support it (CPUID-gated inside `WeightView`); the previous
+    // `matvec` call took the scalar `linear_q8` path and dominated
+    // decode wall-clock at 1024→151 936.
+    let logits = embed_loaded.view().matmul(cfg.hidden_dim, cfg.vocab, &last_normed, 1)?;
 
     // Step 5: every layer succeeded — commit the new positions to
     // the cache so the next call lines up at the right offset.

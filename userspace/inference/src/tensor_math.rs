@@ -65,14 +65,16 @@ fn has_avx2_fma() -> bool {
 }
 
 /// Yield budget: how many cells we compute per matmul row before
-/// calling `yield_cpu()`. The original 32 was tuned for the D.1
-/// 2×2 demo; on real Qwen3-0.6B (Wq is [2048, 1024], 32 blocks per
-/// row × 2048 rows = 65K yields per single matvec, ×many matvecs
-/// per token × prefill length) the syscall + scheduler overhead
-/// alone makes the boot test wedge for ages. 32K means one yield
-/// per ~1K-element row — keeps the compositor + Draug daemon
-/// breathing without choking inference itself.
-const MATMUL_YIELD_EVERY: usize = 32_768;
+/// calling `yield_cpu()`. Bumped 32× from the post-batched-matmul
+/// value of 32 768 once AVX2 + FMA landed: on a host with AVX2 the
+/// inner loop processes ~19 G-cells/sec, so 32K cells is ~1.7 µs of
+/// work per yield — pure syscall overhead. 1 M cells ≈ 50 µs of
+/// math between yields, still well under one tick (10 ms) of the
+/// kernel timer, so the compositor + Draug daemon get plenty of
+/// scheduling slots even on a single-core VM. Preemptive scheduling
+/// in the kernel is the real fairness mechanism; this cooperative
+/// yield is a cheap nudge, not a guarantee.
+const MATMUL_YIELD_EVERY: usize = 1_048_576;
 
 /// Q8_0 block size — same as llama.cpp / GGUF. Picked for
 /// cache-friendly inner loops: a 32-element block is one f16 scale
