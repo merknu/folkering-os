@@ -449,11 +449,10 @@ pub fn is_ready() -> bool {
 }
 
 /// Read multiple consecutive sectors into the caller's buffer.
-/// Loops single-sector reads — fine for boot-time verification and
-/// for the upcoming `read_model_file_shmem` syscall (which streams
-/// 4 KiB at a time per shmem page). At ~100 µs per sector on KVM, a
-/// 232 MiB payload is ~45 s; multi-sector DMA will land alongside
-/// the syscall so it's a single ~few-hundred-ms allocation.
+/// Loops single-sector reads — kept for boot-time verification
+/// where the destination is on-stack and we don't have a phys
+/// address. For the bulk model-streaming path, use
+/// `read_sectors_to_phys` instead — one DMA per call, zero-copy.
 ///
 /// `buf.len()` MUST be a multiple of 512.
 #[allow(dead_code)]
@@ -467,6 +466,131 @@ pub fn read_sectors(sector: u64, buf: &mut [u8]) -> Result<(), ModelDiskError> {
         read_sector(sector + i as u64, &mut tmp)?;
         let off = i * SECTOR_SIZE;
         buf[off..off + SECTOR_SIZE].copy_from_slice(&tmp);
+    }
+    Ok(())
+}
+
+/// Read `sector_count` consecutive sectors starting at `sector`,
+/// landing the bytes DIRECTLY at `dst_phys` via a single VirtIO
+/// data descriptor. Zero-copy: the device DMAs straight into the
+/// caller's physical page, no per-sector kernel buffer round-trip.
+///
+/// Used by `read_into_shmem` to stream model-disk payload pages
+/// into shmem-backed phys pages: one DMA per shmem page (8 sectors
+/// = 4 KiB), instead of 8 single-sector DMAs + 8 memcpy's. On KVM
+/// this turns the 604 MiB Q8 model load from ~120 s to roughly the
+/// device's raw throughput.
+///
+/// SAFETY: `dst_phys` must point to writable memory that the device
+/// is allowed to touch — caller must own the page (e.g. via shmem)
+/// or it must be a kernel-owned scratch page. `sector_count *
+/// SECTOR_SIZE` bytes of memory at that physical address get
+/// clobbered with disk content. The destination must NOT cross a
+/// non-DMA-accessible region; for our shmem path that's guaranteed
+/// because shmem pages come from `alloc_page` in the normal zone.
+fn read_sectors_to_phys(
+    sector: u64,
+    sector_count: usize,
+    dst_phys: usize,
+) -> Result<(), ModelDiskError> {
+    if sector_count == 0 {
+        return Ok(());
+    }
+    let mut dev = MODEL_DISK.lock();
+    let dsk = dev.as_mut().ok_or(ModelDiskError::NotInitialized)?;
+
+    if sector + sector_count as u64 > dsk.capacity {
+        return Err(ModelDiskError::InvalidSector);
+    }
+
+    let header_phys = dsk.req_buf_phys;
+    let status_phys = dsk.req_buf_phys + 16;
+    let header_virt = dsk.req_buf_virt;
+    let status_virt = dsk.req_buf_virt + 16;
+
+    // Build header in the small req_buf — only header (16 B) +
+    // status (1 B) live there now; data goes straight to `dst_phys`.
+    unsafe {
+        let h = header_virt as *mut VirtioBlkReqHeader;
+        (*h).req_type = VIRTIO_BLK_T_IN;
+        (*h).reserved = 0;
+        (*h).sector = sector;
+    }
+    unsafe { core::ptr::write_volatile(status_virt as *mut u8, 0xFF); }
+    fence(Ordering::SeqCst);
+
+    // Three-descriptor chain identical to `read_sector` but with
+    // the data desc retargeted at the caller's phys page and len
+    // set to the full multi-sector byte count.
+    let d0 = dsk.queue.alloc_desc().ok_or(ModelDiskError::IoError)?;
+    let d1 = dsk.queue.alloc_desc().ok_or_else(|| {
+        dsk.queue.free_desc(d0);
+        ModelDiskError::IoError
+    })?;
+    let d2 = dsk.queue.alloc_desc().ok_or_else(|| {
+        dsk.queue.free_desc(d0);
+        dsk.queue.free_desc(d1);
+        ModelDiskError::IoError
+    })?;
+
+    unsafe {
+        let desc = &mut *dsk.queue.desc(d0);
+        desc.addr = header_phys as u64;
+        desc.len = 16;
+        desc.flags = VRING_DESC_F_NEXT;
+        desc.next = d1;
+    }
+    unsafe {
+        let desc = &mut *dsk.queue.desc(d1);
+        desc.addr = dst_phys as u64;
+        desc.len = (sector_count * SECTOR_SIZE) as u32;
+        desc.flags = VRING_DESC_F_NEXT | VRING_DESC_F_WRITE;
+        desc.next = d2;
+    }
+    unsafe {
+        let desc = &mut *dsk.queue.desc(d2);
+        desc.addr = status_phys as u64;
+        desc.len = 1;
+        desc.flags = VRING_DESC_F_WRITE;
+        desc.next = 0;
+    }
+
+    dsk.queue.submit(d0);
+    write_io16(dsk.io_base, VIRTIO_PCI_QUEUE_NOTIFY, 0);
+
+    let io_base = dsk.io_base;
+    drop(dev);
+
+    // Poll-completion identical to `read_sector` — used-ring index
+    // is authoritative; ISR is hygiene.
+    let mut timeout = 5_000_000u32;
+    let mut completed = false;
+    while !completed {
+        {
+            let mut peek = MODEL_DISK.lock();
+            if let Some(d) = peek.as_mut() {
+                if d.queue.pop_used().is_some() {
+                    completed = true;
+                }
+            }
+        }
+        if completed { break; }
+        let _ = read_io8(io_base, VIRTIO_PCI_ISR_STATUS);
+        core::hint::spin_loop();
+        timeout -= 1;
+        if timeout == 0 {
+            return Err(ModelDiskError::Timeout);
+        }
+    }
+
+    let mut dev = MODEL_DISK.lock();
+    let dsk = dev.as_mut().ok_or(ModelDiskError::NotInitialized)?;
+    dsk.queue.free_chain(d0);
+
+    fence(Ordering::SeqCst);
+    let status = unsafe { core::ptr::read_volatile(status_virt as *const u8) };
+    if status != VIRTIO_BLK_S_OK {
+        return Err(ModelDiskError::IoError);
     }
     Ok(())
 }
@@ -548,8 +672,10 @@ pub fn read_into_shmem(name_hash: u32) -> Result<(u32, u64), ModelDiskError> {
     crate::drivers::serial::write_dec(pages.len() as u32);
     crate::serial_strln!(" pages)...");
 
-    // Walk the shmem's pages, filling each with up to 4 KiB from
-    // the model disk. Last page may be partial.
+    // Walk the shmem's pages, DMA-streaming each one (up to 4 KiB =
+    // 8 sectors) directly into its physical address. Zero-copy: the
+    // device writes straight into the shmem page, no req_buf hop.
+    // 8× fewer VirtIO requests than the old per-sector loop.
     for (page_idx, &phys) in pages.iter().enumerate() {
         let page_off = page_idx * 4096;
         let bytes_left = data_len.saturating_sub(page_off);
@@ -560,16 +686,14 @@ pub fn read_into_shmem(name_hash: u32) -> Result<(u32, u64), ModelDiskError> {
         // (sector-padded zeros from build_model_disk.py).
         let sectors_this_page = (bytes_this_page + SECTOR_SIZE - 1) / SECTOR_SIZE;
         let sector = payload_start_sector + (page_idx * 8) as u64;
-        let virt = crate::phys_to_virt(phys);
-        let buf = unsafe {
-            core::slice::from_raw_parts_mut(
-                virt as *mut u8,
-                sectors_this_page * SECTOR_SIZE,
-            )
-        };
-        read_sectors(sector, buf)?;
-        // Yield periodically so the rest of the kernel keeps
-        // breathing during the multi-second stream.
+        // SAFETY: `phys` is owned by this shmem region (we just
+        // allocated it via `shmem_create` and snapshotted the page
+        // list); the kernel hasn't handed it to anyone else yet.
+        // sectors_this_page * 512 ≤ 4096, so the DMA stays inside
+        // the page.
+        read_sectors_to_phys(sector, sectors_this_page, phys)?;
+        // Progress log every 1024 pages — turns the otherwise-silent
+        // ~few-second stream into something the operator can watch.
         if page_idx % 1024 == 0 && page_idx != 0 {
             crate::serial_str!("[MODEL_DISK]   ");
             crate::drivers::serial::write_dec(page_idx as u32);
