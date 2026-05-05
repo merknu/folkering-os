@@ -64,6 +64,7 @@ mod weights_test_blob;
 mod weights_ffn_blob;
 mod weights_attn_blob;
 mod vfs_loader;
+mod sampling;
 mod tokenizer;
 mod forward_pass;
 
@@ -1402,26 +1403,67 @@ fn run_d37_first_blood() -> bool {
         println!("[INFERENCE] D.3.7: argmax matches numpy reference ({})", expected);
     }
 
-    // Greedy decode a few more tokens. Stops on <|im_end|> (151645)
-    // or <|endoftext|> (151643). Each step pushes one token through
-    // the KV-cached forward pass — O(layers) per token instead of
-    // O(seq² × layers). At 28 layers each step is still seconds even
-    // with the AVX2 stack, so 4 steps is enough to verify the cache
-    // holds across multi-step generation. Long-form lands when the
-    // per-call scratch arena (queued PR) drops the bump-heap pressure.
+    // Top-k + temperature sampling for the decode loop. Greedy
+    // argmax got stuck in a `<think> → \n → <think>` cycle on
+    // Qwen3 thinking-mode (PR #170 observation): the reasoning-tag
+    // logit dominates so persistently that argmax can't escape.
+    // K=40 + T=0.7 lets the model commit to <think> on step 0
+    // (where it has overwhelming logit mass — sampler returns
+    // argmax there too) and then drift into actual reasoning text
+    // on later steps where the distribution is flatter.
+    //
+    // Seed from rdtsc — each boot rolls a different sequence, but
+    // we log the seed so a run can be replayed deterministically.
+    let mut prng = sampling::Xoshiro256pp::from_rdtsc();
+    let seed = prng.state();
+    println!(
+        "[INFERENCE] D.3.7: prng_seed=0x{:016x}{:016x}{:016x}{:016x}",
+        seed[0], seed[1], seed[2], seed[3],
+    );
+    const TOP_K: usize = 40;
+    // T > 1 flattens the softmax; the previous T=0.7 + T=1.2 runs
+    // landed on ~99% mass on `\n` (token 198) every step, so the
+    // sampler degenerated to greedy. T=1.0 is HF's default and
+    // gives the repetition-penalty room to redistribute mass.
+    const TEMPERATURE: f32 = 1.0;
+    // Repetition penalty (HF-transformers semantics): positive
+    // logits for already-generated tokens get divided by 1.3.
+    // Breaks Qwen3-0.6B's newline-spiral on its first few tokens.
+    const REPETITION_PENALTY: f32 = 1.3;
+
+    // Decode up to 64 tokens. Stops on <|im_end|> (151645) or
+    // <|endoftext|> (151643). Each step pushes one token through
+    // the KV-cached forward pass — O(layers) per token.
     let mut sampled: Vec<u32> = Vec::new();
     sampled.push(first_id);
     let mut next = first_id;
-    for _ in 0..4 {
+    for step in 0..64 {
         if next == 151645 || next == 151643 { break; }
-        let logits = match forward_pass(&view, &cfg, &mut cache, &[next]) {
+        let mut logits = match forward_pass(&view, &cfg, &mut cache, &[next]) {
             Some(v) => v,
             None => break,
         };
-        next = match argmax(&logits) {
-            Some(i) => i,
-            None => break,
-        };
+
+        // Apply repetition penalty across both prompt and generated
+        // tokens. Without it Qwen3-0.6B re-picks `\n` ~99 % of the
+        // time at this depth and the sampler can never escape.
+        sampling::apply_repetition_penalty(
+            &mut logits, &prompt_ids, REPETITION_PENALTY,
+        );
+        sampling::apply_repetition_penalty(
+            &mut logits, &sampled, REPETITION_PENALTY,
+        );
+
+        // Diagnostic: dump top-5 (logit, token_id) for the first
+        // two decode steps so we can see the distribution shape.
+        if step < 2 {
+            let dbg = sampling::top_k(&logits, 5);
+            crate::println!(
+                "[INFERENCE] D.3.7 dbg: step={} top5_logits={:?}",
+                step, dbg
+            );
+        }
+        next = sampling::sample(&logits, TOP_K, TEMPERATURE, &mut prng);
         sampled.push(next);
     }
 
