@@ -84,6 +84,14 @@ pub const SYS_GPU_INFO: u64 = 0x81;  // 129 - Get GPU info + map framebuffer
 // God Mode Pipe (COM3)
 pub const SYS_COM3_READ: u64 = 0x90; // 144 - Read byte from COM3 (non-blocking)
 
+/// D.3.7.virtio: stream the named file from the model disk into a
+/// fresh shmem region. arg1 = FNV-1a 32-bit hash of the filename
+/// (matches `synapse::hash_name`'s convention). Returns
+/// `((shmem_id as u64) << 32) | (size as u32 as u64)` on success;
+/// `u64::MAX` on any failure (no model disk attached, hash
+/// mismatch, OOM).
+pub const SYS_READ_MODEL_FILE_SHMEM: u64 = 0xE5;
+
 /// Execute a syscall with no arguments
 #[inline(always)]
 pub unsafe fn syscall0(nr: u64) -> u64 {
