@@ -69,15 +69,17 @@ mod forward_pass;
 
 // ── Bump allocator ──────────────────────────────────────────────────
 //
-// 64 MiB. D.3.1.b's real Qwen tokenizer (~150k vocab, ~150k merges)
-// settles at ~14 MiB live before we even load weights; D.3.7's
-// real-Qwen forward pass adds the model itself plus a per-layer
-// KV-cache. Bump never frees, so this is the cumulative high-
-// water mark, not a steady-state. When Q8 quantization (D.3.1.q)
-// shrinks the projections from fp32 to int8, this can come back
-// down — for now 64 MiB covers the worst case (Qwen3-0.6B fp32 +
-// full tokenizer + KV-cache for 1k context).
-const HEAP_SIZE: usize = 64 * 1024 * 1024;
+// 256 MiB. D.3.7 prefill on real Qwen3-0.6B (4 layers) accumulates
+// per-row matvec allocations in attention_block + swiglu_ffn that
+// the bump allocator never frees: 14 prefill tokens × ~50 KiB of
+// intermediate Vecs per layer × 4 layers + 8 decode steps + a
+// 608 KiB lm_head Vec per call adds up to ~50 MiB. Plus the
+// tokenizer's ~14 MiB live state. 64 MiB OOM'd at decode step ~5;
+// 256 MiB covers the full ChatML prompt + 8 sampled tokens with
+// margin to spare. A real generational allocator (or per-call
+// scratch arena that resets) lands in D.4.x once we want to
+// generate hundreds of tokens.
+const HEAP_SIZE: usize = 256 * 1024 * 1024;
 
 struct BumpAllocator {
     heap: UnsafeCell<[u8; HEAP_SIZE]>,
@@ -1290,7 +1292,13 @@ fn run_d37_first_blood() -> bool {
 
     println!("[INFERENCE] D.3.7: First Blood — real Qwen3-0.6B (4 layers, Q8)...");
 
-    let fbin_bytes = match vfs_loader::read_file("qwen.fbin") {
+    // Keep-mapped variant: the 232 MiB qwen.fbin would OOM the
+    // bump heap if we copied it into a Vec. read_file_mapped maps
+    // the shmem at MODEL_VADDR for the lifetime of the process and
+    // returns a borrowed slice. Synapse-first / model-disk-fallback
+    // ordering — works whether qwen.fbin lives in initrd or on
+    // virtio2.
+    let fbin_bytes: &'static [u8] = match vfs_loader::read_file_mapped("qwen.fbin") {
         Ok(b) => b,
         Err(e) => {
             println!("[INFERENCE] D.3.7: VFS read qwen.fbin failed: {:?}", e);
@@ -1298,10 +1306,10 @@ fn run_d37_first_blood() -> bool {
         }
     };
     println!(
-        "[INFERENCE] D.3.7: loaded qwen.fbin ({} MB) from VFS",
+        "[INFERENCE] D.3.7: loaded qwen.fbin ({} MB) via keep-mapped shmem",
         fbin_bytes.len() / (1024 * 1024)
     );
-    let view = match FbinView::parse(&fbin_bytes) {
+    let view = match FbinView::parse(fbin_bytes) {
         Ok(v) => v,
         Err(e) => {
             println!("[INFERENCE] D.3.7: parse error: {:?}", e);

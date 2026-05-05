@@ -19,10 +19,14 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 /// Yield budget: how many cells we compute per matmul row before
-/// calling `yield_cpu()`. With a 32-cell-wide row this yields once
-/// per row; for the D.1 2×2 demo we yield once per matmul (the
-/// `m * k` loop body never reaches 32 cells). Tunable per-phase.
-const MATMUL_YIELD_EVERY: usize = 32;
+/// calling `yield_cpu()`. The original 32 was tuned for the D.1
+/// 2×2 demo; on real Qwen3-0.6B (Wq is [2048, 1024], 32 blocks per
+/// row × 2048 rows = 65K yields per single matvec, ×many matvecs
+/// per token × prefill length) the syscall + scheduler overhead
+/// alone makes the boot test wedge for ages. 32K means one yield
+/// per ~1K-element row — keeps the compositor + Draug daemon
+/// breathing without choking inference itself.
+const MATMUL_YIELD_EVERY: usize = 32_768;
 
 /// Q8_0 block size — same as llama.cpp / GGUF. Picked for
 /// cache-friendly inner loops: a 32-element block is one f16 scale

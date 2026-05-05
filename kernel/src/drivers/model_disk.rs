@@ -471,6 +471,123 @@ pub fn read_sectors(sector: u64, buf: &mut [u8]) -> Result<(), ModelDiskError> {
     Ok(())
 }
 
+/// FNV-1a 32-bit hash. Same algorithm `libfolk::sys::synapse::hash_name`
+/// uses, so userspace can hand us a pre-computed hash in a syscall arg
+/// instead of a string pointer + length pair.
+fn fnv1a_32(bytes: &[u8]) -> u32 {
+    let mut h: u32 = 0x811c9dc5;
+    for &b in bytes {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x01000193);
+    }
+    h
+}
+
+/// Hash of the FMDL filename (NUL-trimmed). Cached at boot via
+/// `read_fmdl_header()`; use this to compare against a userspace
+/// hash without holding the header lock during the comparison.
+pub fn filename_hash() -> Option<u32> {
+    let h = *MODEL_DISK_HEADER.lock();
+    h.map(|h| fnv1a_32(&h.filename[..h.filename_len]))
+}
+
+/// Stream the entire model file payload into a fresh shmem region.
+/// Verifies the requested name hash matches the FMDL filename,
+/// allocates a shmem of `data_len` bytes, then loops the model
+/// disk's pages into the shmem's physical pages 4 KiB at a time
+/// (8 sectors per page).
+///
+/// On success returns `(shmem_id, data_len)`. Userspace maps the
+/// shmem at any free vaddr and reads the .fbin bytes directly out
+/// of the mapping — no kernel-side copy, no Synapse round-trip.
+///
+/// The shmem's owner is the calling task (per `shmem_create`'s
+/// `current_task()` capture). The caller is responsible for
+/// `shmem_destroy` when done if it cares about reclaiming the
+/// pages; for the inference task's path the shmem persists for
+/// the lifetime of the process and the kernel's task teardown
+/// reclaims it.
+pub fn read_into_shmem(name_hash: u32) -> Result<(u32, u64), ModelDiskError> {
+    use crate::ipc::shared_memory::{shmem_create, ShmemPerms, SHMEM_TABLE};
+
+    let header = *MODEL_DISK_HEADER.lock();
+    let header = header.ok_or(ModelDiskError::NotInitialized)?;
+
+    let actual_hash = fnv1a_32(&header.filename[..header.filename_len]);
+    if actual_hash != name_hash {
+        return Err(ModelDiskError::BadMagic);
+    }
+    if header.data_offset % SECTOR_SIZE as u64 != 0 {
+        return Err(ModelDiskError::InvalidSector);
+    }
+
+    let data_len = header.data_len as usize;
+    let payload_start_sector = header.data_offset / SECTOR_SIZE as u64;
+
+    let shmem_id = shmem_create(data_len, ShmemPerms::ReadWrite)
+        .map_err(|_| ModelDiskError::IoError)?;
+
+    // Snapshot the shmem's physical page list. We don't hold the
+    // SHMEM_TABLE lock while reading from disk — that would pin a
+    // global mutex across ~5 s of polling I/O. Cloning the page
+    // list is cheap (one Vec<usize> of ~57k entries for 232 MiB).
+    let pages = {
+        let table = SHMEM_TABLE.lock();
+        let shmem = match table.get(&shmem_id.get()) {
+            Some(s) => s,
+            None => return Err(ModelDiskError::IoError),
+        };
+        shmem.phys_pages.clone()
+    };
+
+    crate::serial_str!("[MODEL_DISK] streaming ");
+    crate::drivers::serial::write_dec((data_len / (1024 * 1024)) as u32);
+    crate::serial_str!(" MiB into shmem ");
+    crate::drivers::serial::write_dec(shmem_id.get());
+    crate::serial_str!(" (");
+    crate::drivers::serial::write_dec(pages.len() as u32);
+    crate::serial_strln!(" pages)...");
+
+    // Walk the shmem's pages, filling each with up to 4 KiB from
+    // the model disk. Last page may be partial.
+    for (page_idx, &phys) in pages.iter().enumerate() {
+        let page_off = page_idx * 4096;
+        let bytes_left = data_len.saturating_sub(page_off);
+        if bytes_left == 0 { break; }
+        let bytes_this_page = bytes_left.min(4096);
+        // Round up to sector boundary; trailing bytes past
+        // `bytes_this_page` get whatever the disk has there
+        // (sector-padded zeros from build_model_disk.py).
+        let sectors_this_page = (bytes_this_page + SECTOR_SIZE - 1) / SECTOR_SIZE;
+        let sector = payload_start_sector + (page_idx * 8) as u64;
+        let virt = crate::phys_to_virt(phys);
+        let buf = unsafe {
+            core::slice::from_raw_parts_mut(
+                virt as *mut u8,
+                sectors_this_page * SECTOR_SIZE,
+            )
+        };
+        read_sectors(sector, buf)?;
+        // Yield periodically so the rest of the kernel keeps
+        // breathing during the multi-second stream.
+        if page_idx % 1024 == 0 && page_idx != 0 {
+            crate::serial_str!("[MODEL_DISK]   ");
+            crate::drivers::serial::write_dec(page_idx as u32);
+            crate::serial_str!(" / ");
+            crate::drivers::serial::write_dec(pages.len() as u32);
+            crate::serial_strln!(" pages streamed");
+        }
+    }
+
+    crate::serial_str!("[MODEL_DISK] streaming done — shmem_id=");
+    crate::drivers::serial::write_dec(shmem_id.get());
+    crate::serial_str!(" size=");
+    crate::drivers::serial::write_dec(data_len as u32);
+    crate::serial_strln!("");
+
+    Ok((shmem_id.get(), header.data_len))
+}
+
 /// Boot-time spot check: re-read the first 8 payload sectors (4 KiB
 /// after the FMDL header) and verify the .fbin magic `FBN1` lives
 /// at offset 0. Confirms the multi-sector read path works end-to-

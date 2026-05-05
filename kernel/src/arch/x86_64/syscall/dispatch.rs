@@ -472,6 +472,25 @@ pub(super) extern "C" fn syscall_handler(
             }
         },
 
+        // 0xE5 — D.3.7.virtio: stream the named file from the model
+        // disk into a fresh shmem region. arg1 is the FNV-1a 32-bit
+        // hash of the filename (matches `synapse::hash_name`'s
+        // convention so userspace can reuse it). Returns:
+        //   ((shmem_id as u64) << 32) | (size as u64) -- but size is
+        //   the LOWER 32 bits — many `.fbin` files exceed 4 GiB only
+        //   under D.5+, and our current 232 MiB Q8 fits comfortably.
+        // u64::MAX on any error (no model disk, hash mismatch, OOM).
+        0xE5 => {
+            let name_hash = arg1 as u32;
+            match crate::drivers::model_disk::read_into_shmem(name_hash) {
+                Ok((shmem_id, size)) => {
+                    let size32 = size as u32;
+                    ((shmem_id as u64) << 32) | (size32 as u64)
+                }
+                Err(_) => u64::MAX,
+            }
+        },
+
         _ => {
             crate::drivers::serial::write_str("[HANDLER] Invalid syscall!\n");
             u64::MAX // Return error

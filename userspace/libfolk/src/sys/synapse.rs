@@ -368,6 +368,42 @@ pub fn hash_name(name: &str) -> u32 {
     hash
 }
 
+// ============================================================================
+// D.3.7.virtio: model-disk file fetch
+// ============================================================================
+
+/// Stream a file from the kernel's model-disk into a fresh shmem
+/// region — bypasses Synapse entirely. The model disk is a
+/// dedicated VirtIO block device whose sector 0 carries an FMDL
+/// header naming a single payload. The kernel verifies
+/// `hash_name(name)` matches the disk's filename hash before
+/// allocating + filling the shmem.
+///
+/// On success returns `Ok((shmem_handle, size))`; the caller should
+/// `shmem_map(handle, vaddr)` and read the bytes directly from
+/// the mapping. The shmem persists until explicitly destroyed or
+/// task teardown (it's owned by the calling task).
+///
+/// Falls back-compatibly to `Err(SynapseError::NotFound)` when no
+/// model disk is attached or the name doesn't match — same error
+/// type the Synapse path uses, so a single fallthrough works in
+/// `vfs_loader::read_file`.
+pub fn read_model_file_shmem(name: &str) -> SynapseResult<ShmemFileResponse> {
+    use crate::syscall::{syscall1, SYS_READ_MODEL_FILE_SHMEM};
+
+    let h = hash_name(name);
+    let ret = unsafe { syscall1(SYS_READ_MODEL_FILE_SHMEM, h as u64) };
+    if ret == u64::MAX {
+        return Err(SynapseError::NotFound);
+    }
+    let shmem_handle = ((ret >> 32) & 0xFFFFFFFF) as u32;
+    let size = (ret & 0xFFFFFFFF) as u32;
+    if shmem_handle == 0 {
+        return Err(SynapseError::IpcFailed);
+    }
+    Ok(ShmemFileResponse { shmem_handle, size })
+}
+
 /// File info returned from read_file_by_name
 #[derive(Debug, Clone, Copy)]
 pub struct FileInfo {

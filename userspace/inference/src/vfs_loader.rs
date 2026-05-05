@@ -41,21 +41,43 @@ pub enum VfsError {
     ShmemMap,
 }
 
+/// Reserved virtual address for the inference task's KEEP-MAPPED
+/// model file (D.3.7.virtio). The model disk's payload sits here
+/// for the lifetime of the process — the shmem is mapped once,
+/// never unmapped, and `FbinView` borrows directly into it.
+/// Intentionally far from `VFS_VADDR` so both can coexist when a
+/// short-lived Synapse read happens during model-loaded steady state.
+const MODEL_VADDR: usize = 0x6004_0000;
+
 /// Read a file from Synapse VFS into a freshly allocated `Vec<u8>`.
 /// Maps the shmem, copies the bytes out, unmaps, destroys the shmem.
 /// The caller owns the Vec and can pass `&[]` slices of it to
 /// downstream parsers (e.g. `FbinView::parse`).
 ///
-/// We could keep the mapping live and hand back a `&'static [u8]`
-/// for zero-copy access, but the bump allocator + the simplicity of
-/// "the file lives in the heap from now on" wins for the small
-/// test files D.3.1.2 deals with. When real models land (~250 MiB
-/// quantized), we'll switch to a keep-mapped variant — the API
-/// will need to grow to expose the lifetime.
+/// Falls through to the model-disk path (D.3.7.virtio) when
+/// Synapse reports `NotFound` — same `ShmemFileResponse` shape, so
+/// the rest of the function is shared. A `qwen.fbin` packed in
+/// initrd takes the Synapse path; a `qwen.fbin` on the secondary
+/// virtio_blk takes the model-disk syscall path. Inference code
+/// never needs to know which.
+///
+/// **Caveat:** copies the file into a Vec, so files larger than
+/// the bump heap (64 MiB) will OOM. Use `read_file_mapped` for
+/// large model files — it borrows the shmem directly and never
+/// copies.
 pub fn read_file(name: &str) -> Result<Vec<u8>, VfsError> {
     let resp = match synapse::read_file_shmem(name) {
         Ok(r) => r,
-        Err(SynapseError::NotFound) => return Err(VfsError::NotFound),
+        Err(SynapseError::NotFound) => {
+            // Try the model disk before declaring NotFound. Cheap
+            // when no model disk is attached (kernel returns u64::MAX
+            // immediately).
+            match synapse::read_model_file_shmem(name) {
+                Ok(r) => r,
+                Err(SynapseError::NotFound) => return Err(VfsError::NotFound),
+                Err(e) => return Err(VfsError::Synapse(e)),
+            }
+        },
         Err(e) => return Err(VfsError::Synapse(e)),
     };
     if resp.size == 0 {
@@ -79,4 +101,50 @@ pub fn read_file(name: &str) -> Result<Vec<u8>, VfsError> {
     let _ = shmem_unmap(resp.shmem_handle, VFS_VADDR);
     let _ = shmem_destroy(resp.shmem_handle);
     Ok(out)
+}
+
+/// Read a file via keep-mapped shmem and return a `&'static [u8]`
+/// pointing into the mapping. Zero-copy — the file's bytes live
+/// in shmem-backed pages mapped once at `MODEL_VADDR` and never
+/// unmapped. Required for files larger than the bump heap (qwen.fbin
+/// at 232 MiB exceeds our 64 MiB heap by 4×, so `read_file`'s
+/// Vec-copy would OOM).
+///
+/// The lifetime is fictional — we promise the caller never to
+/// unmap. If the inference task ever needs to reload the model
+/// from a different disk, this function would need to grow an
+/// `unmap_model()` companion. Today there's only one model and it
+/// lives here forever.
+///
+/// Synapse-first / model-disk-fallback ordering matches `read_file`.
+pub fn read_file_mapped(name: &str) -> Result<&'static [u8], VfsError> {
+    let resp = match synapse::read_file_shmem(name) {
+        Ok(r) => r,
+        Err(SynapseError::NotFound) => {
+            match synapse::read_model_file_shmem(name) {
+                Ok(r) => r,
+                Err(SynapseError::NotFound) => return Err(VfsError::NotFound),
+                Err(e) => return Err(VfsError::Synapse(e)),
+            }
+        },
+        Err(e) => return Err(VfsError::Synapse(e)),
+    };
+    if resp.size == 0 {
+        let _ = shmem_destroy(resp.shmem_handle);
+        return Err(VfsError::Synapse(SynapseError::IpcFailed));
+    }
+    if shmem_map(resp.shmem_handle, MODEL_VADDR).is_err() {
+        let _ = shmem_destroy(resp.shmem_handle);
+        return Err(VfsError::ShmemMap);
+    }
+    // SAFETY: shmem_map succeeded for `resp.size` bytes at
+    // MODEL_VADDR. We deliberately don't unmap or destroy — the
+    // mapping persists for the process lifetime so the `&'static`
+    // lifetime is honest. Re-calling this for the same name would
+    // map a SECOND shmem at the same vaddr (kernel rejects),
+    // returning ShmemMap. Caller is expected to call once.
+    let bytes: &'static [u8] = unsafe {
+        core::slice::from_raw_parts(MODEL_VADDR as *const u8, resp.size as usize)
+    };
+    Ok(bytes)
 }
