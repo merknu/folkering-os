@@ -218,6 +218,18 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
             }
         }
         serial_strln!("[INIT] Looking for VirtIO block device...");
+
+        // We initialise the MODEL DISK first when present, BEFORE the
+        // primary virtio_blk init. Both devices live in the same PCI
+        // PIO region and `virtio_blk::init()` claims globals for the
+        // FIRST device it finds; doing model_disk first keeps that
+        // implicit ordering predictable and lets the secondary disk
+        // run on its own polling-only path without any IRQ conflict.
+        // Done before the main virtio_blk message so the boot trace
+        // shows the disks in PCI order, not init order.
+        let _ = drivers::model_disk::init();
+        let _ = drivers::model_disk::read_fmdl_header();
+
         let virtio_blk_ready = match drivers::virtio_blk::init() {
             Ok(()) => {
                 serial_strln!("[INIT] VirtIO block device ready");

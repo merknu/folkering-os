@@ -6,6 +6,7 @@ pub mod mouse;
 pub mod pci;
 pub mod virtio;
 pub mod virtio_blk;
+pub mod model_disk;
 pub mod virtio_net;
 pub mod virtio_gpu;
 pub mod virtio_input;
