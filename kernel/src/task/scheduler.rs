@@ -292,19 +292,20 @@ pub fn yield_cpu() {
         return;
     }
 
-    // Note: FXSAVE of the current task's XMM is done in the assembly yield_path
-    // (syscall_entry) BEFORE calling this Rust function, so user XMM is already
-    // saved correctly. Do NOT do fxsave64 here — Rust may have clobbered XMM.
+    // Note: xsave64 of the current task's FPU/SSE/AVX state is done in the
+    // assembly yield_path (syscall_entry) BEFORE calling this Rust function,
+    // so user state is already saved correctly. Do NOT do xsave64 here —
+    // Rust may have clobbered XMM/YMM.
 
-    // Get target task's context pointer, page table, and fxsave area
+    // Get target task's context pointer, page table, and xsave area
     let target = task::get_task(next_id).expect("Target task not found");
 
-    let (target_ctx_ptr, target_page_table_phys, target_fxsave_ptr) = {
+    let (target_ctx_ptr, target_page_table_phys, target_xsave_ptr) = {
         let target_locked = target.lock();
         (
             &target_locked.context as *const task::Context as usize,
             target_locked.page_table_phys,
-            &target_locked.fxsave_area as *const _ as usize,
+            &target_locked.xsave_area as *const _ as usize,
         )
     };
 
@@ -321,10 +322,10 @@ pub fn yield_cpu() {
     // Record context switch
     super::statistics::record_context_switch(next_id);
 
-    // Update FXSAVE_CURRENT_PTR to target task's fxsave area so that
-    // restore_context_only can FXRSTOR the correct FPU/SSE state.
-    use crate::task::task::FXSAVE_CURRENT_PTR;
-    FXSAVE_CURRENT_PTR.store(target_fxsave_ptr, core::sync::atomic::Ordering::Release);
+    // Update XSAVE_CURRENT_PTR to target task's xsave area so that
+    // restore_context_only can xrstor64 the correct FPU/SSE/AVX state.
+    use crate::task::task::XSAVE_CURRENT_PTR;
+    XSAVE_CURRENT_PTR.store(target_xsave_ptr, core::sync::atomic::Ordering::Release);
 
     // Update current context pointer for syscalls
     crate::arch::x86_64::syscall::set_current_context_ptr(target_ctx_ptr as *mut task::Context);

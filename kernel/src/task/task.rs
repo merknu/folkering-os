@@ -10,35 +10,65 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use spin::Mutex;
 
-/// 512-byte FXSAVE area, must be 16-byte aligned for FXSAVE/FXRSTOR instructions.
-/// Stores x87 FPU + SSE/AVX MXCSR + XMM0–XMM15 state (FXSAVE64 format).
-#[repr(C, align(16))]
-pub struct FxsaveArea(pub [u8; 512]);
+/// XSAVE area for task FPU/SSE/AVX state — 1024 bytes, 64-byte aligned.
+///
+/// Layout (Intel SDM Vol 1 §13.4, non-compacted):
+///   - 0..512   Legacy region (FXSAVE-compatible: x87 + MXCSR + XMM0–XMM15)
+///   - 512..575 XSAVE header (XSTATE_BV at +0, XCOMP_BV at +8)
+///   - 576..831 AVX YMM_Hi128 state (16 × 16 B for upper halves of YMM0–YMM15)
+///   - 832..    Reserved headroom (we allocate 1024 B for AVX-512 headroom)
+///
+/// Required size for x87 + SSE + AVX (XCR0 = 0x7) is 832 B; CPUID leaf
+/// 0xD subleaf 0 EBX returns the exact size for the host. 1024 B is
+/// safe and gives a power-of-two cache-friendly footprint.
+///
+/// 64-byte alignment is mandatory: `xsave64`/`xrstor64` raise #GP on
+/// misaligned operands. Init state is all-zero — `xrstor64` with
+/// `XSTATE_BV = 0` sets every component to processor INIT state
+/// (FPU CW = 0x037F, MXCSR = 0x1F80, all regs zero), which is what we
+/// want for a fresh task.
+#[repr(C, align(64))]
+pub struct XsaveArea(pub [u8; 1024]);
 
-impl FxsaveArea {
-    /// Create a valid initial FPU/SSE state:
-    ///   FPU CW  (offset  0) = 0x037F  — all exceptions masked, double precision
-    ///   MXCSR   (offset 24) = 0x1F80  — all SSE exceptions masked, round-nearest
+impl XsaveArea {
+    /// Create an XSAVE area pre-populated with explicit init values for
+    /// x87 + SSE + AVX. We set `XSTATE_BV = 0x7` so that `xrstor64`
+    /// unconditionally loads each component from this area (and not
+    /// from whatever the processor's XINUSE happens to be) — without
+    /// this, the first task to run could inherit a dirty MXCSR from
+    /// the kernel boot path and immediately raise #XM with all
+    /// exception masks cleared.
     pub const fn default_init() -> Self {
-        let mut data = [0u8; 512];
-        // FPU Control Word at bytes 0-1 (little-endian)
+        let mut data = [0u8; 1024];
+        // Legacy region (FXSAVE-compatible, bytes 0..512):
+        //   FCW   @ 0..2   = 0x037F  — x87 control word: all exceptions masked,
+        //                              double precision, round-to-nearest
         data[0] = 0x7F;
         data[1] = 0x03;
-        // MXCSR at bytes 24-27 (little-endian)
+        //   MXCSR @ 24..28 = 0x1F80  — SSE control: all 6 exceptions masked,
+        //                              round-to-nearest, no FTZ/DAZ
         data[24] = 0x80;
         data[25] = 0x1F;
+        // XSAVE header (bytes 512..576):
+        //   XSTATE_BV @ 512..520 = 0x7 — components present in this area:
+        //                                bit 0 = x87, bit 1 = SSE, bit 2 = AVX.
+        //   XCOMP_BV  @ 520..528 = 0x0 — non-compacted format (matches xsave64).
+        // Remaining bytes 528..1024 are reserved/extended state — zeros mean
+        // YMM upper halves load as zero, which is the AVX init state.
+        data[512] = 0x07;
         Self(data)
     }
 }
 
-/// Raw pointer to the current task's FXSAVE area.
+/// Raw pointer to the current task's XSAVE area.
 ///
-/// Set by `timer_preempt_handler` on every context switch so that `irq_timer`
-/// assembly can call FXSAVE / FXRSTOR without holding any Rust locks.
+/// Set by `timer_preempt_handler` on every context switch so that
+/// `irq_timer` assembly can call `xsave64` / `xrstor64` without
+/// holding any Rust locks.
 ///
-/// Invariant: always points into a live Task's `fxsave_area` field, or is 0
-/// (before the first userspace task starts).
-pub static FXSAVE_CURRENT_PTR: AtomicUsize = AtomicUsize::new(0);
+/// Invariant: always points into a live Task's `xsave_area` field, or
+/// is 0 (before the first userspace task starts).
+pub static XSAVE_CURRENT_PTR: AtomicUsize = AtomicUsize::new(0);
 
 /// Send wrapper for PageTable pointer (we manage synchronization via Task's Mutex)
 pub struct PageTablePtr(*mut PageTable);
@@ -154,9 +184,9 @@ pub struct Task {
     /// Human-readable task name (e.g. "synapse", "shell", "compositor")
     pub name: [u8; 16],
 
-    /// FXSAVE/FXRSTOR area — stores x87 + SSE state across context switches.
-    /// 512 bytes, 16-byte aligned (required by FXSAVE64).
-    pub fxsave_area: FxsaveArea,
+    /// XSAVE/XRSTOR area — stores x87 + SSE + AVX state across context
+    /// switches. 1024 bytes, 64-byte aligned (required by XSAVE64).
+    pub xsave_area: XsaveArea,
 }
 
 /// CPU context for task switching
@@ -388,8 +418,9 @@ impl Task {
             // Task name (zeroed by default, set via set_name after creation)
             // Already zeroed by write_bytes above
 
-            // FPU/SSE: valid initial state (MXCSR=0x1F80, FPU CW=0x037F)
-            ptr::addr_of_mut!((*task_ptr).fxsave_area).write(FxsaveArea::default_init());
+            // FPU/SSE/AVX: zeroed XSAVE area — XSTATE_BV=0 forces INIT state
+            // (FPU CW=0x037F, MXCSR=0x1F80, all SIMD regs zero) on first xrstor64.
+            ptr::addr_of_mut!((*task_ptr).xsave_area).write(XsaveArea::default_init());
             buffer.assume_init_read()
         }
     }

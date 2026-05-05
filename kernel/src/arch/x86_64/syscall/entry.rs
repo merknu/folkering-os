@@ -313,12 +313,21 @@ pub(super) extern "C" fn syscall_entry() {
         "mov rsi, rdi",
         "pop rdi",
 
-        // FXSAVE: save current task's XMM/FPU state before kernel Rust code runs.
-        "mov rax, qword ptr [rip + {fxsave_ptr}]",
-        "test rax, rax",
+        // XSAVE64: save current task's x87 + SSE + AVX state before the kernel
+        // Rust handler runs. xsave64 takes the state-component mask in EDX:EAX
+        // (here 0x7 = x87 | SSE | AVX), which means we MUST preserve rdx — at
+        // this point it holds C-ABI arg3 for the upcoming `call {handler}`.
+        // r10 is free (the syscall→C-ABI shuffle moved its old value to r8) so
+        // we use it for the area pointer.
+        "push rdx",
+        "mov r10, qword ptr [rip + {xsave_ptr}]",
+        "test r10, r10",
         "jz 5f",
-        "fxsave64 [rax]",
+        "mov eax, 7",
+        "xor edx, edx",
+        "xsave64 [r10]",
         "5:",
+        "pop rdx",
 
         // CRITICAL: Align stack to 16 bytes before call (x86-64 ABI requirement)
         // This prevents #GP from SSE instructions that require 16-byte alignment
@@ -347,11 +356,17 @@ pub(super) extern "C" fn syscall_entry() {
         "mov r15, rax",
         "pop r14",        // Restore return value
 
-        // FXRSTOR: restore current task's XMM/FPU state before returning to userspace.
-        "mov rax, qword ptr [rip + {fxsave_ptr}]",
-        "test rax, rax",
+        // XRSTOR64: restore current task's x87 + SSE + AVX state before returning
+        // to userspace. r14 (return value) and r15 (Context*) are live and must be
+        // preserved — xrstor64 only writes FPU/SIMD state, so leaving the area
+        // pointer in rcx and the mask in EDX:EAX is safe (all three are about to
+        // be overwritten by the GPR restore from r15+offsets below).
+        "mov rcx, qword ptr [rip + {xsave_ptr}]",
+        "test rcx, rcx",
         "jz 6f",
-        "fxrstor64 [rax]",
+        "mov eax, 7",
+        "xor edx, edx",
+        "xrstor64 [rcx]",
         "6:",
 
         // Restore all registers from Context (EXCEPT RAX - use return value!)
@@ -403,13 +418,16 @@ pub(super) extern "C" fn syscall_entry() {
         // Yield path - switch to next task
         "yield_path:",
 
-        // FXSAVE: save user's XMM/FPU state NOW, before any Rust code runs.
-        // yield_cpu() is Rust and may auto-vectorize, clobbering XMM registers.
-        // We must capture the user's XMM HERE, while they're still intact.
-        "mov rax, qword ptr [rip + {fxsave_ptr}]",
-        "test rax, rax",
+        // XSAVE64: save user's x87 + SSE + AVX state NOW, before any Rust runs.
+        // syscall_do_yield() may auto-vectorize and clobber XMM/YMM. yield_fn
+        // takes no args, so rdx is dead here — safe to clobber as the mask
+        // high half. r15 (Context*) is callee-saved across the upcoming call.
+        "mov rcx, qword ptr [rip + {xsave_ptr}]",
+        "test rcx, rcx",
         "jz 7f",
-        "fxsave64 [rax]",
+        "mov eax, 7",
+        "xor edx, edx",
+        "xsave64 [rcx]",
         "7:",
 
         // Update RAX in Context to return value (0 for yield)
@@ -417,13 +435,16 @@ pub(super) extern "C" fn syscall_entry() {
 
         "call {yield_fn}",
 
-        // FXRSTOR: restore user's XMM/FPU state (same-task no-switch case).
-        // yield_fn returned without switching tasks; Rust may have clobbered XMM.
-        // FXSAVE_CURRENT_PTR still points to THIS task's fxsave_area (saved above).
-        "mov rax, qword ptr [rip + {fxsave_ptr}]",
-        "test rax, rax",
+        // XRSTOR64: restore user's x87 + SSE + AVX state (same-task no-switch case).
+        // yield_fn returned without switching tasks; Rust may have clobbered SIMD
+        // regs. XSAVE_CURRENT_PTR still points to THIS task's xsave_area (saved
+        // above). r15 will be reloaded after this from get_ctx_fn.
+        "mov rcx, qword ptr [rip + {xsave_ptr}]",
+        "test rcx, rcx",
         "jz 8f",
-        "fxrstor64 [rax]",
+        "mov eax, 7",
+        "xor edx, edx",
+        "xrstor64 [rcx]",
         "8:",
 
         // If we get here, no task switch - restore and return
@@ -461,7 +482,7 @@ pub(super) extern "C" fn syscall_entry() {
         // Return to user mode via IRETQ
         "iretq",
 
-        fxsave_ptr = sym crate::task::task::FXSAVE_CURRENT_PTR,
+        xsave_ptr = sym crate::task::task::XSAVE_CURRENT_PTR,
         get_ctx_fn = sym get_current_task_context_ptr,
         handler = sym syscall_handler,
         yield_fn = sym syscall_do_yield,

@@ -224,11 +224,16 @@ pub unsafe extern "C" fn restore_context_only(_new_ctx: usize) {
         "mov fs, ax",
         "mov gs, ax",
 
-        // FXRSTOR: restore FPU/SSE state for the new task
-        "mov rax, qword ptr [{fxsave_ptr}]",
-        "test rax, rax",
+        // XRSTOR64: restore x87 + SSE + AVX state for the new task.
+        // EDX:EAX = state-component bitmap; bit 0 = x87, bit 1 = SSE, bit 2 = AVX.
+        // Pointer goes in any GPR except rax/rdx (we use rcx); reordered so the
+        // mask setup stays adjacent to the instruction it parameterises.
+        "mov rcx, qword ptr [{xsave_ptr}]",
+        "test rcx, rcx",
         "jz 4f",
-        "fxrstor64 [rax]",
+        "mov eax, 7",
+        "xor edx, edx",
+        "xrstor64 [rcx]",
         "4:",
 
         // Build IRETQ frame (push in reverse: SS, RSP, RFLAGS, CS, RIP)
@@ -262,7 +267,7 @@ pub unsafe extern "C" fn restore_context_only(_new_ctx: usize) {
 
         "iretq",
 
-        fxsave_ptr = sym crate::task::task::FXSAVE_CURRENT_PTR,
+        xsave_ptr = sym crate::task::task::XSAVE_CURRENT_PTR,
     );
 }
 
