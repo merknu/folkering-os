@@ -31,13 +31,32 @@ use spin::Mutex;
 pub struct XsaveArea(pub [u8; 1024]);
 
 impl XsaveArea {
-    /// Create an XSAVE area that, when restored via `xrstor64` with
-    /// mask 0x7, sets x87 / SSE / AVX state to processor INIT.
-    /// All zeros is correct: `XSTATE_BV = 0` in the header tells
-    /// `xrstor64` to load INIT state for every component in the mask,
-    /// regardless of the legacy region contents.
+    /// Create an XSAVE area pre-populated with explicit init values for
+    /// x87 + SSE + AVX. We set `XSTATE_BV = 0x7` so that `xrstor64`
+    /// unconditionally loads each component from this area (and not
+    /// from whatever the processor's XINUSE happens to be) — without
+    /// this, the first task to run could inherit a dirty MXCSR from
+    /// the kernel boot path and immediately raise #XM with all
+    /// exception masks cleared.
     pub const fn default_init() -> Self {
-        Self([0u8; 1024])
+        let mut data = [0u8; 1024];
+        // Legacy region (FXSAVE-compatible, bytes 0..512):
+        //   FCW   @ 0..2   = 0x037F  — x87 control word: all exceptions masked,
+        //                              double precision, round-to-nearest
+        data[0] = 0x7F;
+        data[1] = 0x03;
+        //   MXCSR @ 24..28 = 0x1F80  — SSE control: all 6 exceptions masked,
+        //                              round-to-nearest, no FTZ/DAZ
+        data[24] = 0x80;
+        data[25] = 0x1F;
+        // XSAVE header (bytes 512..576):
+        //   XSTATE_BV @ 512..520 = 0x7 — components present in this area:
+        //                                bit 0 = x87, bit 1 = SSE, bit 2 = AVX.
+        //   XCOMP_BV  @ 520..528 = 0x0 — non-compacted format (matches xsave64).
+        // Remaining bytes 528..1024 are reserved/extended state — zeros mean
+        // YMM upper halves load as zero, which is the AVX init state.
+        data[512] = 0x07;
+        Self(data)
     }
 }
 
