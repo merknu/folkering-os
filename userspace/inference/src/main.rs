@@ -486,7 +486,7 @@ fn run_d33_self_test() -> bool {
         tensor_math::WeightView::F32(&g),
         tensor_math::WeightView::F32(&u),
         tensor_math::WeightView::F32(&d),
-        /*hidden=*/2, /*inter=*/4,
+        /*hidden=*/2, /*inter=*/4, /*seq=*/1,
     ) {
         Some(v) => v,
         None => {
@@ -647,7 +647,7 @@ fn run_d312_vfs_self_test() -> bool {
         tensor_math::WeightView::F32(&g),
         tensor_math::WeightView::F32(&u),
         tensor_math::WeightView::F32(&d),
-        2, 4,
+        2, 4, 1,
     ) {
         Some(v) => v,
         None => return false,

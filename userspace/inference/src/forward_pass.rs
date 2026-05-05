@@ -236,16 +236,14 @@ pub fn forward_pass(
             x_normed2.extend(tensor_math::rmsnorm(row, &ffn_norm, cfg.eps)?);
         }
 
-        // 2e. SwiGLU FFN (per-row).
-        let mut ffn_out = Vec::with_capacity(new_seq * cfg.hidden_dim);
-        for s in 0..new_seq {
-            let row = &x_normed2[s * cfg.hidden_dim..(s + 1) * cfg.hidden_dim];
-            ffn_out.extend(tensor_math::swiglu_ffn(
-                row,
-                gate.view(), up.view(), down.view(),
-                cfg.hidden_dim, cfg.intermediate,
-            )?);
-        }
+        // 2e. SwiGLU FFN — batched across all `new_seq` tokens in
+        //      one weight-matrix pass per projection (gate/up/down).
+        let ffn_out = tensor_math::swiglu_ffn(
+            &x_normed2,
+            gate.view(), up.view(), down.view(),
+            cfg.hidden_dim, cfg.intermediate,
+            new_seq,
+        )?;
 
         // 2f. Residual.
         for i in 0..x.len() { x[i] += ffn_out[i]; }

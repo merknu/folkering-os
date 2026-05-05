@@ -57,6 +57,150 @@ impl<'a> WeightView<'a> {
             Self::Q8(blocks) => linear_q8(blocks, in_dim, out_dim, x),
         }
     }
+
+    /// Batched matmul: `out[s, j] = sum_k(weights[j, k] * x[s, k])`
+    /// for `s in 0..seq, j in 0..out_dim`. The output Vec is
+    /// `seq * out_dim` long, row-major. Loop order is `(j, s, k)`
+    /// so each weight row is loaded once from memory and reused
+    /// across all `seq` accumulations — for prefill on real Qwen
+    /// (seq=14, weights ≈ 4 MiB per matrix vs input 56 KiB), that
+    /// drops effective weight bandwidth ~`seq`× compared to the
+    /// per-row matvec it replaces.
+    ///
+    /// `seq=1` is identical to `matvec` modulo the stack frame; we
+    /// keep `matvec` around for callers that already work in
+    /// single-row mode (D.3.4 self-test, decode-step
+    /// `forward_pass`).
+    pub fn matmul(
+        &self,
+        in_dim: usize,
+        out_dim: usize,
+        x: &[f32],
+        seq: usize,
+    ) -> Option<Vec<f32>> {
+        match self {
+            Self::F32(w) => matmul_batch_f32(w, in_dim, out_dim, x, seq),
+            Self::Q8(blocks) => matmul_batch_q8(blocks, in_dim, out_dim, x, seq),
+        }
+    }
+}
+
+/// fp32 batched matmul. `out[s, j] = sum_k(weights[j, k] * x[s, k])`.
+/// Loop order `(j, s, k)` keeps each weight row resident in cache
+/// for `seq` accumulations. The four-accumulator unroll from
+/// `linear` is reused on the inner-k loop so each `(j, s)` pair
+/// still benefits from ILP.
+pub fn matmul_batch_f32(
+    weights: &[f32],
+    in_dim: usize,
+    out_dim: usize,
+    x: &[f32],
+    seq: usize,
+) -> Option<Vec<f32>> {
+    if x.len() != seq * in_dim { return None; }
+    if weights.len() != in_dim * out_dim { return None; }
+
+    let mut out = vec![0.0f32; seq * out_dim];
+    let mut since_yield: usize = 0;
+    for j in 0..out_dim {
+        let row = &weights[j * in_dim..(j + 1) * in_dim];
+        for s in 0..seq {
+            let xs = &x[s * in_dim..(s + 1) * in_dim];
+            let mut a0 = 0.0f32;
+            let mut a1 = 0.0f32;
+            let mut a2 = 0.0f32;
+            let mut a3 = 0.0f32;
+            let chunks = in_dim / 4;
+            let mut k = 0;
+            for _ in 0..chunks {
+                a0 += row[k]     * xs[k];
+                a1 += row[k + 1] * xs[k + 1];
+                a2 += row[k + 2] * xs[k + 2];
+                a3 += row[k + 3] * xs[k + 3];
+                k += 4;
+            }
+            let mut acc = a0 + a1 + a2 + a3;
+            while k < in_dim {
+                acc += row[k] * xs[k];
+                k += 1;
+            }
+            out[s * out_dim + j] = acc;
+        }
+        since_yield += in_dim * seq;
+        if since_yield >= MATMUL_YIELD_EVERY {
+            since_yield = 0;
+            libfolk::sys::yield_cpu();
+        }
+    }
+    Some(out)
+}
+
+/// Q8_0 batched matmul. Same `(j, s, k)` loop structure as the
+/// fp32 variant, with one additional optimisation: each Q8 block
+/// is dequantised ONCE per `j` (into a small stack array) and the
+/// dequantised values are reused across every `seq` row's dot
+/// product. That moves the i8→f32 conversion + scale multiply out
+/// of the seq inner loop — for prefill at seq=14 it's ~14× fewer
+/// dequant ops, on top of the weight-row cache locality.
+pub fn matmul_batch_q8(
+    weights_q8: &[u8],
+    in_dim: usize,
+    out_dim: usize,
+    x: &[f32],
+    seq: usize,
+) -> Option<Vec<f32>> {
+    if in_dim % Q8_BLOCK_SIZE != 0 { return None; }
+    if x.len() != seq * in_dim { return None; }
+    let blocks_per_row = in_dim / Q8_BLOCK_SIZE;
+    let row_bytes = blocks_per_row * Q8_BLOCK_BYTES;
+    if weights_q8.len() != out_dim * row_bytes { return None; }
+
+    let mut out = vec![0.0f32; seq * out_dim];
+    let mut since_yield: usize = 0;
+    for j in 0..out_dim {
+        let row_off = j * row_bytes;
+        for b in 0..blocks_per_row {
+            let block_off = row_off + b * Q8_BLOCK_BYTES;
+            let scale = f16_to_f32(u16::from_le_bytes([
+                weights_q8[block_off],
+                weights_q8[block_off + 1],
+            ]));
+            // Dequant block ONCE per (j, b). Stack-allocated, fits
+            // in 128 bytes — never touches heap.
+            let mut deq = [0.0f32; Q8_BLOCK_SIZE];
+            for k in 0..Q8_BLOCK_SIZE {
+                let q = unsafe {
+                    *(weights_q8.as_ptr().add(block_off + 2 + k) as *const i8)
+                };
+                deq[k] = (q as f32) * scale;
+            }
+            // Now dot against every seq row. The inner loop is a
+            // pure FMA stream, four accumulators for ILP.
+            let x_off_b = b * Q8_BLOCK_SIZE;
+            for s in 0..seq {
+                let xs = &x[s * in_dim + x_off_b..s * in_dim + x_off_b + Q8_BLOCK_SIZE];
+                let mut a0 = 0.0f32;
+                let mut a1 = 0.0f32;
+                let mut a2 = 0.0f32;
+                let mut a3 = 0.0f32;
+                let mut k = 0;
+                while k < Q8_BLOCK_SIZE {
+                    a0 += deq[k]     * xs[k];
+                    a1 += deq[k + 1] * xs[k + 1];
+                    a2 += deq[k + 2] * xs[k + 2];
+                    a3 += deq[k + 3] * xs[k + 3];
+                    k += 4;
+                }
+                out[s * out_dim + j] += a0 + a1 + a2 + a3;
+            }
+        }
+        since_yield += blocks_per_row * Q8_BLOCK_SIZE * seq;
+        if since_yield >= MATMUL_YIELD_EVERY {
+            since_yield = 0;
+            libfolk::sys::yield_cpu();
+        }
+    }
+    Some(out)
 }
 
 /// Decode a 16-bit half-precision float to f32. No `core::simd`,
@@ -376,12 +520,16 @@ pub fn swiglu_ffn(
     down_proj: WeightView,
     hidden: usize,
     intermediate: usize,
+    seq: usize,
 ) -> Option<Vec<f32>> {
-    let g = gate_proj.matvec(hidden, intermediate, x)?;
-    let u = up_proj.matvec(hidden, intermediate, x)?;
+    if x.len() != seq * hidden { return None; }
+    // Batched matmul: one weight-matrix pass for all seq rows.
+    // Same memory-bandwidth win as in `attention_block`.
+    let g = gate_proj.matmul(hidden, intermediate, x, seq)?;
+    let u = up_proj.matmul(hidden, intermediate, x, seq)?;
     let g_silu = silu(&g);
     let mixed = elemwise_mul(&g_silu, &u)?;
-    down_proj.matvec(intermediate, hidden, &mixed)
+    down_proj.matmul(intermediate, hidden, &mixed, seq)
 }
 
 /// In-place softmax over a 1-D slice. Numerically stable: subtract
@@ -671,27 +819,29 @@ pub fn attention_block(
     if let Some(n) = q_norm { if n.len() != head_dim { return None; } }
     if let Some(n) = k_norm { if n.len() != head_dim { return None; } }
 
-    // ── 1. Project x → Q (full), K_new, V_new (per-row matvec) ─────
-    let mut q = Vec::with_capacity(new_seq * q_dim);
-    let mut k_new = Vec::with_capacity(new_seq * hkv);
-    let mut v_new = Vec::with_capacity(new_seq * hkv);
-    for s in 0..new_seq {
-        let row = &x[s * hidden_dim..(s + 1) * hidden_dim];
-        let mut q_row = wq.matvec(hidden_dim, q_dim, row)?;
-        let mut k_row = wk.matvec(hidden_dim, hkv, row)?;
-        let mut v_row = wv.matvec(hidden_dim, hkv, row)?;
-        if let Some(b) = q_bias {
-            for i in 0..q_dim { q_row[i] += b[i]; }
+    // ── 1. Project x → Q, K_new, V_new (batched matmul) ────────────
+    //      One pass over each weight matrix, accumulating across
+    //      all `new_seq` input rows. ~`new_seq`× less weight-side
+    //      memory bandwidth than the prior per-row matvec loop —
+    //      what makes 28-layer Qwen3 prefill tractable.
+    let mut q = wq.matmul(hidden_dim, q_dim, x, new_seq)?;
+    let mut k_new = wk.matmul(hidden_dim, hkv, x, new_seq)?;
+    let mut v_new = wv.matmul(hidden_dim, hkv, x, new_seq)?;
+    // Biases applied flat across all rows (broadcast per row).
+    if let Some(b) = q_bias {
+        for s in 0..new_seq {
+            for i in 0..q_dim { q[s * q_dim + i] += b[i]; }
         }
-        if let Some(b) = k_bias {
-            for i in 0..hkv { k_row[i] += b[i]; }
+    }
+    if let Some(b) = k_bias {
+        for s in 0..new_seq {
+            for i in 0..hkv { k_new[s * hkv + i] += b[i]; }
         }
-        if let Some(b) = v_bias {
-            for i in 0..hkv { v_row[i] += b[i]; }
+    }
+    if let Some(b) = v_bias {
+        for s in 0..new_seq {
+            for i in 0..hkv { v_new[s * hkv + i] += b[i]; }
         }
-        q.extend(q_row);
-        k_new.extend(k_row);
-        v_new.extend(v_row);
     }
 
     // ── 2. Per-head RMSNorm on Q and K (Qwen3-only). The same
@@ -740,13 +890,9 @@ pub fn attention_block(
         pos_offset,
     )?;
 
-    // ── 6. Output projection (per-row matvec). Wo is [hidden_dim,
+    // ── 6. Output projection (batched matmul). Wo is [hidden_dim,
     //      q_dim] — i.e., it shrinks back to hidden_dim. ──────────
-    let mut out = Vec::with_capacity(new_seq * hidden_dim);
-    for s in 0..new_seq {
-        let row = &attn[s * q_dim..(s + 1) * q_dim];
-        out.extend(wo.matvec(q_dim, hidden_dim, row)?);
-    }
+    let out = wo.matmul(q_dim, hidden_dim, &attn, new_seq)?;
     Some(out)
 }
 
@@ -950,7 +1096,7 @@ pub fn self_test() -> bool {
         WeightView::F32(&gate),
         WeightView::F32(&up),
         WeightView::F32(&down),
-        2, 4,
+        2, 4, 1,
     ) {
         Some(v) => v,
         None => return false,
