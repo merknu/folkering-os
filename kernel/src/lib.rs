@@ -228,7 +228,26 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
         // Done before the main virtio_blk message so the boot trace
         // shows the disks in PCI order, not init order.
         let _ = drivers::model_disk::init();
-        let _ = drivers::model_disk::read_fmdl_header();
+        if drivers::model_disk::read_fmdl_header().is_ok() {
+            // Spot-check: re-read the first 4 KiB of payload through
+            // the multi-sector path and confirm `FBN1` magic. Proves
+            // the read loop works end-to-end before the userspace
+            // syscall leans on it for 232 MiB.
+            match drivers::model_disk::verify_payload_magic() {
+                Ok(()) => {}
+                Err(e) => {
+                    serial_str!("[MODEL_DISK] verify_payload_magic err: ");
+                    serial_strln!(match e {
+                        drivers::model_disk::ModelDiskError::Timeout => "Timeout",
+                        drivers::model_disk::ModelDiskError::IoError => "IoError",
+                        drivers::model_disk::ModelDiskError::BadMagic => "BadMagic",
+                        drivers::model_disk::ModelDiskError::InvalidSector => "InvalidSector",
+                        drivers::model_disk::ModelDiskError::NotInitialized => "NotInitialized",
+                        _ => "other",
+                    });
+                }
+            }
+        }
 
         let virtio_blk_ready = match drivers::virtio_blk::init() {
             Ok(()) => {

@@ -307,34 +307,29 @@ pub fn read_sector(sector: u64, buf: &mut [u8; SECTOR_SIZE]) -> Result<(), Model
     let io_base = dsk.io_base;
     drop(dev);
 
-    // Polling completion: spin until ISR fires OR used ring advances.
-    // Both work without IRQs because the device updates the used ring
-    // (memory) before raising ISR. We accept whichever signal arrives
-    // first.
+    // Polling completion: peek the used ring directly. ISR alone
+    // is unreliable on legacy VirtIO with no IRQ wired — the
+    // device sets the bit but if we read+clear it racing with the
+    // memory update, the next request sees a stale ISR and
+    // pop_used returns None. Authoritative source: the used ring
+    // index in memory. When it advances past last_used_idx, the
+    // request is done.
     let mut timeout = 5_000_000u32;
-    loop {
-        let isr = read_io8(io_base, VIRTIO_PCI_ISR_STATUS);
-        if isr != 0 { break; }
-        // Also peek at the used ring directly — KVM sometimes updates
-        // memory faster than ISR. Re-acquire briefly.
-        let mut peek = MODEL_DISK.lock();
-        if let Some(d) = peek.as_mut() {
-            // last_used_idx vs the device's current idx in the used ring.
-            // pop_used checks this without consuming if there's nothing.
-            // We check by reading the volatile idx through pop_used's
-            // semantics — simplest: just try popping, if it returns Some,
-            // we're done; if None, we keep polling.
-            if d.queue.pop_used().is_some() {
-                // Re-add to "popped" by leaving the descriptor freed
-                // in the next block; we just want to know it completed.
-                // But pop_used already advanced last_used_idx, so we
-                // need to track this differently. Mark via fence and
-                // proceed to free_chain below.
-                drop(peek);
-                break;
+    let mut completed = false;
+    while !completed {
+        {
+            let mut peek = MODEL_DISK.lock();
+            if let Some(d) = peek.as_mut() {
+                if d.queue.pop_used().is_some() {
+                    completed = true;
+                }
             }
         }
-        drop(peek);
+        if completed { break; }
+        // Also drain ISR so the device doesn't keep re-asserting
+        // (read clears it on legacy transport). We don't TRUST
+        // ISR for completion; this is just hygiene.
+        let _ = read_io8(io_base, VIRTIO_PCI_ISR_STATUS);
         core::hint::spin_loop();
         timeout -= 1;
         if timeout == 0 {
@@ -344,8 +339,8 @@ pub fn read_sector(sector: u64, buf: &mut [u8; SECTOR_SIZE]) -> Result<(), Model
 
     let mut dev = MODEL_DISK.lock();
     let dsk = dev.as_mut().ok_or(ModelDiskError::NotInitialized)?;
-    // Free descriptors (chain may already have advanced via pop_used
-    // above; free_chain is idempotent).
+    // pop_used already advanced last_used_idx for this request.
+    // Free the descriptor chain so subsequent reads can reuse them.
     dsk.queue.free_chain(d0);
 
     fence(Ordering::SeqCst);
@@ -451,4 +446,63 @@ pub fn header() -> Option<FmdlHeader> {
 #[allow(dead_code)]
 pub fn is_ready() -> bool {
     MODEL_DISK_HEADER.lock().is_some()
+}
+
+/// Read multiple consecutive sectors into the caller's buffer.
+/// Loops single-sector reads — fine for boot-time verification and
+/// for the upcoming `read_model_file_shmem` syscall (which streams
+/// 4 KiB at a time per shmem page). At ~100 µs per sector on KVM, a
+/// 232 MiB payload is ~45 s; multi-sector DMA will land alongside
+/// the syscall so it's a single ~few-hundred-ms allocation.
+///
+/// `buf.len()` MUST be a multiple of 512.
+#[allow(dead_code)]
+pub fn read_sectors(sector: u64, buf: &mut [u8]) -> Result<(), ModelDiskError> {
+    if buf.len() % SECTOR_SIZE != 0 {
+        return Err(ModelDiskError::InvalidSector);
+    }
+    let n = buf.len() / SECTOR_SIZE;
+    for i in 0..n {
+        let mut tmp = [0u8; SECTOR_SIZE];
+        read_sector(sector + i as u64, &mut tmp)?;
+        let off = i * SECTOR_SIZE;
+        buf[off..off + SECTOR_SIZE].copy_from_slice(&tmp);
+    }
+    Ok(())
+}
+
+/// Boot-time spot check: re-read the first 8 payload sectors (4 KiB
+/// after the FMDL header) and verify the .fbin magic `FBN1` lives
+/// at offset 0. Confirms the multi-sector read path works end-to-
+/// end on real hardware before the userspace path tries to lean
+/// on it for the full 232 MiB stream.
+pub fn verify_payload_magic() -> Result<(), ModelDiskError> {
+    let header = *MODEL_DISK_HEADER.lock();
+    let header = header.ok_or(ModelDiskError::NotInitialized)?;
+
+    if header.data_offset % SECTOR_SIZE as u64 != 0 {
+        return Err(ModelDiskError::InvalidSector);
+    }
+    let payload_sector = header.data_offset / SECTOR_SIZE as u64;
+
+    let mut buf = [0u8; SECTOR_SIZE * 8]; // 4 KiB
+    read_sectors(payload_sector, &mut buf)?;
+
+    if buf[0..4] != *b"FBN1" {
+        crate::serial_str!("[MODEL_DISK] payload magic mismatch — got 0x");
+        crate::drivers::serial::write_hex(u32::from_le_bytes([
+            buf[0], buf[1], buf[2], buf[3],
+        ]) as u64);
+        crate::serial_strln!(" — wrong .fbin written?");
+        return Err(ModelDiskError::BadMagic);
+    }
+
+    let version = u16::from_le_bytes([buf[4], buf[5]]);
+    let n_tensors = u16::from_le_bytes([buf[6], buf[7]]);
+    crate::serial_str!("[MODEL_DISK] payload OK: FBN1 v");
+    crate::drivers::serial::write_dec(version as u32);
+    crate::serial_str!(" with ");
+    crate::drivers::serial::write_dec(n_tensors as u32);
+    crate::serial_strln!(" tensors");
+    Ok(())
 }
