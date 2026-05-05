@@ -79,6 +79,14 @@ mod forward_pass;
 // margin to spare. A real generational allocator (or per-call
 // scratch arena that resets) lands in D.4.x once we want to
 // generate hundreds of tokens.
+//
+// Full 28-layer Qwen3 (D.3.7+1) needs ~768 MiB here AND a
+// batched matmul (one weight-matrix pass for the whole prefill
+// instead of per-row matvec) so prefill finishes in minutes
+// instead of hours. Numpy fasit on the 28-layer Q8 .fbin:
+// argmax=151667 ('<think>'), top-5=['<think>', '<|im_start|>',
+// 'ол', '<|im_end|>', '</think>'] — Qwen3 thinking-mode opens
+// responses with reasoning tags.
 const HEAP_SIZE: usize = 256 * 1024 * 1024;
 
 struct BumpAllocator {
@@ -1336,7 +1344,15 @@ fn run_d37_first_blood() -> bool {
         }
     };
 
-    // Qwen3-0.6B config (truncated to 4 layers).
+    // Qwen3-0.6B config (truncated to 4 layers). Full 28 layers
+    // is the next milestone — converted .fbin = 604 MiB (Q8 + Q8
+    // embed); numpy fasit on the same .fbin gives argmax=151667
+    // ('<think>'), since Qwen3 is a thinking-mode model that
+    // opens with reasoning tags. Practical 28-layer prefill in
+    // the OS needs the batched-matmul refactor (one weight-matrix
+    // pass for the whole prefill, not per-row matvec) — naive
+    // per-row matvec extrapolates to 60+ minutes, batched should
+    // come in under 5.
     let cfg = ModelConfig {
         n_layers: 4,
         hidden_dim: 1024,
@@ -1380,9 +1396,9 @@ fn run_d37_first_blood() -> bool {
     );
 
     // The numpy reference (forward_ref.py on the same .fbin) gives
-    // argmax = 72 ('i'). If the runtime drifts, we land on a
-    // different token. Don't fatal — log and continue so the rest
-    // of the trace is visible.
+    // argmax = 72 ('i') for the 4-layer truncation. The full 28-
+    // layer model gives argmax = 151667 ('<think>') instead; that
+    // becomes the expected once n_layers flips to 28.
     let expected = 72u32;
     if first_id != expected {
         println!(
@@ -1393,7 +1409,7 @@ fn run_d37_first_blood() -> bool {
         println!("[INFERENCE] D.3.7: argmax matches numpy reference ({})", expected);
     }
 
-    // Greedy decode 8 more tokens. Stops on <|im_end|> (151645) or
+    // Greedy decode 7 more tokens. Stops on <|im_end|> (151645) or
     // <|endoftext|> (151643). Each step pushes one token through
     // the KV-cached forward pass — O(layers) per token instead of
     // O(seq² × layers).
