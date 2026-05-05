@@ -69,17 +69,14 @@ mod forward_pass;
 
 // ── Bump allocator ──────────────────────────────────────────────────
 //
-// 256 MiB. D.3.7 prefill on real Qwen3-0.6B (4 layers) accumulates
-// per-row matvec allocations in attention_block + swiglu_ffn that
-// the bump allocator never frees: 14 prefill tokens × ~50 KiB of
-// intermediate Vecs per layer × 4 layers + 8 decode steps + a
-// 608 KiB lm_head Vec per call adds up to ~50 MiB. Plus the
-// tokenizer's ~14 MiB live state. 64 MiB OOM'd at decode step ~5;
-// 256 MiB covers the full ChatML prompt + 8 sampled tokens with
-// margin to spare. A real generational allocator (or per-call
-// scratch arena that resets) lands in D.4.x once we want to
-// generate hundreds of tokens.
-const HEAP_SIZE: usize = 256 * 1024 * 1024;
+// 768 MiB. Full 28-layer Qwen3 prefill accumulates batched-matmul
+// Vecs that bump never frees: at 4 layers we measured ~50 MiB
+// across the test; 28 layers extrapolates to ~350 MiB, plus per-
+// call lm_head Vec (608 KiB) × decode steps. The model file at
+// MODEL_VADDR (~600 MiB shmem) is separate from heap. A real
+// per-call scratch arena (D.4.x) drops this back down when we
+// want hundreds of generated tokens.
+const HEAP_SIZE: usize = 768 * 1024 * 1024;
 
 struct BumpAllocator {
     heap: UnsafeCell<[u8; HEAP_SIZE]>,
@@ -1336,9 +1333,13 @@ fn run_d37_first_blood() -> bool {
         }
     };
 
-    // Qwen3-0.6B config (truncated to 4 layers).
+    // Qwen3-0.6B config — full 28 layers. With the batched matmul
+    // refactor (#163) prefill is ~seq× faster than the per-row
+    // path, making 28 layers tractable on KVM. Qwen3 is a thinking
+    // model: numpy fasit gives argmax=151667 ('<think>'), since
+    // the response opens with a reasoning tag.
     let cfg = ModelConfig {
-        n_layers: 4,
+        n_layers: 28,
         hidden_dim: 1024,
         n_heads: 16,
         n_kv_heads: 8,
@@ -1380,10 +1381,11 @@ fn run_d37_first_blood() -> bool {
     );
 
     // The numpy reference (forward_ref.py on the same .fbin) gives
-    // argmax = 72 ('i'). If the runtime drifts, we land on a
-    // different token. Don't fatal — log and continue so the rest
-    // of the trace is visible.
-    let expected = 72u32;
+    // argmax = 151667 ('<think>') on the full 28-layer Qwen3.
+    // Qwen3 is a thinking-mode model that opens with reasoning
+    // tags. If the runtime drifts, we land on a different token —
+    // log and continue so the rest of the trace is visible.
+    let expected = 151667u32;
     if first_id != expected {
         println!(
             "[INFERENCE] D.3.7: WARN argmax {} != numpy reference {}",
@@ -1397,10 +1399,15 @@ fn run_d37_first_blood() -> bool {
     // <|endoftext|> (151643). Each step pushes one token through
     // the KV-cached forward pass — O(layers) per token instead of
     // O(seq² × layers).
+    // 28-layer decode is ~7× the cost of 4-layer decode per step;
+    // even with batched matmul each step is several minutes on
+    // our naive triple-loop. 2 decode tokens is enough to verify
+    // the KV-cache holds across multi-step generation; longer
+    // generations queue behind real SIMD intrinsics.
     let mut sampled: Vec<u32> = Vec::new();
     sampled.push(first_id);
     let mut next = first_id;
-    for _ in 0..7 {
+    for _ in 0..2 {
         if next == 151645 || next == 151643 { break; }
         let logits = match forward_pass(&view, &cfg, &mut cache, &[next]) {
             Some(v) => v,
