@@ -2,7 +2,7 @@
 //!
 //! Handles preemptive context switching when the timer interrupt fires.
 
-use super::task::{self, Context, TaskState, FXSAVE_CURRENT_PTR};
+use super::task::{self, Context, TaskState, XSAVE_CURRENT_PTR};
 use super::scheduler;
 use super::statistics;
 use crate::timer;
@@ -125,9 +125,9 @@ pub extern "C" fn timer_preempt_handler(saved_ctx: *const SavedInterruptContext)
     // If same task, just return its context
     if next_id == current_id {
         let task_locked = current_task.lock();
-        // Keep FXSAVE_CURRENT_PTR pointing to this task's area (update in case it was 0)
-        let fxsave_ptr = &task_locked.fxsave_area as *const _ as usize;
-        FXSAVE_CURRENT_PTR.store(fxsave_ptr, Ordering::Release);
+        // Keep XSAVE_CURRENT_PTR pointing to this task's area (update in case it was 0)
+        let xsave_ptr = &task_locked.xsave_area as *const _ as usize;
+        XSAVE_CURRENT_PTR.store(xsave_ptr, Ordering::Release);
         return &task_locked.context as *const Context;
     }
 
@@ -161,18 +161,18 @@ pub extern "C" fn timer_preempt_handler(saved_ctx: *const SavedInterruptContext)
     // Update current task ID
     task::set_current_task(next_id);
 
-    // Update FXSAVE pointer AND syscall context pointer for next task.
+    // Update XSAVE pointer AND syscall context pointer for next task.
     // We lock once and extract both raw pointers so the lock can be released.
-    let (next_ctx_ptr, next_fxsave_ptr) = {
+    let (next_ctx_ptr, next_xsave_ptr) = {
         let next_locked = next_task.lock();
         let ctx = &next_locked.context as *const Context;
-        let fxsave = &next_locked.fxsave_area as *const _ as usize;
-        (ctx, fxsave)
+        let xsave = &next_locked.xsave_area as *const _ as usize;
+        (ctx, xsave)
     };
 
-    // FXSAVE_CURRENT_PTR now points to the NEXT task's fxsave area.
-    // irq_timer will call FXRSTOR [ptr] after this function returns.
-    FXSAVE_CURRENT_PTR.store(next_fxsave_ptr, Ordering::Release);
+    // XSAVE_CURRENT_PTR now points to the NEXT task's xsave area.
+    // irq_timer will call xrstor64 [ptr] after this function returns.
+    XSAVE_CURRENT_PTR.store(next_xsave_ptr, Ordering::Release);
 
     crate::arch::x86_64::syscall::set_current_context_ptr(next_ctx_ptr as *mut Context);
 

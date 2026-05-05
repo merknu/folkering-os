@@ -350,14 +350,17 @@ extern "C" fn irq_timer() {
         "push r14",
         "push r15",
 
-        // FXSAVE: save x87 FPU + XMM0-15 + MXCSR for the preempted task.
-        // FXSAVE_CURRENT_PTR is set by timer_preempt_handler to the current task's
-        // fxsave_area before returning, so before the call it still points at the
-        // task being preempted.
-        "mov rax, qword ptr [rip + {fxsave_ptr}]",
-        "test rax, rax",
+        // XSAVE64: save x87 + SSE + AVX state for the preempted task.
+        // XSAVE_CURRENT_PTR points at the task being preempted (timer_preempt_handler
+        // moves it to the next task only AFTER returning here). EDX:EAX = state mask
+        // 0x7 (x87 + SSE + AVX). We use rcx for the area pointer since rax/rdx
+        // are reserved for the mask.
+        "mov rcx, qword ptr [rip + {xsave_ptr}]",
+        "test rcx, rcx",
         "jz 2f",              // skip if pointer is NULL (no task yet)
-        "fxsave64 [rax]",     // save FPU/SSE state to current task's fxsave_area
+        "mov eax, 7",
+        "xor edx, edx",
+        "xsave64 [rcx]",      // save FPU/SSE/AVX state to current task's xsave_area
         "2:",
 
         // Align stack to 16 bytes before call (15 pushes = 120 bytes, need 8 more)
@@ -383,13 +386,16 @@ extern "C" fn irq_timer() {
         "call {debug_ctx_fn}",
         "pop r11",
 
-        // FXRSTOR: restore FPU/SSE state for the task we are switching TO.
-        // timer_preempt_handler has already updated FXSAVE_CURRENT_PTR to point
-        // at the new task's fxsave_area, so we restore from there.
-        "mov rax, qword ptr [rip + {fxsave_ptr}]",
-        "test rax, rax",
+        // XRSTOR64: restore x87 + SSE + AVX state for the task we are switching TO.
+        // timer_preempt_handler has already updated XSAVE_CURRENT_PTR to point
+        // at the new task's xsave_area, so we restore from there. r11 holds the
+        // returned context pointer and is preserved by xrstor64.
+        "mov rcx, qword ptr [rip + {xsave_ptr}]",
+        "test rcx, rcx",
         "jz 3f",
-        "fxrstor64 [rax]",    // restore XMM state for the incoming task
+        "mov eax, 7",
+        "xor edx, edx",
+        "xrstor64 [rcx]",     // restore SIMD state for the incoming task
         "3:",
 
         // Discard our saved registers (we'll restore from context)
@@ -458,7 +464,7 @@ extern "C" fn irq_timer() {
         eoi_fn = sym folkering_kernel::arch::x86_64::apic::send_eoi,
         heartbeat_fn = sym kernel_timer_heartbeat,
         preempt_fn = sym folkering_kernel::task::preempt::timer_preempt_handler,
-        fxsave_ptr = sym folkering_kernel::task::task::FXSAVE_CURRENT_PTR,
+        xsave_ptr = sym folkering_kernel::task::task::XSAVE_CURRENT_PTR,
         debug_ctx_fn = sym debug_after_preempt_handler,
         preempt_count = sym folkering_kernel::task::preempt_lock::PREEMPT_DISABLE_COUNT,
     );

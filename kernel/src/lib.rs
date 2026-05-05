@@ -95,8 +95,30 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
         drivers::serial::write_dec((stats.free_bytes / (1024 * 1024)) as u32);
         serial_strln!(" MB\n");
 
-        // Enable AVX on BSP: set CR4.OSXSAVE, then configure XCR0
+        // Enable XSAVE + AVX on BSP: verify CPU support, set CR4.OSXSAVE, then
+        // configure XCR0. Context switches use xsave64/xrstor64 to preserve the
+        // full SIMD state (XMM lows + YMM uppers); fxsave64 alone would silently
+        // corrupt YMM[255:128] across preemption.
         {
+            // CPUID leaf 1 → ECX:
+            //   bit 26 = XSAVE supported by CPU
+            //   bit 28 = AVX supported by CPU
+            // Without these we cannot use xsave64 — refuse to boot rather than
+            // execute #UD inside a context switch later.
+            // (Use the intrinsics — inline `cpuid` runs into LLVM's rbx reservation.)
+            let cpuid1 = unsafe { core::arch::x86_64::__cpuid(1) };
+            let has_xsave = (cpuid1.ecx >> 26) & 1 == 1;
+            let has_avx   = (cpuid1.ecx >> 28) & 1 == 1;
+            if !has_xsave {
+                panic!("[INIT] CPU does not support XSAVE (CPUID.1:ECX[26]=0). \
+                        Folkering OS requires xsave64/xrstor64 for context switches.");
+            }
+            if !has_avx {
+                panic!("[INIT] CPU does not support AVX (CPUID.1:ECX[28]=0). \
+                        Folkering OS targets AVX-capable hosts; configure your \
+                        VM with `-cpu host` or `-cpu x86-64-v3`.");
+            }
+
             let mut cr4: u64;
             core::arch::asm!("mov {}, cr4", out(reg) cr4);
             cr4 |= (1 << 9) | (1 << 10) | (1 << 18); // OSFXSR + OSXMMEXCPT + OSXSAVE
@@ -109,7 +131,20 @@ pub fn kernel_main_with_boot_info(boot_info: &boot::BootInfo) -> ! {
                 "xsetbv",
                 out("eax") _, out("ecx") _, out("edx") _,
             );
-            serial_strln!("[INIT] AVX/SSE enabled via CR4.OSXSAVE + XCR0");
+
+            // CPUID leaf 0xD subleaf 0 → EBX = bytes required for XSAVE area
+            // covering all components currently set in XCR0. Sanity-check that
+            // our 1024-byte per-task XsaveArea is large enough.
+            let xsave_size = unsafe { core::arch::x86_64::__cpuid_count(0x0D, 0).ebx };
+            if xsave_size as usize > 1024 {
+                panic!("[INIT] XSAVE area for current XCR0 is {} bytes, but \
+                        XsaveArea is only 1024 bytes. Increase the buffer.",
+                        xsave_size);
+            }
+
+            serial_str!("[INIT] AVX/SSE enabled via CR4.OSXSAVE + XCR0=0x7, XSAVE area = ");
+            drivers::serial::write_dec(xsave_size);
+            serial_strln!(" bytes/task\n");
         }
 
         // Initialize GDT and TSS

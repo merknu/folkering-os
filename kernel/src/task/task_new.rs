@@ -45,8 +45,9 @@ pub fn new_task(id: TaskId, page_table_ptr: PageTablePtr, entry_point: u64) -> B
         ptr::addr_of_mut!((*p).ipc_reply).write(None);
         ptr::addr_of_mut!((*p).blocked_on).write(None);
 
-        // FPU/SSE state: must be valid before first FXRSTOR
-        ptr::addr_of_mut!((*p).fxsave_area).write(FxsaveArea::default_init());
+        // FPU/SSE/AVX state: zeroed XSAVE area — XSTATE_BV=0 forces INIT
+        // state on first xrstor64 (FPU CW=0x037F, MXCSR=0x1F80, all regs 0).
+        ptr::addr_of_mut!((*p).xsave_area).write(XsaveArea::default_init());
 
         // Security
         ptr::addr_of_mut!((*p).capabilities).write(Vec::new());
