@@ -970,6 +970,19 @@ pub fn scaled_dot_product_attention(
         return None;
     }
 
+    // AVX2 fast path: head_dim is always a multiple of 8 for the
+    // models we support (Qwen3=128, Llama=128, Qwen2.5=64). FMA is
+    // a co-requisite (we already gate the rest of the inference task
+    // on AVX2 + FMA via the kernel's xsave64 setup).
+    if head_dim % 8 == 0 {
+        unsafe {
+            return Some(sdpa_avx2(
+                q, k, v, q_seq, kv_seq,
+                n_heads, n_kv_heads, head_dim, q_pos_offset,
+            ));
+        }
+    }
+
     let groups = n_heads / n_kv_heads;
     let scale = fast_rsqrt(head_dim as f32);
     let mut out = vec![0.0f32; q_total];
@@ -1006,10 +1019,114 @@ pub fn scaled_dot_product_attention(
                 let out_idx = i * n_heads * head_dim + h * head_dim + d;
                 out[out_idx] = acc;
             }
-            libfolk::sys::yield_cpu();
         }
     }
     Some(out)
+}
+
+/// AVX2 + FMA scaled dot-product attention. Profiling on PR #183
+/// showed `attention_block` consuming 87-99% of decode wall time at
+/// kv_seq ≈ 230, with the scalar Q·K and attn·V loops being the bulk
+/// of that. This rewrites both loops as 8-lane f32 FMA; per-head Q is
+/// loaded once and reused across all kv positions; attn·V accumulates
+/// into a head_dim-sized AVX2 register bank. The `yield_cpu()` call
+/// from the previous scalar implementation is removed — the SMP
+/// dispatch path's own busy-wait + the kernel APIC timer cover
+/// fairness; an explicit yield in the inner loop just paid for ~448
+/// kernel round-trips per decode step.
+///
+/// Caller must guarantee `head_dim % 8 == 0` and that the slices have
+/// the validated lengths (the wrapper checks).
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn sdpa_avx2(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    q_seq: usize,
+    kv_seq: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    q_pos_offset: usize,
+) -> Vec<f32> {
+    use core::arch::x86_64::*;
+
+    let groups = n_heads / n_kv_heads;
+    let scale = fast_rsqrt(head_dim as f32);
+    let q_total = q_seq * n_heads * head_dim;
+    let mut out = vec![0.0f32; q_total];
+    let mut scores = vec![0.0f32; kv_seq];
+
+    let kv_stride = n_kv_heads * head_dim;
+    let q_stride = n_heads * head_dim;
+    let chunks = head_dim / 8;
+
+    for h in 0..n_heads {
+        let kvh = h / groups;
+        for i in 0..q_seq {
+            let abs_pos = q_pos_offset + i;
+            let q_off = i * q_stride + h * head_dim;
+            let q_ptr = q.as_ptr().add(q_off);
+
+            // ── Q·K dot products with causal mask, AVX2 ─────────────
+            // For each kv position j ≤ abs_pos: 8-lane FMA across
+            // head_dim, hsum once per j.
+            for j in 0..kv_seq {
+                if j > abs_pos {
+                    scores[j] = f32::NEG_INFINITY;
+                    continue;
+                }
+                let k_ptr = k.as_ptr().add(j * kv_stride + kvh * head_dim);
+                let mut acc = _mm256_setzero_ps();
+                for c in 0..chunks {
+                    let qv = _mm256_loadu_ps(q_ptr.add(c * 8));
+                    let kv_lane = _mm256_loadu_ps(k_ptr.add(c * 8));
+                    acc = _mm256_fmadd_ps(qv, kv_lane, acc);
+                }
+                // hsum 8 → scalar
+                let lo = _mm256_castps256_ps128(acc);
+                let hi = _mm256_extractf128_ps(acc, 1);
+                let s4 = _mm_add_ps(lo, hi);
+                let s4_hi = _mm_movehdup_ps(s4);
+                let s2 = _mm_add_ps(s4, s4_hi);
+                let s2_hi = _mm_movehl_ps(s4_hi, s2);
+                let s1 = _mm_add_ss(s2, s2_hi);
+                scores[j] = _mm_cvtss_f32(s1) * scale;
+            }
+
+            softmax_inplace(&mut scores);
+
+            // ── attn @ V — accumulate `scores[j] * v_row_j` over j,
+            //      with V's head_dim laid out contiguously per j.
+            //      Outer loop is j, inner is d (broadcast scores[j],
+            //      stream V row, FMA into a register-resident
+            //      accumulator bank). This pattern keeps V access
+            //      sequential across cache lines.
+            //
+            //      head_dim ≤ 256 in the models we ship; the
+            //      accumulator bank is `chunks` × __m256, which the
+            //      compiler keeps in registers at head_dim ≤ 128
+            //      (16 ymm regs available, 16 chunks for d=128).
+            //      For d=256 it spills, but still beats scalar.
+            let out_ptr = out.as_mut_ptr().add(i * q_stride + h * head_dim);
+            for c in 0..chunks {
+                _mm256_storeu_ps(out_ptr.add(c * 8), _mm256_setzero_ps());
+            }
+            for j in 0..kv_seq {
+                let s = scores[j];
+                if s == 0.0 { continue; } // masked-out (post-softmax)
+                let s_v = _mm256_set1_ps(s);
+                let v_ptr = v.as_ptr().add(j * kv_stride + kvh * head_dim);
+                for c in 0..chunks {
+                    let v_lane = _mm256_loadu_ps(v_ptr.add(c * 8));
+                    let cur = _mm256_loadu_ps(out_ptr.add(c * 8));
+                    let new = _mm256_fmadd_ps(s_v, v_lane, cur);
+                    _mm256_storeu_ps(out_ptr.add(c * 8), new);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Per-layer slot in the KV-cache. `k` and `v` are pre-allocated to
