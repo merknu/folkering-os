@@ -53,6 +53,36 @@ use core::cell::UnsafeCell;
 
 use libfolk::{entry, println};
 use libfolk::sys::yield_cpu;
+use libfolk::sys::shell::{SHELL_OP_DRAUG_STREAM_CHUNK, SHELL_OP_DRAUG_STREAM_END};
+
+/// Hardcoded shell task ID. Tasks 2..8 are spawned in a fixed order
+/// at boot (synapse, shell, draug, compositor, intent, draug-streamer,
+/// draug-daemon) — shell is always task 3. If this ordering ever
+/// changes, the shell will simply not receive the streaming output
+/// (no panic — `ipc::send` to a missing target returns Err) and the
+/// `[STREAM]` serial log is still complete.
+const SHELL_PID: u32 = 3;
+
+/// Pack a UTF-8 fragment (≤ 6 bytes) into a Draug-stream IPC u64
+/// and fire-and-forget it to the shell. The shell's recv_async
+/// only delivers payload0, so we live in 8 bytes total. Most BPE
+/// tokens decode to ≤ 4 bytes; longer fragments are truncated. To
+/// avoid breaking UTF-8 codepoints mid-byte we snap the truncation
+/// point back to the last complete codepoint inside the budget.
+fn send_chunk_to_shell(fragment: &str) {
+    let bytes = fragment.as_bytes();
+    // Snap to a UTF-8 boundary at most 6 bytes into the fragment so
+    // multi-byte characters never split across the truncation.
+    let mut len = bytes.len().min(6);
+    while len > 0 && !fragment.is_char_boundary(len) {
+        len -= 1;
+    }
+    let mut payload0 = SHELL_OP_DRAUG_STREAM_CHUNK | ((len as u64) << 8);
+    for i in 0..len {
+        payload0 |= (bytes[i] as u64) << (16 + i * 8);
+    }
+    let _ = libfolk::sys::ipc::send(SHELL_PID, payload0, 0);
+}
 
 mod ipc_msg;
 mod router;
@@ -1565,23 +1595,23 @@ fn run_d37_first_blood() -> bool {
         let cycles = t_end.wrapping_sub(t_start);
         let ms = cycles / (tsc_freq_hz / 1000);
 
-        // Streaming output: decode the just-sampled token and emit it
-        // to serial in real time. Wrapping the fragment in [STREAM]
-        // markers keeps the per-token diagnostic separable from the
-        // free-form text in the log. `decode_seq(&[t])` reverses the
-        // tokenizer's GPT-2 byte mapping, so the user sees the same
-        // characters they'd get in HF. Multi-byte UTF-8 fragments
-        // (CJK / emoji) come out as the actual bytes — serial-tail
-        // tools (or `tee` to a file) can render them.
+        // Streaming output: decode the just-sampled token and emit
+        // both to serial AND to the shell via IPC, so the user sees
+        // Draug write live in their actual shell window (not just
+        // the kernel's serial log).
         let fragment = tok.decode_seq(&[next_token]);
         println!(
             "[STREAM] step={:03} ~{}ms id={:06} {:?}",
             step, ms, next_token, fragment,
         );
+        send_chunk_to_shell(&fragment);
 
         next = next_token;
         sampled.push(next);
     }
+    // Tell the shell we're done so it can drop a newline and reset
+    // the prompt cleanly.
+    let _ = libfolk::sys::ipc::send(SHELL_PID, SHELL_OP_DRAUG_STREAM_END, 0);
 
     // Heap diagnostic at end-of-decode. Should be roughly identical
     // to `arena_base` from before prefill — proof that the arena

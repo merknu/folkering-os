@@ -6,9 +6,11 @@ use libfolk::sys::shell::{
     SHELL_OP_LIST_FILES, SHELL_OP_CAT_FILE, SHELL_OP_SEARCH,
     SHELL_OP_PS, SHELL_OP_UPTIME, SHELL_OP_EXEC, SHELL_OP_OPEN_APP,
     SHELL_OP_INJECT_STATE,
+    SHELL_OP_DRAUG_STREAM_CHUNK, SHELL_OP_DRAUG_STREAM_END,
     SHELL_STATUS_OK, SHELL_STATUS_NOT_FOUND, SHELL_STATUS_ERROR,
     hash_name as shell_hash_name,
 };
+use libfolk::print;
 use libfolk::sys::synapse::{read_file_shmem, SYNAPSE_TASK_ID, write_file};
 use libfolk::sys::{shmem_create, shmem_destroy, shmem_grant, shmem_map, shmem_unmap, uptime};
 
@@ -58,8 +60,42 @@ pub fn handle_ipc_command(payload0: u64) -> u64 {
         x if x == SHELL_OP_EXEC => op_exec(payload0),
         x if x == SHELL_OP_OPEN_APP => op_open_app(payload0),
         x if x == SHELL_OP_INJECT_STATE => op_inject_state(payload0),
+        // Draug streaming output — print the fragment directly to
+        // the shell's serial console as Draug decodes each token.
+        x if x == SHELL_OP_DRAUG_STREAM_CHUNK => op_draug_stream_chunk(payload0),
+        x if x == SHELL_OP_DRAUG_STREAM_END => op_draug_stream_end(),
         _ => SHELL_STATUS_ERROR,
     }
+}
+
+/// Draug per-token streaming. Unpack up to 6 UTF-8 bytes from
+/// payload0[2..8] (length in [1..2]) and print them. The shell's
+/// stdout is the same serial console the user already sees, but
+/// emitting via the shell task means the fragment shows up between
+/// the prompt and any keyboard echo — no race vs the inference
+/// task's [STREAM] log.
+fn op_draug_stream_chunk(payload0: u64) -> u64 {
+    let len = ((payload0 >> 8) & 0xFF) as usize;
+    let len = len.min(6);
+    let mut buf = [0u8; 6];
+    for i in 0..len {
+        buf[i] = ((payload0 >> (16 + i * 8)) & 0xFF) as u8;
+    }
+    if let Ok(s) = core::str::from_utf8(&buf[..len]) {
+        print!("{}", s);
+    } else {
+        // Multi-byte glyph truncated mid-codepoint — skip rather
+        // than print mojibake.
+        print!("?");
+    }
+    SHELL_STATUS_OK
+}
+
+/// Draug stream-end marker — Draug finished the response. Print a
+/// trailing newline so the next shell prompt lands on a fresh line.
+fn op_draug_stream_end() -> u64 {
+    print!("\n");
+    SHELL_STATUS_OK
 }
 
 // ── 0xAC11: TextInput submit ─────────────────────────────────────────
