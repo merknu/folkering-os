@@ -76,6 +76,46 @@ fn has_avx2_fma() -> bool {
 /// yield is a cheap nudge, not a guarantee.
 const MATMUL_YIELD_EVERY: usize = 1_048_576;
 
+/// Minimum `out_dim` before `WeightView::matmul` tries the SMP
+/// parallel-GEMM path. Below this, the cross-CPU job dispatch
+/// (~tens of µs of syscall + spin coordination) costs more than
+/// the AVX2 single-core path saves. Empirically the lm_head
+/// (151 936-class) wins decisively; everything else (≤ 3072) stays
+/// single-core. Tunable.
+const SMP_DISPATCH_MIN_OUT_DIM: usize = 16_384;
+
+/// Try to run a seq=1 Q8 matmul across the AP cores via
+/// `SYS_PARALLEL_GEMM`. Returns `None` if SMP is unavailable
+/// (no APs online, syscall failed) so the caller can fall back
+/// to single-core. Returns `Some(out)` of length `out_dim` on
+/// success.
+///
+/// `quant_type = 0` matches the kernel's Q8_0 dispatch branch.
+#[cfg(target_arch = "x86_64")]
+fn try_parallel_q8(
+    weights_q8: &[u8],
+    in_dim: usize,
+    out_dim: usize,
+    x: &[f32],
+) -> Option<Vec<f32>> {
+    if x.len() != in_dim { return None; }
+    if in_dim % Q8_BLOCK_SIZE != 0 { return None; }
+    let blocks_per_row = in_dim / Q8_BLOCK_SIZE;
+    let row_bytes = blocks_per_row * Q8_BLOCK_BYTES;
+    if weights_q8.len() != out_dim * row_bytes { return None; }
+
+    let mut out = vec![0.0f32; out_dim];
+    let ok = libfolk::sys::parallel_gemm(
+        x.as_ptr(),
+        weights_q8.as_ptr(),
+        out.as_mut_ptr(),
+        in_dim,
+        out_dim,
+        0,            // quant_type 0 = Q8_0
+    );
+    if ok { Some(out) } else { None }
+}
+
 /// Q8_0 block size — same as llama.cpp / GGUF. Picked for
 /// cache-friendly inner loops: a 32-element block is one f16 scale
 /// + 32 i8 vals = 34 bytes, fits comfortably in any sane L1.
@@ -140,8 +180,20 @@ impl<'a> WeightView<'a> {
                 matmul_batch_f32(w, in_dim, out_dim, x, seq)
             }
             Self::Q8(blocks) => {
+                // SMP fast path — only worth the cross-CPU
+                // coordination overhead for very large `out_dim`.
+                // lm_head at 151 936 dominates decode wall-clock by
+                // ~50 %; everything else (Q/K/V/Wo at ≤3072) stays
+                // on the single-core AVX2 path.
                 #[cfg(target_arch = "x86_64")]
                 {
+                    if seq == 1 && out_dim >= SMP_DISPATCH_MIN_OUT_DIM {
+                        if let Some(out) = try_parallel_q8(blocks, in_dim, out_dim, x) {
+                            return Some(out);
+                        }
+                        // Fall through to single-core if SMP is
+                        // unavailable (no APs online, syscall failed).
+                    }
                     if has_avx2_fma() {
                         // SAFETY: CPUID verified AVX2+FMA at runtime,
                         // so the `target_feature` annotation on the

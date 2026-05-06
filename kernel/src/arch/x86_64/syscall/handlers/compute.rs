@@ -5,13 +5,20 @@ pub fn syscall_parallel_gemm(
     weight_ptr: u64,
     output_ptr: u64,
     k: u64,
-    n: u64,
-    quant_type: u64,
+    n_qt: u64,
 ) -> u64 {
+    // Userspace packs `quant_type` into the top byte of `n` because the
+    // syscall entry shuffle drops C-ABI arg6 (mov r9, r8 overwrites it
+    // before r9 can be preserved). Lower 32 bits of n_qt = n; bits 56..64
+    // = quant_type. See `libfolk::sys::parallel_gemm` doc.
+    let n = (n_qt & 0xFFFF_FFFF) as u64;
+    let quant_type = ((n_qt >> 56) & 0xFF) as u8;
     crate::serial_str!("[PGEMM] syscall entry k=");
     crate::drivers::serial::write_dec(k as u32);
     crate::serial_str!(" n=");
     crate::drivers::serial::write_dec(n as u32);
+    crate::serial_str!(" qt=");
+    crate::drivers::serial::write_dec(quant_type as u32);
     crate::drivers::serial::write_newline();
 
     let task_id = crate::task::task::get_current_task();

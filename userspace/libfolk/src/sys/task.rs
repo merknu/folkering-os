@@ -49,6 +49,12 @@ pub fn spawn(binary: &[u8]) -> Option<u32> {
 
 /// Dispatch parallel GEMM across AP compute workers.
 /// Returns true on success (APs available), false on failure (fallback to sequential).
+///
+/// ABI note: the x86_64 syscall entry shuffle in `kernel::arch::x86_64::syscall::entry`
+/// overwrites C-ABI arg6 with the C-ABI arg5 (it does `mov r9, r8` before
+/// preserving r9). So we have 5 reliable args; we pack `quant_type` into
+/// the upper byte of the `n` argument. Vocab sizes ≤ 16 M (24 bits) fit
+/// fine — Qwen3's 151 936 needs only 18 bits.
 pub fn parallel_gemm(
     input: *const f32,
     weights: *const u8,
@@ -57,15 +63,16 @@ pub fn parallel_gemm(
     n: usize,
     quant_type: u8,
 ) -> bool {
+    debug_assert!(n < (1 << 24), "n must fit in 24 bits for packed ABI");
+    let n_qt = (n as u64) | ((quant_type as u64) << 56);
     let ret = unsafe {
-        syscall6(
+        syscall5(
             SYS_PARALLEL_GEMM,
             input as u64,
             weights as u64,
             output as u64,
             k as u64,
-            n as u64,
-            quant_type as u64,
+            n_qt,
         )
     };
     ret == 0

@@ -199,7 +199,7 @@ pub(super) extern "C" fn syscall_handler(
         0xE2 => crate::net::tcp_async::syscall_tcp_poll_recv(arg1, arg2, arg3),
         0xE3 => crate::net::tcp_async::syscall_tcp_close(arg1),
         // SMP: Parallel GEMM
-        0x60 => syscall_parallel_gemm(arg1, arg2, arg3, arg4, arg5, arg6),
+        0x60 => syscall_parallel_gemm(arg1, arg2, arg3, arg4, arg5),
         // Hybrid AI: Ask Gemini cloud API
         0x70 => syscall_ask_gemini(arg1, arg2, arg3),
         // VirtIO GPU
