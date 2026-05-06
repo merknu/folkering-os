@@ -31,6 +31,13 @@ pub struct GemmWork {
     pub col_start: u32,
     pub col_end: u32,
     pub quant_type: u8,
+    /// Page table to load before executing this work. APs swap CR3
+    /// to this so the userspace virtual addresses in the three ptr
+    /// fields above resolve identically to how the BSP sees them —
+    /// each access goes through the MMU per-page, so scattered
+    /// shmem-backed weights (the 165 MiB Q8 model file is the
+    /// motivating case) just work.
+    pub task_cr3: u64,
 }
 
 static mut WORK_ITEMS: [GemmWork; MAX_CPUS] = unsafe { core::mem::zeroed() };
@@ -149,6 +156,13 @@ fn ap_worker_loop(cpu_index: usize) -> ! {
     crate::drivers::serial::write_dec(cpu_index as u32);
     crate::serial_str!("] Worker loop entered\n");
 
+    // Capture this AP's boot-time CR3 — Limine set up a kernel-only
+    // page table for the AP, identical to the BSP's pre-userspace
+    // mapping. We restore to it after each job so the AP keeps
+    // running in a known kernel address space between dispatches.
+    let mut boot_cr3: u64;
+    unsafe { core::arch::asm!("mov {}, cr3", out(reg) boot_cr3); }
+
     loop {
         // PAUSE-based spin wait. Under WHPX each vCPU is a real thread —
         // PAUSE hints to the CPU that we're spin-waiting, reducing power.
@@ -156,15 +170,23 @@ fn ap_worker_loop(cpu_index: usize) -> ! {
             core::hint::spin_loop();
         }
 
-        // NO CR3 swap! Pointers in WORK_ITEMS are already HHDM-translated
-        // by the BSP in dispatch_parallel_gemm.
-
+        // Swap to the task's page table so the userspace virtual
+        // pointers in WORK_ITEMS resolve through the same MMU
+        // mappings the BSP sees. This is the fix for shmem-backed
+        // weights whose physical pages are scattered — the previous
+        // HHDM-linear translation only worked when userspace virt
+        // mapped to physically-contiguous frames.
         let work = unsafe { &WORK_ITEMS[cpu_index] };
-        unsafe { execute_gemm_work(work); }
-
-        crate::serial_str!("[AP");
-        crate::drivers::serial::write_dec(cpu_index as u32);
-        crate::serial_str!("] Work done\n");
+        let task_cr3 = work.task_cr3;
+        unsafe {
+            if task_cr3 != 0 {
+                core::arch::asm!("mov cr3, {}", in(reg) task_cr3);
+            }
+            execute_gemm_work(work);
+            if task_cr3 != 0 {
+                core::arch::asm!("mov cr3, {}", in(reg) boot_cr3);
+            }
+        }
 
         WORK_DONE[cpu_index].store(1, Ordering::Release);
         WORK_READY[cpu_index].store(0, Ordering::Release);
@@ -187,19 +209,11 @@ pub fn dispatch_parallel_gemm(
         return -1;
     }
 
-    // Translate userspace pointers to HHDM addresses so APs can access them
-    // without switching CR3. BSP walks the task's page table to find physical
-    // addresses, then adds HHDM offset.
-    let hhdm = crate::memory::paging::hhdm_offset() as u64;
-    let input_hhdm = virt_to_hhdm(task_cr3, input_ptr, hhdm);
-    let weight_hhdm = virt_to_hhdm(task_cr3, weight_ptr, hhdm);
-    let output_hhdm = virt_to_hhdm(task_cr3, output_ptr, hhdm);
-
-    if input_hhdm == 0 || weight_hhdm == 0 || output_hhdm == 0 {
-        crate::serial_str!("[PGEMM] HHDM translation failed!\n");
-        return -1;
-    }
-
+    // APs now swap CR3 to the task's page table inside their work
+    // loop, so userspace virtual pointers are valid as-is. No HHDM
+    // pre-translation needed — the MMU handles per-page lookups,
+    // which is the only thing that works for shmem-backed weights
+    // whose physical pages are scattered across the heap.
     let total_workers = num_aps + 1;
     let n_usize = n as usize;
     let cols_per_worker = n_usize / total_workers;
@@ -217,13 +231,14 @@ pub fn dispatch_parallel_gemm(
 
         unsafe {
             WORK_ITEMS[worker_idx] = GemmWork {
-                input_ptr: input_hhdm,   // HHDM-translated for APs
-                weight_ptr: weight_hhdm,
-                output_ptr: output_hhdm,
+                input_ptr,    // userspace virt — AP swaps CR3
+                weight_ptr,
+                output_ptr,
                 k, n,
                 col_start: col as u32,
                 col_end: (col + my_cols) as u32,
                 quant_type,
+                task_cr3,
             };
         }
 
@@ -232,13 +247,16 @@ pub fn dispatch_parallel_gemm(
         col += my_cols;
     }
 
-    // BSP does its share
+    // BSP does its share. BSP is already running in task's CR3
+    // (we're inside a syscall on this task), so userspace virt
+    // pointers resolve through the MMU per-page just like the APs.
     let bsp_work = GemmWork {
         input_ptr, weight_ptr, output_ptr,
         k, n,
         col_start: bsp_col_start as u32,
         col_end: (bsp_col_start + bsp_cols) as u32,
         quant_type,
+        task_cr3: 0, // BSP doesn't swap; it's already in task_cr3
     };
 
     crate::serial_str!("[PGEMM] BSP cols ");
@@ -354,11 +372,100 @@ fn has_avx2() -> bool {
     result & (1 << 5) != 0
 }
 
+// Q8_0: 32 values per block, 34 bytes (1× f16 scale + 32× i8 vals).
+// Same convention as `userspace::inference::tensor_math` and llama.cpp.
+const Q8_0_BLOCK_SIZE: usize = 34;
+const Q8_0_BLOCK_VALUES: usize = 32;
+
 unsafe fn execute_gemm_work(work: &GemmWork) {
-    if has_avx2() {
-        execute_gemm_work_avx2(work);
-    } else {
-        execute_gemm_work_scalar(work);
+    // quant_type: 0 = Q8_0, 1 = Q6_K. Q8_0 is the format the
+    // inference task uses end-to-end (PRs #166/#168/#170); Q6_K is
+    // legacy from libtensor / inference-server. AVX2 path required
+    // for both — we already gate AVX2 enablement at boot (#165 +
+    // smp.rs CR4 setup), so no fallback below.
+    match work.quant_type {
+        0 => execute_gemm_work_q8_avx2(work),
+        _ => {
+            if has_avx2() {
+                execute_gemm_work_avx2(work);
+            } else {
+                execute_gemm_work_scalar(work);
+            }
+        }
+    }
+}
+
+/// Q8_0 GEMM column-strip executor for one AP. Mirror of the
+/// userspace `matmul_batch_q8_avx2` for the seq=1 case: caller
+/// provides one input vector of length `k` (in_dim) and a Q8_0-
+/// quantised weight matrix of shape `[n × k]` with `n` being
+/// out_dim. We compute `c[col] = sum_i (input[i] * dequant(B[col, i]))`
+/// for each `col` in our assigned `[col_start, col_end)` strip.
+///
+/// Layout matches the `.fbin`'s row-major Q8 layout: each output
+/// row (one output element here) is `n_blocks * Q8_0_BLOCK_SIZE`
+/// bytes, with `n_blocks = k / 32`.
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn execute_gemm_work_q8_avx2(work: &GemmWork) {
+    use core::arch::x86_64::*;
+    let k = work.k as usize;
+    let n = work.n as usize;
+    let col_start = work.col_start as usize;
+    let col_end = work.col_end as usize;
+    let n_blocks = k / Q8_0_BLOCK_VALUES;
+    let row_bytes = n_blocks * Q8_0_BLOCK_SIZE;
+
+    let a_f32 = core::slice::from_raw_parts(work.input_ptr as *const f32, k);
+    let b_q8 = core::slice::from_raw_parts(work.weight_ptr as *const u8, n * row_bytes);
+    let c = core::slice::from_raw_parts_mut(work.output_ptr as *mut f32, n);
+
+    for col in col_start..col_end {
+        let row_off = col * row_bytes;
+        let mut acc = _mm256_setzero_ps();
+
+        for b in 0..n_blocks {
+            let block_off = row_off + b * Q8_0_BLOCK_SIZE;
+            // Block scale from f16 → f32, broadcast to 8 lanes.
+            let scale_bits = u16::from_le_bytes([
+                b_q8[block_off],
+                b_q8[block_off + 1],
+            ]);
+            let scale = f16_to_f32(scale_bits);
+            let scale_v = _mm256_set1_ps(scale);
+
+            // Dequant 32 i8s → 4 × __m256. _mm256_cvtepi8_epi32
+            // sign-extends low 8 bytes of __m128i; we slide the
+            // window with srli_si128 to cover all 32 bytes.
+            let q_ptr = b_q8.as_ptr().add(block_off + 2) as *const __m128i;
+            let raw_lo = _mm_loadu_si128(q_ptr);
+            let raw_hi = _mm_loadu_si128(q_ptr.add(1));
+            let deq0 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(raw_lo)), scale_v);
+            let deq1 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(raw_lo, 8))), scale_v);
+            let deq2 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(raw_hi)), scale_v);
+            let deq3 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(raw_hi, 8))), scale_v);
+
+            let a_base = b * Q8_0_BLOCK_VALUES;
+            let xs_ptr = a_f32.as_ptr().add(a_base);
+            let xs0 = _mm256_loadu_ps(xs_ptr);
+            let xs1 = _mm256_loadu_ps(xs_ptr.add(8));
+            let xs2 = _mm256_loadu_ps(xs_ptr.add(16));
+            let xs3 = _mm256_loadu_ps(xs_ptr.add(24));
+
+            acc = _mm256_fmadd_ps(deq0, xs0, acc);
+            acc = _mm256_fmadd_ps(deq1, xs1, acc);
+            acc = _mm256_fmadd_ps(deq2, xs2, acc);
+            acc = _mm256_fmadd_ps(deq3, xs3, acc);
+        }
+
+        // Horizontal reduce 8 lanes to scalar.
+        let lo = _mm256_castps256_ps128(acc);
+        let hi = _mm256_extractf128_ps(acc, 1);
+        let s4 = _mm_add_ps(lo, hi);
+        let s4_hi = _mm_movehdup_ps(s4);
+        let s2 = _mm_add_ps(s4, s4_hi);
+        let s2_hi = _mm_movehl_ps(s4_hi, s2);
+        let s1 = _mm_add_ss(s2, s2_hi);
+        c[col] = _mm_cvtss_f32(s1);
     }
 }
 
