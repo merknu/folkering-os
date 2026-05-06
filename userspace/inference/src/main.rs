@@ -1426,6 +1426,7 @@ fn run_d37_first_blood() -> bool {
     // Prefill: forward the whole prompt at once, populating the
     // cache. The returned logits are at the LAST prompt position;
     // argmax of those is the model's first generated token.
+    let prefill_start = unsafe { core::arch::x86_64::_rdtsc() };
     let first_id: u32 = {
         let logits = match forward_pass(&view, &cfg, &mut cache, &prompt_ids) {
             Some(v) => v,
@@ -1439,6 +1440,12 @@ fn run_d37_first_blood() -> bool {
             None => return false,
         }
     };
+    let prefill_cycles = unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(prefill_start);
+    let prefill_ms = prefill_cycles / 2_400_000;
+    println!(
+        "[INFERENCE] D.3.7: prefill ({} tokens × 28 layers) took ~{} ms",
+        prompt_ids.len(), prefill_ms,
+    );
     // Prefill's logits Vec is dropped at the closing `}` above.
     // We can now safely reclaim everything allocated since the
     // checkpoint — the only thing that survived the scope is the

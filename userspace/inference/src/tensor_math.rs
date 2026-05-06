@@ -86,11 +86,19 @@ const MATMUL_YIELD_EVERY: usize = 1_048_576;
 /// smallest qualifying matmul (1024×1024 Q8 = ~2 ms single-core).
 const SMP_DISPATCH_MIN_OUT_DIM: usize = 1024;
 
-/// Try to run a seq=1 Q8 matmul across the AP cores via
-/// `SYS_PARALLEL_GEMM`. Returns `None` if SMP is unavailable
-/// (no APs online, syscall failed) so the caller can fall back
-/// to single-core. Returns `Some(out)` of length `out_dim` on
-/// success.
+/// Try to run a Q8 matmul across the AP cores via `SYS_PARALLEL_GEMM`.
+/// Handles arbitrary `seq` by looping per row — the kernel's parallel
+/// GEMM operates on a single input vector at a time, so we issue
+/// `seq` syscalls back-to-back. Each dispatch coordinates BSP + APs
+/// in ~tens of µs, dwarfed by even the smallest qualifying matmul
+/// (1024×1024 Q8 ≈ 2 ms single-core), so the per-row loop is a clean
+/// way to cover prefill (seq = 14 on Qwen3 ChatML) without changing
+/// the kernel ABI. The same shared `weights_q8` pointer is read
+/// concurrently across rows — no race because it's read-only.
+///
+/// Returns `None` if SMP is unavailable (no APs online, syscall
+/// failed at any row), so the caller can fall back to single-core.
+/// Returns `Some(out)` of length `seq * out_dim` on success.
 ///
 /// `quant_type = 0` matches the kernel's Q8_0 dispatch branch.
 #[cfg(target_arch = "x86_64")]
@@ -99,23 +107,52 @@ fn try_parallel_q8(
     in_dim: usize,
     out_dim: usize,
     x: &[f32],
+    seq: usize,
 ) -> Option<Vec<f32>> {
-    if x.len() != in_dim { return None; }
+    if seq == 0 { return Some(alloc::vec::Vec::new()); }
+    if x.len() != seq * in_dim { return None; }
     if in_dim % Q8_BLOCK_SIZE != 0 { return None; }
     let blocks_per_row = in_dim / Q8_BLOCK_SIZE;
     let row_bytes = blocks_per_row * Q8_BLOCK_BYTES;
     if weights_q8.len() != out_dim * row_bytes { return None; }
 
-    let mut out = vec![0.0f32; out_dim];
-    let ok = libfolk::sys::parallel_gemm(
-        x.as_ptr(),
-        weights_q8.as_ptr(),
-        out.as_mut_ptr(),
-        in_dim,
-        out_dim,
-        0,            // quant_type 0 = Q8_0
-    );
-    if ok { Some(out) } else { None }
+    let mut out = vec![0.0f32; seq * out_dim];
+    if seq == 1 {
+        // Decode hot path. Direct call — no loop, no slice-by-row,
+        // matches the structure that benchmarked at ~2.9 s/token in
+        // PR #176. Wrapping this in a `for s in 0..1` loop turned out
+        // to add ~40 % overhead on the per-token wall-clock, presumably
+        // from the loop scaffolding interfering with LLVM's syscall
+        // inlining.
+        let ok = libfolk::sys::parallel_gemm(
+            x.as_ptr(),
+            weights_q8.as_ptr(),
+            out.as_mut_ptr(),
+            in_dim,
+            out_dim,
+            0,            // quant_type 0 = Q8_0
+        );
+        return if ok { Some(out) } else { None };
+    }
+    // Prefill / batched path: loop per row.
+    for s in 0..seq {
+        let x_row = &x[s * in_dim..(s + 1) * in_dim];
+        // SAFETY: out_row is a disjoint slice of `out` (we never
+        // re-enter for the same s), so the kernel's SMP workers
+        // can write into it without interference. The shared
+        // `weights_q8` is read-only.
+        let out_row_ptr = unsafe { out.as_mut_ptr().add(s * out_dim) };
+        let ok = libfolk::sys::parallel_gemm(
+            x_row.as_ptr(),
+            weights_q8.as_ptr(),
+            out_row_ptr,
+            in_dim,
+            out_dim,
+            0,            // quant_type 0 = Q8_0
+        );
+        if !ok { return None; }
+    }
+    Some(out)
 }
 
 /// Q8_0 block size — same as llama.cpp / GGUF. Picked for
@@ -189,8 +226,14 @@ impl<'a> WeightView<'a> {
                 // on the single-core AVX2 path.
                 #[cfg(target_arch = "x86_64")]
                 {
-                    if seq == 1 && out_dim >= SMP_DISPATCH_MIN_OUT_DIM {
-                        if let Some(out) = try_parallel_q8(blocks, in_dim, out_dim, x) {
+                    // Both decode (seq=1) and prefill (seq=14 for our
+                    // ChatML prompt) take the SMP path when out_dim
+                    // qualifies. try_parallel_q8 loops per row when
+                    // seq > 1 — coordination overhead per row is a
+                    // negligible fraction of even the smallest matmul
+                    // we dispatch (1024×1024 Q8 ≈ 2 ms single-core).
+                    if out_dim >= SMP_DISPATCH_MIN_OUT_DIM {
+                        if let Some(out) = try_parallel_q8(blocks, in_dim, out_dim, x, seq) {
                             return Some(out);
                         }
                         // Fall through to single-core if SMP is
