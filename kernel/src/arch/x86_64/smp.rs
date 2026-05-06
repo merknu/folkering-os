@@ -196,7 +196,7 @@ fn ap_worker_loop(cpu_index: usize) -> ! {
                 core::arch::asm!("mov cr3, {}", in(reg) target_cr3);
                 current_cr3 = target_cr3;
             }
-            execute_gemm_work(work);
+            execute_gemm_work(work, cpu_index);
             // Stay in target_cr3 for the next job — same task means
             // same CR3 means warm TLB. If a different task ever
             // dispatches to this AP we'll swap on the next iteration.
@@ -274,7 +274,9 @@ pub fn dispatch_parallel_gemm(
         task_cr3: 0, // BSP doesn't swap; it's already in task_cr3
     };
 
-    unsafe { execute_gemm_work(&bsp_work); }
+    // BSP uses cpu_index 0 (which has no AP, so no contention) for its
+    // QUANT_BUFS slot.
+    unsafe { execute_gemm_work(&bsp_work, 0); }
 
     // Wait for APs (with timeout). Quiet path; only TIMEOUT errors
     // print, since they signal a real bug. The per-step PGEMM noise
@@ -382,14 +384,14 @@ fn has_avx2() -> bool {
 const Q8_0_BLOCK_SIZE: usize = 34;
 const Q8_0_BLOCK_VALUES: usize = 32;
 
-unsafe fn execute_gemm_work(work: &GemmWork) {
+unsafe fn execute_gemm_work(work: &GemmWork, cpu_index: usize) {
     // quant_type: 0 = Q8_0, 1 = Q6_K. Q8_0 is the format the
     // inference task uses end-to-end (PRs #166/#168/#170); Q6_K is
     // legacy from libtensor / inference-server. AVX2 path required
     // for both — we already gate AVX2 enablement at boot (#165 +
     // smp.rs CR4 setup), so no fallback below.
     match work.quant_type {
-        0 => execute_gemm_work_q8_avx2(work),
+        0 => execute_gemm_work_q8_avx2(work, cpu_index),
         _ => {
             if has_avx2() {
                 execute_gemm_work_avx2(work);
@@ -399,6 +401,21 @@ unsafe fn execute_gemm_work(work: &GemmWork) {
         }
     }
 }
+
+/// Per-CPU scratch for online f32→i8 input quantization. Q8 maddubs
+/// path needs both operands as i8 — weights already are, but the
+/// activation row is f32 (post-RMSNorm). We quantize per-row with a
+/// max-abs scale into this buffer, then the inner loop runs native
+/// int8 multiply-accumulate via `_mm256_maddubs_epi16`. 64 KiB per
+/// CPU is enough for seq=64 × k=1024 and the worst real case
+/// (seq=14 prefill × k=2816 mlp_down ≈ 39 KiB).
+const QUANT_BUF_BYTES: usize = 65536;
+#[repr(C, align(32))]
+struct QuantBuf {
+    input: [i8; QUANT_BUF_BYTES],
+    scales: [f32; MAX_SEQ],
+}
+static mut QUANT_BUFS: [QuantBuf; MAX_CPUS] = unsafe { core::mem::zeroed() };
 
 /// Q8_0 batched GEMM column-strip executor for one AP. Caller
 /// provides:
@@ -421,8 +438,135 @@ unsafe fn execute_gemm_work(work: &GemmWork) {
 /// stack per executor — well within budget.
 const MAX_SEQ: usize = 64;
 
+/// Q8_0 batched GEMM via int8 multiply-accumulate (`_mm256_maddubs_epi16`).
+///
+/// Replaces the dequant-then-FMA path with native int8 MAC, after pre-
+/// quantizing the f32 activation row to i8 with a per-row max-abs scale.
+/// 32 i8 lanes per maddubs instruction vs 8 f32 lanes per FMA — and the
+/// 4× input-bandwidth saving (32 B i8 vs 128 B f32 per block) is just
+/// as important as the lane count on a TLB-warmed shmem-backed weight
+/// stream. Two-signed-i8 dot product uses the standard sign-fold trick:
+/// `|w|` as the unsigned operand, `x · sign(w)` as the signed operand.
+/// Q8_0 quantizer clamps weights to [-127, +127] (skipping -128) so the
+/// `sign_epi8(-128, -128)` overflow case never fires.
+///
+/// Falls back to the dequant path when `seq * k` exceeds the per-CPU
+/// quant scratch (`QUANT_BUF_BYTES = 64 KiB`) — currently unreachable
+/// on Qwen3-0.6B (worst case is seq=14 × k=2816 ≈ 39 KiB), but defensive
+/// against future larger contexts.
 #[target_feature(enable = "avx2", enable = "fma")]
-unsafe fn execute_gemm_work_q8_avx2(work: &GemmWork) {
+unsafe fn execute_gemm_work_q8_avx2(work: &GemmWork, cpu_index: usize) {
+    use core::arch::x86_64::*;
+    let k = work.k as usize;
+    let n = work.n as usize;
+    let seq = (work.seq as usize).max(1).min(MAX_SEQ);
+    let col_start = work.col_start as usize;
+    let col_end = work.col_end as usize;
+    let n_blocks = k / Q8_0_BLOCK_VALUES;
+    let row_bytes = n_blocks * Q8_0_BLOCK_SIZE;
+
+    if seq * k > QUANT_BUF_BYTES {
+        execute_gemm_work_q8_avx2_dequant(work);
+        return;
+    }
+
+    let a_f32 = core::slice::from_raw_parts(work.input_ptr as *const f32, seq * k);
+    let b_q8 = core::slice::from_raw_parts(work.weight_ptr as *const u8, n * row_bytes);
+    let c = core::slice::from_raw_parts_mut(work.output_ptr as *mut f32, seq * n);
+
+    // Per-CPU input quantization scratch. Each AP / BSP owns a unique
+    // slot indexed by cpu_index — no locking needed.
+    let buf = &mut *core::ptr::addr_of_mut!(QUANT_BUFS[cpu_index]);
+    let q_input = &mut buf.input[..seq * k];
+    let row_scales = &mut buf.scales[..seq];
+
+    // Per-row max-abs quantization. Weight scales are already per-block
+    // (Q8_0 blocks of 32 elements); a single scale per input row is
+    // coarser but correctness-wise fine for normalized activations.
+    for s in 0..seq {
+        let row = &a_f32[s * k..s * k + k];
+        let mut max_abs = 0.0f32;
+        for &v in row {
+            let av = if v < 0.0 { -v } else { v };
+            if av > max_abs { max_abs = av; }
+        }
+        let scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
+        let inv_scale = 1.0 / scale;
+        row_scales[s] = scale;
+        let dst = &mut q_input[s * k..s * k + k];
+        for i in 0..k {
+            let q = (row[i] * inv_scale) as i32;
+            // `as i8` saturates by truncation; clamp explicitly to
+            // [-127, 127] to keep the sign-fold trick safe.
+            dst[i] = if q > 127 { 127 } else if q < -127 { -127 } else { q as i8 };
+        }
+    }
+
+    let ones16 = _mm256_set1_epi16(1);
+    let mut acc: [__m256; MAX_SEQ] = [_mm256_setzero_ps(); MAX_SEQ];
+
+    for col in col_start..col_end {
+        let row_off = col * row_bytes;
+        for s in 0..seq {
+            acc[s] = _mm256_setzero_ps();
+        }
+
+        for b in 0..n_blocks {
+            let block_off = row_off + b * Q8_0_BLOCK_SIZE;
+            let scale_bits = u16::from_le_bytes([
+                b_q8[block_off],
+                b_q8[block_off + 1],
+            ]);
+            let weight_scale = f16_to_f32(scale_bits);
+            let scale_v = _mm256_set1_ps(weight_scale);
+
+            // Load 32 i8 weights, derive |w| once per (col, block) —
+            // reused across all `seq` rows. `xs_signed` depends on
+            // sign(w) too, so we re-fold per s.
+            let w = _mm256_loadu_si256(
+                b_q8.as_ptr().add(block_off + 2) as *const __m256i,
+            );
+            let w_abs = _mm256_sign_epi8(w, w);
+
+            let a_base = b * Q8_0_BLOCK_VALUES;
+            for s in 0..seq {
+                let xs = _mm256_loadu_si256(
+                    q_input.as_ptr().add(s * k + a_base) as *const __m256i,
+                );
+                // sign(w) folded onto x: maddubs(|w|, x·sign(w)) = w·x.
+                let xs_signed = _mm256_sign_epi8(xs, w);
+                // 32 × i8·i8 → 16 × i16 (pairwise sums; saturation
+                // can't fire here: |w·x| ≤ 127² = 16129, so
+                // |sum_pair| ≤ 32258 < 32767).
+                let prod16 = _mm256_maddubs_epi16(w_abs, xs_signed);
+                // 16 × i16 → 8 × i32 (multiply by 1, sum adjacent).
+                let prod32 = _mm256_madd_epi16(prod16, ones16);
+                // Convert to f32 and FMA into the row's accumulator,
+                // scaled by the block weight scale. Per-row input
+                // scale is applied once at the end of (col, s).
+                let prod_f32 = _mm256_cvtepi32_ps(prod32);
+                acc[s] = _mm256_fmadd_ps(prod_f32, scale_v, acc[s]);
+            }
+        }
+
+        for s in 0..seq {
+            let v = acc[s];
+            let lo = _mm256_castps256_ps128(v);
+            let hi = _mm256_extractf128_ps(v, 1);
+            let s4 = _mm_add_ps(lo, hi);
+            let s4_hi = _mm_movehdup_ps(s4);
+            let s2 = _mm_add_ps(s4, s4_hi);
+            let s2_hi = _mm_movehl_ps(s4_hi, s2);
+            let s1 = _mm_add_ss(s2, s2_hi);
+            c[s * n + col] = _mm_cvtss_f32(s1) * row_scales[s];
+        }
+    }
+}
+
+/// Original dequant-to-f32 + FMA path. Kept as a fallback for the
+/// (currently unreachable) case where `seq * k > QUANT_BUF_BYTES`.
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn execute_gemm_work_q8_avx2_dequant(work: &GemmWork) {
     use core::arch::x86_64::*;
     let k = work.k as usize;
     let n = work.n as usize;
@@ -436,7 +580,6 @@ unsafe fn execute_gemm_work_q8_avx2(work: &GemmWork) {
     let b_q8 = core::slice::from_raw_parts(work.weight_ptr as *const u8, n * row_bytes);
     let c = core::slice::from_raw_parts_mut(work.output_ptr as *mut f32, seq * n);
 
-    // Per-s accumulators. Reset to zero at the top of each col.
     let mut acc: [__m256; MAX_SEQ] = [_mm256_setzero_ps(); MAX_SEQ];
 
     for col in col_start..col_end {
@@ -447,7 +590,6 @@ unsafe fn execute_gemm_work_q8_avx2(work: &GemmWork) {
 
         for b in 0..n_blocks {
             let block_off = row_off + b * Q8_0_BLOCK_SIZE;
-            // Block scale from f16 → f32, broadcast to 8 lanes.
             let scale_bits = u16::from_le_bytes([
                 b_q8[block_off],
                 b_q8[block_off + 1],
@@ -455,9 +597,6 @@ unsafe fn execute_gemm_work_q8_avx2(work: &GemmWork) {
             let scale = f16_to_f32(scale_bits);
             let scale_v = _mm256_set1_ps(scale);
 
-            // Dequant 32 i8s → 4 × __m256, ONCE per (col, block).
-            // _mm256_cvtepi8_epi32 sign-extends low 8 bytes of an
-            // __m128i; we slide with srli_si128 to cover 32 bytes.
             let q_ptr = b_q8.as_ptr().add(block_off + 2) as *const __m128i;
             let raw_lo = _mm_loadu_si128(q_ptr);
             let raw_hi = _mm_loadu_si128(q_ptr.add(1));
@@ -466,10 +605,6 @@ unsafe fn execute_gemm_work_q8_avx2(work: &GemmWork) {
             let deq2 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(raw_hi)), scale_v);
             let deq3 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(raw_hi, 8))), scale_v);
 
-            // FMA the dequantised block into each row's accumulator.
-            // Reused dequant means the per-(col, block) cost is paid
-            // once across all `seq` rows — that's the whole point of
-            // the batched API.
             let a_base = b * Q8_0_BLOCK_VALUES;
             for s in 0..seq {
                 let xs_ptr = a_f32.as_ptr().add(s * k + a_base);
@@ -484,7 +619,6 @@ unsafe fn execute_gemm_work_q8_avx2(work: &GemmWork) {
             }
         }
 
-        // Horizontal reduce each row's accumulator and write to c.
         for s in 0..seq {
             let v = acc[s];
             let lo = _mm256_castps256_ps128(v);
