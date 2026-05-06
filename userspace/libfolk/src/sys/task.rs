@@ -50,20 +50,28 @@ pub fn spawn(binary: &[u8]) -> Option<u32> {
 /// Dispatch parallel GEMM across AP compute workers.
 /// Returns true on success (APs available), false on failure (fallback to sequential).
 ///
-/// ABI note: the x86_64 syscall entry shuffle in `kernel::arch::x86_64::syscall::entry`
-/// overwrites C-ABI arg6 with the C-ABI arg5 (it does `mov r9, r8` before
-/// preserving r9). So we have 5 reliable args; we pack `quant_type` into
-/// the upper byte of the `n` argument. Vocab sizes ≤ 16 M (24 bits) fit
-/// fine — Qwen3's 151 936 needs only 18 bits.
+/// ABI note: the x86_64 syscall entry shuffle drops C-ABI arg6
+/// (mov r9, r8 overwrites it before r9 can be preserved). We have
+/// 5 reliable args, so we pack:
+///   arg4 = (seq << 32) | k      (both u32; 4 G samples × 4 G dim each)
+///   arg5 = (quant_type << 56) | n  (top byte = quant_type, low 24 bits = n)
+///
+/// `seq` is the batch dimension — input shape `[seq, k]`, output
+/// `[seq, n]`. seq=1 covers decode; seq=14 covers our ChatML prefill.
+/// One syscall amortises BSP+AP coordination across all `seq` rows.
 pub fn parallel_gemm(
     input: *const f32,
     weights: *const u8,
     output: *mut f32,
     k: usize,
     n: usize,
+    seq: usize,
     quant_type: u8,
 ) -> bool {
+    debug_assert!(k < (1 << 32), "k must fit in 32 bits for packed ABI");
+    debug_assert!(seq < (1 << 32), "seq must fit in 32 bits for packed ABI");
     debug_assert!(n < (1 << 24), "n must fit in 24 bits for packed ABI");
+    let k_seq = (k as u64) | ((seq as u64) << 32);
     let n_qt = (n as u64) | ((quant_type as u64) << 56);
     let ret = unsafe {
         syscall5(
@@ -71,7 +79,7 @@ pub fn parallel_gemm(
             input as u64,
             weights as u64,
             output as u64,
-            k as u64,
+            k_seq,
             n_qt,
         )
     };

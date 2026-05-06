@@ -117,42 +117,22 @@ fn try_parallel_q8(
     if weights_q8.len() != out_dim * row_bytes { return None; }
 
     let mut out = vec![0.0f32; seq * out_dim];
-    if seq == 1 {
-        // Decode hot path. Direct call — no loop, no slice-by-row,
-        // matches the structure that benchmarked at ~2.9 s/token in
-        // PR #176. Wrapping this in a `for s in 0..1` loop turned out
-        // to add ~40 % overhead on the per-token wall-clock, presumably
-        // from the loop scaffolding interfering with LLVM's syscall
-        // inlining.
-        let ok = libfolk::sys::parallel_gemm(
-            x.as_ptr(),
-            weights_q8.as_ptr(),
-            out.as_mut_ptr(),
-            in_dim,
-            out_dim,
-            0,            // quant_type 0 = Q8_0
-        );
-        return if ok { Some(out) } else { None };
-    }
-    // Prefill / batched path: loop per row.
-    for s in 0..seq {
-        let x_row = &x[s * in_dim..(s + 1) * in_dim];
-        // SAFETY: out_row is a disjoint slice of `out` (we never
-        // re-enter for the same s), so the kernel's SMP workers
-        // can write into it without interference. The shared
-        // `weights_q8` is read-only.
-        let out_row_ptr = unsafe { out.as_mut_ptr().add(s * out_dim) };
-        let ok = libfolk::sys::parallel_gemm(
-            x_row.as_ptr(),
-            weights_q8.as_ptr(),
-            out_row_ptr,
-            in_dim,
-            out_dim,
-            0,            // quant_type 0 = Q8_0
-        );
-        if !ok { return None; }
-    }
-    Some(out)
+    // One batched syscall covers all `seq` rows. The kernel's
+    // execute_gemm_work_q8_avx2 dequants each weight block ONCE
+    // per (col, block) and FMAs into per-row accumulators — so
+    // prefill (seq = 14) pays ~the same dequant cost as decode
+    // (seq = 1), and the syscall coordination overhead is
+    // amortised across the whole batch instead of repeated 14×.
+    let ok = libfolk::sys::parallel_gemm(
+        x.as_ptr(),
+        weights_q8.as_ptr(),
+        out.as_mut_ptr(),
+        in_dim,
+        out_dim,
+        seq,
+        0, // quant_type 0 = Q8_0
+    );
+    if ok { Some(out) } else { None }
 }
 
 /// Q8_0 block size — same as llama.cpp / GGUF. Picked for
