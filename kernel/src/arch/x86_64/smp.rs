@@ -160,11 +160,22 @@ fn ap_worker_loop(cpu_index: usize) -> ! {
     crate::serial_str!("] Worker loop entered\n");
 
     // Capture this AP's boot-time CR3 — Limine set up a kernel-only
-    // page table for the AP, identical to the BSP's pre-userspace
-    // mapping. We restore to it after each job so the AP keeps
-    // running in a known kernel address space between dispatches.
-    let mut boot_cr3: u64;
+    // page table for the AP. We track `current_cr3` so we only emit
+    // a `mov cr3, ...` when the target page table actually changes.
+    // Writing the same value back into CR3 STILL flushes the TLB
+    // (Intel SDM Vol. 3 §4.10.4.1: any write to CR3 invalidates
+    // non-global TLB entries), so the previous unconditional
+    // swap-out at end-of-job paid for a full TLB rebuild on every
+    // single job — 196 jobs × 3 APs × 2 swaps × full rebuild was a
+    // significant fraction of the 2.9 s/token wall-clock.
+    //
+    // With sticky CR3: AP swaps to the inference task's CR3 on the
+    // first job and stays there for the rest of its life. TLB warms
+    // up once per task, then weight reads stream through the L1/L2
+    // dTLB at full bandwidth.
+    let boot_cr3: u64;
     unsafe { core::arch::asm!("mov {}, cr3", out(reg) boot_cr3); }
+    let mut current_cr3 = boot_cr3;
 
     loop {
         // PAUSE-based spin wait. Under WHPX each vCPU is a real thread —
@@ -175,20 +186,20 @@ fn ap_worker_loop(cpu_index: usize) -> ! {
 
         // Swap to the task's page table so the userspace virtual
         // pointers in WORK_ITEMS resolve through the same MMU
-        // mappings the BSP sees. This is the fix for shmem-backed
-        // weights whose physical pages are scattered — the previous
-        // HHDM-linear translation only worked when userspace virt
-        // mapped to physically-contiguous frames.
+        // mappings the BSP sees. Only swap if the target differs
+        // from what's already loaded — otherwise we'd flush the TLB
+        // for nothing.
         let work = unsafe { &WORK_ITEMS[cpu_index] };
-        let task_cr3 = work.task_cr3;
+        let target_cr3 = if work.task_cr3 != 0 { work.task_cr3 } else { boot_cr3 };
         unsafe {
-            if task_cr3 != 0 {
-                core::arch::asm!("mov cr3, {}", in(reg) task_cr3);
+            if target_cr3 != current_cr3 {
+                core::arch::asm!("mov cr3, {}", in(reg) target_cr3);
+                current_cr3 = target_cr3;
             }
             execute_gemm_work(work);
-            if task_cr3 != 0 {
-                core::arch::asm!("mov cr3, {}", in(reg) boot_cr3);
-            }
+            // Stay in target_cr3 for the next job — same task means
+            // same CR3 means warm TLB. If a different task ever
+            // dispatches to this AP we'll swap on the next iteration.
         }
 
         WORK_DONE[cpu_index].store(1, Ordering::Release);
