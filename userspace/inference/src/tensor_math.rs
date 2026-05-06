@@ -180,14 +180,20 @@ impl<'a> WeightView<'a> {
                 matmul_batch_f32(w, in_dim, out_dim, x, seq)
             }
             Self::Q8(blocks) => {
-                // SMP fast path scaffolded but disabled — kernel-side
-                // Q8 GEMM produces wrong argmax for unknown reasons;
-                // single-core AVX2 below is the verified path.
-                // `try_parallel_q8` and `SMP_DISPATCH_MIN_OUT_DIM`
-                // remain in source for the future SMP debug session
-                // but won't be reached at runtime.
+                // SMP fast path — only worth the cross-CPU
+                // coordination overhead for very large `out_dim`.
+                // lm_head at 151 936 dominates decode wall-clock by
+                // ~50 %; everything else (Q/K/V/Wo at ≤3072) stays
+                // on the single-core AVX2 path.
                 #[cfg(target_arch = "x86_64")]
                 {
+                    if seq == 1 && out_dim >= SMP_DISPATCH_MIN_OUT_DIM {
+                        if let Some(out) = try_parallel_q8(blocks, in_dim, out_dim, x) {
+                            return Some(out);
+                        }
+                        // Fall through to single-core if SMP is
+                        // unavailable (no APs online, syscall failed).
+                    }
                     if has_avx2_fma() {
                         // SAFETY: CPUID verified AVX2+FMA at runtime,
                         // so the `target_feature` annotation on the
