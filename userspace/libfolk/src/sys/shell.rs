@@ -40,6 +40,21 @@ pub const SHELL_TASK_ID: u32 = 3;
 /// Reply: (count << 32) | 0  (files follow via shmem if > 0)
 pub const SHELL_OP_LIST_FILES: u64 = 0x80;
 
+/// Draug streaming-token chunk — fired by the inference task per
+/// decoded token so the shell can paint Draug's response live.
+/// Request payload layout (single u64 — `recv_async` only delivers
+/// `payload0`, so we live in 8 bytes):
+///   payload0 [0..1]  = 0xDA (opcode)
+///   payload0 [1..2]  = fragment length in bytes (1..6)
+///   payload0 [2..8]  = up to 6 bytes of UTF-8 fragment
+/// Most BPE tokens decode to ≤ 4 bytes; longer fragments are
+/// truncated (rare — only happens for special-token strings).
+pub const SHELL_OP_DRAUG_STREAM_CHUNK: u64 = 0xDA;
+
+/// Draug streaming-end marker — fired after the last token.
+/// payload0 [0..1]  = 0xDB (opcode), rest 0.
+pub const SHELL_OP_DRAUG_STREAM_END: u64 = 0xDB;
+
 /// Read file by name hash
 /// Request: op | (name_hash << 8)
 /// Reply: (size << 32) | shmem_handle, or SHELL_STATUS_NOT_FOUND
