@@ -107,6 +107,33 @@ unsafe impl GlobalAlloc for BumpAllocator {
     unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
 }
 
+impl BumpAllocator {
+    /// Return the current bump offset. Pair with `reset_to` to
+    /// reclaim everything allocated between checkpoint and reset.
+    pub fn checkpoint(&self) -> usize {
+        // SAFETY: single-threaded userspace task; concurrent access
+        // to the bump offset is impossible without an explicit
+        // task::spawn for inference, which we don't do.
+        unsafe { *self.offset.get() }
+    }
+
+    /// Roll the bump offset back to `offset`. Any `Vec`/`Box`/`String`
+    /// allocated in the rolled-back range becomes a zombie — its
+    /// pointer dangles into reused memory. The caller MUST ensure
+    /// no live references into that range exist after this call.
+    ///
+    /// The contract is automatically satisfied for "checkpoint, run
+    /// `forward_pass`, sample, reset" because the only borrow that
+    /// outlives `forward_pass` is the returned `Vec<f32>` of logits,
+    /// which the caller drops before resetting.
+    pub unsafe fn reset_to(&self, offset: usize) {
+        // SAFETY: same single-threaded argument as `checkpoint`.
+        // Caller's invariant on dangling pointers is the dangerous
+        // part; the offset write itself is trivial.
+        *self.offset.get() = offset;
+    }
+}
+
 #[global_allocator]
 static ALLOCATOR: BumpAllocator = BumpAllocator {
     heap: UnsafeCell::new([0; HEAP_SIZE]),
@@ -1370,20 +1397,58 @@ fn run_d37_first_blood() -> bool {
         prompt_ids.len()
     );
 
+    // ── Heap layout discipline for the decode loop ────────────────
+    // The bump allocator never frees on drop. To keep heap pressure
+    // constant across hundreds of decode steps, we capture a
+    // checkpoint and `reset_to` it at the end of each iteration.
+    // Anything allocated BELOW the checkpoint (KvCache, tokenizer,
+    // prompt_ids, the persistent `sampled` buffer) survives every
+    // reset; anything ABOVE (matmul scratch, attention buffers,
+    // lm_head logits) is reclaimed in O(1) when we rewind the bump
+    // offset.
+    //
+    // Critical invariant: `sampled` MUST be allocated below the
+    // checkpoint, with full capacity so it never realloc-grows
+    // inside the loop. The first attempt put `sampled` above the
+    // checkpoint and reset_to silently overwrote its buffer with
+    // f32 logits from the next forward_pass — token IDs came back
+    // looking like 0x40750BAC (≈3.83 as f32).
+    const MAX_DECODE: usize = 256;
+    let mut sampled: Vec<u32> = Vec::with_capacity(MAX_DECODE + 1);
+
+    let arena_base: usize = ALLOCATOR.checkpoint();
+    println!(
+        "[INFERENCE] D.3.7: arena_base=0x{:x} (heap free below {} MiB)",
+        arena_base,
+        arena_base / (1024 * 1024),
+    );
+
     // Prefill: forward the whole prompt at once, populating the
     // cache. The returned logits are at the LAST prompt position;
     // argmax of those is the model's first generated token.
-    let logits = match forward_pass(&view, &cfg, &mut cache, &prompt_ids) {
-        Some(v) => v,
-        None => {
-            println!("[INFERENCE] D.3.7: prefill returned None");
-            return false;
+    let first_id: u32 = {
+        let logits = match forward_pass(&view, &cfg, &mut cache, &prompt_ids) {
+            Some(v) => v,
+            None => {
+                println!("[INFERENCE] D.3.7: prefill returned None");
+                return false;
+            }
+        };
+        match argmax(&logits) {
+            Some(i) => i,
+            None => return false,
         }
     };
-    let first_id = match argmax(&logits) {
-        Some(i) => i,
-        None => return false,
-    };
+    // Prefill's logits Vec is dropped at the closing `}` above.
+    // We can now safely reclaim everything allocated since the
+    // checkpoint — the only thing that survived the scope is the
+    // primitive `first_id: u32`, no pointers into the arena.
+    // SAFETY: `sampled`'s buffer lives BELOW arena_base, so it
+    // survives the reset; nothing else above the line is in scope.
+    unsafe { ALLOCATOR.reset_to(arena_base); }
+
+    sampled.push(first_id);
+
     println!(
         "[INFERENCE] D.3.7: first token = {} ({:?})",
         first_id, tok.decode(first_id).unwrap_or("?")
@@ -1431,41 +1496,65 @@ fn run_d37_first_blood() -> bool {
     // Breaks Qwen3-0.6B's newline-spiral on its first few tokens.
     const REPETITION_PENALTY: f32 = 1.3;
 
-    // Decode up to 64 tokens. Stops on <|im_end|> (151645) or
-    // <|endoftext|> (151643). Each step pushes one token through
-    // the KV-cached forward pass — O(layers) per token.
-    let mut sampled: Vec<u32> = Vec::new();
-    sampled.push(first_id);
+    // Decode up to MAX_DECODE tokens. Stops on <|im_end|> (151645)
+    // or <|endoftext|> (151643). Each step pushes one token through
+    // the KV-cached forward pass — O(layers) per token. `sampled`
+    // was pre-allocated above the prefill checkpoint with full
+    // capacity so `push` here never grows-and-reallocates (which
+    // would leave the buffer dangling after the next reset_to).
     let mut next = first_id;
-    for step in 0..64 {
+    for step in 0..MAX_DECODE {
         if next == 151645 || next == 151643 { break; }
-        let mut logits = match forward_pass(&view, &cfg, &mut cache, &[next]) {
-            Some(v) => v,
-            None => break,
+        let next_token = {
+            let mut logits = match forward_pass(&view, &cfg, &mut cache, &[next]) {
+                Some(v) => v,
+                None => break,
+            };
+
+            // Apply repetition penalty across both prompt and
+            // generated tokens. Without it Qwen3-0.6B re-picks `\n`
+            // ~99 % of the time and the sampler can never escape.
+            sampling::apply_repetition_penalty(
+                &mut logits, &prompt_ids, REPETITION_PENALTY,
+            );
+            sampling::apply_repetition_penalty(
+                &mut logits, &sampled, REPETITION_PENALTY,
+            );
+
+            // Diagnostic: dump top-5 (logit, token_id) for the first
+            // two decode steps so we can see the distribution shape.
+            if step < 2 {
+                let dbg = sampling::top_k(&logits, 5);
+                crate::println!(
+                    "[INFERENCE] D.3.7 dbg: step={} top5_logits={:?}",
+                    step, dbg
+                );
+            }
+            sampling::sample(&logits, TOP_K, TEMPERATURE, &mut prng)
+            // `logits` and any temporaries from sampling drop here.
         };
 
-        // Apply repetition penalty across both prompt and generated
-        // tokens. Without it Qwen3-0.6B re-picks `\n` ~99 % of the
-        // time at this depth and the sampler can never escape.
-        sampling::apply_repetition_penalty(
-            &mut logits, &prompt_ids, REPETITION_PENALTY,
-        );
-        sampling::apply_repetition_penalty(
-            &mut logits, &sampled, REPETITION_PENALTY,
-        );
+        // Reclaim the entire forward_pass + sampler scratch in one
+        // O(1) bump-rewind. KvCache lives below `arena_base` and is
+        // untouched. `next_token` is a primitive — survives the
+        // reset cleanly.
+        // SAFETY: every Vec/Box/String allocated since arena_base in
+        // this iteration has dropped at the `}` above. The only thing
+        // crossing the reset boundary is `next_token: u32`.
+        unsafe { ALLOCATOR.reset_to(arena_base); }
 
-        // Diagnostic: dump top-5 (logit, token_id) for the first
-        // two decode steps so we can see the distribution shape.
-        if step < 2 {
-            let dbg = sampling::top_k(&logits, 5);
-            crate::println!(
-                "[INFERENCE] D.3.7 dbg: step={} top5_logits={:?}",
-                step, dbg
-            );
-        }
-        next = sampling::sample(&logits, TOP_K, TEMPERATURE, &mut prng);
+        next = next_token;
         sampled.push(next);
     }
+
+    // Heap diagnostic at end-of-decode. Should be roughly identical
+    // to `arena_base` from before prefill — proof that the arena
+    // reset is reclaiming all per-step scratch.
+    println!(
+        "[INFERENCE] D.3.7: arena tip after decode = {} MiB (was {} MiB pre-prefill)",
+        ALLOCATOR.checkpoint() / (1024 * 1024),
+        arena_base / (1024 * 1024),
+    );
 
     let response = tok.decode_seq(&sampled);
     println!(
