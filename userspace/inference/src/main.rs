@@ -1486,6 +1486,13 @@ fn run_d37_first_blood() -> bool {
         seed[0], seed[1], seed[2], seed[3],
     );
     const TOP_K: usize = 40;
+    // Top-P (nucleus): keep the smallest set of tokens whose
+    // cumulative probability ≥ TOP_P. 0.92 is the HF / OpenAI
+    // default — narrow enough to keep gibberish out, wide enough
+    // to let creative continuations through. Composed with TOP_K
+    // = 40 as upper bound: nucleus is min(40, smallest set with
+    // ≥ 92 % mass).
+    const TOP_P: f32 = 0.92;
     // T > 1 flattens the softmax; the previous T=0.7 + T=1.2 runs
     // landed on ~99% mass on `\n` (token 198) every step, so the
     // sampler degenerated to greedy. T=1.0 is HF's default and
@@ -1530,7 +1537,7 @@ fn run_d37_first_blood() -> bool {
                     step, dbg
                 );
             }
-            sampling::sample(&logits, TOP_K, TEMPERATURE, &mut prng)
+            sampling::sample(&logits, TOP_K, TOP_P, TEMPERATURE, &mut prng)
             // `logits` and any temporaries from sampling drop here.
         };
 

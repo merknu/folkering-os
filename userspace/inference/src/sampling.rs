@@ -192,16 +192,30 @@ pub fn apply_repetition_penalty(
     }
 }
 
-/// Sample one token from `logits` using top-K + temperature + softmax.
+/// Sample one token from `logits` using top-K + top-P + temperature + softmax.
 ///
-/// - `k = 0` or `temperature ≤ 0` falls back to argmax (deterministic).
-/// - Temperature divides logits before softmax: lower T = sharper
-///   distribution, higher T = flatter.
+/// HF-transformers semantics: top-K truncates the tail to a fixed K
+/// (cheap O(N log K) partial sort), THEN top-P walks the K candidates
+/// in descending probability order and stops once cumulative mass
+/// reaches `top_p`. The final nucleus is the intersection of the two
+/// — at most K candidates, never less than 1, and exactly enough to
+/// cover `top_p` of the post-temperature softmax mass.
+///
+/// - `k = 0` or `temperature ≤ 0` → argmax (deterministic).
+/// - `top_p ≥ 1.0` → pure top-K (no nucleus truncation).
+/// - `top_p ≤ 0.0` → top-1 (treat as nucleus of size 1).
+///
+/// Why both: top-K alone keeps the long tail out, but on a sharply-
+/// peaked distribution it still hands the sampler 40 mostly-impossible
+/// tokens. Top-P alone adapts to the distribution shape but on a flat
+/// distribution can let in the entire vocabulary. Composed, they
+/// give "narrow when the model is sure, wide when it isn't" behaviour.
 ///
 /// Returns the chosen token id.
 pub fn sample(
     logits: &[f32],
     k: usize,
+    top_p: f32,
     temperature: f32,
     prng: &mut Xoshiro256pp,
 ) -> u32 {
@@ -243,17 +257,52 @@ pub fn sample(
     }
     let inv_sum = 1.0 / sum;
 
-    // Inverse-CDF roll: pick first index where cumsum ≥ r.
+    // Top-P (nucleus): walk the K candidates in descending order,
+    // accumulate mass, stop when we cross `top_p`. The tail beyond
+    // that point is dropped before we roll. If `top_p ≥ 1.0` this
+    // collapses to plain top-K (we keep all `candidates.len()`).
+    let nucleus_size: usize = if top_p >= 1.0 {
+        candidates.len()
+    } else if top_p <= 0.0 {
+        1
+    } else {
+        let mut cum = 0.0f32;
+        let mut n = 0usize;
+        for &p in &probs {
+            cum += p * inv_sum;
+            n += 1;
+            if cum >= top_p { break; }
+        }
+        n.max(1)
+    };
+
+    // Renormalise mass over the nucleus only. Without this, dropping
+    // the tail leaves the inverse-CDF roll with `r ∈ [0, 1)` walking
+    // a CDF that only reaches `top_p < 1.0` — anything past `top_p`
+    // would silently fall through to the fallback return at the end
+    // (always picking the smallest nucleus token), which exactly
+    // inverts the desired behaviour. Sum the kept mass and roll
+    // against the renormalised CDF instead.
+    let mut nucleus_sum = 0.0f32;
+    for &p in &probs[..nucleus_size] {
+        nucleus_sum += p;
+    }
+    if nucleus_sum <= 0.0 || !nucleus_sum.is_finite() {
+        return candidates[0].1;
+    }
+    let inv_nucleus_sum = 1.0 / nucleus_sum;
+
+    // Inverse-CDF roll on the nucleus: pick first index where cumsum ≥ r.
     let r = prng.next_f32();
     let mut cum = 0.0f32;
-    for (i, &p) in probs.iter().enumerate() {
-        cum += p * inv_sum;
+    for i in 0..nucleus_size {
+        cum += probs[i] * inv_nucleus_sum;
         if r < cum {
             return candidates[i].1;
         }
     }
     // Numerical edge: r rounded just past 1.0 worth of cumsum.
-    candidates[candidates.len() - 1].1
+    candidates[nucleus_size - 1].1
 }
 
 /// no_std-safe `exp(x)` approximation. Uses the standard 7-term
@@ -327,7 +376,7 @@ mod tests {
         let logits = [1.0, 5.0, 2.0, 8.0, 3.0];
         let mut r = Xoshiro256pp::from_seed_u64(0xdead);
         // Temperature 0 → argmax.
-        assert_eq!(sample(&logits, 5, 0.0, &mut r), 3);
+        assert_eq!(sample(&logits, 5, 1.0, 0.0, &mut r), 3);
     }
 
     #[test]
