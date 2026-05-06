@@ -1564,12 +1564,20 @@ fn run_d37_first_blood() -> bool {
         let t_end = unsafe { core::arch::x86_64::_rdtsc() };
         let cycles = t_end.wrapping_sub(t_start);
         let ms = cycles / (tsc_freq_hz / 1000);
-        if step < 4 || step % 8 == 0 {
-            println!(
-                "[INFERENCE] D.3.7 token: step={} took ~{} ms (next_id={})",
-                step, ms, next_token,
-            );
-        }
+
+        // Streaming output: decode the just-sampled token and emit it
+        // to serial in real time. Wrapping the fragment in [STREAM]
+        // markers keeps the per-token diagnostic separable from the
+        // free-form text in the log. `decode_seq(&[t])` reverses the
+        // tokenizer's GPT-2 byte mapping, so the user sees the same
+        // characters they'd get in HF. Multi-byte UTF-8 fragments
+        // (CJK / emoji) come out as the actual bytes — serial-tail
+        // tools (or `tee` to a file) can render them.
+        let fragment = tok.decode_seq(&[next_token]);
+        println!(
+            "[STREAM] step={:03} ~{}ms id={:06} {:?}",
+            step, ms, next_token, fragment,
+        );
 
         next = next_token;
         sampled.push(next);
