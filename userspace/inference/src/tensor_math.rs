@@ -127,7 +127,18 @@ impl<'a> WeightView<'a> {
         seq: usize,
     ) -> Option<Vec<f32>> {
         match self {
-            Self::F32(w) => matmul_batch_f32(w, in_dim, out_dim, x, seq),
+            Self::F32(w) => {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    if has_avx2_fma() {
+                        // SAFETY: CPUID verified AVX2+FMA at runtime.
+                        return unsafe {
+                            matmul_batch_f32_avx2(w, in_dim, out_dim, x, seq)
+                        };
+                    }
+                }
+                matmul_batch_f32(w, in_dim, out_dim, x, seq)
+            }
             Self::Q8(blocks) => {
                 #[cfg(target_arch = "x86_64")]
                 {
@@ -186,6 +197,72 @@ pub fn matmul_batch_f32(
                 k += 1;
             }
             out[s * out_dim + j] = acc;
+        }
+        since_yield += in_dim * seq;
+        if since_yield >= MATMUL_YIELD_EVERY {
+            since_yield = 0;
+            libfolk::sys::yield_cpu();
+        }
+    }
+    Some(out)
+}
+
+/// AVX2 + FMA fp32 batched matmul. Mirror of `matmul_batch_f32` with
+/// the inner-k scalar 4-way ILP unroll replaced by 8-lane FMA
+/// (`_mm256_fmadd_ps`). No dequant step (unlike the Q8 variant), so
+/// the inner loop is just load-load-FMA at memory-bandwidth speed.
+///
+/// Tail handling: if `in_dim` isn't divisible by 8, the residual 0–7
+/// elements run through a scalar fallback. Real Qwen / Llama dims
+/// are 8-aligned (1024, 3072, 8192 etc.) so the tail almost never
+/// fires, but the guard keeps the function honest for arbitrary
+/// inputs (D.3.5 self-test fixtures and ad-hoc tensors).
+///
+/// SAFETY: caller must verify CPUID for AVX2 + FMA before calling.
+/// `WeightView::matmul` enforces this via `has_avx2_fma()`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn matmul_batch_f32_avx2(
+    weights: &[f32],
+    in_dim: usize,
+    out_dim: usize,
+    x: &[f32],
+    seq: usize,
+) -> Option<Vec<f32>> {
+    use core::arch::x86_64::*;
+    if x.len() != seq * in_dim { return None; }
+    if weights.len() != in_dim * out_dim { return None; }
+
+    let mut out = vec![0.0f32; seq * out_dim];
+    let mut since_yield: usize = 0;
+    let chunks_8 = in_dim / 8;
+    let tail_start = chunks_8 * 8;
+
+    for j in 0..out_dim {
+        let row_ptr = weights.as_ptr().add(j * in_dim);
+        for s in 0..seq {
+            let xs_ptr = x.as_ptr().add(s * in_dim);
+            let mut acc = _mm256_setzero_ps();
+            // 8-wide FMA stream over the aligned bulk of the row.
+            for c in 0..chunks_8 {
+                let row_v = _mm256_loadu_ps(row_ptr.add(c * 8));
+                let xs_v  = _mm256_loadu_ps(xs_ptr.add(c * 8));
+                acc = _mm256_fmadd_ps(row_v, xs_v, acc);
+            }
+            // Horizontal reduce the 8 lanes to a scalar.
+            let lo = _mm256_castps256_ps128(acc);
+            let hi = _mm256_extractf128_ps(acc, 1);
+            let s4 = _mm_add_ps(lo, hi);
+            let s4_hi = _mm_movehdup_ps(s4);
+            let s2 = _mm_add_ps(s4, s4_hi);
+            let s2_hi = _mm_movehl_ps(s4_hi, s2);
+            let s1 = _mm_add_ss(s2, s2_hi);
+            let mut sum = _mm_cvtss_f32(s1);
+            // Scalar tail for in_dim % 8 != 0 (rare on real models).
+            for k in tail_start..in_dim {
+                sum += *row_ptr.add(k) * *xs_ptr.add(k);
+            }
+            *out.get_unchecked_mut(s * out_dim + j) = sum;
         }
         since_yield += in_dim * seq;
         if since_yield >= MATMUL_YIELD_EVERY {
