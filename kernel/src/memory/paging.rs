@@ -10,7 +10,7 @@ use core::arch::asm;
 use spin::Mutex;
 use x86_64::structures::paging::{
     FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame,
-    Size4KiB,
+    Size2MiB, Size4KiB,
 };
 use x86_64::{PhysAddr, VirtAddr};
 
@@ -441,6 +441,88 @@ pub fn map_page_in_table(
     }
 
     Ok(())
+}
+
+/// Map a single 2 MiB huge page into a task's page table.
+///
+/// The mapping installs a PD entry with the PS (page size) bit set, so
+/// the MMU short-circuits the PT walk for any virt within this 2 MiB
+/// region — one TLB entry covers 512× more memory than a 4 KiB page.
+/// The dramatic case is the 604 MiB shmem-backed Qwen3 weight stream,
+/// which falls from 154,729 4 KiB PTEs (way over dTLB capacity) to
+/// just 302 PD entries (fits comfortably in the dTLB).
+///
+/// Both `virt_addr` and `phys_addr` MUST be 2 MiB-aligned. Caller is
+/// responsible for ensuring the physical region is contiguous (the PMM
+/// returns 2 MiB-contiguous blocks via `alloc_pages(9)`). Intermediate
+/// page tables (PDPT, PD) are still 4 KiB; only the final PD entry is
+/// huge.
+pub fn map_huge_page_in_table(
+    pml4_phys: u64,
+    virt_addr: usize,
+    phys_addr: usize,
+    flags: PageTableFlags,
+) -> Result<(), MapError> {
+    const HUGE_2M: usize = 2 * 1024 * 1024;
+    if virt_addr & (HUGE_2M - 1) != 0 || phys_addr & (HUGE_2M - 1) != 0 {
+        return Err(MapError::MapFailed);
+    }
+
+    let pml4_virt = crate::phys_to_virt(pml4_phys as usize);
+    let hhdm = crate::HHDM_OFFSET.load(core::sync::atomic::Ordering::Relaxed);
+    let phys_mem_offset = VirtAddr::new(hhdm as u64);
+
+    let pml4 = unsafe { &mut *(pml4_virt as *mut PageTable) };
+    let mut mapper = unsafe { OffsetPageTable::new(pml4, phys_mem_offset) };
+
+    let page = Page::<Size2MiB>::containing_address(VirtAddr::new(virt_addr as u64));
+    let frame = PhysFrame::<Size2MiB>::containing_address(PhysAddr::new(phys_addr as u64));
+
+    // The 2 MiB mapper still asks the frame allocator for *intermediate*
+    // tables (PDPT, PD) — those stay 4 KiB. The final PD entry
+    // is the 2 MiB one with the PS bit set; that's installed without
+    // a frame allocation.
+    let mut frame_allocator = BootFrameAllocator;
+
+    unsafe {
+        <OffsetPageTable as Mapper<Size2MiB>>::map_to(
+            &mut mapper, page, frame, flags, &mut frame_allocator,
+        )
+        .map_err(|_| MapError::MapFailed)?
+        .flush();
+    }
+
+    Ok(())
+}
+
+/// Tear down a 2 MiB huge mapping installed by `map_huge_page_in_table`.
+/// Returns the physical base of the freed huge frame (matches the
+/// `Result<usize, MapError>` shape used by `unmap_page_in_table`, so
+/// shmem teardown can branch on huge vs 4 KiB without rewriting the
+/// signatures).
+pub fn unmap_huge_page_in_table(
+    pml4_phys: u64,
+    virt_addr: usize,
+) -> Result<usize, MapError> {
+    const HUGE_2M: usize = 2 * 1024 * 1024;
+    if virt_addr & (HUGE_2M - 1) != 0 {
+        return Err(MapError::UnmapFailed);
+    }
+
+    let pml4_virt = crate::phys_to_virt(pml4_phys as usize);
+    let hhdm = crate::HHDM_OFFSET.load(core::sync::atomic::Ordering::Relaxed);
+    let phys_mem_offset = VirtAddr::new(hhdm as u64);
+
+    let pml4 = unsafe { &mut *(pml4_virt as *mut PageTable) };
+    let mut mapper = unsafe { OffsetPageTable::new(pml4, phys_mem_offset) };
+
+    let page = Page::<Size2MiB>::containing_address(VirtAddr::new(virt_addr as u64));
+
+    let (frame, flush) = <OffsetPageTable as Mapper<Size2MiB>>::unmap(&mut mapper, page)
+        .map_err(|_| MapError::UnmapFailed)?;
+    flush.flush();
+
+    Ok(frame.start_address().as_u64() as usize)
 }
 
 /// Change protection flags for a page in a specific task's page table.

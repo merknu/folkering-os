@@ -632,7 +632,7 @@ pub fn filename_hash() -> Option<u32> {
 /// the lifetime of the process and the kernel's task teardown
 /// reclaims it.
 pub fn read_into_shmem(name_hash: u32) -> Result<(u32, u64), ModelDiskError> {
-    use crate::ipc::shared_memory::{shmem_create, ShmemPerms, SHMEM_TABLE};
+    use crate::ipc::shared_memory::{shmem_create_huge, ShmemPerms, SHMEM_TABLE};
 
     let header = *MODEL_DISK_HEADER.lock();
     let header = header.ok_or(ModelDiskError::NotInitialized)?;
@@ -648,58 +648,69 @@ pub fn read_into_shmem(name_hash: u32) -> Result<(u32, u64), ModelDiskError> {
     let data_len = header.data_len as usize;
     let payload_start_sector = header.data_offset / SECTOR_SIZE as u64;
 
-    let shmem_id = shmem_create(data_len, ShmemPerms::ReadWrite)
+    // The 604 MiB weight stream wants 2 MiB huge pages so userspace's
+    // tight matmul loop streams through the dTLB without thrashing.
+    // Falls back to 4 KiB internally if the buddy + bootstrap arena
+    // can't satisfy a 2 MiB allocation, so the inference path still
+    // boots even on a fragmented PMM — just with more TLB pressure.
+    let shmem_id = shmem_create_huge(data_len, ShmemPerms::ReadWrite)
         .map_err(|_| ModelDiskError::IoError)?;
 
-    // Snapshot the shmem's physical page list. We don't hold the
-    // SHMEM_TABLE lock while reading from disk — that would pin a
-    // global mutex across ~5 s of polling I/O. Cloning the page
-    // list is cheap (one Vec<usize> of ~57k entries for 232 MiB).
-    let pages = {
+    // Snapshot the shmem's physical block list and the block order.
+    // We don't hold the SHMEM_TABLE lock while reading from disk —
+    // that would pin a global mutex across ~5 s of polling I/O.
+    // Cloning the block list is cheap (302 entries for 604 MiB at
+    // 2 MiB blocks; or 154,729 at 4 KiB).
+    let (blocks, block_order) = {
         let table = SHMEM_TABLE.lock();
         let shmem = match table.get(&shmem_id.get()) {
             Some(s) => s,
             None => return Err(ModelDiskError::IoError),
         };
-        shmem.phys_pages.clone()
+        (shmem.phys_pages.clone(), shmem.block_order)
     };
+    let block_size = 4096usize << block_order; // 4 KiB or 2 MiB
+    let pages_per_block = block_size / 4096; // 1 or 512
 
     crate::serial_str!("[MODEL_DISK] streaming ");
     crate::drivers::serial::write_dec((data_len / (1024 * 1024)) as u32);
     crate::serial_str!(" MiB into shmem ");
     crate::drivers::serial::write_dec(shmem_id.get());
     crate::serial_str!(" (");
-    crate::drivers::serial::write_dec(pages.len() as u32);
-    crate::serial_strln!(" pages)...");
+    crate::drivers::serial::write_dec(blocks.len() as u32);
+    if block_order != 0 {
+        crate::serial_str!(" × 2 MiB blocks)...\n");
+    } else {
+        crate::serial_str!(" × 4 KiB pages)...\n");
+    }
 
-    // Walk the shmem's pages, DMA-streaming each one (up to 4 KiB =
-    // 8 sectors) directly into its physical address. Zero-copy: the
-    // device writes straight into the shmem page, no req_buf hop.
-    // 8× fewer VirtIO requests than the old per-sector loop.
-    for (page_idx, &phys) in pages.iter().enumerate() {
-        let page_off = page_idx * 4096;
-        let bytes_left = data_len.saturating_sub(page_off);
-        if bytes_left == 0 { break; }
-        let bytes_this_page = bytes_left.min(4096);
-        // Round up to sector boundary; trailing bytes past
-        // `bytes_this_page` get whatever the disk has there
-        // (sector-padded zeros from build_model_disk.py).
-        let sectors_this_page = (bytes_this_page + SECTOR_SIZE - 1) / SECTOR_SIZE;
-        let sector = payload_start_sector + (page_idx * 8) as u64;
-        // SAFETY: `phys` is owned by this shmem region (we just
-        // allocated it via `shmem_create` and snapshotted the page
-        // list); the kernel hasn't handed it to anyone else yet.
-        // sectors_this_page * 512 ≤ 4096, so the DMA stays inside
-        // the page.
-        read_sectors_to_phys(sector, sectors_this_page, phys)?;
-        // Progress log every 1024 pages — turns the otherwise-silent
-        // ~few-second stream into something the operator can watch.
-        if page_idx % 1024 == 0 && page_idx != 0 {
-            crate::serial_str!("[MODEL_DISK]   ");
-            crate::drivers::serial::write_dec(page_idx as u32);
-            crate::serial_str!(" / ");
-            crate::drivers::serial::write_dec(pages.len() as u32);
-            crate::serial_strln!(" pages streamed");
+    // Walk the shmem's blocks. For huge-page (2 MiB) blocks we still
+    // DMA in 4 KiB chunks because the VirtIO ring buffer can hold
+    // descriptors for at most a handful of MiB per request, and
+    // because the polling-mode driver handshake is per-request — but
+    // the destination physical addresses inside each huge block are
+    // contiguous, so we just step by 4 KiB through each block.
+    let mut total_pages = 0usize;
+    let total_pages_max = blocks.len() * pages_per_block;
+    'outer: for &block_phys in blocks.iter() {
+        for page_in_block in 0..pages_per_block {
+            let page_off = total_pages * 4096;
+            let bytes_left = data_len.saturating_sub(page_off);
+            if bytes_left == 0 { break 'outer; }
+            let bytes_this_page = bytes_left.min(4096);
+            let sectors_this_page = (bytes_this_page + SECTOR_SIZE - 1) / SECTOR_SIZE;
+            let sector = payload_start_sector + (total_pages * 8) as u64;
+            let phys = block_phys + page_in_block * 4096;
+            // SAFETY: `phys` lies inside a contiguous block we own.
+            read_sectors_to_phys(sector, sectors_this_page, phys)?;
+            total_pages += 1;
+            if total_pages % 4096 == 0 {
+                crate::serial_str!("[MODEL_DISK]   ");
+                crate::drivers::serial::write_dec(total_pages as u32);
+                crate::serial_str!(" / ");
+                crate::drivers::serial::write_dec(total_pages_max as u32);
+                crate::serial_strln!(" pages streamed");
+            }
         }
     }
 
