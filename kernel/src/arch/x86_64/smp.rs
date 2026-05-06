@@ -28,6 +28,9 @@ pub struct GemmWork {
     pub output_ptr: u64,
     pub k: u32,
     pub n: u32,
+    /// Batch dimension. Input shape `[seq, k]`, output `[seq, n]`.
+    /// seq=1 = decode, seq=14 = ChatML prefill.
+    pub seq: u32,
     pub col_start: u32,
     pub col_end: u32,
     pub quant_type: u8,
@@ -201,6 +204,7 @@ pub fn dispatch_parallel_gemm(
     output_ptr: u64,
     k: u32,
     n: u32,
+    seq: u32,
     quant_type: u8,
     task_cr3: u64,
 ) -> i64 {
@@ -234,7 +238,7 @@ pub fn dispatch_parallel_gemm(
                 input_ptr,    // userspace virt — AP swaps CR3
                 weight_ptr,
                 output_ptr,
-                k, n,
+                k, n, seq,
                 col_start: col as u32,
                 col_end: (col + my_cols) as u32,
                 quant_type,
@@ -252,7 +256,7 @@ pub fn dispatch_parallel_gemm(
     // pointers resolve through the MMU per-page just like the APs.
     let bsp_work = GemmWork {
         input_ptr, weight_ptr, output_ptr,
-        k, n,
+        k, n, seq,
         col_start: bsp_col_start as u32,
         col_end: (bsp_col_start + bsp_cols) as u32,
         quant_type,
@@ -385,33 +389,50 @@ unsafe fn execute_gemm_work(work: &GemmWork) {
     }
 }
 
-/// Q8_0 GEMM column-strip executor for one AP. Mirror of the
-/// userspace `matmul_batch_q8_avx2` for the seq=1 case: caller
-/// provides one input vector of length `k` (in_dim) and a Q8_0-
-/// quantised weight matrix of shape `[n × k]` with `n` being
-/// out_dim. We compute `c[col] = sum_i (input[i] * dequant(B[col, i]))`
-/// for each `col` in our assigned `[col_start, col_end)` strip.
+/// Q8_0 batched GEMM column-strip executor for one AP. Caller
+/// provides:
+///   - input  shape `[seq, k]`   row-major f32
+///   - weights shape `[n, k]`    row-major Q8_0 (34 B per 32-elem block)
+///   - output shape `[seq, n]`   row-major f32
+/// We compute `c[s, col] = sum_i (a[s, i] * dequant(B[col, i]))` for
+/// each `col` in `[col_start, col_end)` and each `s` in `[0, seq)`.
 ///
-/// Layout matches the `.fbin`'s row-major Q8 layout: each output
-/// row (one output element here) is `n_blocks * Q8_0_BLOCK_SIZE`
-/// bytes, with `n_blocks = k / 32`.
+/// Per-block dequant is reused across all `seq` rows: the weight
+/// row's bytes are loaded + sign-extended + scaled ONCE per (col,
+/// block), then 4 FMAs are issued per `s` within that block. This
+/// amortises ~the entire dequant cost across the batch — the
+/// motivating case is prefill at seq = 14 where naive per-row
+/// dispatch did 14× redundant dequant work.
+///
+/// Per-s accumulators live on the stack (a fixed-size array of
+/// `__m256` vectors). MAX_SEQ = 64 is comfortably larger than
+/// the ChatML prefill (seq = 14) and uses 64 × 32 = 2 KiB of
+/// stack per executor — well within budget.
+const MAX_SEQ: usize = 64;
+
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn execute_gemm_work_q8_avx2(work: &GemmWork) {
     use core::arch::x86_64::*;
     let k = work.k as usize;
     let n = work.n as usize;
+    let seq = (work.seq as usize).max(1).min(MAX_SEQ);
     let col_start = work.col_start as usize;
     let col_end = work.col_end as usize;
     let n_blocks = k / Q8_0_BLOCK_VALUES;
     let row_bytes = n_blocks * Q8_0_BLOCK_SIZE;
 
-    let a_f32 = core::slice::from_raw_parts(work.input_ptr as *const f32, k);
+    let a_f32 = core::slice::from_raw_parts(work.input_ptr as *const f32, seq * k);
     let b_q8 = core::slice::from_raw_parts(work.weight_ptr as *const u8, n * row_bytes);
-    let c = core::slice::from_raw_parts_mut(work.output_ptr as *mut f32, n);
+    let c = core::slice::from_raw_parts_mut(work.output_ptr as *mut f32, seq * n);
+
+    // Per-s accumulators. Reset to zero at the top of each col.
+    let mut acc: [__m256; MAX_SEQ] = [_mm256_setzero_ps(); MAX_SEQ];
 
     for col in col_start..col_end {
         let row_off = col * row_bytes;
-        let mut acc = _mm256_setzero_ps();
+        for s in 0..seq {
+            acc[s] = _mm256_setzero_ps();
+        }
 
         for b in 0..n_blocks {
             let block_off = row_off + b * Q8_0_BLOCK_SIZE;
@@ -423,9 +444,9 @@ unsafe fn execute_gemm_work_q8_avx2(work: &GemmWork) {
             let scale = f16_to_f32(scale_bits);
             let scale_v = _mm256_set1_ps(scale);
 
-            // Dequant 32 i8s → 4 × __m256. _mm256_cvtepi8_epi32
-            // sign-extends low 8 bytes of __m128i; we slide the
-            // window with srli_si128 to cover all 32 bytes.
+            // Dequant 32 i8s → 4 × __m256, ONCE per (col, block).
+            // _mm256_cvtepi8_epi32 sign-extends low 8 bytes of an
+            // __m128i; we slide with srli_si128 to cover 32 bytes.
             let q_ptr = b_q8.as_ptr().add(block_off + 2) as *const __m128i;
             let raw_lo = _mm_loadu_si128(q_ptr);
             let raw_hi = _mm_loadu_si128(q_ptr.add(1));
@@ -434,28 +455,36 @@ unsafe fn execute_gemm_work_q8_avx2(work: &GemmWork) {
             let deq2 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(raw_hi)), scale_v);
             let deq3 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(raw_hi, 8))), scale_v);
 
+            // FMA the dequantised block into each row's accumulator.
+            // Reused dequant means the per-(col, block) cost is paid
+            // once across all `seq` rows — that's the whole point of
+            // the batched API.
             let a_base = b * Q8_0_BLOCK_VALUES;
-            let xs_ptr = a_f32.as_ptr().add(a_base);
-            let xs0 = _mm256_loadu_ps(xs_ptr);
-            let xs1 = _mm256_loadu_ps(xs_ptr.add(8));
-            let xs2 = _mm256_loadu_ps(xs_ptr.add(16));
-            let xs3 = _mm256_loadu_ps(xs_ptr.add(24));
-
-            acc = _mm256_fmadd_ps(deq0, xs0, acc);
-            acc = _mm256_fmadd_ps(deq1, xs1, acc);
-            acc = _mm256_fmadd_ps(deq2, xs2, acc);
-            acc = _mm256_fmadd_ps(deq3, xs3, acc);
+            for s in 0..seq {
+                let xs_ptr = a_f32.as_ptr().add(s * k + a_base);
+                let xs0 = _mm256_loadu_ps(xs_ptr);
+                let xs1 = _mm256_loadu_ps(xs_ptr.add(8));
+                let xs2 = _mm256_loadu_ps(xs_ptr.add(16));
+                let xs3 = _mm256_loadu_ps(xs_ptr.add(24));
+                acc[s] = _mm256_fmadd_ps(deq0, xs0, acc[s]);
+                acc[s] = _mm256_fmadd_ps(deq1, xs1, acc[s]);
+                acc[s] = _mm256_fmadd_ps(deq2, xs2, acc[s]);
+                acc[s] = _mm256_fmadd_ps(deq3, xs3, acc[s]);
+            }
         }
 
-        // Horizontal reduce 8 lanes to scalar.
-        let lo = _mm256_castps256_ps128(acc);
-        let hi = _mm256_extractf128_ps(acc, 1);
-        let s4 = _mm_add_ps(lo, hi);
-        let s4_hi = _mm_movehdup_ps(s4);
-        let s2 = _mm_add_ps(s4, s4_hi);
-        let s2_hi = _mm_movehl_ps(s4_hi, s2);
-        let s1 = _mm_add_ss(s2, s2_hi);
-        c[col] = _mm_cvtss_f32(s1);
+        // Horizontal reduce each row's accumulator and write to c.
+        for s in 0..seq {
+            let v = acc[s];
+            let lo = _mm256_castps256_ps128(v);
+            let hi = _mm256_extractf128_ps(v, 1);
+            let s4 = _mm_add_ps(lo, hi);
+            let s4_hi = _mm_movehdup_ps(s4);
+            let s2 = _mm_add_ps(s4, s4_hi);
+            let s2_hi = _mm_movehl_ps(s4_hi, s2);
+            let s1 = _mm_add_ss(s2, s2_hi);
+            c[s * n + col] = _mm_cvtss_f32(s1);
+        }
     }
 }
 

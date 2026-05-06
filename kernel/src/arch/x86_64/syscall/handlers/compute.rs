@@ -4,14 +4,17 @@ pub fn syscall_parallel_gemm(
     input_ptr: u64,
     weight_ptr: u64,
     output_ptr: u64,
-    k: u64,
+    k_seq: u64,
     n_qt: u64,
 ) -> u64 {
-    // Userspace packs `quant_type` into the top byte of `n` because the
-    // syscall entry shuffle drops C-ABI arg6 (mov r9, r8 overwrites it
-    // before r9 can be preserved). Lower 32 bits of n_qt = n; bits 56..64
-    // = quant_type. See `libfolk::sys::parallel_gemm` doc.
-    let n = (n_qt & 0xFFFF_FFFF) as u64;
+    // Packed ABI (see `libfolk::sys::parallel_gemm`):
+    //   k_seq lower 32 = k (in_dim), upper 32 = seq (batch size)
+    //   n_qt  lower 32 = n (out_dim), top byte = quant_type
+    // The syscall entry shuffle drops C-ABI arg6, so we live within
+    // 5 args and pack two pairs of fields.
+    let k = (k_seq & 0xFFFF_FFFF) as u32;
+    let seq = ((k_seq >> 32) & 0xFFFF_FFFF) as u32;
+    let n = (n_qt & 0xFFFF_FFFF) as u32;
     let quant_type = ((n_qt >> 56) & 0xFF) as u8;
 
     let task_id = crate::task::task::get_current_task();
@@ -24,9 +27,10 @@ pub fn syscall_parallel_gemm(
         input_ptr,
         weight_ptr,
         output_ptr,
-        k as u32,
-        n as u32,
-        quant_type as u8,
+        k,
+        n,
+        seq,
+        quant_type,
         cr3,
     );
 
