@@ -34,6 +34,13 @@ pub struct GemmWork {
     pub col_start: u32,
     pub col_end: u32,
     pub quant_type: u8,
+    /// 1 = activation row was pre-quantized into GLOBAL_QUANT_INPUT by
+    /// BSP before dispatch (Q8 maddubs fast path, the common case).
+    /// 0 = `input_ptr` is f32 and the worker must dequant the weights
+    /// to f32 inline (Q8 dequant fallback, taken only when seq*k
+    /// exceeds the 64 KiB pre-quant scratch). Ignored for non-Q8
+    /// quant_types.
+    pub pre_quantized: u8,
     /// Page table to load before executing this work. APs swap CR3
     /// to this so the userspace virtual addresses in the three ptr
     /// fields above resolve identically to how the BSP sees them —
@@ -196,7 +203,7 @@ fn ap_worker_loop(cpu_index: usize) -> ! {
                 core::arch::asm!("mov cr3, {}", in(reg) target_cr3);
                 current_cr3 = target_cr3;
             }
-            execute_gemm_work(work, cpu_index);
+            execute_gemm_work(work);
             // Stay in target_cr3 for the next job — same task means
             // same CR3 means warm TLB. If a different task ever
             // dispatches to this AP we'll swap on the next iteration.
@@ -234,6 +241,27 @@ pub fn dispatch_parallel_gemm(
     let cols_per_worker = n_usize / total_workers;
     let remainder = n_usize % total_workers;
 
+    // BSP-side input quantization: walk the f32 activation row(s) once
+    // here, fill GLOBAL_QUANT_INPUT, and signal workers via the
+    // pre_quantized flag. All Q8 workers (BSP + APs) then read i8 lanes
+    // from the shared buffer — no per-AP redundant quantization. APs
+    // are still racing on weight loads + maddubs ALU, which is the
+    // actual hot path.
+    //
+    // Falls back to dequant when seq*k > 64 KiB (unreachable on
+    // Qwen3-0.6B today; worst case seq=14 × k=2816 ≈ 39 KiB).
+    let pre_quantized: u8 = if quant_type == 0 {
+        let seq_usize = (seq as usize).max(1);
+        let k_usize = k as usize;
+        if unsafe { quantize_input_global(input_ptr, seq_usize, k_usize) } {
+            1
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+
     let mut col = 0usize;
     let bsp_cols = cols_per_worker + if 0 < remainder { 1 } else { 0 };
     let bsp_col_start = col;
@@ -253,6 +281,7 @@ pub fn dispatch_parallel_gemm(
                 col_start: col as u32,
                 col_end: (col + my_cols) as u32,
                 quant_type,
+                pre_quantized,
                 task_cr3,
             };
         }
@@ -271,12 +300,11 @@ pub fn dispatch_parallel_gemm(
         col_start: bsp_col_start as u32,
         col_end: (bsp_col_start + bsp_cols) as u32,
         quant_type,
+        pre_quantized,
         task_cr3: 0, // BSP doesn't swap; it's already in task_cr3
     };
 
-    // BSP uses cpu_index 0 (which has no AP, so no contention) for its
-    // QUANT_BUFS slot.
-    unsafe { execute_gemm_work(&bsp_work, 0); }
+    unsafe { execute_gemm_work(&bsp_work); }
 
     // Wait for APs (with timeout). Quiet path; only TIMEOUT errors
     // print, since they signal a real bug. The per-step PGEMM noise
@@ -384,14 +412,25 @@ fn has_avx2() -> bool {
 const Q8_0_BLOCK_SIZE: usize = 34;
 const Q8_0_BLOCK_VALUES: usize = 32;
 
-unsafe fn execute_gemm_work(work: &GemmWork, cpu_index: usize) {
+unsafe fn execute_gemm_work(work: &GemmWork) {
     // quant_type: 0 = Q8_0, 1 = Q6_K. Q8_0 is the format the
     // inference task uses end-to-end (PRs #166/#168/#170); Q6_K is
     // legacy from libtensor / inference-server. AVX2 path required
     // for both — we already gate AVX2 enablement at boot (#165 +
     // smp.rs CR4 setup), so no fallback below.
     match work.quant_type {
-        0 => execute_gemm_work_q8_avx2(work, cpu_index),
+        0 => {
+            // Q8_0 path: when BSP pre-quantized the input row into
+            // GLOBAL_QUANT_INPUT (the common case), all workers run
+            // the int8 maddubs kernel reading from that shared buffer.
+            // Otherwise (seq*k overflow, very rare), fall back to the
+            // dequant-then-FMA kernel that reads the f32 input directly.
+            if work.pre_quantized != 0 {
+                execute_gemm_work_q8_maddubs(work);
+            } else {
+                execute_gemm_work_q8_avx2_dequant(work);
+            }
+        }
         _ => {
             if has_avx2() {
                 execute_gemm_work_avx2(work);
@@ -402,20 +441,61 @@ unsafe fn execute_gemm_work(work: &GemmWork, cpu_index: usize) {
     }
 }
 
-/// Per-CPU scratch for online f32→i8 input quantization. Q8 maddubs
-/// path needs both operands as i8 — weights already are, but the
-/// activation row is f32 (post-RMSNorm). We quantize per-row with a
-/// max-abs scale into this buffer, then the inner loop runs native
-/// int8 multiply-accumulate via `_mm256_maddubs_epi16`. 64 KiB per
-/// CPU is enough for seq=64 × k=1024 and the worst real case
-/// (seq=14 prefill × k=2816 mlp_down ≈ 39 KiB).
+/// Single shared scratch for BSP-hoisted f32 → i8 input quantization.
+/// PR #182 had each AP redundantly walking the activation row to quantize
+/// it locally — for a 4-AP dispatch over a single matmul that's 4×
+/// duplicated work on the same bytes. With the input row pre-quantized
+/// once on BSP into this buffer, APs just read i8 lanes via maddubs, no
+/// per-AP quantization in the hot path.
+///
+/// 64 KiB is enough for the worst real case on Qwen3-0.6B (seq=14
+/// prefill × k=2816 mlp_down ≈ 39 KiB). MAX_SEQ scales array (256 B)
+/// holds per-row max-abs scale factors.
+///
+/// Single-static is safe because `dispatch_parallel_gemm` synchronously
+/// waits for all APs before returning — there's never more than one
+/// parallel-Q8 matmul in flight on this kernel.
 const QUANT_BUF_BYTES: usize = 65536;
 #[repr(C, align(32))]
 struct QuantBuf {
     input: [i8; QUANT_BUF_BYTES],
     scales: [f32; MAX_SEQ],
 }
-static mut QUANT_BUFS: [QuantBuf; MAX_CPUS] = unsafe { core::mem::zeroed() };
+static mut GLOBAL_QUANT_INPUT: QuantBuf = unsafe { core::mem::zeroed() };
+
+/// BSP-side: pre-quantize the activation rows once into GLOBAL_QUANT_INPUT.
+/// Returns true if the input fit; false signals the caller to fall back
+/// to the dequant kernel (which reads the f32 input directly).
+///
+/// Must be called while in the inference task's CR3 — `input_ptr` is a
+/// userspace virtual address and resolves through the task page table.
+/// `dispatch_parallel_gemm` is invoked from inside the parallel-GEMM
+/// syscall, so BSP is already in the right page table.
+#[target_feature(enable = "avx2")]
+unsafe fn quantize_input_global(input_ptr: u64, seq: usize, k: usize) -> bool {
+    if seq * k > QUANT_BUF_BYTES {
+        return false;
+    }
+    let a_f32 = core::slice::from_raw_parts(input_ptr as *const f32, seq * k);
+    let buf = &mut *core::ptr::addr_of_mut!(GLOBAL_QUANT_INPUT);
+    for s in 0..seq {
+        let row = &a_f32[s * k..s * k + k];
+        let mut max_abs = 0.0f32;
+        for &v in row {
+            let av = if v < 0.0 { -v } else { v };
+            if av > max_abs { max_abs = av; }
+        }
+        let scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
+        let inv_scale = 1.0 / scale;
+        buf.scales[s] = scale;
+        let dst = &mut buf.input[s * k..s * k + k];
+        for i in 0..k {
+            let q = (row[i] * inv_scale) as i32;
+            dst[i] = if q > 127 { 127 } else if q < -127 { -127 } else { q as i8 };
+        }
+    }
+    true
+}
 
 /// Q8_0 batched GEMM column-strip executor for one AP. Caller
 /// provides:
@@ -438,24 +518,23 @@ static mut QUANT_BUFS: [QuantBuf; MAX_CPUS] = unsafe { core::mem::zeroed() };
 /// stack per executor — well within budget.
 const MAX_SEQ: usize = 64;
 
-/// Q8_0 batched GEMM via int8 multiply-accumulate (`_mm256_maddubs_epi16`).
+/// Q8_0 batched GEMM via int8 multiply-accumulate (`_mm256_maddubs_epi16`),
+/// reading the pre-quantized activation row from GLOBAL_QUANT_INPUT.
 ///
-/// Replaces the dequant-then-FMA path with native int8 MAC, after pre-
-/// quantizing the f32 activation row to i8 with a per-row max-abs scale.
-/// 32 i8 lanes per maddubs instruction vs 8 f32 lanes per FMA — and the
-/// 4× input-bandwidth saving (32 B i8 vs 128 B f32 per block) is just
-/// as important as the lane count on a TLB-warmed shmem-backed weight
-/// stream. Two-signed-i8 dot product uses the standard sign-fold trick:
-/// `|w|` as the unsigned operand, `x · sign(w)` as the signed operand.
+/// Two-signed-i8 dot product via the standard sign-fold trick:
+///   `|w|` as the unsigned operand, `x · sign(w)` as the signed operand,
+/// then `maddubs(|w|, x·sign(w)) = w·x` pairwise summed into i16 lanes.
 /// Q8_0 quantizer clamps weights to [-127, +127] (skipping -128) so the
 /// `sign_epi8(-128, -128)` overflow case never fires.
 ///
-/// Falls back to the dequant path when `seq * k` exceeds the per-CPU
-/// quant scratch (`QUANT_BUF_BYTES = 64 KiB`) — currently unreachable
-/// on Qwen3-0.6B (worst case is seq=14 × k=2816 ≈ 39 KiB), but defensive
-/// against future larger contexts.
+/// 32 i8 lanes per maddubs instruction vs 8 f32 lanes per FMA — and the
+/// 4× input-bandwidth saving (32 B i8 vs 128 B f32 per block) matters
+/// just as much as the lane count on a TLB-warmed shmem-backed weight
+/// stream. With BSP-side input quantization (this PR), the per-AP
+/// quantization redundancy from PR #182 is gone — APs walk only the
+/// weight stream and the shared int8 input.
 #[target_feature(enable = "avx2", enable = "fma")]
-unsafe fn execute_gemm_work_q8_avx2(work: &GemmWork, cpu_index: usize) {
+unsafe fn execute_gemm_work_q8_maddubs(work: &GemmWork) {
     use core::arch::x86_64::*;
     let k = work.k as usize;
     let n = work.n as usize;
@@ -465,42 +544,15 @@ unsafe fn execute_gemm_work_q8_avx2(work: &GemmWork, cpu_index: usize) {
     let n_blocks = k / Q8_0_BLOCK_VALUES;
     let row_bytes = n_blocks * Q8_0_BLOCK_SIZE;
 
-    if seq * k > QUANT_BUF_BYTES {
-        execute_gemm_work_q8_avx2_dequant(work);
-        return;
-    }
-
-    let a_f32 = core::slice::from_raw_parts(work.input_ptr as *const f32, seq * k);
     let b_q8 = core::slice::from_raw_parts(work.weight_ptr as *const u8, n * row_bytes);
     let c = core::slice::from_raw_parts_mut(work.output_ptr as *mut f32, seq * n);
 
-    // Per-CPU input quantization scratch. Each AP / BSP owns a unique
-    // slot indexed by cpu_index — no locking needed.
-    let buf = &mut *core::ptr::addr_of_mut!(QUANT_BUFS[cpu_index]);
-    let q_input = &mut buf.input[..seq * k];
-    let row_scales = &mut buf.scales[..seq];
-
-    // Per-row max-abs quantization. Weight scales are already per-block
-    // (Q8_0 blocks of 32 elements); a single scale per input row is
-    // coarser but correctness-wise fine for normalized activations.
-    for s in 0..seq {
-        let row = &a_f32[s * k..s * k + k];
-        let mut max_abs = 0.0f32;
-        for &v in row {
-            let av = if v < 0.0 { -v } else { v };
-            if av > max_abs { max_abs = av; }
-        }
-        let scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
-        let inv_scale = 1.0 / scale;
-        row_scales[s] = scale;
-        let dst = &mut q_input[s * k..s * k + k];
-        for i in 0..k {
-            let q = (row[i] * inv_scale) as i32;
-            // `as i8` saturates by truncation; clamp explicitly to
-            // [-127, 127] to keep the sign-fold trick safe.
-            dst[i] = if q > 127 { 127 } else if q < -127 { -127 } else { q as i8 };
-        }
-    }
+    // Read the pre-quantized input that BSP filled before dispatching us.
+    // Single static, safe because dispatch_parallel_gemm waits for all
+    // APs before returning — never more than one matmul in flight.
+    let buf = &*core::ptr::addr_of!(GLOBAL_QUANT_INPUT);
+    let q_input = &buf.input[..seq * k];
+    let row_scales = &buf.scales[..seq];
 
     let ones16 = _mm256_set1_epi16(1);
     let mut acc: [__m256; MAX_SEQ] = [_mm256_setzero_ps(); MAX_SEQ];
