@@ -74,7 +74,26 @@ pub fn read_file(name: &str) -> Result<Vec<u8>, VfsError> {
             // immediately).
             match synapse::read_model_file_shmem(name) {
                 Ok(r) => r,
-                Err(SynapseError::NotFound) => return Err(VfsError::NotFound),
+                Err(SynapseError::NotFound) => {
+                    // Last resort: read directly from initrd ramdisk.
+                    // Synapse-with-SQLite-backend ignores FPK entries,
+                    // so files like qwen.tokb that ship in initrd but
+                    // aren't registered in the SQLite `files` table
+                    // would otherwise be unreachable. The kernel
+                    // ramdisk syscall (SYS_FS_READ_FILE = 14) walks
+                    // FPK entries directly.
+                    // Kernel SYS_FS_READ_FILE caps buf_size at 4 MiB
+                    // (`buf_size > 4 * 1024 * 1024 → u64::MAX`); the only
+                    // file we currently fall back for is qwen.tokb at
+                    // ~3.79 MiB, so this fits with margin.
+                    let mut buf = alloc::vec![0u8; 4 * 1024 * 1024];
+                    let n = libfolk::sys::fs::read_file(name, &mut buf);
+                    if n == 0 {
+                        return Err(VfsError::NotFound);
+                    }
+                    buf.truncate(n);
+                    return Ok(buf);
+                }
                 Err(e) => return Err(VfsError::Synapse(e)),
             }
         },
