@@ -77,12 +77,14 @@ fn has_avx2_fma() -> bool {
 const MATMUL_YIELD_EVERY: usize = 1_048_576;
 
 /// Minimum `out_dim` before `WeightView::matmul` tries the SMP
-/// parallel-GEMM path. Below this, the cross-CPU job dispatch
-/// (~tens of µs of syscall + spin coordination) costs more than
-/// the AVX2 single-core path saves. Empirically the lm_head
-/// (151 936-class) wins decisively; everything else (≤ 3072) stays
-/// single-core. Tunable.
-const SMP_DISPATCH_MIN_OUT_DIM: usize = 16_384;
+/// parallel-GEMM path. Layer matmuls (Q/K/V/Wo at 1024–2048,
+/// gate/up/down at 1024–3072) all qualify at 1024. With 4 cores
+/// each layer's seven matmuls run ~3× faster end-to-end; at 28
+/// layers + lm_head this aggregates to a meaningful per-token
+/// drop on top of #175's lm_head-only SMP. The ~tens-of-µs
+/// coordination overhead per dispatch is dwarfed by even the
+/// smallest qualifying matmul (1024×1024 Q8 = ~2 ms single-core).
+const SMP_DISPATCH_MIN_OUT_DIM: usize = 1024;
 
 /// Try to run a seq=1 Q8 matmul across the AP cores via
 /// `SYS_PARALLEL_GEMM`. Returns `None` if SMP is unavailable

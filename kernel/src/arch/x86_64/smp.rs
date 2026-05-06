@@ -259,20 +259,15 @@ pub fn dispatch_parallel_gemm(
         task_cr3: 0, // BSP doesn't swap; it's already in task_cr3
     };
 
-    crate::serial_str!("[PGEMM] BSP cols ");
-    crate::drivers::serial::write_dec(bsp_col_start as u32);
-    crate::serial_str!("-");
-    crate::drivers::serial::write_dec((bsp_col_start + bsp_cols) as u32);
-    crate::serial_str!(" AVX2=");
-    crate::drivers::serial::write_dec(if has_avx2() { 1 } else { 0 });
-    crate::drivers::serial::write_newline();
-
     unsafe { execute_gemm_work(&bsp_work); }
 
-    crate::serial_str!("[PGEMM] BSP done, waiting APs...\n");
-
-    // Wait for APs (with timeout)
-    let mut all_done = true;
+    // Wait for APs (with timeout). Quiet path; only TIMEOUT errors
+    // print, since they signal a real bug. The per-step PGEMM noise
+    // (entry / cols / done) was useful while debugging the ABI bug
+    // in #175 but is pure overhead now — at SMP_DISPATCH_MIN_OUT_DIM
+    // = 1024 we dispatch ~196 PGEMMs per token across 28 layers,
+    // each writing five lines is ~1 KB serial per token = real
+    // throughput drag.
     for i in 0..num_aps {
         let mut done = false;
         for _ in 0..500_000_000u64 {
@@ -286,12 +281,7 @@ pub fn dispatch_parallel_gemm(
             crate::serial_str!("[PGEMM] AP ");
             crate::drivers::serial::write_dec((i + 1) as u32);
             crate::serial_str!(" TIMEOUT\n");
-            all_done = false;
         }
-    }
-
-    if all_done {
-        crate::serial_str!("[PGEMM] All workers done\n");
     }
 
     0

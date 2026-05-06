@@ -1510,8 +1510,10 @@ fn run_d37_first_blood() -> bool {
     // capacity so `push` here never grows-and-reallocates (which
     // would leave the buffer dangling after the next reset_to).
     let mut next = first_id;
+    let tsc_freq_hz: u64 = 2_400_000_000; // approximate; only used for human display
     for step in 0..MAX_DECODE {
         if next == 151645 || next == 151643 { break; }
+        let t_start = unsafe { core::arch::x86_64::_rdtsc() };
         let next_token = {
             let mut logits = match forward_pass(&view, &cfg, &mut cache, &[next]) {
                 Some(v) => v,
@@ -1549,6 +1551,18 @@ fn run_d37_first_blood() -> bool {
         // this iteration has dropped at the `}` above. The only thing
         // crossing the reset boundary is `next_token: u32`.
         unsafe { ALLOCATOR.reset_to(arena_base); }
+
+        // Per-token timing — TSC delta gives approximate ms
+        // (assumes 2.4 GHz; sufficient for relative comparison).
+        let t_end = unsafe { core::arch::x86_64::_rdtsc() };
+        let cycles = t_end.wrapping_sub(t_start);
+        let ms = cycles / (tsc_freq_hz / 1000);
+        if step < 4 || step % 8 == 0 {
+            println!(
+                "[INFERENCE] D.3.7 token: step={} took ~{} ms (next_id={})",
+                step, ms, next_token,
+            );
+        }
 
         next = next_token;
         sampled.push(next);

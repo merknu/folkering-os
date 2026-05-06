@@ -13,25 +13,12 @@ pub fn syscall_parallel_gemm(
     // = quant_type. See `libfolk::sys::parallel_gemm` doc.
     let n = (n_qt & 0xFFFF_FFFF) as u64;
     let quant_type = ((n_qt >> 56) & 0xFF) as u8;
-    crate::serial_str!("[PGEMM] syscall entry k=");
-    crate::drivers::serial::write_dec(k as u32);
-    crate::serial_str!(" n=");
-    crate::drivers::serial::write_dec(n as u32);
-    crate::serial_str!(" qt=");
-    crate::drivers::serial::write_dec(quant_type as u32);
-    crate::drivers::serial::write_newline();
 
     let task_id = crate::task::task::get_current_task();
     let cr3 = match crate::task::task::get_task(task_id) {
         Some(t) => t.lock().page_table_phys,
         None => return u64::MAX,
     };
-
-    crate::serial_str!("[PGEMM] task CR3=");
-    crate::drivers::serial::write_hex(cr3);
-    crate::serial_str!(" APs=");
-    crate::drivers::serial::write_dec(crate::arch::x86_64::smp::ap_count() as u32);
-    crate::drivers::serial::write_newline();
 
     let result = crate::arch::x86_64::smp::dispatch_parallel_gemm(
         input_ptr,
