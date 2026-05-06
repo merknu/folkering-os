@@ -47,7 +47,13 @@ pub enum VfsError {
 /// never unmapped, and `FbinView` borrows directly into it.
 /// Intentionally far from `VFS_VADDR` so both can coexist when a
 /// short-lived Synapse read happens during model-loaded steady state.
-const MODEL_VADDR: usize = 0x6004_0000;
+// 2 MiB-aligned. The kernel's shmem layer now backs large allocations
+// (≥ 2 MiB) with 2 MiB huge pages so the 604 MiB Qwen3 weight stream
+// collapses from 154,729 4 KiB PTEs to 302 PD entries — fits in dTLB,
+// kills TLB-thrash on the inner matmul loop. shmem_map enforces the
+// alignment match: 0x6004_0000 (the prior value) was 256 KiB-aligned
+// only, which would have rejected the huge mapping.
+const MODEL_VADDR: usize = 0x6000_0000;
 
 /// Read a file from Synapse VFS into a freshly allocated `Vec<u8>`.
 /// Maps the shmem, copies the bytes out, unmaps, destroys the shmem.

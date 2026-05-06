@@ -388,6 +388,31 @@ impl BootstrapAllocator {
             None
         }
     }
+
+    /// Allocate `1 << order` contiguous, naturally aligned pages from
+    /// the bump arena. Used by `alloc_pages(order)` when the buddy
+    /// free-list is empty for that order — the buddy lists only get
+    /// populated as pages get freed back, so at boot they're empty
+    /// and a huge-page request would otherwise fail despite plenty
+    /// of contiguous physical RAM sitting in the bump arena.
+    ///
+    /// Skips bytes if needed to land the allocation on a `(PAGE_SIZE
+    /// << order)`-aligned boundary; the skipped tail isn't returned
+    /// to anyone (acceptable for boot-time allocation, the alternative
+    /// is a freelist of small fragments which complicates teardown).
+    fn alloc_block(&mut self, order: usize) -> Option<usize> {
+        let block_size = PAGE_SIZE << order;
+        let alignment = block_size; // natural alignment
+        let aligned_start = (self.next_page + alignment - 1) & !(alignment - 1);
+        let aligned_end = aligned_start.checked_add(block_size)?;
+        if aligned_end > self.end_page {
+            return None;
+        }
+        self.next_page = aligned_end;
+        let pages = 1usize << order;
+        ALLOCATED_PAGES.fetch_add(pages, core::sync::atomic::Ordering::Relaxed);
+        Some(aligned_start)
+    }
 }
 
 /// Initialize physical memory manager
@@ -408,7 +433,24 @@ pub fn init(boot_info: &BootInfo) {
 /// let addr = alloc_pages(2).expect("Out of memory");
 /// ```
 pub fn alloc_pages(order: usize) -> Option<usize> {
-    ALLOCATOR.lock().alloc_pages(order)
+    // Try buddy first (recycled freed allocations).
+    if let Some(addr) = ALLOCATOR.lock().alloc_pages(order) {
+        return Some(addr);
+    }
+    // Buddy is empty for this order — most likely it's never been
+    // populated yet (free lists only fill on free_pages). Fall back
+    // to the bump arena for naturally-aligned multi-page blocks. This
+    // is what makes the 2 MiB huge-page shmem path actually work at
+    // boot — alloc_pages(9) was always failing because the buddy
+    // never had a 2 MiB block to hand out.
+    if order > 0 {
+        if let Some(ref mut bootstrap) = *BOOTSTRAP_ALLOCATOR.lock() {
+            if let Some(addr) = bootstrap.alloc_block(order) {
+                return Some(addr);
+            }
+        }
+    }
+    None
 }
 
 /// Free 2^order contiguous pages starting at addr

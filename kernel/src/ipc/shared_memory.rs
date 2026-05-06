@@ -4,7 +4,7 @@
 //! Essential for high-performance file I/O and network operations.
 
 use crate::ipc::message::{ShmemId, TaskId};
-use crate::memory::physical::{alloc_page, free_pages};
+use crate::memory::physical::{alloc_page, alloc_pages, free_pages};
 use crate::memory::paging;
 use alloc::vec::Vec;
 use hashbrown::{HashMap, hash_map::DefaultHashBuilder};
@@ -69,8 +69,21 @@ pub struct SharedMemory {
     /// Unique identifier
     pub id: ShmemId,
 
-    /// Physical pages backing this region
+    /// Physical pages backing this region. Each entry is the base
+    /// physical address of one allocation block; the block size is
+    /// `PAGE_SIZE << block_order`. For the standard 4 KiB path this
+    /// is one entry per 4 KiB page (block_order = 0); for the
+    /// huge-page path we get one entry per 2 MiB block (block_order = 9).
     pub phys_pages: Vec<PhysAddr>,
+
+    /// Buddy-allocator order of each entry in `phys_pages`. 0 = 4 KiB,
+    /// 9 = 2 MiB. Same value across the whole region — we don't mix
+    /// page sizes inside one shmem.
+    ///
+    /// Selected by `shmem_create` based on size and physical-memory
+    /// availability. Read by `shmem_map` / `shmem_unmap` /
+    /// `shmem_destroy` to pick the right paging routine + free order.
+    pub block_order: u8,
 
     /// Total size in bytes (multiple of PAGE_SIZE)
     pub size: usize,
@@ -93,6 +106,21 @@ pub struct SharedMemory {
     /// addresses produces two entries, tracked independently.
     pub mappings: Vec<(TaskId, VirtAddr)>,
 }
+
+/// Block size threshold above which `shmem_create` tries the 2 MiB
+/// huge-page path. The motivating case is the 604 MiB shmem-backed
+/// Qwen3 weight stream (PR #170) — at 4 KiB pages that's 154,729 PTEs,
+/// far exceeding any x86_64 dTLB capacity (1024-4096 entries). With
+/// 2 MiB pages it collapses to 302 PD entries, fits in dTLB
+/// comfortably.
+///
+/// Smaller regions (the 4 KiB IPC shmems libfolk hands out per task,
+/// the 280 KiB SQLite buffer Synapse loads, etc.) keep the 4 KiB path
+/// — internal-fragmentation cost of huge pages outweighs the TLB win
+/// at that scale.
+const HUGE_PAGE_THRESHOLD: usize = 2 * 1024 * 1024;
+const HUGE_PAGE_SIZE: usize = 2 * 1024 * 1024;
+const HUGE_PAGE_ORDER: u8 = 9;
 
 /// Global shared memory table
 lazy_static! {
@@ -157,21 +185,19 @@ pub enum ShmemError {
 /// unsafe { *(ptr as *mut u64) = 42; }
 /// ```
 pub fn shmem_create(size: usize, perms: ShmemPerms) -> Result<ShmemId, ShmemError> {
-    // 1. Round size up to page boundary (4KB)
     if size == 0 {
         return Err(ShmemError::InvalidSize);
     }
 
+    // Standard 4 KiB path.
     let num_pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
     let actual_size = num_pages * PAGE_SIZE;
 
-    // 2. Allocate individual physical pages (order 0 each)
     let mut phys_pages = Vec::new();
     for _ in 0..num_pages {
         match alloc_page() {
             Some(page_addr) => phys_pages.push(page_addr),
             None => {
-                // Free any pages we already allocated
                 for &addr in &phys_pages {
                     free_pages(addr, 0);
                 }
@@ -180,27 +206,90 @@ pub fn shmem_create(size: usize, perms: ShmemPerms) -> Result<ShmemId, ShmemErro
         }
     }
 
-    // 3. Generate unique ShmemId
     let id_raw = NEXT_SHMEM_ID.fetch_add(1, Ordering::Relaxed);
     let id = NonZeroU32::new(id_raw)
         .ok_or(ShmemError::IdOverflow)?;
 
-    // 4. Get current task as owner
     let current_task_id = crate::task::task::current_task().lock().id;
 
-    // 5. Create SharedMemory object
     let shmem = SharedMemory {
         id,
         phys_pages,
+        block_order: 0,
         size: actual_size,
         perms,
         tasks: alloc::vec![current_task_id],
         mappings: Vec::new(),
     };
 
-    // 6. Insert into global table
     SHMEM_TABLE.lock().insert(id_raw, shmem);
 
+    Ok(id)
+}
+
+/// Create a shared memory region backed by 2 MiB huge pages.
+///
+/// Distinct from `shmem_create` because callers MUST guarantee that
+/// the eventual `shmem_map` virt address is 2 MiB-aligned — otherwise
+/// the mapping is rejected. The motivating case is the 604 MiB Qwen3
+/// weight stream (`drivers::model_disk::read_into_shmem` →
+/// inference task's `MODEL_VADDR = 0x6000_0000`); collapsing that
+/// from 154,729 4 KiB PTEs to 302 PD entries fits the entire weight
+/// table in dTLB and unlocks streaming bandwidth on the inner
+/// matmul loop.
+///
+/// We deliberately avoid a "guess huge if size is large" heuristic
+/// inside `shmem_create` because most existing callers fix their
+/// VFS_VADDR / SHMEM_BUFFER constants at non-2 MiB-aligned offsets.
+/// Auto-promoting their requests to huge pages would silently fail
+/// the map step. Callers who want huge pages opt in here, and own
+/// the alignment contract.
+///
+/// Falls back to the standard 4 KiB path internally if the buddy +
+/// bootstrap arena can't satisfy a 2 MiB allocation — better than
+/// hard-failing on PMM fragmentation. The fall-back region behaves
+/// identically to `shmem_create`'s output (4 KiB block_order), so
+/// the caller still has to map at a 2 MiB-aligned address; the OS
+/// just spent more PTEs to get there.
+pub fn shmem_create_huge(size: usize, perms: ShmemPerms) -> Result<ShmemId, ShmemError> {
+    if size == 0 {
+        return Err(ShmemError::InvalidSize);
+    }
+    let num_blocks = (size + HUGE_PAGE_SIZE - 1) / HUGE_PAGE_SIZE;
+    let actual_size = num_blocks * HUGE_PAGE_SIZE;
+    let mut phys_pages = Vec::with_capacity(num_blocks);
+    let mut all_ok = true;
+    for _ in 0..num_blocks {
+        match alloc_pages(HUGE_PAGE_ORDER as usize) {
+            Some(addr) => phys_pages.push(addr),
+            None => { all_ok = false; break; }
+        }
+    }
+    if !all_ok {
+        // Roll back partial huge allocation and fall through to 4 KiB.
+        for &addr in &phys_pages { free_pages(addr, HUGE_PAGE_ORDER as usize); }
+        return shmem_create(size, perms);
+    }
+
+    let id_raw = NEXT_SHMEM_ID.fetch_add(1, Ordering::Relaxed);
+    let id = match NonZeroU32::new(id_raw) {
+        Some(i) => i,
+        None => {
+            for &addr in &phys_pages { free_pages(addr, HUGE_PAGE_ORDER as usize); }
+            return Err(ShmemError::IdOverflow);
+        }
+    };
+    let current_task_id = crate::task::task::current_task().lock().id;
+    let shmem = SharedMemory {
+        id,
+        phys_pages,
+        block_order: HUGE_PAGE_ORDER,
+        size: actual_size,
+        perms,
+        tasks: alloc::vec![current_task_id],
+        mappings: Vec::new(),
+    };
+    SHMEM_TABLE.lock().insert(id_raw, shmem);
     Ok(id)
 }
 
@@ -246,11 +335,6 @@ pub fn shmem_create(size: usize, perms: ShmemPerms) -> Result<ShmemId, ShmemErro
 /// assert_eq!(value, 0xDEADBEEF);
 /// ```
 pub fn shmem_map(id: ShmemId, virt: VirtAddr) -> Result<(), ShmemError> {
-    // Validate address is page-aligned
-    if virt % PAGE_SIZE != 0 {
-        return Err(ShmemError::InvalidSize);
-    }
-
     // 1. Validate ShmemId exists
     let shmem = {
         let table = SHMEM_TABLE.lock();
@@ -258,6 +342,21 @@ pub fn shmem_map(id: ShmemId, virt: VirtAddr) -> Result<(), ShmemError> {
             .ok_or(ShmemError::InvalidId)?
             .clone()
     };
+
+    // Page-alignment check: 4 KiB for standard regions, 2 MiB for
+    // huge-page regions. Userspace callers that target a fixed virt
+    // address need to know which it is — see the MODEL_VADDR change
+    // in inference's vfs_loader: bumped from 0x6004_0000 to a
+    // 2 MiB-aligned slot once the model-disk shmem started using
+    // huge pages.
+    let block_size = if shmem.block_order == HUGE_PAGE_ORDER {
+        HUGE_PAGE_SIZE
+    } else {
+        PAGE_SIZE
+    };
+    if virt % block_size != 0 {
+        return Err(ShmemError::InvalidSize);
+    }
 
     // 2. Check current task has access
     let current_task_id = crate::task::task::current_task().lock().id;
@@ -281,23 +380,32 @@ pub fn shmem_map(id: ShmemId, virt: VirtAddr) -> Result<(), ShmemError> {
         return Err(ShmemError::MapFailed); // No page table for this task
     }
 
-    // Install PTEs page by page. Track how many succeeded so we can
-    // roll back on partial failure — without this, a failure at the
-    // N-th page leaves pages 0..N mapped to phys pages the caller
-    // thinks it didn't get, and the error return gives them no way
-    // to unmap the leftovers.
-    let mut mapped_pages = 0usize;
+    // Install PTEs / PD entries. Track how many succeeded so we can
+    // roll back on partial failure — a failure at the N-th block
+    // leaves blocks 0..N mapped to phys pages the caller can't unmap.
+    let huge = shmem.block_order == HUGE_PAGE_ORDER;
+    let mut mapped_blocks = 0usize;
     for (i, &phys) in shmem.phys_pages.iter().enumerate() {
-        let virt_page = virt + (i * PAGE_SIZE);
-        if paging::map_page_in_table(task_pml4, virt_page, phys, pt_flags).is_err() {
-            // Roll back the ones that did land.
-            for j in 0..mapped_pages {
-                let _ = paging::unmap_page_in_table(task_pml4, virt + j * PAGE_SIZE);
+        let virt_block = virt + (i * block_size);
+        let map_result = if huge {
+            paging::map_huge_page_in_table(task_pml4, virt_block, phys, pt_flags)
+        } else {
+            paging::map_page_in_table(task_pml4, virt_block, phys, pt_flags)
+        };
+        if map_result.is_err() {
+            for j in 0..mapped_blocks {
+                let v = virt + j * block_size;
+                let _ = if huge {
+                    paging::unmap_huge_page_in_table(task_pml4, v)
+                } else {
+                    paging::unmap_page_in_table(task_pml4, v)
+                };
             }
             return Err(ShmemError::MapFailed);
         }
-        mapped_pages += 1;
+        mapped_blocks += 1;
     }
+    let mapped_pages = mapped_blocks; // alias used below
 
     // Re-acquire SHMEM_TABLE and verify the region is STILL in the
     // table. If a concurrent `shmem_destroy` (or `free_task_regions`
@@ -323,7 +431,12 @@ pub fn shmem_map(id: ShmemId, virt: VirtAddr) -> Result<(), ShmemError> {
                 // Region vanished under us. Don't leave dangling PTEs.
                 drop(table);
                 for i in 0..mapped_pages {
-                    let _ = paging::unmap_page_in_table(task_pml4, virt + i * PAGE_SIZE);
+                    let v = virt + i * block_size;
+                    let _ = if huge {
+                        paging::unmap_huge_page_in_table(task_pml4, v)
+                    } else {
+                        paging::unmap_page_in_table(task_pml4, v)
+                    };
                 }
                 return Err(ShmemError::InvalidId);
             }
@@ -347,11 +460,6 @@ pub fn shmem_map(id: ShmemId, virt: VirtAddr) -> Result<(), ShmemError> {
 /// This does NOT free the physical pages - other tasks may still
 /// have the region mapped. Use `shmem_destroy()` to free pages.
 pub fn shmem_unmap(id: ShmemId, virt: VirtAddr) -> Result<(), ShmemError> {
-    // Validate address is page-aligned
-    if virt % PAGE_SIZE != 0 {
-        return Err(ShmemError::InvalidSize);
-    }
-
     // Get region info
     let shmem = {
         let table = SHMEM_TABLE.lock();
@@ -360,16 +468,26 @@ pub fn shmem_unmap(id: ShmemId, virt: VirtAddr) -> Result<(), ShmemError> {
             .clone()
     };
 
-    // Unmap each page from CURRENT TASK's page table
+    let huge = shmem.block_order == HUGE_PAGE_ORDER;
+    let block_size = if huge { HUGE_PAGE_SIZE } else { PAGE_SIZE };
+    if virt % block_size != 0 {
+        return Err(ShmemError::InvalidSize);
+    }
+
+    // Unmap each block from CURRENT TASK's page table
     let task_pml4 = crate::task::task::current_task().lock().page_table_phys;
     if task_pml4 == 0 {
         return Err(ShmemError::UnmapFailed);
     }
 
     for i in 0..shmem.phys_pages.len() {
-        let virt_page = virt + (i * PAGE_SIZE);
-        paging::unmap_page_in_table(task_pml4, virt_page)
-            .map_err(|_| ShmemError::UnmapFailed)?;
+        let virt_block = virt + (i * block_size);
+        let r = if huge {
+            paging::unmap_huge_page_in_table(task_pml4, virt_block)
+        } else {
+            paging::unmap_page_in_table(task_pml4, virt_block)
+        };
+        r.map_err(|_| ShmemError::UnmapFailed)?;
     }
 
     // De-register the mapping record so a future destroy doesn't
@@ -428,9 +546,10 @@ pub fn shmem_destroy(id: ShmemId) -> Result<(), ShmemError> {
     //    enforces on the tasks it reaches.
     clear_mappings(&shmem);
 
-    // 4. Free physical pages.
+    // 4. Free physical pages at the right buddy order.
+    let order = shmem.block_order as usize;
     for &phys_addr in &shmem.phys_pages {
-        free_pages(phys_addr, 0);
+        free_pages(phys_addr, order);
     }
 
     Ok(())
@@ -458,15 +577,22 @@ pub fn shmem_destroy(id: ShmemId) -> Result<(), ShmemError> {
 /// tasks, this comment is the flag to revisit and add a proper
 /// IPI-driven flush via `arch::x86_64::apic`.
 fn clear_mappings(shmem: &SharedMemory) {
-    let num_pages = shmem.phys_pages.len();
+    let huge = shmem.block_order == HUGE_PAGE_ORDER;
+    let block_size = if huge { HUGE_PAGE_SIZE } else { PAGE_SIZE };
+    let num_blocks = shmem.phys_pages.len();
     for &(task_id, virt_base) in &shmem.mappings {
         let pml4 = match crate::task::task::get_task(task_id) {
             Some(t) => t.lock().page_table_phys,
             None => continue, // task exited — nothing to clear
         };
         if pml4 == 0 { continue; }
-        for i in 0..num_pages {
-            let _ = paging::unmap_page_in_table(pml4, virt_base + i * PAGE_SIZE);
+        for i in 0..num_blocks {
+            let v = virt_base + i * block_size;
+            let _ = if huge {
+                paging::unmap_huge_page_in_table(pml4, v)
+            } else {
+                paging::unmap_page_in_table(pml4, v)
+            };
         }
     }
 }
@@ -589,8 +715,9 @@ pub fn free_task_regions(task_id: TaskId) {
     for mut region in to_destroy {
         region.mappings.retain(|&(t, _)| t != task_id);
         clear_mappings(&region);
+        let order = region.block_order as usize;
         for &phys in &region.phys_pages {
-            free_pages(phys, 0);
+            free_pages(phys, order);
         }
     }
 }
