@@ -1579,19 +1579,68 @@ fn run_d37_first_blood() -> bool {
         arena_base / (1024 * 1024),
     );
 
-    // Prefill: forward the whole prompt at once, populating the
-    // cache. The returned logits are at the LAST prompt position;
-    // argmax of those is the model's first generated token.
+    // Chunked prefill: kernel's `dispatch_parallel_gemm` caps a
+    // single batched matmul at MAX_SEQ=128 (AP stack budget under
+    // Limine's ~64 KiB-per-core stack). A prompt longer than that
+    // would hit either:
+    //   - silent rows-128..N corruption in the dequant fallback
+    //     (it `.min(MAX_SEQ)`s instead of failing), or
+    //   - silent triple-fault if MAX_SEQ is bumped past stack
+    //     budget on the kernel side.
+    // Solving this at the userspace boundary keeps the kernel hot
+    // path simple and lets us prefill arbitrarily long prompts:
+    // each chunk advances `cache.seq_len`, and the next chunk's
+    // attention reads the cache for past positions just like
+    // decode does. KvCache is allocated BELOW `arena_base`, so the
+    // per-chunk `reset_to` we do here reclaims the chunk's scratch
+    // (embedding rows, attention buffers, logits Vec) without
+    // touching the cache.
+    //
+    // PREFILL_CHUNK is the per-call seq dimension we hand the
+    // kernel. 64 is conservative (kernel MAX_SEQ=128, so we have
+    // 2× headroom); larger chunks mean fewer kernel dispatches
+    // but more arena pressure per chunk.
+    const PREFILL_CHUNK: usize = 64;
     let prefill_start = unsafe { core::arch::x86_64::_rdtsc() };
+    let total_prompt = prompt_ids.len();
+    let n_chunks = (total_prompt + PREFILL_CHUNK - 1) / PREFILL_CHUNK;
+    println!(
+        "[INFERENCE] D.3.7: prefilling {} tokens in {} chunk(s) of \
+         up to {} tokens each",
+        total_prompt, n_chunks, PREFILL_CHUNK,
+    );
     let first_id: u32 = {
-        let logits = match forward_pass(&view, &cfg, &mut cache, &prompt_ids) {
-            Some(v) => v,
-            None => {
-                println!("[INFERENCE] D.3.7: prefill returned None");
-                return false;
+        let mut chunk_start = 0usize;
+        let mut chunk_idx = 0usize;
+        let mut last_first_id: Option<u32> = None;
+        while chunk_start < total_prompt {
+            let chunk_end = (chunk_start + PREFILL_CHUNK).min(total_prompt);
+            let chunk = &prompt_ids[chunk_start..chunk_end];
+            let logits = match forward_pass(&view, &cfg, &mut cache, chunk) {
+                Some(v) => v,
+                None => {
+                    println!(
+                        "[INFERENCE] D.3.7: prefill chunk {}/{} ({}..{}) \
+                         returned None",
+                        chunk_idx, n_chunks, chunk_start, chunk_end,
+                    );
+                    return false;
+                }
+            };
+            if chunk_end == total_prompt {
+                // Final chunk — argmax NOW while logits is alive. The
+                // primitive u32 result outlives the upcoming reset.
+                last_first_id = argmax(&logits);
             }
-        };
-        match argmax(&logits) {
+            // Reclaim the chunk's scratch immediately so the next
+            // chunk doesn't compound arena pressure. KvCache writes
+            // land in storage allocated below `arena_base` and are
+            // unaffected by the reset.
+            unsafe { ALLOCATOR.reset_to(arena_base); }
+            chunk_idx += 1;
+            chunk_start = chunk_end;
+        }
+        match last_first_id {
             Some(i) => i,
             None => return false,
         }
@@ -1599,15 +1648,14 @@ fn run_d37_first_blood() -> bool {
     let prefill_cycles = unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(prefill_start);
     let prefill_ms = prefill_cycles / 2_400_000;
     println!(
-        "[INFERENCE] D.3.7: prefill ({} tokens × 28 layers) took ~{} ms",
-        prompt_ids.len(), prefill_ms,
+        "[INFERENCE] D.3.7: prefill ({} tokens × 28 layers, {} chunk(s)) \
+         took ~{} ms",
+        total_prompt, n_chunks, prefill_ms,
     );
-    // Prefill's logits Vec is dropped at the closing `}` above.
-    // We can now safely reclaim everything allocated since the
-    // checkpoint — the only thing that survived the scope is the
-    // primitive `first_id: u32`, no pointers into the arena.
-    // SAFETY: `sampled`'s buffer lives BELOW arena_base, so it
-    // survives the reset; nothing else above the line is in scope.
+    // Belt-and-braces reset: the chunked-prefill loop already called
+    // `reset_to(arena_base)` after the last chunk, but doing it again
+    // here is free (offset is already at arena_base) and keeps the
+    // post-prefill invariant explicit for readers.
     unsafe { ALLOCATOR.reset_to(arena_base); }
 
     sampled.push(first_id);
