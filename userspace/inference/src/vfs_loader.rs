@@ -23,15 +23,21 @@ use libfolk::sys::{shmem_map, shmem_unmap, shmem_destroy};
 /// then unmap, so a single slot suffices. If a future use case
 /// streams multiple files concurrently it gets its own vaddr.
 ///
-/// Address picked in the same low-half range the compositor uses
-/// for its `VFS_OPEN_VADDR` (`0x50040000`); Synapse's shmem grant
-/// path expects mapping requests inside the standard user range
-/// rather than the per-task upper-half private zone our IPC
-/// request buffer (`router::REQ_VADDR = 0x4100_0000_0000`) lives
-/// in. The upper-half mappings work for shmem we *create* (e.g.
-/// the compositor display-list rings); shmem we *receive* via
-/// Synapse needs the lower half for the kernel's grant fast-path.
-const VFS_VADDR: usize = 0x5004_0000;
+/// Synapse's shmem grant path requires a lower-half address (high
+/// bit clear) — upper-half mappings only work for shmem we *create*,
+/// not shmem we *receive*. So this stays in the low half.
+///
+/// Placed at 8 GiB virtual to clear the inference task's 1.5 GiB
+/// BSS heap (`HEAP_SIZE` in main.rs), which extends from the ELF
+/// load base ~0x400000 through ~0x6040_0000. The previous home at
+/// 0x5004_0000 (matching the compositor's `VFS_OPEN_VADDR`) lived
+/// inside the heap region — it worked under one linker layout but
+/// collided when a 5 KiB binary growth shifted .bss enough that
+/// `shmem_map` started returning ShmemMap on `qwen.tokb`. 8 GiB
+/// gives the heap unbounded growth room and stays well below
+/// `MODEL_VADDR = 16 GiB`, so a 4 MiB short-lived read can never
+/// crash into the 4 GiB keep-mapped weights.
+const VFS_VADDR: usize = 0x2_0000_0000;
 
 #[derive(Debug)]
 #[allow(dead_code)] // payload fields read via Debug only
@@ -47,13 +53,18 @@ pub enum VfsError {
 /// never unmapped, and `FbinView` borrows directly into it.
 /// Intentionally far from `VFS_VADDR` so both can coexist when a
 /// short-lived Synapse read happens during model-loaded steady state.
-// 2 MiB-aligned. The kernel's shmem layer now backs large allocations
-// (≥ 2 MiB) with 2 MiB huge pages so the 604 MiB Qwen3 weight stream
-// collapses from 154,729 4 KiB PTEs to 302 PD entries — fits in dTLB,
-// kills TLB-thrash on the inner matmul loop. shmem_map enforces the
-// alignment match: 0x6004_0000 (the prior value) was 256 KiB-aligned
-// only, which would have rejected the huge mapping.
-const MODEL_VADDR: usize = 0x6000_0000;
+// 2 MiB-aligned, placed well above the inference task's HEAP_SIZE
+// BSS array (which starts at the ELF load base ~0x400000 and grows
+// through the static heap; with HEAP_SIZE = 1.5 GiB it reaches
+// ~0x6040_0000). The 4 GiB Qwen3-4B weight shmem at 0x4_0000_0000
+// stretches from 16 GiB virtual to 20 GiB — far above any task's
+// stack/heap and well below USERSPACE_TOP (0x0000_8000_0000_0000).
+//
+// History: 0x6004_0000 worked for Qwen3-0.6B (small heap), 0x6000_0000
+// worked when MODEL_VADDR moved up for huge-page alignment. The 4 GiB
+// model + 1.5 GiB HEAP is what overflowed into the model region;
+// bumping MODEL_VADDR clear of HEAP fixes it permanently.
+const MODEL_VADDR: usize = 0x4_0000_0000;
 
 /// Read a file from Synapse VFS into a freshly allocated `Vec<u8>`.
 /// Maps the shmem, copies the bytes out, unmaps, destroys the shmem.

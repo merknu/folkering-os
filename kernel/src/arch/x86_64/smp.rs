@@ -236,10 +236,35 @@ pub fn dispatch_parallel_gemm(
     // pre-translation needed — the MMU handles per-page lookups,
     // which is the only thing that works for shmem-backed weights
     // whose physical pages are scattered across the heap.
-    let total_workers = num_aps + 1;
     let n_usize = n as usize;
-    let cols_per_worker = n_usize / total_workers;
-    let remainder = n_usize % total_workers;
+
+    // Skewed column split: BSP gets a smaller share than each AP
+    // because BSP carries the dispatch coordination + input
+    // quantization on top of its matmul work. Equal splits leave APs
+    // idling at the barrier waiting for BSP. Empirical ratio for our
+    // 4-vCPU layout (1 BSP + 3 APs) is 10/30 — BSP does ~10/100 of
+    // total work, each AP does ~30/100. For other AP counts the
+    // weights stay the same, denominator scales: total = 10 + 30*N.
+    //
+    // For num_aps=0 (uniprocessor fallback), BSP does everything
+    // (handled below: bsp_cols falls out as n_usize).
+    const BSP_WEIGHT: usize = 10;
+    const AP_WEIGHT: usize = 30;
+    let denom = BSP_WEIGHT + AP_WEIGHT * num_aps;
+    let bsp_cols_target = if num_aps == 0 {
+        n_usize
+    } else {
+        n_usize * BSP_WEIGHT / denom
+    };
+    let cols_per_ap = if num_aps == 0 {
+        0
+    } else {
+        n_usize * AP_WEIGHT / denom
+    };
+    // Any leftover cols (integer-division remainder) go onto APs in
+    // round-robin from worker 1 upward; BSP keeps its smaller share.
+    let assigned = bsp_cols_target + cols_per_ap * num_aps;
+    let leftover = n_usize - assigned;
 
     // BSP-side input quantization: walk the f32 activation row(s) once
     // here, fill GLOBAL_QUANT_INPUT, and signal workers via the
@@ -263,14 +288,17 @@ pub fn dispatch_parallel_gemm(
     };
 
     let mut col = 0usize;
-    let bsp_cols = cols_per_worker + if 0 < remainder { 1 } else { 0 };
+    let bsp_cols = bsp_cols_target;
     let bsp_col_start = col;
     col += bsp_cols;
 
     for i in 0..num_aps {
         let worker_idx = i + 1;
-        let extra = if worker_idx < remainder { 1 } else { 0 };
-        let my_cols = cols_per_worker + extra;
+        // Distribute the integer-division remainder across the first
+        // `leftover` APs (each gets one extra column). BSP keeps its
+        // smaller deterministic share regardless.
+        let extra = if i < leftover { 1 } else { 0 };
+        let my_cols = cols_per_ap + extra;
 
         unsafe {
             WORK_ITEMS[worker_idx] = GemmWork {
@@ -407,10 +435,15 @@ fn has_avx2() -> bool {
     result & (1 << 5) != 0
 }
 
-// Q8_0: 32 values per block, 34 bytes (1× f16 scale + 32× i8 vals).
-// Same convention as `userspace::inference::tensor_math` and llama.cpp.
-const Q8_0_BLOCK_SIZE: usize = 34;
+// Q8 block layout: `[scale_lo: f16][scale_hi: f16][q[0..32]: i8]` =
+// 36 bytes. scale_lo applies to q[0..16], scale_hi applies to
+// q[16..32]. Same convention as `userspace::inference::tensor_math`.
+// (Diverges from llama.cpp's 34-byte single-scale Q8_0; we made the
+// trade for ~50% less Q8 noise at +6% file size, which mattered for
+// 36-layer Qwen3-4B argmax stability.)
+const Q8_0_BLOCK_SIZE: usize = 36;
 const Q8_0_BLOCK_VALUES: usize = 32;
+const Q8_0_HALF: usize = 16;
 
 unsafe fn execute_gemm_work(work: &GemmWork) {
     // quant_type: 0 = Q8_0, 1 = Q6_K. Q8_0 is the format the
@@ -565,18 +598,34 @@ unsafe fn execute_gemm_work_q8_maddubs(work: &GemmWork) {
 
         for b in 0..n_blocks {
             let block_off = row_off + b * Q8_0_BLOCK_SIZE;
-            let scale_bits = u16::from_le_bytes([
+            // Two block scales: lo for q[0..16], hi for q[16..32].
+            // Build a __m256 with [lo,lo,lo,lo,hi,hi,hi,hi]: after
+            // maddubs+madd, the 8 i32 lanes correspond to
+            //   lanes 0..4 → low 16 bytes of the block (q[0..16])
+            //   lanes 4..8 → high 16 bytes (q[16..32])
+            // so blending the two scales at lane-4 boundary applies
+            // each scale to the correct half. Verified by walking the
+            // `_mm256_maddubs_epi16` semantics: low/high 128-bit
+            // halves operate independently, and `_mm256_madd_epi16`
+            // sums adjacent i16 pairs without crossing the 128-bit
+            // boundary, so the lane→half mapping is preserved.
+            let scale_lo = f16_to_f32(u16::from_le_bytes([
                 b_q8[block_off],
                 b_q8[block_off + 1],
-            ]);
-            let weight_scale = f16_to_f32(scale_bits);
-            let scale_v = _mm256_set1_ps(weight_scale);
+            ]));
+            let scale_hi = f16_to_f32(u16::from_le_bytes([
+                b_q8[block_off + 2],
+                b_q8[block_off + 3],
+            ]));
+            let scale_lo_v = _mm256_set1_ps(scale_lo);
+            let scale_hi_v = _mm256_set1_ps(scale_hi);
+            let scale_split = _mm256_blend_ps(scale_lo_v, scale_hi_v, 0xF0);
 
             // Load 32 i8 weights, derive |w| once per (col, block) —
             // reused across all `seq` rows. `xs_signed` depends on
             // sign(w) too, so we re-fold per s.
             let w = _mm256_loadu_si256(
-                b_q8.as_ptr().add(block_off + 2) as *const __m256i,
+                b_q8.as_ptr().add(block_off + 4) as *const __m256i,
             );
             let w_abs = _mm256_sign_epi8(w, w);
 
@@ -594,10 +643,10 @@ unsafe fn execute_gemm_work_q8_maddubs(work: &GemmWork) {
                 // 16 × i16 → 8 × i32 (multiply by 1, sum adjacent).
                 let prod32 = _mm256_madd_epi16(prod16, ones16);
                 // Convert to f32 and FMA into the row's accumulator,
-                // scaled by the block weight scale. Per-row input
-                // scale is applied once at the end of (col, s).
+                // scaled by per-half block scale. Per-row input scale
+                // is applied once at the end of (col, s).
                 let prod_f32 = _mm256_cvtepi32_ps(prod32);
-                acc[s] = _mm256_fmadd_ps(prod_f32, scale_v, acc[s]);
+                acc[s] = _mm256_fmadd_ps(prod_f32, scale_split, acc[s]);
             }
         }
 
@@ -642,20 +691,27 @@ unsafe fn execute_gemm_work_q8_avx2_dequant(work: &GemmWork) {
 
         for b in 0..n_blocks {
             let block_off = row_off + b * Q8_0_BLOCK_SIZE;
-            let scale_bits = u16::from_le_bytes([
+            // Two scales: lo for q[0..16] (raw_lo), hi for q[16..32]
+            // (raw_hi). Same layout/semantics as the maddubs path
+            // and userspace `matmul_batch_q8_avx2`.
+            let scale_lo = f16_to_f32(u16::from_le_bytes([
                 b_q8[block_off],
                 b_q8[block_off + 1],
-            ]);
-            let scale = f16_to_f32(scale_bits);
-            let scale_v = _mm256_set1_ps(scale);
+            ]));
+            let scale_hi = f16_to_f32(u16::from_le_bytes([
+                b_q8[block_off + 2],
+                b_q8[block_off + 3],
+            ]));
+            let scale_lo_v = _mm256_set1_ps(scale_lo);
+            let scale_hi_v = _mm256_set1_ps(scale_hi);
 
-            let q_ptr = b_q8.as_ptr().add(block_off + 2) as *const __m128i;
+            let q_ptr = b_q8.as_ptr().add(block_off + 4) as *const __m128i;
             let raw_lo = _mm_loadu_si128(q_ptr);
             let raw_hi = _mm_loadu_si128(q_ptr.add(1));
-            let deq0 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(raw_lo)), scale_v);
-            let deq1 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(raw_lo, 8))), scale_v);
-            let deq2 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(raw_hi)), scale_v);
-            let deq3 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(raw_hi, 8))), scale_v);
+            let deq0 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(raw_lo)), scale_lo_v);
+            let deq1 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(raw_lo, 8))), scale_lo_v);
+            let deq2 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(raw_hi)), scale_hi_v);
+            let deq3 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(raw_hi, 8))), scale_hi_v);
 
             let a_base = b * Q8_0_BLOCK_VALUES;
             for s in 0..seq {

@@ -91,6 +91,79 @@ pub struct ModelConfig {
     pub eps: f32,
 }
 
+impl ModelConfig {
+    /// Derive a config from the .fbin's tensor metadata. Lets one
+    /// binary boot any Qwen3 (0.6B / 4B / future sizes) — the fbin
+    /// already carries everything we need.
+    ///
+    /// Shape convention: HF safetensors stores PyTorch `nn.Linear.weight`
+    /// as `[out_features, in_features]`, and `hf_to_fbin.py` propagates
+    /// that verbatim into the .fbin. So:
+    ///   embed.shape       = [vocab,             hidden_dim]
+    ///   rope_cos.shape    = [max_pos,           head_dim / 2]
+    ///   layer.N.q.shape   = [n_heads*head_dim,  hidden_dim]
+    ///   layer.N.k.shape   = [n_kv_heads*head_dim, hidden_dim]
+    ///   layer.N.up.shape  = [intermediate,      hidden_dim]
+    /// `n_layers` is found by walking `layer.N.q` until missing.
+    ///
+    /// `eps` defaults to 1e-6 (Qwen3); the .fbin doesn't carry it so
+    /// it stays a model-family hardcode. Flip back to 1e-5 if/when
+    /// we add Qwen2.5 again.
+    pub fn from_fbin(view: &crate::weights::FbinView) -> Option<Self> {
+        let embed = view.find("embed")?;
+        if embed.shape.len() < 2 { return None; }
+        let vocab = embed.shape[0] as usize;
+        let hidden_dim = embed.shape[1] as usize;
+
+        let rope_cos = view.find("rope_cos")?;
+        if rope_cos.shape.len() < 2 { return None; }
+        let max_pos = rope_cos.shape[0] as usize;
+        let head_dim = (rope_cos.shape[1] as usize) * 2;
+        if head_dim == 0 || head_dim % 2 != 0 { return None; }
+
+        // Walk layers until the q-projection for layer N is missing.
+        let mut n_layers = 0usize;
+        loop {
+            let mut name_buf = alloc::string::String::new();
+            use core::fmt::Write;
+            let _ = core::write!(&mut name_buf, "layer.{}.q", n_layers);
+            if view.find(&name_buf).is_none() { break; }
+            n_layers += 1;
+            // Sanity bound — no Qwen3 / Llama variant exceeds this.
+            if n_layers > 256 { break; }
+        }
+        if n_layers == 0 { return None; }
+
+        let q0 = view.find("layer.0.q")?;
+        let k0 = view.find("layer.0.k")?;
+        let up0 = view.find("layer.0.up")?;
+        if q0.shape.len() < 2 || k0.shape.len() < 2 || up0.shape.len() < 2 {
+            return None;
+        }
+        // shape[0] is `out_features` (the first index in HF / PyTorch
+        // Linear weight). For projections out_features encodes the
+        // attention/FFN dimensions; shape[1] is in_features = hidden_dim.
+        let n_heads = (q0.shape[0] as usize) / head_dim;
+        let n_kv_heads = (k0.shape[0] as usize) / head_dim;
+        let intermediate = up0.shape[0] as usize;
+        if n_heads == 0 || n_kv_heads == 0 || intermediate == 0 {
+            return None;
+        }
+
+        Some(Self {
+            n_layers,
+            hidden_dim,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            intermediate,
+            vocab,
+            max_pos,
+            eps: 1e-6,
+        })
+    }
+}
+
 /// Run the forward pass over `new_token_ids`, advance `cache` to
 /// reflect the new positions, and return unnormalized logits at the
 /// LAST position. Caller picks the next token via `argmax` /

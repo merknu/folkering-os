@@ -340,7 +340,12 @@ pub fn gemm_f32_x_q6k(
     n: usize,
     yield_every: usize,
 ) {
-    // For output projection (m=1, large n), try parallel GEMM across cores
+    // For output projection (m=1, large n), try parallel GEMM across cores.
+    // libtensor is the legacy inference-server path; the production
+    // inference task uses userspace/inference instead. Keeping this
+    // call compiling against the current `parallel_gemm` ABI so the
+    // workspace `cargo check` stays green — the call site itself is
+    // dead in practice but the crate still has to build.
     if m == 1 && n >= 1024 {
         if libfolk::sys::parallel_gemm(
             a_f32.as_ptr(),
@@ -348,7 +353,8 @@ pub fn gemm_f32_x_q6k(
             c.as_mut_ptr(),
             k,
             n,
-            0, // Q6_K
+            1, // seq = m
+            1, // quant_type: 1 = Q6_K (0 = Q8_0)
         ) {
             return;
         }

@@ -140,7 +140,14 @@ fn try_parallel_q8(
 /// + 32 i8 vals = 34 bytes, fits comfortably in any sane L1.
 pub const Q8_BLOCK_SIZE: usize = 32;
 /// Q8_0 bytes per block: 2 (f16 scale) + 32 (i8 vals).
-pub const Q8_BLOCK_BYTES: usize = 34;
+/// Q8 block layout: `[scale_lo: f16][scale_hi: f16][q[0..32]: i8]`
+/// = 36 bytes. `scale_lo` quantizes q[0..16], `scale_hi` quantizes
+/// q[16..32]. Two scales per 32 elements roughly halves Q8 noise vs
+/// the original single-scale layout (34 bytes), at a cost of +6%
+/// file size — and matches what HuggingFace ground-truth tells us
+/// the model needs to recover the right argmax on close-tier tokens.
+pub const Q8_BLOCK_BYTES: usize = 36;
+pub const Q8_HALF: usize = 16;
 
 /// View into a weight matrix that may be either fp32 or Q8_0. The
 /// matvec entry point (`matvec`) dispatches to `linear` for the
@@ -376,18 +383,24 @@ pub fn matmul_batch_q8(
         let row_off = j * row_bytes;
         for b in 0..blocks_per_row {
             let block_off = row_off + b * Q8_BLOCK_BYTES;
-            let scale = f16_to_f32(u16::from_le_bytes([
+            let scale_lo = f16_to_f32(u16::from_le_bytes([
                 weights_q8[block_off],
                 weights_q8[block_off + 1],
             ]));
+            let scale_hi = f16_to_f32(u16::from_le_bytes([
+                weights_q8[block_off + 2],
+                weights_q8[block_off + 3],
+            ]));
             // Dequant block ONCE per (j, b). Stack-allocated, fits
-            // in 128 bytes — never touches heap.
+            // in 128 bytes — never touches heap. Two scales: lo for
+            // q[0..16], hi for q[16..32].
             let mut deq = [0.0f32; Q8_BLOCK_SIZE];
             for k in 0..Q8_BLOCK_SIZE {
                 let q = unsafe {
-                    *(weights_q8.as_ptr().add(block_off + 2 + k) as *const i8)
+                    *(weights_q8.as_ptr().add(block_off + 4 + k) as *const i8)
                 };
-                deq[k] = (q as f32) * scale;
+                let s = if k < Q8_HALF { scale_lo } else { scale_hi };
+                deq[k] = (q as f32) * s;
             }
             // Now dot against every seq row. The inner loop is a
             // pure FMA stream, four accumulators for ILP.
@@ -460,24 +473,31 @@ pub unsafe fn matmul_batch_q8_avx2(
         for b in 0..blocks_per_row {
             let block_off = row_off + b * Q8_BLOCK_BYTES;
 
-            // Block scale: f16 → f32 broadcast across 8 lanes.
-            let scale = f16_to_f32(u16::from_le_bytes([
+            // Two block scales: lo for q[0..16], hi for q[16..32].
+            let scale_lo = f16_to_f32(u16::from_le_bytes([
                 weights_q8[block_off],
                 weights_q8[block_off + 1],
             ]));
-            let scale_v = _mm256_set1_ps(scale);
+            let scale_hi = f16_to_f32(u16::from_le_bytes([
+                weights_q8[block_off + 2],
+                weights_q8[block_off + 3],
+            ]));
+            let scale_lo_v = _mm256_set1_ps(scale_lo);
+            let scale_hi_v = _mm256_set1_ps(scale_hi);
 
             // Dequant 32 i8s → 4 × __m256. _mm256_cvtepi8_epi32 sign-
             // extends the LOW 8 bytes of an __m128i into 8 i32 lanes.
             // We slide the byte window with `srli_si128` to cover all
-            // 32 bytes in two halves of 16.
-            let q_ptr = weights_q8.as_ptr().add(block_off + 2) as *const __m128i;
+            // 32 bytes in two halves of 16. raw_lo's 16 bytes are
+            // q[0..16] → scale_lo; raw_hi's 16 bytes are q[16..32]
+            // → scale_hi.
+            let q_ptr = weights_q8.as_ptr().add(block_off + 4) as *const __m128i;
             let raw_lo = _mm_loadu_si128(q_ptr);
             let raw_hi = _mm_loadu_si128(q_ptr.add(1));
-            let deq0 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(raw_lo)), scale_v);
-            let deq1 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(raw_lo, 8))), scale_v);
-            let deq2 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(raw_hi)), scale_v);
-            let deq3 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(raw_hi, 8))), scale_v);
+            let deq0 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(raw_lo)), scale_lo_v);
+            let deq1 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(raw_lo, 8))), scale_lo_v);
+            let deq2 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(raw_hi)), scale_hi_v);
+            let deq3 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(raw_hi, 8))), scale_hi_v);
 
             let x_off_b = b * Q8_BLOCK_SIZE;
             for s in 0..seq {
@@ -574,44 +594,52 @@ pub fn linear_q8(weights_q8: &[u8], in_dim: usize, out_dim: usize, x: &[f32]) ->
         let row_off = i * row_bytes;
         for b in 0..blocks_per_row {
             let block_off = row_off + b * Q8_BLOCK_BYTES;
-            let scale = f16_to_f32(u16::from_le_bytes([
+            let scale_lo = f16_to_f32(u16::from_le_bytes([
                 weights_q8[block_off],
                 weights_q8[block_off + 1],
             ]));
+            let scale_hi = f16_to_f32(u16::from_le_bytes([
+                weights_q8[block_off + 2],
+                weights_q8[block_off + 3],
+            ]));
             let x_off = b * Q8_BLOCK_SIZE;
-            // Inner-block dot product, optimised in three ways:
-            //   1. `scale` factored OUT of the inner loop — one
-            //      multiply at the end instead of 32. Math is
-            //      identical (distributive property over fp32).
-            //   2. Four parallel accumulators (block_acc0..3) so the
-            //      compiler can issue 4 independent FMA chains
-            //      instead of a single 32-deep dependency chain.
-            //   3. Loop body simplified to (i8 → f32) × x, no scale
-            //      in the hot path — easier for autovectorisation.
-            // Combined gain: ~5–10× on this loop on x86_64 release;
-            // the matmul as a whole moves from "memory-bound after
-            // dequant" to "memory-bound on input streaming", which
-            // is what we wanted from Q8 in the first place.
+            // Two scales per block: lo for q[0..16], hi for q[16..32].
+            // Same four-accumulator inner loop, but compute the lo-half
+            // and hi-half partial sums separately, then combine with
+            // their respective scales at the end. Math: one extra
+            // f32 multiply per block; bandwidth identical.
             let q_block = unsafe {
                 core::slice::from_raw_parts(
-                    weights_q8.as_ptr().add(block_off + 2) as *const i8,
+                    weights_q8.as_ptr().add(block_off + 4) as *const i8,
                     Q8_BLOCK_SIZE,
                 )
             };
             let x_block = &x[x_off..x_off + Q8_BLOCK_SIZE];
-            let mut a0 = 0.0f32;
+            let mut a0 = 0.0f32; // lo half: q_block[0..4]·x[0..4] etc.
             let mut a1 = 0.0f32;
             let mut a2 = 0.0f32;
             let mut a3 = 0.0f32;
+            let mut b0 = 0.0f32; // hi half: q_block[16..20]·x[16..20] etc.
+            let mut b1 = 0.0f32;
+            let mut b2 = 0.0f32;
+            let mut b3 = 0.0f32;
             let mut k = 0;
-            while k < Q8_BLOCK_SIZE {
+            while k < Q8_HALF {
                 a0 += (q_block[k] as f32) * x_block[k];
                 a1 += (q_block[k + 1] as f32) * x_block[k + 1];
                 a2 += (q_block[k + 2] as f32) * x_block[k + 2];
                 a3 += (q_block[k + 3] as f32) * x_block[k + 3];
                 k += 4;
             }
-            acc += (a0 + a1 + a2 + a3) * scale;
+            while k < Q8_BLOCK_SIZE {
+                b0 += (q_block[k] as f32) * x_block[k];
+                b1 += (q_block[k + 1] as f32) * x_block[k + 1];
+                b2 += (q_block[k + 2] as f32) * x_block[k + 2];
+                b3 += (q_block[k + 3] as f32) * x_block[k + 3];
+                k += 4;
+            }
+            acc += (a0 + a1 + a2 + a3) * scale_lo
+                 + (b0 + b1 + b2 + b3) * scale_hi;
             since_yield += Q8_BLOCK_SIZE;
             if since_yield >= MATMUL_YIELD_EVERY {
                 since_yield = 0;
@@ -886,10 +914,24 @@ pub fn softmax_inplace(x: &mut [f32]) {
 /// `[seq_len * n_heads * head_dim]`).
 ///
 /// `cos_table` and `sin_table` both have shape `[seq_len, head_dim/2]`,
-/// pre-computed by the build-time tooling (`gen_test_blobs.py` and the
-/// future HuggingFace converter). For each (s, h, i) where `i` indexes
-/// the pair (`pair_i = i / 2`), rotates `(qk[s,h,2*pair], qk[s,h,2*pair+1])`
-/// by the angle `arctan2(sin, cos)` baked into the tables.
+/// pre-computed by the build-time tooling. For pair index `p` (i.e.
+/// frequency `1 / theta^(2p/head_dim)`), rotates the coordinate pair
+/// `(qk[s,h,p], qk[s,h,p + head_dim/2])` by the angle baked into the
+/// tables.
+///
+/// **Convention: split-halves**, matching HuggingFace transformers'
+/// `apply_rotary_pos_emb` for Llama / Qwen / Mistral / Qwen3:
+///
+///     rotate_half(x) = concat(-x[d/2:], x[:d/2])
+///     out = x * cos + rotate_half(x) * sin
+///
+/// This pairs index `p` with `p + d/2`. The earlier code used
+/// interleaved pairs `(2p, 2p+1)` — same arithmetic but different
+/// coordinate mapping, which the model's weights are NOT trained for.
+/// Switching to split-halves was the fix that put Rust's first
+/// generated tokens back on Python's greedy trajectory ("Jeg er Qwen,
+/// en AI-..." instead of "Jeg er en AI-..."). The pre-computed tables
+/// don't change — only the index mapping does.
 ///
 /// Why pre-compute the tables instead of running sin/cos in the kernel:
 /// fast `sin/cos` approximations cost ~30 cycles per call, and we'd
@@ -914,9 +956,11 @@ pub fn apply_rope(
 
     for s in 0..seq_len {
         for h in 0..n_heads {
+            let head_base = s * n_heads * head_dim + h * head_dim;
             for p in 0..pairs {
-                let i = s * n_heads * head_dim + h * head_dim + 2 * p;
-                let j = i + 1;
+                // Split-halves: pair p couples coords (p, p + d/2).
+                let i = head_base + p;
+                let j = head_base + p + pairs;
                 let cos = cos_table[s * pairs + p];
                 let sin = sin_table[s * pairs + p];
                 let x = qk[i];
@@ -1350,13 +1394,19 @@ pub fn embedding_lookup_q8(
     let mut out = Vec::with_capacity(hidden_dim);
     for b in 0..blocks_per_row {
         let block_off = row_off + b * Q8_BLOCK_BYTES;
-        let scale = f16_to_f32(u16::from_le_bytes([
+        let scale_lo = f16_to_f32(u16::from_le_bytes([
             table_q8[block_off],
             table_q8[block_off + 1],
         ]));
+        let scale_hi = f16_to_f32(u16::from_le_bytes([
+            table_q8[block_off + 2],
+            table_q8[block_off + 3],
+        ]));
+        // q[0..16] use scale_lo, q[16..32] use scale_hi.
         for k in 0..Q8_BLOCK_SIZE {
-            let q = table_q8[block_off + 2 + k] as i8;
-            out.push((q as f32) * scale);
+            let q = table_q8[block_off + 4 + k] as i8;
+            let s = if k < Q8_HALF { scale_lo } else { scale_hi };
+            out.push((q as f32) * s);
         }
     }
     Some(out)
@@ -1414,6 +1464,20 @@ fn fast_rsqrt(x: f32) -> f32 {
 pub fn rmsnorm(x: &[f32], weight: &[f32], eps: f32) -> Option<Vec<f32>> {
     if x.len() != weight.len() { return None; }
     if x.is_empty() { return Some(Vec::new()); }
+
+    // AVX2 fast path: head_dim and hidden_dim on every model we
+    // support are multiples of 8 (Qwen3 has hidden=1024, head_dim=128;
+    // Llama-3 same; Qwen2.5 has hidden=896, head_dim=64). q_norm and
+    // k_norm fire 24 times per layer × 28 layers = 672 calls per
+    // decode token; the pre-attn / pre-ffn norms add another 56.
+    // Worth the AVX2 path even though each call is small.
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2_fma() && x.len() % 8 == 0 {
+            return Some(unsafe { rmsnorm_avx2(x, weight, eps) });
+        }
+    }
+
     let n = x.len();
     let mut sum_sq: f32 = 0.0;
     for &v in x { sum_sq += v * v; }
@@ -1424,6 +1488,48 @@ pub fn rmsnorm(x: &[f32], weight: &[f32], eps: f32) -> Option<Vec<f32>> {
         out.push(x[i] * inv_rms * weight[i]);
     }
     Some(out)
+}
+
+/// AVX2 + FMA rmsnorm. Two passes: sum-of-squares accumulator in 8
+/// f32 lanes (hsum once at the end), then scale + weight in 8 lanes.
+/// Caller guarantees `x.len() == weight.len()` and `x.len() % 8 == 0`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn rmsnorm_avx2(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
+    use core::arch::x86_64::*;
+    let n = x.len();
+    let chunks = n / 8;
+
+    // Pass 1: sum of squares.
+    let mut acc = _mm256_setzero_ps();
+    for c in 0..chunks {
+        let v = _mm256_loadu_ps(x.as_ptr().add(c * 8));
+        acc = _mm256_fmadd_ps(v, v, acc);
+    }
+    let lo = _mm256_castps256_ps128(acc);
+    let hi = _mm256_extractf128_ps(acc, 1);
+    let s4 = _mm_add_ps(lo, hi);
+    let s4_hi = _mm_movehdup_ps(s4);
+    let s2 = _mm_add_ps(s4, s4_hi);
+    let s2_hi = _mm_movehl_ps(s4_hi, s2);
+    let s1 = _mm_add_ss(s2, s2_hi);
+    let sum_sq = _mm_cvtss_f32(s1);
+
+    let mean_sq = sum_sq / (n as f32);
+    let inv_rms = fast_rsqrt(mean_sq + eps);
+    let inv_rms_v = _mm256_set1_ps(inv_rms);
+
+    // Pass 2: out[i] = x[i] * inv_rms * weight[i].
+    let mut out: Vec<f32> = Vec::with_capacity(n);
+    out.set_len(n);
+    for c in 0..chunks {
+        let xv = _mm256_loadu_ps(x.as_ptr().add(c * 8));
+        let wv = _mm256_loadu_ps(weight.as_ptr().add(c * 8));
+        let scaled = _mm256_mul_ps(xv, inv_rms_v);
+        let res = _mm256_mul_ps(scaled, wv);
+        _mm256_storeu_ps(out.as_mut_ptr().add(c * 8), res);
+    }
+    out
 }
 
 /// Boot-time correctness check. Runs all `tensor_math` ops on small
