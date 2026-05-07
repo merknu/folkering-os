@@ -140,7 +140,14 @@ fn try_parallel_q8(
 /// + 32 i8 vals = 34 bytes, fits comfortably in any sane L1.
 pub const Q8_BLOCK_SIZE: usize = 32;
 /// Q8_0 bytes per block: 2 (f16 scale) + 32 (i8 vals).
-pub const Q8_BLOCK_BYTES: usize = 34;
+/// Q8 block layout: `[scale_lo: f16][scale_hi: f16][q[0..32]: i8]`
+/// = 36 bytes. `scale_lo` quantizes q[0..16], `scale_hi` quantizes
+/// q[16..32]. Two scales per 32 elements roughly halves Q8 noise vs
+/// the original single-scale layout (34 bytes), at a cost of +6%
+/// file size — and matches what HuggingFace ground-truth tells us
+/// the model needs to recover the right argmax on close-tier tokens.
+pub const Q8_BLOCK_BYTES: usize = 36;
+pub const Q8_HALF: usize = 16;
 
 /// View into a weight matrix that may be either fp32 or Q8_0. The
 /// matvec entry point (`matvec`) dispatches to `linear` for the
@@ -376,18 +383,24 @@ pub fn matmul_batch_q8(
         let row_off = j * row_bytes;
         for b in 0..blocks_per_row {
             let block_off = row_off + b * Q8_BLOCK_BYTES;
-            let scale = f16_to_f32(u16::from_le_bytes([
+            let scale_lo = f16_to_f32(u16::from_le_bytes([
                 weights_q8[block_off],
                 weights_q8[block_off + 1],
             ]));
+            let scale_hi = f16_to_f32(u16::from_le_bytes([
+                weights_q8[block_off + 2],
+                weights_q8[block_off + 3],
+            ]));
             // Dequant block ONCE per (j, b). Stack-allocated, fits
-            // in 128 bytes — never touches heap.
+            // in 128 bytes — never touches heap. Two scales: lo for
+            // q[0..16], hi for q[16..32].
             let mut deq = [0.0f32; Q8_BLOCK_SIZE];
             for k in 0..Q8_BLOCK_SIZE {
                 let q = unsafe {
-                    *(weights_q8.as_ptr().add(block_off + 2 + k) as *const i8)
+                    *(weights_q8.as_ptr().add(block_off + 4 + k) as *const i8)
                 };
-                deq[k] = (q as f32) * scale;
+                let s = if k < Q8_HALF { scale_lo } else { scale_hi };
+                deq[k] = (q as f32) * s;
             }
             // Now dot against every seq row. The inner loop is a
             // pure FMA stream, four accumulators for ILP.
@@ -460,24 +473,31 @@ pub unsafe fn matmul_batch_q8_avx2(
         for b in 0..blocks_per_row {
             let block_off = row_off + b * Q8_BLOCK_BYTES;
 
-            // Block scale: f16 → f32 broadcast across 8 lanes.
-            let scale = f16_to_f32(u16::from_le_bytes([
+            // Two block scales: lo for q[0..16], hi for q[16..32].
+            let scale_lo = f16_to_f32(u16::from_le_bytes([
                 weights_q8[block_off],
                 weights_q8[block_off + 1],
             ]));
-            let scale_v = _mm256_set1_ps(scale);
+            let scale_hi = f16_to_f32(u16::from_le_bytes([
+                weights_q8[block_off + 2],
+                weights_q8[block_off + 3],
+            ]));
+            let scale_lo_v = _mm256_set1_ps(scale_lo);
+            let scale_hi_v = _mm256_set1_ps(scale_hi);
 
             // Dequant 32 i8s → 4 × __m256. _mm256_cvtepi8_epi32 sign-
             // extends the LOW 8 bytes of an __m128i into 8 i32 lanes.
             // We slide the byte window with `srli_si128` to cover all
-            // 32 bytes in two halves of 16.
-            let q_ptr = weights_q8.as_ptr().add(block_off + 2) as *const __m128i;
+            // 32 bytes in two halves of 16. raw_lo's 16 bytes are
+            // q[0..16] → scale_lo; raw_hi's 16 bytes are q[16..32]
+            // → scale_hi.
+            let q_ptr = weights_q8.as_ptr().add(block_off + 4) as *const __m128i;
             let raw_lo = _mm_loadu_si128(q_ptr);
             let raw_hi = _mm_loadu_si128(q_ptr.add(1));
-            let deq0 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(raw_lo)), scale_v);
-            let deq1 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(raw_lo, 8))), scale_v);
-            let deq2 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(raw_hi)), scale_v);
-            let deq3 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(raw_hi, 8))), scale_v);
+            let deq0 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(raw_lo)), scale_lo_v);
+            let deq1 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(raw_lo, 8))), scale_lo_v);
+            let deq2 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(raw_hi)), scale_hi_v);
+            let deq3 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(raw_hi, 8))), scale_hi_v);
 
             let x_off_b = b * Q8_BLOCK_SIZE;
             for s in 0..seq {
@@ -574,44 +594,52 @@ pub fn linear_q8(weights_q8: &[u8], in_dim: usize, out_dim: usize, x: &[f32]) ->
         let row_off = i * row_bytes;
         for b in 0..blocks_per_row {
             let block_off = row_off + b * Q8_BLOCK_BYTES;
-            let scale = f16_to_f32(u16::from_le_bytes([
+            let scale_lo = f16_to_f32(u16::from_le_bytes([
                 weights_q8[block_off],
                 weights_q8[block_off + 1],
             ]));
+            let scale_hi = f16_to_f32(u16::from_le_bytes([
+                weights_q8[block_off + 2],
+                weights_q8[block_off + 3],
+            ]));
             let x_off = b * Q8_BLOCK_SIZE;
-            // Inner-block dot product, optimised in three ways:
-            //   1. `scale` factored OUT of the inner loop — one
-            //      multiply at the end instead of 32. Math is
-            //      identical (distributive property over fp32).
-            //   2. Four parallel accumulators (block_acc0..3) so the
-            //      compiler can issue 4 independent FMA chains
-            //      instead of a single 32-deep dependency chain.
-            //   3. Loop body simplified to (i8 → f32) × x, no scale
-            //      in the hot path — easier for autovectorisation.
-            // Combined gain: ~5–10× on this loop on x86_64 release;
-            // the matmul as a whole moves from "memory-bound after
-            // dequant" to "memory-bound on input streaming", which
-            // is what we wanted from Q8 in the first place.
+            // Two scales per block: lo for q[0..16], hi for q[16..32].
+            // Same four-accumulator inner loop, but compute the lo-half
+            // and hi-half partial sums separately, then combine with
+            // their respective scales at the end. Math: one extra
+            // f32 multiply per block; bandwidth identical.
             let q_block = unsafe {
                 core::slice::from_raw_parts(
-                    weights_q8.as_ptr().add(block_off + 2) as *const i8,
+                    weights_q8.as_ptr().add(block_off + 4) as *const i8,
                     Q8_BLOCK_SIZE,
                 )
             };
             let x_block = &x[x_off..x_off + Q8_BLOCK_SIZE];
-            let mut a0 = 0.0f32;
+            let mut a0 = 0.0f32; // lo half: q_block[0..4]·x[0..4] etc.
             let mut a1 = 0.0f32;
             let mut a2 = 0.0f32;
             let mut a3 = 0.0f32;
+            let mut b0 = 0.0f32; // hi half: q_block[16..20]·x[16..20] etc.
+            let mut b1 = 0.0f32;
+            let mut b2 = 0.0f32;
+            let mut b3 = 0.0f32;
             let mut k = 0;
-            while k < Q8_BLOCK_SIZE {
+            while k < Q8_HALF {
                 a0 += (q_block[k] as f32) * x_block[k];
                 a1 += (q_block[k + 1] as f32) * x_block[k + 1];
                 a2 += (q_block[k + 2] as f32) * x_block[k + 2];
                 a3 += (q_block[k + 3] as f32) * x_block[k + 3];
                 k += 4;
             }
-            acc += (a0 + a1 + a2 + a3) * scale;
+            while k < Q8_BLOCK_SIZE {
+                b0 += (q_block[k] as f32) * x_block[k];
+                b1 += (q_block[k + 1] as f32) * x_block[k + 1];
+                b2 += (q_block[k + 2] as f32) * x_block[k + 2];
+                b3 += (q_block[k + 3] as f32) * x_block[k + 3];
+                k += 4;
+            }
+            acc += (a0 + a1 + a2 + a3) * scale_lo
+                 + (b0 + b1 + b2 + b3) * scale_hi;
             since_yield += Q8_BLOCK_SIZE;
             if since_yield >= MATMUL_YIELD_EVERY {
                 since_yield = 0;
@@ -1366,13 +1394,19 @@ pub fn embedding_lookup_q8(
     let mut out = Vec::with_capacity(hidden_dim);
     for b in 0..blocks_per_row {
         let block_off = row_off + b * Q8_BLOCK_BYTES;
-        let scale = f16_to_f32(u16::from_le_bytes([
+        let scale_lo = f16_to_f32(u16::from_le_bytes([
             table_q8[block_off],
             table_q8[block_off + 1],
         ]));
+        let scale_hi = f16_to_f32(u16::from_le_bytes([
+            table_q8[block_off + 2],
+            table_q8[block_off + 3],
+        ]));
+        // q[0..16] use scale_lo, q[16..32] use scale_hi.
         for k in 0..Q8_BLOCK_SIZE {
-            let q = table_q8[block_off + 2 + k] as i8;
-            out.push((q as f32) * scale);
+            let q = table_q8[block_off + 4 + k] as i8;
+            let s = if k < Q8_HALF { scale_lo } else { scale_hi };
+            out.push((q as f32) * s);
         }
     }
     Some(out)

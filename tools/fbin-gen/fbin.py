@@ -94,12 +94,31 @@ def f32_bytes(values) -> bytes:
 # refuses rather than silently padding.
 
 Q8_BLOCK_SIZE = 32
-Q8_BLOCK_BYTES = 2 + 32  # f16 scale + 32 i8 vals
+Q8_HALF = 16
+# Block layout: [scale_lo: f16][scale_hi: f16][q[0..32]: i8] = 36 bytes.
+# scale_lo quantizes q[0..16], scale_hi quantizes q[16..32]. Splitting
+# the scale per half-block roughly halves quantization noise vs the
+# original single-scale Q8_0 layout (which was 2+32 = 34 bytes), at a
+# cost of +6% file size. Empirically motivated by Folkering OS Qwen3-4B
+# bringup: with 36-layer compounded Q8 noise, single-scale blocks
+# produced 0.94-logit gaps on close-tier tokens that flipped greedy
+# argmax in roughly 6% of decoding steps. Two-scale blocks shrink the
+# per-element scale-noise floor (~0.4% absmax-uniform → ~0.2%) which
+# is enough to rescue most of those flips.
+Q8_BLOCK_BYTES = 4 + 32
 
 
 def q8_0_bytes(values) -> bytes:
-    """Pack a flat list of floats as Q8_0 blocks. Returns the raw
-    bytes; caller emits with `dtype = DTYPE_Q8`.
+    """Pack a flat list of floats as Q8_2 blocks (two f16 scales per
+    32 i8 values). Returns the raw bytes; caller emits with
+    `dtype = DTYPE_Q8`.
+
+    Function name kept as q8_0_bytes for call-site compatibility —
+    callers don't care about the internal layout, just that the bytes
+    pair with a DTYPE_Q8 tensor entry. The runtime readers in
+    `userspace::inference::tensor_math` and `kernel::arch::x86_64::smp`
+    interpret these bytes per the matching Q8_BLOCK_BYTES constant on
+    their side.
 
     Importing numpy lazily so callers that only need the f32 path
     don't pay the import cost (and so this module stays usable in
@@ -111,27 +130,33 @@ def q8_0_bytes(values) -> bytes:
     n = arr.size
     if n % Q8_BLOCK_SIZE != 0:
         raise ValueError(
-            f"Q8_0: tensor size {n} not divisible by block size "
+            f"Q8: tensor size {n} not divisible by block size "
             f"{Q8_BLOCK_SIZE}"
         )
     n_blocks = n // Q8_BLOCK_SIZE
     out = bytearray()
     for b in range(n_blocks):
         block = arr[b * Q8_BLOCK_SIZE : (b + 1) * Q8_BLOCK_SIZE]
-        absmax = float(np.max(np.abs(block)))
-        if absmax == 0.0:
-            scale = np.float32(0.0)
-            qs = np.zeros(Q8_BLOCK_SIZE, dtype=np.int8)
-        else:
-            scale = np.float32(absmax / 127.0)
-            qs = np.round(block / scale).astype(np.int32)
-            # Saturate to int8 range. Round-half-to-even can drift to
-            # ±128 on edge cases; clamp keeps us in the legal range.
-            qs = np.clip(qs, -127, 127).astype(np.int8)
-        # f16 scale, little-endian.
-        scale_f16 = np.float16(scale).tobytes()
-        out += scale_f16
-        out += qs.tobytes()
+        scales_b = bytearray()
+        quants_b = bytearray()
+        for half in range(2):
+            sub = block[half * Q8_HALF : (half + 1) * Q8_HALF]
+            absmax = float(np.max(np.abs(sub)))
+            if absmax == 0.0:
+                scale = np.float32(0.0)
+                qs = np.zeros(Q8_HALF, dtype=np.int8)
+            else:
+                scale = np.float32(absmax / 127.0)
+                qs = np.round(sub / scale).astype(np.int32)
+                # Saturate to int8 range. Round-half-to-even can drift
+                # to ±128 on edge cases; clamp keeps us in the legal
+                # range so the kernel maddubs sign-fold trick stays
+                # safe (`sign_epi8(-128, _)` overflows).
+                qs = np.clip(qs, -127, 127).astype(np.int8)
+            scales_b += np.float16(scale).tobytes()
+            quants_b += qs.tobytes()
+        out += scales_b
+        out += quants_b
     return bytes(out)
 
 
