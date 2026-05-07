@@ -113,7 +113,7 @@ mod forward_pass;
 // top-5 = ['<think>', '<|im_start|>', 'ол', '<|im_end|>', '</think>'].
 // Qwen3 is a thinking-mode model — responses open with reasoning tags
 // before the user-facing text.
-const HEAP_SIZE: usize = 768 * 1024 * 1024;
+const HEAP_SIZE: usize = 1536 * 1024 * 1024;
 
 struct BumpAllocator {
     heap: UnsafeCell<[u8; HEAP_SIZE]>,
@@ -1345,6 +1345,56 @@ fn run_d31q_q8_self_test() -> bool {
 /// On failure the test logs but doesn't fatal the boot — the
 /// router still serves IPC requests. Useful so a freshly-cloned
 /// repo without the converted .fbin still boots.
+/// Sampler parameters that travel with a `ModelConfig`. Lets the
+/// same binary run 0.6B and 4B with the right tuning each — the
+/// rep-penalty strategy in particular cannot be shared, since the
+/// per-occurrence compounding our `apply_repetition_penalty`
+/// implements is what 0.6B leans on to escape its `<think>→\n→<think>`
+/// spiral, but is what destroys 4B's distribution after ~30 tokens.
+#[derive(Debug, Clone, Copy)]
+struct SamplerConfig {
+    top_k: usize,
+    top_p: f32,
+    temperature: f32,
+    rep_penalty: f32,
+    /// `true`: dedupe `prompt ∪ sampled` and apply rep-penalty once
+    /// (HF-correct). `false`: apply rep-penalty twice (once on raw
+    /// `prompt_ids`, once on raw `sampled`) without deduping —
+    /// preserves Qwen3-0.6B's exact escape behaviour.
+    dedupe_rep_penalty: bool,
+}
+
+impl SamplerConfig {
+    /// Pick a tuning from model architecture. Discriminates on
+    /// `hidden_dim` — 0.6B uses 1024, 4B uses 2560. New models
+    /// (8B at 4096, etc.) currently land on the 4B path; revisit
+    /// when we add a third model.
+    const fn for_model(cfg: &forward_pass::ModelConfig) -> Self {
+        if cfg.hidden_dim >= 2048 {
+            // Qwen3-4B-Instruct-2507 (and larger): HF defaults +
+            // deduped, single-application rep-penalty.
+            Self {
+                top_k: 50,
+                top_p: 0.9,
+                temperature: 0.7,
+                rep_penalty: 1.05,
+                dedupe_rep_penalty: true,
+            }
+        } else {
+            // Qwen3-0.6B (legacy): aggressive twice-applied,
+            // un-deduped rep-penalty needed to break the
+            // thinking-mode newline spiral.
+            Self {
+                top_k: 40,
+                top_p: 0.92,
+                temperature: 1.0,
+                rep_penalty: 1.3,
+                dedupe_rep_penalty: false,
+            }
+        }
+    }
+}
+
 fn run_d37_first_blood() -> bool {
     use weights::FbinView;
     use forward_pass::{forward_pass, argmax, ModelConfig};
@@ -1404,13 +1454,21 @@ fn run_d37_first_blood() -> bool {
     // Full 28-layer Qwen3-0.6B with the perf stack (#165 xsave +
     // #166 AVX2 FMA + #168 yield-tune + #169 multi-sector DMA),
     // running on a 768 MiB bump heap.
+    // Qwen3-4B-Instruct-2507 config (full 36 layers). Bumps from
+    // Qwen3-0.6B (28 / 1024 / 16 heads / 3072 ffn) — model file is
+    // ~4.0 GiB Q8 + Q8 embed; the larger weight stream needs the
+    // 1.5 GiB HEAP_SIZE bump above. Non-thinking mode means no
+    // automatic <think>...</think> emission; the model answers
+    // directly. rope_theta is baked into the .fbin's RoPE tables
+    // (5e6 for 4B vs 1e6 for 0.6B), so the runtime config doesn't
+    // need to change.
     let cfg = ModelConfig {
-        n_layers: 28,
-        hidden_dim: 1024,
-        n_heads: 16,
+        n_layers: 36,
+        hidden_dim: 2560,
+        n_heads: 32,
         n_kv_heads: 8,
         head_dim: 128,
-        intermediate: 3072,
+        intermediate: 9728,
         vocab: 151936,
         max_pos: 512,
         eps: 1e-6,
@@ -1419,8 +1477,23 @@ fn run_d37_first_blood() -> bool {
         cfg.n_layers, cfg.max_pos, cfg.n_kv_heads, cfg.head_dim,
     );
 
-    // ChatML wrap of "Hvem er du?". HF reference is 14 tokens.
-    let prompt = "<|im_start|>user\nHvem er du?<|im_end|>\n<|im_start|>assistant\n";
+    // ChatML with explicit Norwegian system prompt. Without the
+    // system message Qwen3-4B answers "Hvem er du?" in Danish/Swedish
+    // (the question parses cleanly in all three Scandinavian
+    // languages and the model's training data probably leans Danish
+    // for that exact phrase). The system message removes the
+    // ambiguity. Also gives the model a defined role, which usually
+    // tightens the response and makes EOS more likely on short
+    // questions.
+    let prompt = concat!(
+        "<|im_start|>system\n",
+        "Du er en hjelpsom AI-assistent. Svar kort og presist på norsk bokmål.",
+        "<|im_end|>\n",
+        "<|im_start|>user\n",
+        "Hvem er du?",
+        "<|im_end|>\n",
+        "<|im_start|>assistant\n",
+    );
     let prompt_ids = tok.encode(prompt);
     println!(
         "[INFERENCE] D.3.7: encoded prompt -> {} tokens",
@@ -1522,23 +1595,26 @@ fn run_d37_first_blood() -> bool {
         "[INFERENCE] D.3.7: prng_seed=0x{:016x}{:016x}{:016x}{:016x}",
         seed[0], seed[1], seed[2], seed[3],
     );
-    const TOP_K: usize = 40;
-    // Top-P (nucleus): keep the smallest set of tokens whose
-    // cumulative probability ≥ TOP_P. 0.92 is the HF / OpenAI
-    // default — narrow enough to keep gibberish out, wide enough
-    // to let creative continuations through. Composed with TOP_K
-    // = 40 as upper bound: nucleus is min(40, smallest set with
-    // ≥ 92 % mass).
-    const TOP_P: f32 = 0.92;
-    // T > 1 flattens the softmax; the previous T=0.7 + T=1.2 runs
-    // landed on ~99% mass on `\n` (token 198) every step, so the
-    // sampler degenerated to greedy. T=1.0 is HF's default and
-    // gives the repetition-penalty room to redistribute mass.
-    const TEMPERATURE: f32 = 1.0;
-    // Repetition penalty (HF-transformers semantics): positive
-    // logits for already-generated tokens get divided by 1.3.
-    // Breaks Qwen3-0.6B's newline-spiral on its first few tokens.
-    const REPETITION_PENALTY: f32 = 1.3;
+    // Sampler config picked from model architecture so the same
+    // binary handles both Qwen3-0.6B and Qwen3-4B without rebuild.
+    //
+    // 0.6B (legacy): T=1.0, K=40, P=0.92, RP=1.3 applied TWICE on
+    // the raw prompt and raw sampled buffer (no dedupe). The
+    // double-application was a bug in HF semantics — it divides
+    // a token appearing N times by penalty^N — but it happens to
+    // be exactly the right amount of force to break thinking-mode
+    // 0.6B's `<think>→\n→<think>` greedy spiral. Preserved verbatim
+    // so we can ship 0.6B unchanged when we swap the model.
+    //
+    // 4B (HF defaults): T=0.7, K=50, P=0.9, RP=1.05 applied ONCE
+    // over a deduped `prompt ∪ sampled` set. RP=1.3 with dedupe
+    // also works but flattens the distribution more than necessary.
+    let sampler_cfg = SamplerConfig::for_model(&cfg);
+    println!(
+        "[INFERENCE] D.3.7: sampler K={} P={} T={} RP={} dedupe={}",
+        sampler_cfg.top_k, sampler_cfg.top_p, sampler_cfg.temperature,
+        sampler_cfg.rep_penalty, sampler_cfg.dedupe_rep_penalty,
+    );
 
     // Decode up to MAX_DECODE tokens. Stops on <|im_end|> (151645)
     // or <|endoftext|> (151643). Each step pushes one token through
@@ -1557,27 +1633,57 @@ fn run_d37_first_blood() -> bool {
                 None => break,
             };
 
-            // Apply repetition penalty across both prompt and
-            // generated tokens. Without it Qwen3-0.6B re-picks `\n`
-            // ~99 % of the time and the sampler can never escape.
-            sampling::apply_repetition_penalty(
-                &mut logits, &prompt_ids, REPETITION_PENALTY,
-            );
-            sampling::apply_repetition_penalty(
-                &mut logits, &sampled, REPETITION_PENALTY,
-            );
+            // Repetition penalty: dispatch on the per-model strategy.
+            // 0.6B path: apply twice on raw prompt + raw sampled (no
+            //   dedupe — penalty compounds per occurrence, which is
+            //   what 0.6B needs to escape its newline spiral).
+            // 4B path: apply once on a deduped prompt ∪ sampled set
+            //   (HF-correct; per-occurrence compounding would collapse
+            //   common function words).
+            // Both Vecs allocated above arena_base; dropped at this
+            // block's `}` and reclaimed by the bump-rewind below.
+            if sampler_cfg.dedupe_rep_penalty {
+                let mut recent: Vec<u32> =
+                    Vec::with_capacity(prompt_ids.len() + sampled.len());
+                recent.extend_from_slice(&prompt_ids);
+                recent.extend_from_slice(&sampled);
+                recent.sort_unstable();
+                recent.dedup();
+                sampling::apply_repetition_penalty(
+                    &mut logits, &recent, sampler_cfg.rep_penalty,
+                );
+            } else {
+                sampling::apply_repetition_penalty(
+                    &mut logits, &prompt_ids, sampler_cfg.rep_penalty,
+                );
+                sampling::apply_repetition_penalty(
+                    &mut logits, &sampled, sampler_cfg.rep_penalty,
+                );
+            }
 
-            // Diagnostic: dump top-5 (logit, token_id) for the first
-            // two decode steps so we can see the distribution shape.
-            if step < 2 {
+            // Diagnostic: dump top-5 (logit, token_id) at sparse
+            // positions so we can localise drift. Dense for the first
+            // 12 steps (where model should still be coherent), then
+            // every 8 steps to step 64, then every 32 to MAX_DECODE.
+            let dump = step < 12
+                || (step < 64 && step % 8 == 0)
+                || step % 32 == 0;
+            if dump {
                 let dbg = sampling::top_k(&logits, 5);
                 crate::println!(
                     "[INFERENCE] D.3.7 dbg: step={} top5_logits={:?}",
                     step, dbg
                 );
             }
-            sampling::sample(&logits, TOP_K, TOP_P, TEMPERATURE, &mut prng)
-            // `logits` and any temporaries from sampling drop here.
+            sampling::sample(
+                &logits,
+                sampler_cfg.top_k,
+                sampler_cfg.top_p,
+                sampler_cfg.temperature,
+                &mut prng,
+            )
+            // `logits` and any `recent` Vec drop here; arena_base
+            // reset below reclaims their pages in O(1).
         };
 
         // Reclaim the entire forward_pass + sampler scratch in one
