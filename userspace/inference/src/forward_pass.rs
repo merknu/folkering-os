@@ -94,16 +94,21 @@ pub struct ModelConfig {
 impl ModelConfig {
     /// Derive a config from the .fbin's tensor metadata. Lets one
     /// binary boot any Qwen3 (0.6B / 4B / future sizes) — the fbin
-    /// already carries everything we need:
-    ///   embed.shape       = [vocab, hidden_dim]
-    ///   layer.0.q.shape   = [hidden_dim, n_heads * head_dim]
-    ///   layer.0.k.shape   = [hidden_dim, n_kv_heads * head_dim]
-    ///   layer.0.up.shape  = [hidden_dim, intermediate]
-    ///   rope_cos.shape    = [max_pos, head_dim / 2]
+    /// already carries everything we need.
+    ///
+    /// Shape convention: HF safetensors stores PyTorch `nn.Linear.weight`
+    /// as `[out_features, in_features]`, and `hf_to_fbin.py` propagates
+    /// that verbatim into the .fbin. So:
+    ///   embed.shape       = [vocab,             hidden_dim]
+    ///   rope_cos.shape    = [max_pos,           head_dim / 2]
+    ///   layer.N.q.shape   = [n_heads*head_dim,  hidden_dim]
+    ///   layer.N.k.shape   = [n_kv_heads*head_dim, hidden_dim]
+    ///   layer.N.up.shape  = [intermediate,      hidden_dim]
     /// `n_layers` is found by walking `layer.N.q` until missing.
-    /// `eps` defaults to 1e-6 (Qwen3); flip back to 1e-5 if/when we
-    /// add Qwen2.5 again — the .fbin doesn't carry this so it's a
-    /// model-family choice.
+    ///
+    /// `eps` defaults to 1e-6 (Qwen3); the .fbin doesn't carry it so
+    /// it stays a model-family hardcode. Flip back to 1e-5 if/when
+    /// we add Qwen2.5 again.
     pub fn from_fbin(view: &crate::weights::FbinView) -> Option<Self> {
         let embed = view.find("embed")?;
         if embed.shape.len() < 2 { return None; }
@@ -135,9 +140,12 @@ impl ModelConfig {
         if q0.shape.len() < 2 || k0.shape.len() < 2 || up0.shape.len() < 2 {
             return None;
         }
-        let n_heads = (q0.shape[1] as usize) / head_dim;
-        let n_kv_heads = (k0.shape[1] as usize) / head_dim;
-        let intermediate = up0.shape[1] as usize;
+        // shape[0] is `out_features` (the first index in HF / PyTorch
+        // Linear weight). For projections out_features encodes the
+        // attention/FFN dimensions; shape[1] is in_features = hidden_dim.
+        let n_heads = (q0.shape[0] as usize) / head_dim;
+        let n_kv_heads = (k0.shape[0] as usize) / head_dim;
+        let intermediate = up0.shape[0] as usize;
         if n_heads == 0 || n_kv_heads == 0 || intermediate == 0 {
             return None;
         }
