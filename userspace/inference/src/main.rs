@@ -1374,16 +1374,15 @@ impl SamplerConfig {
             // Qwen3-4B-Instruct-2507 (and larger): HF defaults +
             // deduped, single-application rep-penalty.
             //
-            // Verified against Python ground-truth via greedy diff
-            // (T=0 / RP=1.0): 31 of 32 generated tokens match HF
-            // greedy verbatim; the one diverging step has the right
-            // answer in our top-2 with a 0.94-logit gap to top-1.
-            // That gap is the Q8 quantization noise floor across 36
-            // layers — closing it further requires either fp16
-            // weights (~8 GiB instead of 4 GiB Q8) or finer Q8 block
-            // size (16-element groups instead of 32). Logged here so
-            // the next time this question comes up we don't re-derive
-            // it from scratch.
+            // Verified vs Python ground-truth greedy after the
+            // Q8_2 weight format landed: Folkering's greedy now
+            // matches HF token-for-token through index 34 (was 11
+            // under Q8_0 with a 0.94-logit gap to the right token
+            // at index 12). Remaining greedy differences past
+            // index 34 are linguistic alternatives at natural
+            // decision points (tekst vs tekster, optional ' i dag'
+            // closer), not numerical drift — so the production
+            // sampler can roll either trajectory and stay correct.
             Self {
                 top_k: 50,
                 top_p: 0.9,
