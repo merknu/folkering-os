@@ -70,7 +70,7 @@ from typing import Dict
 
 # Local helpers
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from fbin import write_fbin, q8_0_bytes, DTYPE_F32, DTYPE_Q8, Q8_BLOCK_SIZE  # type: ignore
+from fbin import write_fbin, write_fbin_streaming, q8_0_bytes, DTYPE_F32, DTYPE_Q8, Q8_BLOCK_SIZE  # type: ignore
 
 import numpy as np
 from safetensors import safe_open
@@ -242,6 +242,48 @@ def emit_tensor(
     out.append((name, DTYPE_F32, list(arr.shape), to_f32_le_bytes(arr)))
 
 
+def _build_safetensors_index(model_dir: str):
+    """Map every tensor key → (shard_path) without loading data.
+    Lets the streaming converter pull tensors one at a time instead
+    of materialising the full bf16→fp32 model in RAM."""
+    files = sorted(
+        os.path.join(model_dir, f) for f in os.listdir(model_dir)
+        if f.endswith(".safetensors")
+    )
+    if not files:
+        raise FileNotFoundError(
+            f"no .safetensors in {model_dir} — is this a real HF dir?"
+        )
+    index = {}
+    for path in files:
+        with safe_open(path, framework="numpy") as st:
+            for k in st.keys():
+                index[k] = path
+    return index
+
+
+def _load_one_tensor(path: str, key: str) -> np.ndarray:
+    """Load a single tensor as fp32 numpy. Tries numpy backend first;
+    falls back to torch if dtype is bf16 (numpy can't decode bf16
+    natively until recent versions)."""
+    try:
+        with safe_open(path, framework="numpy") as st:
+            return st.get_tensor(key)
+    except TypeError as e:
+        if "bfloat16" not in str(e):
+            raise
+        try:
+            import torch  # noqa: F401
+        except ImportError as ie:
+            raise SystemExit(
+                "model uses bfloat16, which numpy can't decode. "
+                "Install torch: `pip install torch`."
+            ) from ie
+        with safe_open(path, framework="pt") as st:
+            t = st.get_tensor(key)
+            return t.to(dtype=__import__("torch").float32).numpy()
+
+
 def convert(
     model_dir: str,
     out_path: str,
@@ -250,6 +292,16 @@ def convert(
     quant: str = "f32",
     quant_embed: bool = False,
 ):
+    """Streaming HF safetensors → .fbin converter.
+
+    Loads exactly ONE tensor at a time, quantizes (or just promotes
+    to fp32), writes to an .fbin tempfile, and frees. Peak RAM is
+    dominated by the largest single tensor (typically embed for
+    Qwen3-4B at ~1.5 GiB fp32 → ~410 MiB Q8_2). The previous version
+    of this function held the whole model in `weights: dict` plus
+    every quantized blob in `tensors: list`, which OOM'd on hosts
+    with <16 GiB free.
+    """
     cfg_path = os.path.join(model_dir, "config.json")
     with open(cfg_path) as f:
         cfg = json.load(f)
@@ -270,54 +322,63 @@ def convert(
         f"max_pos={max_pos} tied_embed={tie_emb}"
     )
 
-    weights = load_safetensors(model_dir)
+    index = _build_safetensors_index(model_dir)
+    print(f"[hf_to_fbin] indexed {len(index)} tensors across "
+          f"{len(set(index.values()))} shard(s)")
 
-    # Output tensor list, in the order the inference task expects to
-    # find them. Order doesn't matter for correctness (lookup is by
-    # name), but consistent ordering means deterministic .fbin output
-    # so byte-for-byte comparisons across runs catch regressions.
-    tensors: list = []
+    n_tensors = [0]
+    n_bytes = [0]
 
-    # ── Embedding ──
-    if "model.embed_tokens.weight" in weights:
-        emit_tensor(tensors, "embed", weights["model.embed_tokens.weight"], quant=quant, quant_embed=quant_embed)
-    else:
-        raise KeyError("missing model.embed_tokens.weight")
+    def stream_tensor(emit, our_name: str, hf_name: str):
+        if hf_name not in index:
+            return False
+        arr = _load_one_tensor(index[hf_name], hf_name)
+        # Buffered emit; emit_tensor expects a list, so we fake one
+        # for one tensor at a time and forward to the streaming sink.
+        sink = []
+        emit_tensor(sink, our_name, arr, quant=quant, quant_embed=quant_embed)
+        del arr
+        for name, dtype, shape, raw in sink:
+            emit(name, dtype, shape, raw)
+            n_tensors[0] += 1
+            n_bytes[0] += len(raw)
+        return True
 
-    # ── Per-layer ──
-    for layer_i in range(n_layers):
-        for hf_suffix, our_suffix in HF_LAYER_TENSORS.items():
-            hf_name = f"model.layers.{layer_i}.{hf_suffix}"
-            if hf_name not in weights:
-                # Some tensors are model-specific (Qwen has q_bias,
-                # Llama doesn't). Skip silently when absent — the
-                # runtime will skip the corresponding op.
-                continue
-            our_name = f"layer.{layer_i}.{our_suffix}"
-            emit_tensor(tensors, our_name, weights[hf_name], quant=quant, quant_embed=quant_embed)
+    def emit_synth(emit, name: str, arr):
+        sink = []
+        emit_tensor(sink, name, arr, quant=quant, quant_embed=quant_embed)
+        for n, dtype, shape, raw in sink:
+            emit(n, dtype, shape, raw)
+            n_tensors[0] += 1
+            n_bytes[0] += len(raw)
 
-    # ── Final norm ──
-    if "model.norm.weight" in weights:
-        emit_tensor(tensors, "final_norm", weights["model.norm.weight"], quant=quant, quant_embed=quant_embed)
+    def iter_tensors(emit):
+        # Order matches the previous in-memory `convert` for
+        # determinism / byte-for-byte regression diffs across runs.
+        if not stream_tensor(emit, "embed", "model.embed_tokens.weight"):
+            raise KeyError("missing model.embed_tokens.weight")
 
-    # ── lm_head (skip if tied to embed) ──
-    if not tie_emb and "lm_head.weight" in weights:
-        emit_tensor(tensors, "lm_head", weights["lm_head.weight"], quant=quant, quant_embed=quant_embed)
+        for layer_i in range(n_layers):
+            for hf_suffix, our_suffix in HF_LAYER_TENSORS.items():
+                hf_name = f"model.layers.{layer_i}.{hf_suffix}"
+                our_name = f"layer.{layer_i}.{our_suffix}"
+                stream_tensor(emit, our_name, hf_name)
 
-    # ── RoPE precomputed tables ──
-    cos_t, sin_t = precompute_rope(head_dim, max_pos, rope_theta)
-    emit_tensor(tensors, "rope_cos", cos_t, quant=quant, quant_embed=quant_embed)
-    emit_tensor(tensors, "rope_sin", sin_t, quant=quant, quant_embed=quant_embed)
+        stream_tensor(emit, "final_norm", "model.norm.weight")
 
-    blob = write_fbin(tensors)
-    with open(out_path, "wb") as f:
-        f.write(blob)
+        if not tie_emb:
+            stream_tensor(emit, "lm_head", "lm_head.weight")
 
-    total_data_mb = sum(len(t[3]) for t in tensors) / (1024 * 1024)
+        # RoPE tables are synthesised, not loaded.
+        cos_t, sin_t = precompute_rope(head_dim, max_pos, rope_theta)
+        emit_synth(emit, "rope_cos", cos_t)
+        emit_synth(emit, "rope_sin", sin_t)
+
+    write_fbin_streaming(out_path, iter_tensors)
+
     print(
         f"[hf_to_fbin] wrote {out_path} "
-        f"({len(blob):,} bytes, {len(tensors)} tensors, "
-        f"~{total_data_mb:.1f} MiB of weights)"
+        f"({n_tensors[0]} tensors, ~{n_bytes[0] / (1024 * 1024):.1f} MiB of weights)"
     )
 
 

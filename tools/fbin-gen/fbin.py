@@ -23,6 +23,85 @@ DTYPE_Q8 = 1
 DTYPE_Q4 = 2
 
 
+def write_fbin_streaming(
+    out_path: str,
+    tensor_iter,
+):
+    """Stream-write an .fbin file without holding all tensor bytes in
+    memory. `tensor_iter` is a callable taking `(emit_fn)` where
+    `emit_fn(name, dtype, shape, raw_bytes)` is called once per tensor
+    in the desired output order. We make TWO passes:
+
+      Pass 1: caller iterates and emits; we just record (name, dtype,
+              shape, data_len) per tensor and discard raw_bytes after
+              writing them to a tempfile next to `out_path`.
+      Pass 2: open final output, write header + metadata (with offsets
+              now known), pad to page boundary, append tempfile body.
+
+    Used by the HuggingFace converter for large models where loading
+    the full f32-promoted weight tensor for embed/lm_head (~1.5 GiB
+    on Qwen3-4B) plus all projection bytes simultaneously exceeds RAM
+    + page file. Functionally identical to `write_fbin` over the same
+    tensor sequence.
+    """
+    import os, tempfile
+    out_dir = os.path.dirname(os.path.abspath(out_path)) or "."
+    fd, tmp_path = tempfile.mkstemp(prefix=".fbin_data_", dir=out_dir)
+    os.close(fd)
+
+    metas = []  # (name, dtype, shape, data_len)
+    try:
+        with open(tmp_path, "wb") as tmp:
+            def emit(name, dtype, shape, raw):
+                tmp.write(raw)
+                metas.append((name, dtype, list(shape), len(raw)))
+            tensor_iter(emit)
+            tmp.flush()
+
+        # Build metadata section in memory (small even for 4B).
+        metadata = bytearray()
+        placeholders = []  # (offset_into_metadata, data_len)
+        for name, dtype, shape, dlen in metas:
+            name_bytes = name.encode("utf-8")
+            metadata += struct.pack("<H", len(name_bytes))
+            metadata += name_bytes
+            metadata += struct.pack("<BB", dtype, len(shape))
+            for d in shape:
+                metadata += struct.pack("<I", d)
+            offset_ph = len(metadata)
+            metadata += struct.pack("<QQ", 0, dlen)
+            placeholders.append((offset_ph, dlen))
+
+        data_section_start = ((16 + len(metadata) + (PAGE - 1)) // PAGE) * PAGE
+        cur_off = data_section_start
+        for (ph_off, dlen) in placeholders:
+            struct.pack_into("<QQ", metadata, ph_off, cur_off, dlen)
+            cur_off += dlen
+
+        # Final output: header + metadata + zero-pad + data (copied
+        # from tempfile in 16 MiB chunks so peak RAM stays bounded).
+        with open(out_path, "wb") as out, open(tmp_path, "rb") as tmp:
+            out.write(MAGIC)
+            out.write(struct.pack("<H", VERSION))
+            out.write(struct.pack("<H", len(metas)))
+            out.write(struct.pack("<Q", len(metadata)))
+            out.write(metadata)
+            written = 16 + len(metadata)
+            if written < data_section_start:
+                out.write(b"\x00" * (data_section_start - written))
+            chunk = 16 * 1024 * 1024
+            while True:
+                buf = tmp.read(chunk)
+                if not buf:
+                    break
+                out.write(buf)
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
 def write_fbin(tensors: List[Tuple[str, int, List[int], bytes]]) -> bytes:
     """Pack `(name, dtype, shape, raw_bytes)` tuples into a `.fbin` blob.
 

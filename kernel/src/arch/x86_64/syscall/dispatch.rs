@@ -476,16 +476,21 @@ pub(super) extern "C" fn syscall_handler(
         // disk into a fresh shmem region. arg1 is the FNV-1a 32-bit
         // hash of the filename (matches `synapse::hash_name`'s
         // convention so userspace can reuse it). Returns:
-        //   ((shmem_id as u64) << 32) | (size as u64) -- but size is
-        //   the LOWER 32 bits — many `.fbin` files exceed 4 GiB only
-        //   under D.5+, and our current 232 MiB Q8 fits comfortably.
+        //   ((shmem_id as u64) << 48) | (size & 0x0000_FFFF_FFFF_FFFF)
+        // shmem_id fits in 16 bits (we never allocate more than a
+        // handful per boot); size has 48 bits = up to 256 TiB —
+        // enough for any model we'll plausibly load. The previous
+        // packing used (handle<<32)|size32 and silently truncated
+        // `data_len` for files >4 GiB, breaking Qwen3-4B Q8_2 at
+        // 4.3 GiB.
         // u64::MAX on any error (no model disk, hash mismatch, OOM).
         0xE5 => {
             let name_hash = arg1 as u32;
             match crate::drivers::model_disk::read_into_shmem(name_hash) {
                 Ok((shmem_id, size)) => {
-                    let size32 = size as u32;
-                    ((shmem_id as u64) << 32) | (size32 as u64)
+                    debug_assert!(shmem_id <= 0xFFFF, "shmem_id overflows 16-bit packing");
+                    debug_assert!(size <= 0x0000_FFFF_FFFF_FFFF, "size overflows 48-bit packing");
+                    ((shmem_id as u64) << 48) | (size & 0x0000_FFFF_FFFF_FFFF)
                 }
                 Err(_) => u64::MAX,
             }

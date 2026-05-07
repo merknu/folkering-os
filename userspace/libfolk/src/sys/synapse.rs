@@ -396,8 +396,11 @@ pub fn read_model_file_shmem(name: &str) -> SynapseResult<ShmemFileResponse> {
     if ret == u64::MAX {
         return Err(SynapseError::NotFound);
     }
-    let shmem_handle = ((ret >> 32) & 0xFFFFFFFF) as u32;
-    let size = (ret & 0xFFFFFFFF) as u32;
+    // Kernel packs: shmem_id in bits 48-63 (16-bit), size in bits 0-47
+    // (48-bit, 256 TiB max). The previous encoding used handle<<32|size32
+    // and silently truncated payloads >4 GiB.
+    let shmem_handle = ((ret >> 48) & 0xFFFF) as u32;
+    let size = ret & 0x0000_FFFF_FFFF_FFFF;
     if shmem_handle == 0 {
         return Err(SynapseError::IpcFailed);
     }
@@ -497,8 +500,11 @@ pub fn read_file_chunk(file_id: u16, offset: u32) -> SynapseResult<u64> {
 pub struct ShmemFileResponse {
     /// Shared memory handle (pass to shmem_map)
     pub shmem_handle: u32,
-    /// File size in bytes
-    pub size: u32,
+    /// File size in bytes. u64 to handle model-disk payloads >4 GiB
+    /// (Qwen3-4B Q8_2 is 4.3 GiB). Synapse-VFS path silently caps
+    /// at u32::MAX since its kernel-side ABI hasn't been widened
+    /// yet — files up to 4 GiB only on that path.
+    pub size: u64,
 }
 
 /// Read a file via shared memory (zero-copy)
@@ -535,9 +541,12 @@ pub fn read_file_shmem(name: &str) -> SynapseResult<ShmemFileResponse> {
         return Err(SynapseError::NotFound);
     }
 
-    // Decode: shmem_handle in low 32 bits, size in upper 32 bits
+    // Decode: shmem_handle in low 32 bits, size in upper 32 bits.
+    // Synapse-VFS kernel ABI hasn't been widened yet, so size is
+    // u32-bounded on this path (files >4 GiB use the model-disk
+    // path through `read_model_file_shmem` instead).
     let shmem_handle = (ret & 0xFFFFFFFF) as u32;
-    let size = ((ret >> 32) & 0xFFFFFFFF) as u32;
+    let size = ((ret >> 32) & 0xFFFFFFFF) as u64;
 
     // Handle 0 is invalid (error case)
     if shmem_handle == 0 {
@@ -904,7 +913,7 @@ pub fn read_intent(file_id: u32) -> SynapseResult<ShmemFileResponse> {
     if ret == SYN_STATUS_NOT_FOUND { return Err(SynapseError::NotFound); }
 
     let shmem_handle = (ret & 0xFFFF) as u32;
-    let size = ((ret >> 32) & 0xFFFFFFFF) as u32;
+    let size = ((ret >> 32) & 0xFFFFFFFF) as u64;
 
     Ok(ShmemFileResponse { shmem_handle, size })
 }
