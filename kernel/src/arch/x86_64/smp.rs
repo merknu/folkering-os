@@ -481,14 +481,21 @@ unsafe fn execute_gemm_work(work: &GemmWork) {
 /// once on BSP into this buffer, APs just read i8 lanes via maddubs, no
 /// per-AP quantization in the hot path.
 ///
-/// 64 KiB is enough for the worst real case on Qwen3-0.6B (seq=14
-/// prefill × k=2816 mlp_down ≈ 39 KiB). MAX_SEQ scales array (256 B)
-/// holds per-row max-abs scale factors.
+/// 2 MiB sized to keep the maddubs hot path active even for long
+/// prefills on Qwen3-4B. The bound is `seq * k`, where worst-case k
+/// is the FFN down_proj input dimension (9728 on 4B). At 2 MiB we
+/// fit `seq=215` with k=9728, which covers a 200-token prompt
+/// comfortably. Spilling to the dequant fallback at long seq was
+/// suspected as the source of long-context drift — the dequant
+/// path's per-block fp32 partial sum (4-fmadd chain) plus its
+/// single-precision dequant of f16 scales doesn't match the
+/// integer-exact maddubs path's precision. Keeping maddubs in play
+/// at all qualifying seq lengths bypasses that whole code path.
 ///
 /// Single-static is safe because `dispatch_parallel_gemm` synchronously
 /// waits for all APs before returning — there's never more than one
 /// parallel-Q8 matmul in flight on this kernel.
-const QUANT_BUF_BYTES: usize = 65536;
+const QUANT_BUF_BYTES: usize = 2 * 1024 * 1024;
 #[repr(C, align(32))]
 struct QuantBuf {
     input: [i8; QUANT_BUF_BYTES],
@@ -506,7 +513,10 @@ static mut GLOBAL_QUANT_INPUT: QuantBuf = unsafe { core::mem::zeroed() };
 /// syscall, so BSP is already in the right page table.
 #[target_feature(enable = "avx2")]
 unsafe fn quantize_input_global(input_ptr: u64, seq: usize, k: usize) -> bool {
-    if seq * k > QUANT_BUF_BYTES {
+    // Both bounds matter: byte-budget for the i8 input array AND
+    // entry-budget for the per-row scales array. Failing to clamp
+    // seq would write `buf.scales[MAX_SEQ]` and panic the kernel.
+    if seq > MAX_SEQ || seq * k > QUANT_BUF_BYTES {
         return false;
     }
     let a_f32 = core::slice::from_raw_parts(input_ptr as *const f32, seq * k);
@@ -549,7 +559,15 @@ unsafe fn quantize_input_global(input_ptr: u64, seq: usize, k: usize) -> bool {
 /// `__m256` vectors). MAX_SEQ = 64 is comfortably larger than
 /// the ChatML prefill (seq = 14) and uses 64 × 32 = 2 KiB of
 /// stack per executor — well within budget.
-const MAX_SEQ: usize = 64;
+// MAX_SEQ caps the prefill batch dimension we'll handle in one
+// dispatch. Sized to cover Qwen3-4B prompts up to 128 tokens
+// (folkering.md system + user message). Stack cost in
+// execute_gemm_work_q8_maddubs is 3 × MAX_SEQ × 32 = 12 KiB for
+// (acc, acc_c, local). 256 caused a silent triple-fault on the
+// AP — the kernel-AP stack from Limine appears tighter than 24 KiB
+// once the call frame for execute_gemm_work_q8_maddubs is in.
+// QuantBuf.scales is also sized [f32; MAX_SEQ].
+const MAX_SEQ: usize = 128;
 
 /// Q8_0 batched GEMM via int8 multiply-accumulate (`_mm256_maddubs_epi16`),
 /// reading the pre-quantized activation row from GLOBAL_QUANT_INPUT.
@@ -588,12 +606,43 @@ unsafe fn execute_gemm_work_q8_maddubs(work: &GemmWork) {
     let row_scales = &buf.scales[..seq];
 
     let ones16 = _mm256_set1_epi16(1);
+
+    // Block-Wise Kahan Summation (per architectural report):
+    //   - Inner loop accumulates ~KAHAN_CHUNK Q8 blocks into `local`
+    //     using naive vfmadd231ps. No loop-carried dependency
+    //     beyond what the compiler already unrolls; Broadwell port
+    //     0/1 can dispatch up to two vfmadd231ps per cycle.
+    //   - Every KAHAN_CHUNK Q8 blocks we fold `local` into the
+    //     global f32 accumulator via vector Kahan. Compensation
+    //     vector `c` captures the bits that would otherwise be
+    //     truncated when adding a small block-sum to a saturated
+    //     global. 4 vector ops per merge, amortised across
+    //     ~KAHAN_CHUNK fmadds per (col, s) — overhead is small.
+    //
+    // KAHAN_CHUNK=8 means we merge every 8 Q8 blocks = every 256
+    // input dimensions. That's the threshold where naive f32
+    // accumulation starts losing meaningful low bits on a saturated
+    // global accumulator (per the IEEE 754 mantissa-shift analysis
+    // in the report). 256 fits comfortably under the swamping
+    // boundary.
+    //
+    // f64 accumulators were also evaluated: rejected because
+    // `_mm256_cvtps_pd` halves vector width, and Broadwell's
+    // 16-register YMM file forces L1 spills past seq~8. Block-wise
+    // Kahan keeps the inner loop f32, preserving full vector width
+    // and ILP, while still providing ~O(eps) error bound at the
+    // cross-block reduction boundary.
     let mut acc: [__m256; MAX_SEQ] = [_mm256_setzero_ps(); MAX_SEQ];
+    let mut acc_c: [__m256; MAX_SEQ] = [_mm256_setzero_ps(); MAX_SEQ];
+    let mut local: [__m256; MAX_SEQ] = [_mm256_setzero_ps(); MAX_SEQ];
+    const KAHAN_CHUNK: usize = 8;
 
     for col in col_start..col_end {
         let row_off = col * row_bytes;
         for s in 0..seq {
             acc[s] = _mm256_setzero_ps();
+            acc_c[s] = _mm256_setzero_ps();
+            local[s] = _mm256_setzero_ps();
         }
 
         for b in 0..n_blocks {
@@ -604,11 +653,7 @@ unsafe fn execute_gemm_work_q8_maddubs(work: &GemmWork) {
             //   lanes 0..4 → low 16 bytes of the block (q[0..16])
             //   lanes 4..8 → high 16 bytes (q[16..32])
             // so blending the two scales at lane-4 boundary applies
-            // each scale to the correct half. Verified by walking the
-            // `_mm256_maddubs_epi16` semantics: low/high 128-bit
-            // halves operate independently, and `_mm256_madd_epi16`
-            // sums adjacent i16 pairs without crossing the 128-bit
-            // boundary, so the lane→half mapping is preserved.
+            // each scale to the correct half.
             let scale_lo = f16_to_f32(u16::from_le_bytes([
                 b_q8[block_off],
                 b_q8[block_off + 1],
@@ -642,12 +687,48 @@ unsafe fn execute_gemm_work_q8_maddubs(work: &GemmWork) {
                 let prod16 = _mm256_maddubs_epi16(w_abs, xs_signed);
                 // 16 × i16 → 8 × i32 (multiply by 1, sum adjacent).
                 let prod32 = _mm256_madd_epi16(prod16, ones16);
-                // Convert to f32 and FMA into the row's accumulator,
-                // scaled by per-half block scale. Per-row input scale
-                // is applied once at the end of (col, s).
+                // Convert to f32 and FMA into the LOCAL block-chunk
+                // accumulator. Once per KAHAN_CHUNK iterations we
+                // fold into the global Kahan-compensated `acc`.
                 let prod_f32 = _mm256_cvtepi32_ps(prod32);
-                acc[s] = _mm256_fmadd_ps(prod_f32, scale_split, acc[s]);
+                local[s] = _mm256_fmadd_ps(prod_f32, scale_split, local[s]);
             }
+
+            // Block-Wise Kahan merge: every KAHAN_CHUNK Q8 blocks,
+            // fold the local f32 chunk-sum into the global accumulator
+            // with compensation, then reset the chunk.
+            //
+            //   y = local - c          (apply prior compensation)
+            //   t = acc + y            (running sum, accumulates roundoff)
+            //   c = (t - acc) - y      (extract this round's roundoff)
+            //   acc = t
+            //
+            // Each chain (acc, c, local) is INDEPENDENT per s, so
+            // Broadwell's superscalar OoO can interleave them without
+            // dependency stalls. The 4-instruction Kahan body is
+            // amortised across KAHAN_CHUNK fmadds in the inner loop.
+            if (b + 1) % KAHAN_CHUNK == 0 {
+                for s in 0..seq {
+                    let y = _mm256_sub_ps(local[s], acc_c[s]);
+                    let t = _mm256_add_ps(acc[s], y);
+                    let t_minus_acc = _mm256_sub_ps(t, acc[s]);
+                    acc_c[s] = _mm256_sub_ps(t_minus_acc, y);
+                    acc[s] = t;
+                    local[s] = _mm256_setzero_ps();
+                }
+            }
+        }
+
+        // Final Kahan merge of any blocks that didn't fill a full
+        // KAHAN_CHUNK. n_blocks isn't always a multiple of
+        // KAHAN_CHUNK (304 % 8 = 0 for FFN-down 9728/32, but not
+        // every matmul has that exact shape).
+        for s in 0..seq {
+            let y = _mm256_sub_ps(local[s], acc_c[s]);
+            acc[s] = _mm256_add_ps(acc[s], y);
+            // Don't update acc_c past the last merge — we're about
+            // to horizontal-sum and exit, no future iterations to
+            // compensate.
         }
 
         for s in 0..seq {

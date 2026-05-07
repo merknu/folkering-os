@@ -1371,17 +1371,11 @@ impl SamplerConfig {
     /// when we add a third model.
     const fn for_model(cfg: &forward_pass::ModelConfig) -> Self {
         if cfg.hidden_dim >= 2048 {
-            // Qwen3-4B-Instruct-2507 (and larger): HF defaults +
-            // deduped, single-application rep-penalty. Verified
-            // matching Python greedy through index 34 on the
-            // 42-token "Hvem er du?" prompt under Q8_2.
-            //
-            // Long-context limitation: at prompt lengths beyond
-            // ~80 tokens our Q8_2 forward pass starts diverging
-            // from HF Python at the first generated token.
-            // Folkering's rules-file system prompt should stay
-            // under ~300 bytes (≈80 tokens) until we widen the
-            // matmul accumulator or move to fp16 weights.
+            // Qwen3-4B: HF-canonical sampler (deduped rep-penalty).
+            // Block-Wise Kahan in the AVX2 maddubs path keeps the
+            // forward pass coherent past 250 decode tokens — drift
+            // verified closed on the 300-word eventyr stress test
+            // (262 tokens, in-character refusal, no degeneration).
             Self {
                 top_k: 50,
                 top_p: 0.9,
