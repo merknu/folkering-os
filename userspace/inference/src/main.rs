@@ -1454,25 +1454,28 @@ fn run_d37_first_blood() -> bool {
     // Full 28-layer Qwen3-0.6B with the perf stack (#165 xsave +
     // #166 AVX2 FMA + #168 yield-tune + #169 multi-sector DMA),
     // running on a 768 MiB bump heap.
-    // Qwen3-4B-Instruct-2507 config (full 36 layers). Bumps from
-    // Qwen3-0.6B (28 / 1024 / 16 heads / 3072 ffn) — model file is
-    // ~4.0 GiB Q8 + Q8 embed; the larger weight stream needs the
-    // 1.5 GiB HEAP_SIZE bump above. Non-thinking mode means no
-    // automatic <think>...</think> emission; the model answers
-    // directly. rope_theta is baked into the .fbin's RoPE tables
-    // (5e6 for 4B vs 1e6 for 0.6B), so the runtime config doesn't
-    // need to change.
-    let cfg = ModelConfig {
-        n_layers: 36,
-        hidden_dim: 2560,
-        n_heads: 32,
-        n_kv_heads: 8,
-        head_dim: 128,
-        intermediate: 9728,
-        vocab: 151936,
-        max_pos: 512,
-        eps: 1e-6,
+    // Auto-detect topology from the .fbin so one binary handles every
+    // Qwen3 size (0.6B / 4B / future). The shapes are already in the
+    // fbin tensor table; hardcoding them is a footgun every time we
+    // swap the model disk. rope_theta is baked into the precomputed
+    // RoPE tables, so the runtime never sees it directly. eps stays
+    // at Qwen3's 1e-6; flip to 1e-5 if/when we add Qwen2.5 again.
+    let cfg = match ModelConfig::from_fbin(&view) {
+        Some(c) => c,
+        None => {
+            println!(
+                "[INFERENCE] D.3.7: ModelConfig::from_fbin failed — \
+                 .fbin missing required tensors"
+            );
+            return false;
+        }
     };
+    println!(
+        "[INFERENCE] D.3.7: detected {}-layer model — hidden={} heads={}/{}kv \
+         head_dim={} ffn={} vocab={} max_pos={}",
+        cfg.n_layers, cfg.hidden_dim, cfg.n_heads, cfg.n_kv_heads,
+        cfg.head_dim, cfg.intermediate, cfg.vocab, cfg.max_pos,
+    );
     let mut cache = KvCache::new(
         cfg.n_layers, cfg.max_pos, cfg.n_kv_heads, cfg.head_dim,
     );
