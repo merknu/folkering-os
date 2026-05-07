@@ -886,10 +886,24 @@ pub fn softmax_inplace(x: &mut [f32]) {
 /// `[seq_len * n_heads * head_dim]`).
 ///
 /// `cos_table` and `sin_table` both have shape `[seq_len, head_dim/2]`,
-/// pre-computed by the build-time tooling (`gen_test_blobs.py` and the
-/// future HuggingFace converter). For each (s, h, i) where `i` indexes
-/// the pair (`pair_i = i / 2`), rotates `(qk[s,h,2*pair], qk[s,h,2*pair+1])`
-/// by the angle `arctan2(sin, cos)` baked into the tables.
+/// pre-computed by the build-time tooling. For pair index `p` (i.e.
+/// frequency `1 / theta^(2p/head_dim)`), rotates the coordinate pair
+/// `(qk[s,h,p], qk[s,h,p + head_dim/2])` by the angle baked into the
+/// tables.
+///
+/// **Convention: split-halves**, matching HuggingFace transformers'
+/// `apply_rotary_pos_emb` for Llama / Qwen / Mistral / Qwen3:
+///
+///     rotate_half(x) = concat(-x[d/2:], x[:d/2])
+///     out = x * cos + rotate_half(x) * sin
+///
+/// This pairs index `p` with `p + d/2`. The earlier code used
+/// interleaved pairs `(2p, 2p+1)` — same arithmetic but different
+/// coordinate mapping, which the model's weights are NOT trained for.
+/// Switching to split-halves was the fix that put Rust's first
+/// generated tokens back on Python's greedy trajectory ("Jeg er Qwen,
+/// en AI-..." instead of "Jeg er en AI-..."). The pre-computed tables
+/// don't change — only the index mapping does.
 ///
 /// Why pre-compute the tables instead of running sin/cos in the kernel:
 /// fast `sin/cos` approximations cost ~30 cycles per call, and we'd
@@ -914,9 +928,11 @@ pub fn apply_rope(
 
     for s in 0..seq_len {
         for h in 0..n_heads {
+            let head_base = s * n_heads * head_dim + h * head_dim;
             for p in 0..pairs {
-                let i = s * n_heads * head_dim + h * head_dim + 2 * p;
-                let j = i + 1;
+                // Split-halves: pair p couples coords (p, p + d/2).
+                let i = head_base + p;
+                let j = head_base + p + pairs;
                 let cos = cos_table[s * pairs + p];
                 let sin = sin_table[s * pairs + p];
                 let x = qk[i];
@@ -1414,6 +1430,20 @@ fn fast_rsqrt(x: f32) -> f32 {
 pub fn rmsnorm(x: &[f32], weight: &[f32], eps: f32) -> Option<Vec<f32>> {
     if x.len() != weight.len() { return None; }
     if x.is_empty() { return Some(Vec::new()); }
+
+    // AVX2 fast path: head_dim and hidden_dim on every model we
+    // support are multiples of 8 (Qwen3 has hidden=1024, head_dim=128;
+    // Llama-3 same; Qwen2.5 has hidden=896, head_dim=64). q_norm and
+    // k_norm fire 24 times per layer × 28 layers = 672 calls per
+    // decode token; the pre-attn / pre-ffn norms add another 56.
+    // Worth the AVX2 path even though each call is small.
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2_fma() && x.len() % 8 == 0 {
+            return Some(unsafe { rmsnorm_avx2(x, weight, eps) });
+        }
+    }
+
     let n = x.len();
     let mut sum_sq: f32 = 0.0;
     for &v in x { sum_sq += v * v; }
@@ -1424,6 +1454,48 @@ pub fn rmsnorm(x: &[f32], weight: &[f32], eps: f32) -> Option<Vec<f32>> {
         out.push(x[i] * inv_rms * weight[i]);
     }
     Some(out)
+}
+
+/// AVX2 + FMA rmsnorm. Two passes: sum-of-squares accumulator in 8
+/// f32 lanes (hsum once at the end), then scale + weight in 8 lanes.
+/// Caller guarantees `x.len() == weight.len()` and `x.len() % 8 == 0`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn rmsnorm_avx2(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
+    use core::arch::x86_64::*;
+    let n = x.len();
+    let chunks = n / 8;
+
+    // Pass 1: sum of squares.
+    let mut acc = _mm256_setzero_ps();
+    for c in 0..chunks {
+        let v = _mm256_loadu_ps(x.as_ptr().add(c * 8));
+        acc = _mm256_fmadd_ps(v, v, acc);
+    }
+    let lo = _mm256_castps256_ps128(acc);
+    let hi = _mm256_extractf128_ps(acc, 1);
+    let s4 = _mm_add_ps(lo, hi);
+    let s4_hi = _mm_movehdup_ps(s4);
+    let s2 = _mm_add_ps(s4, s4_hi);
+    let s2_hi = _mm_movehl_ps(s4_hi, s2);
+    let s1 = _mm_add_ss(s2, s2_hi);
+    let sum_sq = _mm_cvtss_f32(s1);
+
+    let mean_sq = sum_sq / (n as f32);
+    let inv_rms = fast_rsqrt(mean_sq + eps);
+    let inv_rms_v = _mm256_set1_ps(inv_rms);
+
+    // Pass 2: out[i] = x[i] * inv_rms * weight[i].
+    let mut out: Vec<f32> = Vec::with_capacity(n);
+    out.set_len(n);
+    for c in 0..chunks {
+        let xv = _mm256_loadu_ps(x.as_ptr().add(c * 8));
+        let wv = _mm256_loadu_ps(weight.as_ptr().add(c * 8));
+        let scaled = _mm256_mul_ps(xv, inv_rms_v);
+        let res = _mm256_mul_ps(scaled, wv);
+        _mm256_storeu_ps(out.as_mut_ptr().add(c * 8), res);
+    }
+    out
 }
 
 /// Boot-time correctness check. Runs all `tensor_math` ops on small
