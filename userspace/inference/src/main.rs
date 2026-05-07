@@ -113,7 +113,23 @@ mod forward_pass;
 // top-5 = ['<think>', '<|im_start|>', 'ол', '<|im_end|>', '</think>'].
 // Qwen3 is a thinking-mode model — responses open with reasoning tags
 // before the user-facing text.
-const HEAP_SIZE: usize = 1536 * 1024 * 1024;
+// 12 GiB inference heap — sized to fit a Qwen3-4B KvCache at
+// max_pos=32768 (n_layers=36 × 2 × 32768 × n_kv=8 × head_dim=128 ×
+// 4 = 9 GiB) plus per-chunk forward scratch (~360 MiB leaked into
+// the bump arena until each chunk's reset_to). Remaining ~2.5 GiB
+// is headroom for embeds, lm_head logits, sampler scratch.
+//
+// Static array — committed at task start, so the VM's RAM
+// allocation must cover this plus kernel/userspace (Proxmox VM 900
+// needs ≥16 GiB; we ship recommending 24-32 GiB).
+//
+// Linking past 2 GiB of `.bss` requires `code-model = medium` in
+// the userspace target spec (small mode caps PC32 reach at ±2 GiB).
+// `link.ld` also emits a `QUAD(0)` anchor in `.data` so lld keeps
+// the writable PHDR alive — without it, medium mode merges `.bss`
+// into the preceding R+X PT_LOAD and the task #PFs on first heap
+// write.
+const HEAP_SIZE: usize = 12 * 1024 * 1024 * 1024;
 
 struct BumpAllocator {
     heap: UnsafeCell<[u8; HEAP_SIZE]>,
