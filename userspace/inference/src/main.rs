@@ -50,6 +50,7 @@ extern crate alloc;
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
+use core::mem::MaybeUninit;
 
 use libfolk::{entry, println};
 use libfolk::sys::yield_cpu;
@@ -113,10 +114,33 @@ mod forward_pass;
 // top-5 = ['<think>', '<|im_start|>', 'ол', '<|im_end|>', '</think>'].
 // Qwen3 is a thinking-mode model — responses open with reasoning tags
 // before the user-facing text.
-const HEAP_SIZE: usize = 1536 * 1024 * 1024;
+// 12 GiB inference heap — sized to fit a Qwen3-4B KvCache at
+// max_pos=32768 (n_layers=36 × 2 × 32768 × n_kv=8 × head_dim=128 ×
+// 4 = 9 GiB) plus per-chunk forward scratch (~360 MiB leaked into
+// the bump arena until each chunk's reset_to). Remaining ~2.5 GiB
+// is headroom for embeds, lm_head logits, sampler scratch.
+//
+// Static array — committed at task start, so the VM's RAM
+// allocation must cover this plus kernel/userspace (Proxmox VM 900
+// needs ≥16 GiB; we ship recommending 24-32 GiB).
+//
+// Linking past 2 GiB of `.bss` requires `code-model = medium` in
+// the userspace target spec (small mode caps PC32 reach at ±2 GiB).
+// `link.ld` also emits a `QUAD(0)` anchor in `.data` so lld keeps
+// the writable PHDR alive — without it, medium mode merges `.bss`
+// into the preceding R+X PT_LOAD and the task #PFs on first heap
+// write.
+const HEAP_SIZE: usize = 12 * 1024 * 1024 * 1024;
 
+// `MaybeUninit` instead of `[u8; HEAP_SIZE] = [0; HEAP_SIZE]` so rustc
+// doesn't try to const-evaluate a 12 GiB zero array during codegen.
+// At HEAP_SIZE=1.5 GiB the const-eval was tolerable; at 12 GiB it
+// OOM-kills `cargo check --release` on a 7 GB GitHub Actions runner.
+// The kernel ELF loader zero-fills .bss pages at task spawn anyway,
+// so the runtime semantics are identical — the array is observably
+// zero on first access.
 struct BumpAllocator {
-    heap: UnsafeCell<[u8; HEAP_SIZE]>,
+    heap: UnsafeCell<MaybeUninit<[u8; HEAP_SIZE]>>,
     offset: UnsafeCell<usize>,
 }
 
@@ -132,7 +156,7 @@ unsafe impl GlobalAlloc for BumpAllocator {
             return core::ptr::null_mut();
         }
         *offset = new_offset;
-        (*self.heap.get()).as_mut_ptr().add(aligned)
+        (*self.heap.get()).as_mut_ptr().cast::<u8>().add(aligned)
     }
     unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
 }
@@ -166,7 +190,7 @@ impl BumpAllocator {
 
 #[global_allocator]
 static ALLOCATOR: BumpAllocator = BumpAllocator {
-    heap: UnsafeCell::new([0; HEAP_SIZE]),
+    heap: UnsafeCell::new(MaybeUninit::uninit()),
     offset: UnsafeCell::new(0),
 };
 
