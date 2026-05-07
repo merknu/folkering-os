@@ -108,27 +108,60 @@ impl BuddyAllocator {
         crate::drivers::serial::write_dec((usable_mem * PAGE_SIZE / (1024 * 1024)) as u32);
         crate::serial_strln!(" MB");
 
-        // Set up bootstrap allocator with first usable region > 1MB
-        // We'll use this for heap initialization
+        // Register ALL usable regions with the bootstrap allocator,
+        // sorted largest-first. Limine on Proxmox/QEMU returns the
+        // 8 GiB VM split into ~5-6 chunks (ACPI, framebuffer, E820
+        // reservations etc carve gaps), and earlier we used only
+        // the first region — which left ~3 GiB of physical RAM
+        // unreachable. Now `alloc_pages` walks every region until
+        // one satisfies the request, so the 4 GiB Qwen3-4B weight
+        // shmem can stretch across multiple regions if no single
+        // chunk is big enough.
+        //
+        // Largest-first ordering minimises huge-page fragmentation:
+        // the biggest region absorbs most of the small-block traffic
+        // first; smaller regions stay clean for late huge requests.
+        // Fixed-size scratch — no heap allocation, since PMM runs
+        // before the kernel heap.
+        let mut regions: [(usize, usize); MAX_REGIONS] = [(0, 0); MAX_REGIONS];
+        let mut region_count = 0usize;
         for entry in boot_info.memory_map {
-            if entry.entry_type == EntryType::USABLE {
+            if entry.entry_type == EntryType::USABLE && region_count < MAX_REGIONS {
                 let base = entry.base as usize;
                 let size = entry.length as usize;
-
                 let aligned_base = (base + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
                 let aligned_end = (base + size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-
                 if aligned_end > aligned_base && aligned_base >= 0x100000 {
-                    let aligned_size = aligned_end - aligned_base;
-                    let num_pages = aligned_size / PAGE_SIZE;
-
-                    crate::serial_println!("[PMM] Bootstrap allocator ready");
-
-                    *BOOTSTRAP_ALLOCATOR.lock() = Some(BootstrapAllocator::new(aligned_base, num_pages));
-                    break;
+                    let pages = (aligned_end - aligned_base) / PAGE_SIZE;
+                    regions[region_count] = (aligned_base, pages);
+                    region_count += 1;
                 }
             }
         }
+        // Largest-first sort (selection sort, region_count ≤ 16).
+        for i in 0..region_count {
+            let mut max_j = i;
+            for j in (i + 1)..region_count {
+                if regions[j].1 > regions[max_j].1 {
+                    max_j = j;
+                }
+            }
+            if max_j != i {
+                regions.swap(i, max_j);
+            }
+        }
+        let mut bootstrap = BootstrapAllocator::new();
+        let mut total_mib = 0usize;
+        for i in 0..region_count {
+            bootstrap.add_region(regions[i].0, regions[i].1);
+            total_mib += regions[i].1 * PAGE_SIZE / (1024 * 1024);
+        }
+        crate::serial_str!("[PMM] Bootstrap allocator ready (");
+        crate::drivers::serial::write_dec(region_count as u32);
+        crate::serial_str!(" regions, ");
+        crate::drivers::serial::write_dec(total_mib as u32);
+        crate::serial_strln!(" MB total)");
+        *BOOTSTRAP_ALLOCATOR.lock() = Some(bootstrap);
     }
 
     /// Add a physical memory region to the allocator
@@ -364,54 +397,86 @@ static ALLOCATOR: Mutex<BuddyAllocator> = Mutex::new(BuddyAllocator::new());
 /// Simple bump allocator for bootstrap (before buddy allocator is ready)
 static BOOTSTRAP_ALLOCATOR: Mutex<Option<BootstrapAllocator>> = Mutex::new(None);
 
-/// Simple bump allocator that doesn't need free list metadata
-struct BootstrapAllocator {
+/// One contiguous physical region the bootstrap allocator owns.
+/// Each entry tracks its own `next_page` cursor — independent bump
+/// arenas chained together. We pick the first region whose remaining
+/// tail can satisfy the request (after natural alignment), letting
+/// the 4 GiB Qwen3-4B weight-shmem stretch across two ~3-4 GiB
+/// USABLE regions if no single one is big enough.
+struct BootstrapRegion {
     next_page: usize,
     end_page: usize,
 }
 
+/// Bump allocator spanning up to MAX_REGIONS BootstrapRegion entries.
+/// Fixed-size array keeps PMM init self-contained — PMM runs before
+/// the kernel heap is set up, so we can't allocate a Vec here. 16
+/// regions is way more than any real x86 firmware reports for E820
+/// USABLE — Limine on Proxmox/QEMU emits ~6 on an 8 GiB VM.
+const MAX_REGIONS: usize = 16;
+struct BootstrapAllocator {
+    regions: [BootstrapRegion; MAX_REGIONS],
+    region_count: usize,
+}
+
 impl BootstrapAllocator {
-    fn new(start: usize, num_pages: usize) -> Self {
+    const fn new() -> Self {
+        const EMPTY: BootstrapRegion = BootstrapRegion {
+            next_page: 0,
+            end_page: 0,
+        };
         Self {
+            regions: [EMPTY; MAX_REGIONS],
+            region_count: 0,
+        }
+    }
+
+    fn add_region(&mut self, start: usize, num_pages: usize) {
+        if self.region_count >= MAX_REGIONS {
+            return;
+        }
+        self.regions[self.region_count] = BootstrapRegion {
             next_page: start,
             end_page: start + num_pages * PAGE_SIZE,
-        }
+        };
+        self.region_count += 1;
     }
 
     fn alloc_page(&mut self) -> Option<usize> {
-        if self.next_page < self.end_page {
-            let page = self.next_page;
-            self.next_page += PAGE_SIZE;
-            ALLOCATED_PAGES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            Some(page)
-        } else {
-            None
+        for i in 0..self.region_count {
+            let r = &mut self.regions[i];
+            if r.next_page < r.end_page {
+                let page = r.next_page;
+                r.next_page += PAGE_SIZE;
+                ALLOCATED_PAGES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                return Some(page);
+            }
         }
+        None
     }
 
     /// Allocate `1 << order` contiguous, naturally aligned pages from
-    /// the bump arena. Used by `alloc_pages(order)` when the buddy
-    /// free-list is empty for that order — the buddy lists only get
-    /// populated as pages get freed back, so at boot they're empty
-    /// and a huge-page request would otherwise fail despite plenty
-    /// of contiguous physical RAM sitting in the bump arena.
-    ///
-    /// Skips bytes if needed to land the allocation on a `(PAGE_SIZE
-    /// << order)`-aligned boundary; the skipped tail isn't returned
-    /// to anyone (acceptable for boot-time allocation, the alternative
-    /// is a freelist of small fragments which complicates teardown).
+    /// any region with enough space. Walks regions in registration
+    /// order and picks the first one whose remaining tail (post-
+    /// alignment) covers the block.
     fn alloc_block(&mut self, order: usize) -> Option<usize> {
         let block_size = PAGE_SIZE << order;
-        let alignment = block_size; // natural alignment
-        let aligned_start = (self.next_page + alignment - 1) & !(alignment - 1);
-        let aligned_end = aligned_start.checked_add(block_size)?;
-        if aligned_end > self.end_page {
-            return None;
+        let alignment = block_size;
+        for i in 0..self.region_count {
+            let r = &mut self.regions[i];
+            let aligned_start = (r.next_page + alignment - 1) & !(alignment - 1);
+            let aligned_end = match aligned_start.checked_add(block_size) {
+                Some(e) => e,
+                None => continue,
+            };
+            if aligned_end <= r.end_page {
+                r.next_page = aligned_end;
+                let pages = 1usize << order;
+                ALLOCATED_PAGES.fetch_add(pages, core::sync::atomic::Ordering::Relaxed);
+                return Some(aligned_start);
+            }
         }
-        self.next_page = aligned_end;
-        let pages = 1usize << order;
-        ALLOCATED_PAGES.fetch_add(pages, core::sync::atomic::Ordering::Relaxed);
-        Some(aligned_start)
+        None
     }
 }
 
