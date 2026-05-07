@@ -1372,17 +1372,16 @@ impl SamplerConfig {
     const fn for_model(cfg: &forward_pass::ModelConfig) -> Self {
         if cfg.hidden_dim >= 2048 {
             // Qwen3-4B-Instruct-2507 (and larger): HF defaults +
-            // deduped, single-application rep-penalty.
+            // deduped, single-application rep-penalty. Verified
+            // matching Python greedy through index 34 on the
+            // 42-token "Hvem er du?" prompt under Q8_2.
             //
-            // Verified vs Python ground-truth greedy after the
-            // Q8_2 weight format landed: Folkering's greedy now
-            // matches HF token-for-token through index 34 (was 11
-            // under Q8_0 with a 0.94-logit gap to the right token
-            // at index 12). Remaining greedy differences past
-            // index 34 are linguistic alternatives at natural
-            // decision points (tekst vs tekster, optional ' i dag'
-            // closer), not numerical drift — so the production
-            // sampler can roll either trajectory and stay correct.
+            // Long-context limitation: at prompt lengths beyond
+            // ~80 tokens our Q8_2 forward pass starts diverging
+            // from HF Python at the first generated token.
+            // Folkering's rules-file system prompt should stay
+            // under ~300 bytes (≈80 tokens) until we widen the
+            // matmul accumulator or move to fp16 weights.
             Self {
                 top_k: 50,
                 top_p: 0.9,
@@ -1490,28 +1489,75 @@ fn run_d37_first_blood() -> bool {
         cfg.n_layers, cfg.max_pos, cfg.n_kv_heads, cfg.head_dim,
     );
 
-    // ChatML with explicit Norwegian system prompt. Without the
-    // system message Qwen3-4B answers "Hvem er du?" in Danish/Swedish
-    // (the question parses cleanly in all three Scandinavian
-    // languages and the model's training data probably leans Danish
-    // for that exact phrase). The system message removes the
-    // ambiguity. Also gives the model a defined role, which usually
-    // tightens the response and makes EOS more likely on short
-    // questions.
-    let prompt = concat!(
-        "<|im_start|>system\n",
-        "Du er en hjelpsom AI-assistent. Svar kort og presist på norsk bokmål.",
-        "<|im_end|>\n",
-        "<|im_start|>user\n",
-        "Hvem er du?",
-        "<|im_end|>\n",
-        "<|im_start|>assistant\n",
-    );
-    let prompt_ids = tok.encode(prompt);
+    // System prompt loaded from VFS file `folkering.md` if present.
+    // Lets the operator change Draug's behaviour (language, tone,
+    // role, allowed topics) without rebuilding the inference binary
+    // — same idea as Claude Code's `CLAUDE.md`. Falls back to a
+    // baked-in Norwegian default if the file is missing or empty.
+    //
+    // Why hardcode a fallback at all: we want First Blood to work
+    // on a fresh image even if someone forgets to pack the file.
+    // The fallback is identical to what we shipped pre-rules-file,
+    // so behaviour is unchanged when no rules are installed.
+    let default_system = "Du er en hjelpsom AI-assistent. Svar kort og presist på norsk bokmål.";
+    let system_prompt = match vfs_loader::read_file("folkering.md") {
+        Ok(bytes) => match core::str::from_utf8(&bytes) {
+            Ok(s) if !s.trim().is_empty() => {
+                let owned: alloc::string::String = s.trim().into();
+                println!(
+                    "[INFERENCE] D.3.7: loaded folkering.md ({} bytes) as system prompt",
+                    owned.len()
+                );
+                owned
+            }
+            _ => {
+                println!(
+                    "[INFERENCE] D.3.7: folkering.md present but empty / non-UTF-8, using default"
+                );
+                default_system.into()
+            }
+        },
+        Err(_) => {
+            println!(
+                "[INFERENCE] D.3.7: no folkering.md in VFS, using baked-in default system prompt"
+            );
+            default_system.into()
+        }
+    };
+
+    // The user message stays hardcoded for the boot self-test —
+    // interactive chat (input from shell, output via IPC) is the
+    // next milestone. Picking "Hvem er du?" because it forces the
+    // model to invoke the system-prompt persona, which makes the
+    // rules-file effect obvious in the response.
+    let user_message = "Hvem er du?";
+    let mut prompt = alloc::string::String::new();
+    prompt.push_str("<|im_start|>system\n");
+    prompt.push_str(&system_prompt);
+    prompt.push_str("<|im_end|>\n<|im_start|>user\n");
+    prompt.push_str(user_message);
+    prompt.push_str("<|im_end|>\n<|im_start|>assistant\n");
+    let prompt_ids = tok.encode(&prompt);
     println!(
         "[INFERENCE] D.3.7: encoded prompt -> {} tokens",
         prompt_ids.len()
     );
+    // Diagnostic: dump prompt token IDs so we can diff against
+    // Python's tokeniser. Catches subtle BPE divergences that would
+    // otherwise present as forward-pass bugs at long contexts.
+    if prompt_ids.len() <= 256 {
+        // Avoid spamming serial on huge prompts. Build the line as
+        // a single String first so it lands as one log entry.
+        use core::fmt::Write;
+        let mut line = alloc::string::String::new();
+        line.push_str("[INFERENCE] D.3.7: prompt_ids=[");
+        for (i, t) in prompt_ids.iter().enumerate() {
+            if i > 0 { line.push_str(", "); }
+            let _ = core::write!(&mut line, "{}", t);
+        }
+        line.push(']');
+        println!("{}", line);
+    }
 
     // ── Heap layout discipline for the decode loop ────────────────
     // The bump allocator never frees on drop. To keep heap pressure
