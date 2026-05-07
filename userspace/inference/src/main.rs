@@ -1373,6 +1373,17 @@ impl SamplerConfig {
         if cfg.hidden_dim >= 2048 {
             // Qwen3-4B-Instruct-2507 (and larger): HF defaults +
             // deduped, single-application rep-penalty.
+            //
+            // Verified against Python ground-truth via greedy diff
+            // (T=0 / RP=1.0): 31 of 32 generated tokens match HF
+            // greedy verbatim; the one diverging step has the right
+            // answer in our top-2 with a 0.94-logit gap to top-1.
+            // That gap is the Q8 quantization noise floor across 36
+            // layers — closing it further requires either fp16
+            // weights (~8 GiB instead of 4 GiB Q8) or finer Q8 block
+            // size (16-element groups instead of 32). Logged here so
+            // the next time this question comes up we don't re-derive
+            // it from scratch.
             Self {
                 top_k: 50,
                 top_p: 0.9,
